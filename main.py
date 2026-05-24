@@ -204,6 +204,8 @@ async def upload(
             "alerts": alerts, "cashflow": cashflow,
             "runway_months": runway_months,
             "forecast": forecast, "anomalies": anomalies, "breakeven": breakeven,
+            "currency":        df.attrs.get("currency", "USD"),
+            "currency_symbol": df.attrs.get("currency_symbol", "$"),
         })
     except Exception as e:
         traceback.print_exc()
