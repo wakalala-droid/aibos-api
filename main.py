@@ -240,7 +240,7 @@ async def analyse(body: AnalyseBody):
 async def forecast(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return clean(return engine.forecast_revenue(df, body.months_ahead))
+        return clean(engine.forecast_revenue(df, body.months_ahead))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -250,7 +250,7 @@ async def forecast(body: AnalyseBody):
 async def anomalies(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return clean(return engine.detect_anomalies(df, body.z_threshold))
+        return clean(engine.detect_anomalies(df, body.z_threshold))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -260,7 +260,7 @@ async def anomalies(body: AnalyseBody):
 async def breakeven(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return clean(return engine.calculate_breakeven(df, body.fixed_cost_pct))
+        return clean(engine.calculate_breakeven(df, body.fixed_cost_pct))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -270,7 +270,7 @@ async def breakeven(body: AnalyseBody):
 async def cashflow(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return clean(return engine.forecast_cashflow(df, body.current_cash, body.months_ahead))
+        return clean(engine.forecast_cashflow(df, body.current_cash, body.months_ahead))
     except Exception as e:
         raise HTTPException(500, str(e))
 
