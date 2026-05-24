@@ -82,10 +82,16 @@ def parse_upload(file: UploadFile) -> pd.DataFrame:
 
 def df_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
-    df["revenue"]    = pd.to_numeric(df["revenue"],    errors="coerce").fillna(0)
-    df["costs"]      = pd.to_numeric(df["costs"],      errors="coerce").fillna(0)
-    df["profit"]     = df["revenue"] - df["costs"]
-    df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
+    df = normalise_columns(df)
+    for col in ["revenue", "costs", "profit", "margin_pct"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    if "costs" not in df.columns:
+        df["costs"] = (df["revenue"] * 0.70).round(2)
+    if "profit" not in df.columns:
+        df["profit"] = df["revenue"] - df["costs"]
+    if "margin_pct" not in df.columns:
+        df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
     return df
 
 def safe_records(df: pd.DataFrame) -> list:
