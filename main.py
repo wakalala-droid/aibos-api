@@ -24,6 +24,33 @@ from supabase import create_client, Client
 
 import engine   # ← your existing engine.py, untouched
 
+# ── JSON serialiser — converts numpy types to native Python ────────
+def clean(obj):
+    """Recursively convert numpy/pandas types to JSON-safe Python types."""
+    if isinstance(obj, dict):
+        return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean(i) for i in obj]
+    if isinstance(obj, float) and (obj != obj):   # NaN check
+        return None
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer,)):  return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj) if obj == obj else None
+        if isinstance(obj, np.ndarray):     return [clean(i) for i in obj.tolist()]
+        if isinstance(obj, np.bool_):       return bool(obj)
+    except ImportError:
+        pass
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.Timestamp): return str(obj)
+        if isinstance(obj, pd.NA.__class__): return None
+    except ImportError:
+        pass
+    return obj
+
+
+
 # ── App ────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI-BOS API", version="2.0.0")
@@ -170,14 +197,14 @@ async def upload(
         avg_costs     = float(df["costs"].tail(3).mean())
         runway_months = round(current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
 
-        return {
+        return clean({
             "ok": True, "rows": len(df), "columns": list(df.columns),
             "records": safe_records(df),
             "pnl": pnl, "health_score": score, "health_label": label,
             "alerts": alerts, "cashflow": cashflow,
             "runway_months": runway_months,
             "forecast": forecast, "anomalies": anomalies, "breakeven": breakeven,
-        }
+        })
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Analysis failed: {e}")
@@ -197,12 +224,12 @@ async def analyse(body: AnalyseBody):
         breakeven    = engine.calculate_breakeven(df, body.fixed_cost_pct)
         avg_costs     = float(df["costs"].tail(3).mean())
         runway_months = round(body.current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
-        return {
+        return clean({
             "ok": True,
             "pnl": pnl, "health_score": score, "health_label": label,
             "alerts": alerts, "cashflow": cashflow, "runway_months": runway_months,
             "forecast": forecast, "anomalies": anomalies, "breakeven": breakeven,
-        }
+        })
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, str(e))
@@ -213,7 +240,7 @@ async def analyse(body: AnalyseBody):
 async def forecast(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return engine.forecast_revenue(df, body.months_ahead)
+        return clean(return engine.forecast_revenue(df, body.months_ahead))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -223,7 +250,7 @@ async def forecast(body: AnalyseBody):
 async def anomalies(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return engine.detect_anomalies(df, body.z_threshold)
+        return clean(return engine.detect_anomalies(df, body.z_threshold))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -233,7 +260,7 @@ async def anomalies(body: AnalyseBody):
 async def breakeven(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return engine.calculate_breakeven(df, body.fixed_cost_pct)
+        return clean(return engine.calculate_breakeven(df, body.fixed_cost_pct))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -243,7 +270,7 @@ async def breakeven(body: AnalyseBody):
 async def cashflow(body: AnalyseBody):
     try:
         df = df_from_records(body.records)
-        return engine.forecast_cashflow(df, body.current_cash, body.months_ahead)
+        return clean(return engine.forecast_cashflow(df, body.current_cash, body.months_ahead))
     except Exception as e:
         raise HTTPException(500, str(e))
 
