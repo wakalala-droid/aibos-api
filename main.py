@@ -81,31 +81,91 @@ def get_supabase() -> Client:
 # This function adds profit + margin_pct if the upload omits them.
 
 def parse_upload(file: UploadFile) -> pd.DataFrame:
-    content = file.file.read()
-    name    = (file.filename or "").lower()
+    """Read CSV or Excel upload → clean DataFrame ready for engine."""
+    raw  = file.file.read()
+    name = (file.filename or "").lower()
+
     try:
-        df = pd.read_csv(io.BytesIO(content)) if name.endswith(".csv") \
-             else pd.read_excel(io.BytesIO(content))
-    except Exception:
-        try:
-            df = pd.read_csv(io.BytesIO(content))   # fallback
-        except Exception as e:
-            raise HTTPException(400, f"Cannot read file: {e}")
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw))
+        elif name.endswith((".xlsx", ".xls")):
+            try:
+                df = pd.read_excel(io.BytesIO(raw))
+            except Exception:
+                xl = pd.ExcelFile(io.BytesIO(raw))
+                df = pd.concat([xl.parse(s) for s in xl.sheet_names], ignore_index=True)
+        else:
+            try:
+                df = pd.read_csv(io.BytesIO(raw))
+            except Exception:
+                df = pd.read_excel(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"Could not read file: {e}")
 
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    missing = {"month", "revenue", "costs"} - set(df.columns)
-    if missing:
-        raise HTTPException(422, f"Missing columns: {missing}. Got: {list(df.columns)}")
+    df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    df = normalise_columns(df)
 
-    df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
-    df["costs"]   = pd.to_numeric(df["costs"],   errors="coerce").fillna(0)
+    if "revenue" not in df.columns:
+        raise HTTPException(422, f"Could not find a revenue column. Your columns: {list(df.columns)}")
+
+    for col in ["revenue", "costs", "profit", "margin_pct"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    if "costs" not in df.columns:
+        df["costs"] = (df["revenue"] * 0.70).round(2)
     if "profit" not in df.columns:
         df["profit"] = df["revenue"] - df["costs"]
     if "margin_pct" not in df.columns:
-        df["margin_pct"] = (
-            df["profit"] / df["revenue"].replace(0, pd.NA) * 100
-        ).fillna(0).round(1)
+        df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
+
+    df = df[df["revenue"] > 0].reset_index(drop=True)
+
+    if len(df) == 0:
+        raise HTTPException(422, "No valid rows found with revenue > 0.")
+
+    # Detect currency from original column names
+    orig_cols = " ".join([str(c) for c in df.columns]).upper()
+    if "ZMW" in orig_cols:
+        df.attrs["currency"] = "ZMW"; df.attrs["currency_symbol"] = "K"
+    elif "EUR" in orig_cols:
+        df.attrs["currency"] = "EUR"; df.attrs["currency_symbol"] = "€"
+    elif "GBP" in orig_cols:
+        df.attrs["currency"] = "GBP"; df.attrs["currency_symbol"] = "£"
+    else:
+        df.attrs["currency"] = "USD"; df.attrs["currency_symbol"] = "$"
+
+    # Aggregate product-based files into monthly buckets
+    date_kw = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec",
+               "q1","q2","q3","q4","week","month","2020","2021","2022","2023","2024","2025","2026"]
+    sample  = df["month"].str.lower().head(5).tolist()
+    is_ts   = any(any(kw in str(m) for kw in date_kw) for m in sample)
+
+    if not is_ts and len(df) > 6:
+        chunk  = max(1, len(df) // 12)
+        mnames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        rows   = []
+        for i in range(0, len(df), chunk):
+            c  = df.iloc[i:i+chunk]
+            mi = min(i // chunk, 11)
+            rev = float(c["revenue"].sum())
+            cst = float(c["costs"].sum())
+            prf = float(c["profit"].sum())
+            rows.append({
+                "month":      mnames[mi],
+                "revenue":    rev,
+                "costs":      cst,
+                "profit":     prf,
+                "margin_pct": round(prf / rev * 100, 1) if rev > 0 else 0,
+            })
+        currency        = df.attrs.get("currency", "USD")
+        currency_symbol = df.attrs.get("currency_symbol", "$")
+        df              = pd.DataFrame(rows)
+        df.attrs["currency"]        = currency
+        df.attrs["currency_symbol"] = currency_symbol
+
     return df
+
 
 def df_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
