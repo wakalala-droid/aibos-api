@@ -1,17 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════
-# AI-BOS — FastAPI Backend
-# Wraps engine.py exactly as written — zero changes to engine logic.
-#
-# Folder (this is ALL you need):
-#   aibos-api/
-#     engine.py      ← paste your existing file here (unchanged)
-#     main.py        ← this file
-#     requirements.txt
-#     railway.toml
-#     .env
-# ═══════════════════════════════════════════════════════════════════
-
-import io, os, json, traceback
+import io, os, traceback
 from typing import Optional, List
 
 import numpy as np
@@ -22,161 +9,187 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-import engine   # ← your existing engine.py, untouched
+import engine
 
-# ── JSON serialiser — converts numpy types to native Python ────────
-def clean(obj):
-    """Recursively convert numpy/pandas types to JSON-safe Python types."""
-    if isinstance(obj, dict):
-        return {k: clean(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [clean(i) for i in obj]
-    if isinstance(obj, float) and (obj != obj):   # NaN check
-        return None
-    try:
-        import numpy as np
-        if isinstance(obj, (np.integer,)):  return int(obj)
-        if isinstance(obj, (np.floating,)): return float(obj) if obj == obj else None
-        if isinstance(obj, np.ndarray):     return [clean(i) for i in obj.tolist()]
-        if isinstance(obj, np.bool_):       return bool(obj)
-    except ImportError:
-        pass
-    try:
-        import pandas as pd
-        if isinstance(obj, pd.Timestamp): return str(obj)
-        if isinstance(obj, pd.NA.__class__): return None
-    except ImportError:
-        pass
-    return obj
-
-
-
-# ── App ────────────────────────────────────────────────────────────
+# ── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI-BOS API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        os.environ.get("NEXT_PUBLIC_APP_URL", "https://your-app.vercel.app"),
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Supabase (for chat history) ────────────────────────────────────
+# ── JSON serialiser ───────────────────────────────────────────────────────────
+
+def clean(obj):
+    if isinstance(obj, dict):   return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [clean(i) for i in obj]
+    if isinstance(obj, float) and obj != obj: return None
+    try:
+        import numpy as np
+        if isinstance(obj, np.integer):  return int(obj)
+        if isinstance(obj, np.floating): return None if obj != obj else float(obj)
+        if isinstance(obj, np.ndarray):  return [clean(i) for i in obj.tolist()]
+        if isinstance(obj, np.bool_):    return bool(obj)
+    except: pass
+    return obj
+
+# ── Supabase ──────────────────────────────────────────────────────────────────
 
 def get_supabase() -> Client:
     url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     if not url or not key:
-        raise HTTPException(500, "SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+        raise HTTPException(500, "Supabase env vars not set")
     return create_client(url, key)
 
-# ── File parser ────────────────────────────────────────────────────
-# engine.py needs: month · revenue · costs · profit · margin_pct
-# This function adds profit + margin_pct if the upload omits them.
+# ── Column alias map ──────────────────────────────────────────────────────────
+
+COLUMN_ALIASES = {
+    "month": [
+        "month","month_name","date","period","time","flower_type","flower type",
+        "category","product","item","type","name","label","description",
+    ],
+    "revenue": [
+        "revenue","sales","income","turnover","receipts","total_revenue",
+        "gross_revenue","net_sales","total_income","gross_income",
+        "revenue_zmw","revenue_(zmw)","revenue (zmw)",
+        "sales_revenue_(zmw)","sales revenue (zmw)","sales_revenue",
+        "wedding/event_revenue_zmw","wedding/event revenue (zmw)",
+    ],
+    "costs": [
+        "costs","expenses","expenditure","total_costs","total_expenses",
+        "operating_expenses","cogs","cost_of_sales","spend",
+        "expenses_(zmw)","expenses (zmw)","total expenses (zmw)",
+        "total_expenses_(zmw)","operating expenses (zmw)","cogs (zmw)",
+        "wedding/event_costs_zmw","wedding/event costs (zmw)",
+    ],
+    "profit": [
+        "profit","net_profit","gross_profit","net_income","net_impact",
+        "profit_(zmw)","profit (zmw)","net profit (zmw)","net impact (zmw)",
+    ],
+    "margin_pct": [
+        "margin_pct","profit_margin","margin","net_margin","gross_margin",
+        "profit margin (%)","profit_margin_(%)","margin (%)","profit margin",
+    ],
+}
+
+# ── Column normaliser ─────────────────────────────────────────────────────────
+
+def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Step 1 — lowercase + clean col names
+    raw = {c: c.strip().lower()
+             .replace(" ","_").replace("(","").replace(")","")
+             .replace("%","pct").replace("/","_")
+           for c in df.columns}
+    df = df.rename(columns=raw)
+
+    # Step 2 — match aliases
+    rename = {}; used = set()
+    for target, aliases in COLUMN_ALIASES.items():
+        if target in df.columns: used.add(target); continue
+        for alias in aliases:
+            an = alias.strip().lower().replace(" ","_").replace("(","").replace(")","").replace("%","pct").replace("/","_")
+            for cand in [an, an.replace("_zmw","").replace("_usd","").replace("_eur","").replace("_gbp","")]:
+                if cand in df.columns and cand not in used:
+                    rename[cand] = target; used.add(cand); break
+
+    if rename: df = df.rename(columns=rename)
+
+    # Step 3 — AI fallback: pick largest numeric cols for revenue/costs
+    nums  = df.select_dtypes(include=[np.number]).columns.tolist()
+    avail = [c for c in nums if c not in ["revenue","costs","profit","margin_pct"]]
+    if "revenue" not in df.columns and avail:
+        best = max(avail, key=lambda c: df[c].mean()); df = df.rename(columns={best:"revenue"}); avail.remove(best)
+    if "costs" not in df.columns and avail:
+        best = max(avail, key=lambda c: df[c].mean()); df = df.rename(columns={best:"costs"})
+
+    # Step 4 — month col
+    if "month" not in df.columns:
+        df["month"] = [f"Row {i+1}" for i in range(len(df))]
+    df["month"] = df["month"].astype(str).str.strip()
+
+    return df
+
+# ── File parser ───────────────────────────────────────────────────────────────
 
 def parse_upload(file: UploadFile) -> pd.DataFrame:
-    """Read CSV or Excel upload → clean DataFrame ready for engine."""
     raw  = file.file.read()
     name = (file.filename or "").lower()
 
+    # Read file
     try:
-        if name.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(raw))
-        elif name.endswith((".xlsx", ".xls")):
-            try:
-                df = pd.read_excel(io.BytesIO(raw))
-            except Exception:
-                xl = pd.ExcelFile(io.BytesIO(raw))
-                df = pd.concat([xl.parse(s) for s in xl.sheet_names], ignore_index=True)
+        if   name.endswith(".csv"):          df = pd.read_csv(io.BytesIO(raw))
+        elif name.endswith((".xlsx",".xls")): df = pd.read_excel(io.BytesIO(raw))
         else:
-            try:
-                df = pd.read_csv(io.BytesIO(raw))
-            except Exception:
-                df = pd.read_excel(io.BytesIO(raw))
+            try: df = pd.read_csv(io.BytesIO(raw))
+            except: df = pd.read_excel(io.BytesIO(raw))
     except Exception as e:
-        raise HTTPException(400, f"Could not read file: {e}")
+        raise HTTPException(400, f"Cannot read file: {e}")
 
     df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+
+    # Detect currency before normalising
+    orig_cols = " ".join(str(c) for c in df.columns).upper()
+    if   "ZMW" in orig_cols: currency, sym = "ZMW", "K"
+    elif "EUR" in orig_cols: currency, sym = "EUR", "€"
+    elif "GBP" in orig_cols: currency, sym = "GBP", "£"
+    else:                    currency, sym = "USD", "$"
+
     df = normalise_columns(df)
 
     if "revenue" not in df.columns:
-        raise HTTPException(422, f"Could not find a revenue column. Your columns: {list(df.columns)}")
+        raise HTTPException(422, f"No revenue column found. Got: {list(df.columns)}")
 
-    for col in ["revenue", "costs", "profit", "margin_pct"]:
+    # Ensure numeric
+    for col in ["revenue","costs","profit","margin_pct"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    if "costs" not in df.columns:
-        df["costs"] = (df["revenue"] * 0.70).round(2)
-    if "profit" not in df.columns:
-        df["profit"] = df["revenue"] - df["costs"]
+    # Derive missing
+    if "costs"      not in df.columns: df["costs"]      = (df["revenue"] * 0.70).round(2)
+    if "profit"     not in df.columns: df["profit"]     = df["revenue"] - df["costs"]
     if "margin_pct" not in df.columns:
         df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
     df = df[df["revenue"] > 0].reset_index(drop=True)
 
     if len(df) == 0:
-        raise HTTPException(422, "No valid rows found with revenue > 0.")
+        raise HTTPException(422, "No rows with revenue > 0 found.")
 
-    # Detect currency from original column names
-    orig_cols = " ".join([str(c) for c in df.columns]).upper()
-    if "ZMW" in orig_cols:
-        df.attrs["currency"] = "ZMW"; df.attrs["currency_symbol"] = "K"
-    elif "EUR" in orig_cols:
-        df.attrs["currency"] = "EUR"; df.attrs["currency_symbol"] = "€"
-    elif "GBP" in orig_cols:
-        df.attrs["currency"] = "GBP"; df.attrs["currency_symbol"] = "£"
-    else:
-        df.attrs["currency"] = "USD"; df.attrs["currency_symbol"] = "$"
-
-    # Aggregate product-based files into monthly buckets
+    # Aggregate product-based files (non-time-series) into monthly buckets
     date_kw = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec",
-               "q1","q2","q3","q4","week","month","2020","2021","2022","2023","2024","2025","2026"]
-    sample  = df["month"].str.lower().head(5).tolist()
-    is_ts   = any(any(kw in str(m) for kw in date_kw) for m in sample)
+               "q1","q2","q3","q4","2020","2021","2022","2023","2024","2025","2026","week","month"]
+    is_ts   = any(any(kw in str(m).lower() for kw in date_kw) for m in df["month"].head(5))
 
     if not is_ts and len(df) > 6:
         chunk  = max(1, len(df) // 12)
         mnames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
         rows   = []
         for i in range(0, len(df), chunk):
-            c  = df.iloc[i:i+chunk]
-            mi = min(i // chunk, 11)
+            c   = df.iloc[i:i+chunk]; mi = min(i//chunk, 11)
             rev = float(c["revenue"].sum())
             cst = float(c["costs"].sum())
             prf = float(c["profit"].sum())
-            rows.append({
-                "month":      mnames[mi],
-                "revenue":    rev,
-                "costs":      cst,
-                "profit":     prf,
-                "margin_pct": round(prf / rev * 100, 1) if rev > 0 else 0,
-            })
-        currency        = df.attrs.get("currency", "USD")
-        currency_symbol = df.attrs.get("currency_symbol", "$")
-        df              = pd.DataFrame(rows)
-        df.attrs["currency"]        = currency
-        df.attrs["currency_symbol"] = currency_symbol
+            rows.append({"month": mnames[mi], "revenue": rev, "costs": cst, "profit": prf,
+                         "margin_pct": round(prf/rev*100,1) if rev > 0 else 0})
+        df = pd.DataFrame(rows)
 
+    df.attrs["currency"]        = currency
+    df.attrs["currency_symbol"] = sym
     return df
-
 
 def df_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
     df = normalise_columns(df)
-    for col in ["revenue", "costs", "profit", "margin_pct"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    if "costs" not in df.columns:
-        df["costs"] = (df["revenue"] * 0.70).round(2)
-    if "profit" not in df.columns:
-        df["profit"] = df["revenue"] - df["costs"]
+    for col in ["revenue","costs","profit","margin_pct"]:
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    if "costs"      not in df.columns: df["costs"]      = (df["revenue"] * 0.70).round(2)
+    if "profit"     not in df.columns: df["profit"]     = df["revenue"] - df["costs"]
     if "margin_pct" not in df.columns:
         df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
     return df
@@ -184,7 +197,7 @@ def df_from_records(records: list) -> pd.DataFrame:
 def safe_records(df: pd.DataFrame) -> list:
     return df.replace({np.nan: None}).to_dict(orient="records")
 
-# ── Pydantic models ────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class AnalyseBody(BaseModel):
     records:        List[dict]
@@ -222,19 +235,12 @@ class SubscribeBody(BaseModel):
     frequency: str  = "weekly"
     active:    bool = True
 
-# ══════════════════════════════════════════════════════════════════
-# ROUTES
-# ══════════════════════════════════════════════════════════════════
+# ── Routes ────────────────────────────────────────────────────────────────────
 
-# 1 ── Health check ─────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.0.0"}
 
-
-# 2 ── Upload file → full analysis in one shot ──────────────────────
-#   Frontend drops a file → gets back everything in one call.
-#   Zustand caches the result; no further API calls until re-upload.
 
 @app.post("/upload")
 async def upload(
@@ -254,40 +260,32 @@ async def upload(
         anomalies    = engine.detect_anomalies(df, z_threshold)
         breakeven    = engine.calculate_breakeven(df, fixed_cost_pct)
 
-        avg_costs     = float(df["costs"].tail(3).mean()) if "costs" in df.columns else 0
-        avg_revenue   = float(df["revenue"].tail(3).mean()) if "revenue" in df.columns else 0
+        avg_costs   = float(df["costs"].tail(3).mean())   if "costs"   in df.columns else 0
+        avg_revenue = float(df["revenue"].tail(3).mean()) if "revenue" in df.columns else 0
         runway_months = round(current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
 
-        # Enrich cashflow with inflow/outflow from df for frontend charts
+        # Enrich cashflow with inflow/outflow for charts
         for i, cf_item in enumerate(cashflow):
-            cf_item["inflow"]  = float(avg_revenue)
-            cf_item["outflow"] = float(avg_costs)
+            cf_item["inflow"]  = avg_revenue
+            cf_item["outflow"] = avg_costs
             cf_item["month"]   = f"M+{cf_item.get('month_ahead', i+1)}"
 
-        # Compute period-over-period deltas (first half vs second half)
+        # Compute deltas (first half vs second half)
         mid = max(1, len(df) // 2)
-        first_half  = df.iloc[:mid]
-        second_half = df.iloc[mid:]
-
+        fh, sh = df.iloc[:mid], df.iloc[mid:]
         def pct_delta(a, b):
-            a_val = float(a.sum())
-            b_val = float(b.sum())
-            if a_val == 0: return 0.0
-            return round(((b_val - a_val) / abs(a_val)) * 100, 1)
-
-        pnl["revenue_delta"] = pct_delta(first_half["revenue"],    second_half["revenue"])
-        pnl["costs_delta"]   = pct_delta(first_half["costs"],      second_half["costs"])
-        pnl["profit_delta"]  = pct_delta(first_half["profit"],     second_half["profit"])
-        pnl["margin_delta"]  = round(
-            float(second_half["margin_pct"].mean()) - float(first_half["margin_pct"].mean()), 1
-        )
+            av = float(a.sum()); bv = float(b.sum())
+            return round(((bv - av) / abs(av)) * 100, 1) if av != 0 else 0.0
+        pnl["revenue_delta"] = pct_delta(fh["revenue"],    sh["revenue"])
+        pnl["costs_delta"]   = pct_delta(fh["costs"],      sh["costs"])
+        pnl["profit_delta"]  = pct_delta(fh["profit"],     sh["profit"])
+        pnl["margin_delta"]  = round(float(sh["margin_pct"].mean()) - float(fh["margin_pct"].mean()), 1)
 
         return clean({
             "ok": True, "rows": len(df), "columns": list(df.columns),
             "records": safe_records(df),
             "pnl": pnl, "health_score": score, "health_label": label,
-            "alerts": alerts, "cashflow": cashflow,
-            "runway_months": runway_months,
+            "alerts": alerts, "cashflow": cashflow, "runway_months": runway_months,
             "forecast": forecast, "anomalies": anomalies, "breakeven": breakeven,
             "currency":        df.attrs.get("currency", "USD"),
             "currency_symbol": df.attrs.get("currency_symbol", "$"),
@@ -297,7 +295,6 @@ async def upload(
         raise HTTPException(500, f"Analysis failed: {e}")
 
 
-# 3 ── Re-analyse (JSON body — user changed a slider parameter) ──────
 @app.post("/analyse")
 async def analyse(body: AnalyseBody):
     try:
@@ -309,61 +306,38 @@ async def analyse(body: AnalyseBody):
         forecast     = engine.forecast_revenue(df, body.months_ahead)
         anomalies    = engine.detect_anomalies(df, body.z_threshold)
         breakeven    = engine.calculate_breakeven(df, body.fixed_cost_pct)
-        avg_costs     = float(df["costs"].tail(3).mean())
-        runway_months = round(body.current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
-        return clean({
-            "ok": True,
-            "pnl": pnl, "health_score": score, "health_label": label,
-            "alerts": alerts, "cashflow": cashflow, "runway_months": runway_months,
-            "forecast": forecast, "anomalies": anomalies, "breakeven": breakeven,
-        })
+        avg_costs    = float(df["costs"].tail(3).mean()) if "costs" in df.columns else 0
+        runway       = round(body.current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
+        return clean({"ok":True,"pnl":pnl,"health_score":score,"health_label":label,
+                      "alerts":alerts,"cashflow":cashflow,"runway_months":runway,
+                      "forecast":forecast,"anomalies":anomalies,"breakeven":breakeven})
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
+        traceback.print_exc(); raise HTTPException(500, str(e))
 
 
-# 4 ── Forecast only ────────────────────────────────────────────────
 @app.post("/forecast")
-async def forecast(body: AnalyseBody):
-    try:
-        df = df_from_records(body.records)
-        return clean(engine.forecast_revenue(df, body.months_ahead))
-    except Exception as e:
-        raise HTTPException(500, str(e))
+async def forecast_ep(body: AnalyseBody):
+    try: return clean(engine.forecast_revenue(df_from_records(body.records), body.months_ahead))
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# 5 ── Anomalies only ───────────────────────────────────────────────
 @app.post("/anomalies")
-async def anomalies(body: AnalyseBody):
-    try:
-        df = df_from_records(body.records)
-        return clean(engine.detect_anomalies(df, body.z_threshold))
-    except Exception as e:
-        raise HTTPException(500, str(e))
+async def anomalies_ep(body: AnalyseBody):
+    try: return clean(engine.detect_anomalies(df_from_records(body.records), body.z_threshold))
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# 6 ── Breakeven only ───────────────────────────────────────────────
 @app.post("/breakeven")
-async def breakeven(body: AnalyseBody):
-    try:
-        df = df_from_records(body.records)
-        return clean(engine.calculate_breakeven(df, body.fixed_cost_pct))
-    except Exception as e:
-        raise HTTPException(500, str(e))
+async def breakeven_ep(body: AnalyseBody):
+    try: return clean(engine.calculate_breakeven(df_from_records(body.records), body.fixed_cost_pct))
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# 7 ── Cashflow only ────────────────────────────────────────────────
 @app.post("/cashflow")
-async def cashflow(body: AnalyseBody):
-    try:
-        df = df_from_records(body.records)
-        return clean(engine.forecast_cashflow(df, body.current_cash, body.months_ahead))
-    except Exception as e:
-        raise HTTPException(500, str(e))
+async def cashflow_ep(body: AnalyseBody):
+    try: return clean(engine.forecast_cashflow(df_from_records(body.records), body.current_cash, body.months_ahead))
+    except Exception as e: raise HTTPException(500, str(e))
 
-
-# 8 ── AI CFO Chat ──────────────────────────────────────────────────
-#   Loads history from Supabase → calls Groq → saves reply
 
 @app.post("/chat")
 async def chat(body: ChatBody):
@@ -371,126 +345,75 @@ async def chat(body: ChatBody):
         supabase = get_supabase()
         history  = engine.load_chat_history(supabase, body.user_id, 20, body.session_label)
         messages = engine.build_chat_context_from_history(history)
-
         if body.pnl:
-            messages.insert(1, {
-                "role": "system",
-                "content": (
-                    f"Financial context: Revenue K{body.pnl.get('total_revenue',0):,}, "
-                    f"Costs K{body.pnl.get('total_costs',0):,}, "
-                    f"Profit K{body.pnl.get('total_profit',0):,}, "
-                    f"Margin {body.pnl.get('avg_margin',0)}%, "
-                    f"Best {body.pnl.get('best_month','')}, "
-                    f"Worst {body.pnl.get('worst_month','')}. "
-                    f"Alerts: {len(body.alerts or [])}."
-                ),
-            })
-
-        messages.append({"role": "user", "content": body.question})
-
+            messages.insert(1, {"role":"system","content":
+                f"Financial context: Revenue {body.pnl.get('total_revenue',0):,}, "
+                f"Costs {body.pnl.get('total_costs',0):,}, "
+                f"Profit {body.pnl.get('total_profit',0):,}, "
+                f"Margin {body.pnl.get('avg_margin',0)}%, "
+                f"Alerts: {len(body.alerts or [])}."})
+        messages.append({"role":"user","content":body.question})
         if body.persist:
-            engine.save_chat_message(supabase, body.user_id, "user",
-                                     body.question, body.session_label)
-
+            engine.save_chat_message(supabase, body.user_id, "user", body.question, body.session_label)
         response = engine.client_ai.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            timeout=30,
-        )
+            model="llama-3.3-70b-versatile", messages=messages, timeout=30)
         answer = response.choices[0].message.content.strip()
-
         if body.persist:
-            engine.save_chat_message(supabase, body.user_id, "assistant",
-                                     answer, body.session_label)
-
+            engine.save_chat_message(supabase, body.user_id, "assistant", answer, body.session_label)
         return {"ok": True, "answer": answer}
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Chat error: {e}")
+        traceback.print_exc(); raise HTTPException(500, f"Chat error: {e}")
 
 
-# 9 ── Chat history ─────────────────────────────────────────────────
 @app.get("/chat/history")
 async def get_chat_history(user_id: str, session_label: str = "default", limit: int = 30):
     try:
-        supabase = get_supabase()
-        msgs = engine.load_chat_history(supabase, user_id, limit, session_label)
-        return {"ok": True, "messages": msgs}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        return {"ok":True,"messages":engine.load_chat_history(get_supabase(), user_id, limit, session_label)}
+    except Exception as e: raise HTTPException(500, str(e))
 
 
 @app.delete("/chat/history")
 async def delete_chat_history(user_id: str, session_label: str = "default"):
-    try:
-        supabase = get_supabase()
-        engine.clear_chat_history(supabase, user_id, session_label)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    try: engine.clear_chat_history(get_supabase(), user_id, session_label); return {"ok":True}
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# 10 ── Excel export ────────────────────────────────────────────────
 @app.post("/export/excel")
 async def export_excel(body: ExcelBody):
     try:
-        df = df_from_records(body.records)
-        xlsx = engine.export_excel_report(
-            df=df, pnl=body.pnl,
-            health_score=body.health_score, health_label=body.health_label,
-            alerts=body.alerts, runway_months=body.runway_months,
-            forecast_data=body.forecast_data,
-            anomaly_data=body.anomaly_data,
-            breakeven_data=body.breakeven_data,
-        )
-        return StreamingResponse(
-            io.BytesIO(xlsx),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=aibos_report.xlsx"},
-        )
+        df   = df_from_records(body.records)
+        xlsx = engine.export_excel_report(df=df, pnl=body.pnl, health_score=body.health_score,
+               health_label=body.health_label, alerts=body.alerts, runway_months=body.runway_months,
+               forecast_data=body.forecast_data, anomaly_data=body.anomaly_data, breakeven_data=body.breakeven_data)
+        return StreamingResponse(io.BytesIO(xlsx),
+               media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               headers={"Content-Disposition":"attachment; filename=aibos_report.xlsx"})
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Excel export failed: {e}")
+        traceback.print_exc(); raise HTTPException(500, f"Excel export failed: {e}")
 
 
-# 11 ── Send email ──────────────────────────────────────────────────
 @app.post("/email/send")
 async def send_email(body: EmailBody):
     try:
-        ok, msg = engine.send_report_email(
-            recipient_email=body.recipient_email, pdf_bytes=b"", subject=body.subject
-        )
-        if not ok:
-            raise HTTPException(500, msg)
-        return {"ok": True, "message": msg}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        ok, msg = engine.send_report_email(recipient_email=body.recipient_email, pdf_bytes=b"", subject=body.subject)
+        if not ok: raise HTTPException(500, msg)
+        return {"ok":True,"message":msg}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# 12 ── Subscriptions ───────────────────────────────────────────────
 @app.post("/email/subscribe")
 async def subscribe(body: SubscribeBody):
-    try:
-        supabase = get_supabase()
-        ok = engine.upsert_subscription(supabase, body.user_id, body.email,
-                                        body.frequency, body.active)
-        return {"ok": ok}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    try: return {"ok": engine.upsert_subscription(get_supabase(), body.user_id, body.email, body.frequency, body.active)}
+    except Exception as e: raise HTTPException(500, str(e))
+
 
 @app.get("/email/subscribe")
 async def get_sub(user_id: str):
-    try:
-        supabase = get_supabase()
-        sub = engine.get_subscription(supabase, user_id)
-        return {"ok": True, "subscription": sub}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    try: return {"ok":True,"subscription":engine.get_subscription(get_supabase(), user_id)}
+    except Exception as e: raise HTTPException(500, str(e))
 
 
-# ── Local dev: uvicorn main:app --reload --port 8000 ───────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
