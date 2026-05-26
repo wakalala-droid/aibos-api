@@ -197,6 +197,24 @@ async def upload(
         avg_costs     = float(df["costs"].tail(3).mean())
         runway_months = round(current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
 
+        # Compute period-over-period deltas (first half vs second half)
+        mid = max(1, len(df) // 2)
+        first_half  = df.iloc[:mid]
+        second_half = df.iloc[mid:]
+
+        def pct_delta(a, b):
+            a_val = float(a.sum())
+            b_val = float(b.sum())
+            if a_val == 0: return 0.0
+            return round(((b_val - a_val) / abs(a_val)) * 100, 1)
+
+        pnl["revenue_delta"] = pct_delta(first_half["revenue"],    second_half["revenue"])
+        pnl["costs_delta"]   = pct_delta(first_half["costs"],      second_half["costs"])
+        pnl["profit_delta"]  = pct_delta(first_half["profit"],     second_half["profit"])
+        pnl["margin_delta"]  = round(
+            float(second_half["margin_pct"].mean()) - float(first_half["margin_pct"].mean()), 1
+        )
+
         return clean({
             "ok": True, "rows": len(df), "columns": list(df.columns),
             "records": safe_records(df),
