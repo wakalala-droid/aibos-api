@@ -194,8 +194,15 @@ async def upload(
         anomalies    = engine.detect_anomalies(df, z_threshold)
         breakeven    = engine.calculate_breakeven(df, fixed_cost_pct)
 
-        avg_costs     = float(df["costs"].tail(3).mean())
+        avg_costs     = float(df["costs"].tail(3).mean()) if "costs" in df.columns else 0
+        avg_revenue   = float(df["revenue"].tail(3).mean()) if "revenue" in df.columns else 0
         runway_months = round(current_cash / avg_costs, 1) if avg_costs > 0 else 0.0
+
+        # Enrich cashflow with inflow/outflow from df for frontend charts
+        for i, cf_item in enumerate(cashflow):
+            cf_item["inflow"]  = float(avg_revenue)
+            cf_item["outflow"] = float(avg_costs)
+            cf_item["month"]   = f"M+{cf_item.get('month_ahead', i+1)}"
 
         # Compute period-over-period deltas (first half vs second half)
         mid = max(1, len(df) // 2)
