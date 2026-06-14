@@ -1,48 +1,33 @@
 """
-AI-BOS — FastAPI Backend
-Engines: 1 (Financial) + 2 (Customer) + 3 (POS/Operations) + Cross-Intelligence
+AI-BOS Backend — FastAPI
+Fixes: column detection, multi-sheet Excel, Groq chat, cabinet, data studio
 """
 
-from __future__ import annotations
-
-import io
-import logging
 import os
+import io
+import json
+import uuid
+import logging
 import traceback
-from typing import Any, Optional
+from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from groq import Groq
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from groq import Groq
 
-from engine import (
-    analyse_pnl,
-    build_chat_context_from_history,
-    calculate_breakeven,
-    clear_chat_history,
-    detect_anomalies,
-    detect_variances,
-    export_excel_report,
-    forecast_cashflow,
-    forecast_revenue,
-    get_structured_analysis,
-    get_subscription,
-    health_score,
-    load_chat_history,
-    save_chat_message,
-    send_report_email,
-    upsert_subscription,
-)
-from engine2 import is_engine2_data, run_engine2
-from engine3 import is_engine3_data, run_engine3
-from intelligence import run_intelligence
+# ─── Engine imports ──────────────────────────────────────────────────────────
+from engine import run_engine1
+from engine2 import run_engine2
+from engine3 import run_engine3, parse_pos_report
+from intelligence import run_cross_engine
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("aibos")
 
 app = FastAPI(title="AI-BOS API", version="3.0.0")
 
@@ -54,128 +39,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-
-class AnalyseRequest(BaseModel):
-    records: list[dict]
-    current_cash: float = 50000
-    months_ahead: int = 3
-    z_threshold: float = 2.0
-    fixed_cost_pct: float = 0.40
-
-class ForecastRequest(BaseModel):
-    records: list[dict]
-    months: int = 6
-
-class AnomalyRequest(BaseModel):
-    records: list[dict]
-    z_threshold: float = 2.0
-
-class BreakevenRequest(BaseModel):
-    records: list[dict]
-    fixed_cost_pct: float = 0.40
-
-class CashflowRequest(BaseModel):
-    records: list[dict]
-    current_cash: float = 50000
-    months_ahead: int = 3
-
-class ChatRequest(BaseModel):
-    message: str
-    user_id: str
-    context: Optional[dict] = None
-
-class EmailRequest(BaseModel):
-    to_email: str
-    subject: str
-    pnl: dict
-    alerts: list[dict]
-    currency_symbol: str = "K"
-
-class SubscribeRequest(BaseModel):
-    user_id: str
-    email: str
-    frequency: str = "weekly"
-
-class ExportRequest(BaseModel):
-    records: list[dict]
-    pnl: dict
-    alerts: list[dict]
-    currency_symbol: str = "K"
-
-# ---------------------------------------------------------------------------
-# Column detection — FUZZY (fixes "Cannot find revenue and cost columns" error)
-# ---------------------------------------------------------------------------
-
-# Exact aliases (checked first, fast path)
-REVENUE_ALIASES = {
-    "revenue", "sales", "income", "turnover", "takings", "receipts",
-    "revenue_(zmw)", "revenue_zmw", "gross_revenue", "total_revenue",
-    "net_revenue", "gross_sales", "total_sales", "net_sales",
-    "total income", "total_income", "gross income", "gross_income",
-    "revenue zmw", "sales zmw", "income zmw",
-}
-COST_ALIASES = {
-    "costs", "expenses", "expenditure", "cost", "expense",
-    "total_costs", "total_expenses", "cogs", "operating_costs",
-    "total costs", "total expenses", "operating costs", "operating expenses",
-    "cost of sales", "cost_of_sales", "outgoings", "outflows",
-    "costs zmw", "expenses zmw",
-}
-
-# Partial substrings — if any of these appear anywhere in a column name
-REVENUE_PARTIALS = ("revenue", "sales", "income", "turnover", "takings", "receipt")
-COST_PARTIALS    = ("cost", "expense", "expenditure", "outgoing", "outflow", "cogs")
-
-TIME_KEYWORDS = {
-    "jan", "feb", "mar", "apr", "may", "jun",
-    "jul", "aug", "sep", "oct", "nov", "dec",
-    "january", "february", "march", "april", "june",
-    "july", "august", "september", "october", "november", "december",
-    "q1", "q2", "q3", "q4", "month", "quarter", "week", "period",
-    "fy", "year", "date",
-}
-
-CURRENCY_MAP = {
-    "zmw": ("ZMW", "K"), "k": ("ZMW", "K"),
-    "usd": ("USD", "$"), "$": ("USD", "$"),
-    "eur": ("EUR", "€"), "gbp": ("GBP", "£"),
-    "£":   ("GBP", "£"), "€":   ("EUR", "€"),
-}
+# ─── In-memory cabinet (file storage across sessions) ────────────────────────
+# Keyed by cabinet_id → {name, file_type, sheets, active_sheet, df_json, analysis}
+CABINET: Dict[str, Dict[str, Any]] = {}
 
 
-def _detect_currency(df: pd.DataFrame, filename: str = "") -> tuple[str, str]:
-    text = " ".join(str(c).lower() for c in df.columns) + filename.lower()
-    for key, val in CURRENCY_MAP.items():
-        if key in text:
-            return val
-    return ("ZMW", "K")
+# ══════════════════════════════════════════════════════════════════════════════
+# COLUMN DETECTION — 4-PASS FAULT-TOLERANT
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _resolve_columns(df: pd.DataFrame) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _resolve_columns(df: pd.DataFrame):
     """
-    Resolve (revenue_col, cost_col, month_col) using a 3-pass strategy:
-      Pass 1 — exact alias match
-      Pass 2 — partial substring match
-      Pass 3 — numeric fallback: pick the two largest numeric columns
+    Returns (revenue_col, cost_col, month_col) using ACTUAL DataFrame column names.
+    Never returns alias strings — always returns the real column as it exists in df.
     """
     cols_lower = {c.lower().strip(): c for c in df.columns}
-    rev_col = cost_col = month_col = None
 
-    # ── Pass 1: exact alias ────────────────────────────────────────────────
-    for alias in REVENUE_ALIASES:
+    rev_col = cost_col = month_col = profit_col = None
+
+    # ── PASS 1: Exact alias match ─────────────────────────────────────────────
+    REVENUE_EXACT = {
+        "revenue", "sales", "income", "turnover", "takings", "receipts",
+        "total revenue", "gross revenue", "net revenue", "total sales",
+        "gross sales", "net sales", "total income", "gross income",
+        "revenue zmw", "sales zmw", "income zmw", "revenue (zmw)",
+        "revenue_(zmw)", "sales revenue (zmw)", "sales revenue",
+        "sales revenue zmw",
+    }
+    COST_EXACT = {
+        "costs", "expenses", "expenditure", "cost", "expense", "cogs",
+        "total costs", "total expenses", "operating expenses",
+        "operating costs", "cost of sales", "outgoings",
+        "expenses (zmw)", "total expenses (zmw)", "cogs (zmw)",
+        "expenses zmw", "cost (zmw)", "costs (zmw)",
+    }
+    PROFIT_EXACT = {
+        "profit", "net profit", "profit (zmw)", "profit zmw",
+        "net income", "gross profit", "operating profit",
+    }
+
+    for alias in REVENUE_EXACT:
         if alias in cols_lower:
             rev_col = cols_lower[alias]
             break
 
-    for alias in COST_ALIASES:
+    for alias in COST_EXACT:
         if alias in cols_lower:
             cost_col = cols_lower[alias]
             break
 
-    # ── Pass 2: partial substring ──────────────────────────────────────────
+    for alias in PROFIT_EXACT:
+        if alias in cols_lower:
+            profit_col = cols_lower[alias]
+            break
+
+    # ── PASS 2: Partial substring match ──────────────────────────────────────
+    REVENUE_PARTIALS = ("revenue", "sales", "income", "turnover", "takings")
+    COST_PARTIALS    = ("cost", "expense", "expenditure", "cogs", "outgoing", "overhead")
+
     if rev_col is None:
         for cl, orig in cols_lower.items():
             if orig == cost_col:
@@ -192,460 +113,840 @@ def _resolve_columns(df: pd.DataFrame) -> tuple[Optional[str], Optional[str], Op
                 cost_col = orig
                 break
 
-    # ── Pass 3: numeric fallback ───────────────────────────────────────────
-    # If still missing, find all numeric columns and pick by sum size
+    if profit_col is None:
+        for cl, orig in cols_lower.items():
+            if orig in (rev_col, cost_col):
+                continue
+            if "profit" in cl or "margin" in cl:
+                profit_col = orig
+                break
+
+    # ── PASS 3: Cost synthesis — Costs = Revenue − Profit ────────────────────
+    if rev_col is not None and cost_col is None and profit_col is not None:
+        rev_series = pd.to_numeric(df[rev_col], errors="coerce").fillna(0)
+        pft_series = pd.to_numeric(df[profit_col], errors="coerce").fillna(0)
+        df["_costs_synth"] = rev_series - pft_series
+        cost_col = "_costs_synth"
+        logger.info("Cost synthesis: %s - %s → _costs_synth", rev_col, profit_col)
+
+    # ── PASS 4: Numeric fallback ──────────────────────────────────────────────
     if rev_col is None or cost_col is None:
         numeric_cols = [
             c for c in df.columns
-            if c not in (rev_col, cost_col)
-            and pd.api.types.is_numeric_dtype(df[c])
+            if pd.api.types.is_numeric_dtype(df[c])
+            and c not in (rev_col, cost_col, "_costs_synth")
         ]
-        # Try to coerce non-numeric cols
-        if not numeric_cols:
-            for c in df.columns:
-                if c in (rev_col, cost_col):
-                    continue
-                try:
-                    converted = pd.to_numeric(df[c], errors="coerce")
-                    if converted.notna().sum() > len(df) * 0.5:
-                        numeric_cols.append(c)
-                except Exception:
-                    pass
+        sums = {c: pd.to_numeric(df[c], errors="coerce").sum() for c in numeric_cols}
+        sorted_cols = sorted(sums, key=lambda c: sums[c], reverse=True)
+        if rev_col is None and len(sorted_cols) >= 1:
+            rev_col = sorted_cols[0]
+            logger.warning("Numeric fallback for revenue: %s", rev_col)
+        if cost_col is None and len(sorted_cols) >= 2:
+            cost_col = sorted_cols[1]
+            logger.warning("Numeric fallback for cost: %s", cost_col)
 
-        if numeric_cols:
-            sums = {c: pd.to_numeric(df[c], errors="coerce").sum() for c in numeric_cols}
-            sorted_cols = sorted(sums, key=lambda c: sums[c], reverse=True)
-            if rev_col is None and len(sorted_cols) >= 1:
-                rev_col = sorted_cols[0]
-                logger.warning("Fallback: using '%s' as revenue column", rev_col)
-            if cost_col is None and len(sorted_cols) >= 2:
-                cost_col = sorted_cols[1]
-                logger.warning("Fallback: using '%s' as cost column", cost_col)
-            elif cost_col is None and len(sorted_cols) == 1 and rev_col:
-                # Only one numeric col — synthesise costs at 72% of revenue
-                logger.warning("Only one numeric column found — synthesising costs at 72%%")
-                df["_costs_synth"] = pd.to_numeric(df[rev_col], errors="coerce").fillna(0) * 0.72
-                cost_col = "_costs_synth"
-
-    # ── Month column ───────────────────────────────────────────────────────
-    for c_lower, c_orig in cols_lower.items():
-        if any(kw in c_lower for kw in ("month", "date", "period", "quarter", "week", "year")):
-            month_col = c_orig
+    # ── Month column ──────────────────────────────────────────────────────────
+    TIME_KEYWORDS = {
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep",
+        "oct", "nov", "dec", "january", "february", "march", "april",
+        "june", "july", "august", "september", "october", "november",
+        "december", "q1", "q2", "q3", "q4",
+    }
+    for cl, orig in cols_lower.items():
+        if any(kw in cl for kw in ("month", "date", "period", "quarter", "week", "year")):
+            month_col = orig
             break
     if month_col is None:
-        for c_lower, c_orig in cols_lower.items():
+        for cl, orig in cols_lower.items():
             try:
-                sample = df[c_orig].dropna().head(5).astype(str).str.lower()
+                sample = df[orig].dropna().head(5).astype(str).str.lower()
                 if sample.apply(lambda v: any(kw in v for kw in TIME_KEYWORDS)).any():
-                    month_col = c_orig
+                    month_col = orig
                     break
             except Exception:
                 pass
 
+    logger.info(
+        "Column resolution → rev=%s | cost=%s | month=%s | profit=%s",
+        rev_col, cost_col, month_col, profit_col,
+    )
     return rev_col, cost_col, month_col
 
 
-def _is_time_series(df: pd.DataFrame, month_col: Optional[str]) -> bool:
-    if month_col:
+# ══════════════════════════════════════════════════════════════════════════════
+# SHEET SELECTOR — FIND BEST SHEET FOR FINANCIAL DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_best_sheet(xl_file: pd.ExcelFile) -> str:
+    """Return the sheet name most likely to contain financial data."""
+    best_sheet = xl_file.sheet_names[0]
+    best_score = -1
+    for sheet in xl_file.sheet_names:
         try:
-            sample = df[month_col].dropna().head(5).astype(str).str.lower()
-            if sample.apply(lambda v: any(kw in v for kw in TIME_KEYWORDS)).any():
-                return True
+            df = xl_file.parse(sheet, header=None, nrows=50)
+            score = 0
+            all_text = " ".join(
+                str(v).lower() for v in df.values.flatten() if pd.notna(v)
+            )
+            for kw in ("revenue", "sales", "income", "profit", "cost",
+                       "expense", "zmw", "kwacha", "total", "month"):
+                if kw in all_text:
+                    score += 1
+            num_cols = sum(
+                1 for c in df.columns
+                if pd.to_numeric(df[c], errors="coerce").notna().sum() > len(df) * 0.3
+            )
+            score += num_cols
+            if score > best_score:
+                best_score = score
+                best_sheet = sheet
         except Exception:
             pass
-    try:
-        first_col = df.iloc[:, 0].dropna().head(5).astype(str).str.lower()
-        if first_col.apply(lambda v: any(kw in v for kw in TIME_KEYWORDS)).any():
-            return True
-    except Exception:
-        pass
-    return False
+    logger.info("Best sheet selected: %s (score=%d)", best_sheet, best_score)
+    return best_sheet
 
 
-def _normalise_to_monthly(
-    df: pd.DataFrame,
-    rev_col: str,
-    cost_col: str,
-    month_col: Optional[str],
-    is_ts: bool,
-) -> pd.DataFrame:
-    MONTH_LABELS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+def _load_sheet(content: bytes, filename: str, sheet_name: Optional[str] = None) -> tuple:
+    """
+    Load a specific sheet from an Excel file.
+    Returns (df, all_sheet_names, selected_sheet_name).
+    """
+    ext = filename.rsplit(".", 1)[-1].lower()
+    engine = "xlrd" if ext == "xls" else "openpyxl"
 
-    if is_ts and month_col:
-        df["Revenue"] = pd.to_numeric(df[rev_col], errors="coerce").fillna(0)
-        df["Costs"]   = pd.to_numeric(df[cost_col], errors="coerce").fillna(0)
-        monthly = df[[month_col, "Revenue", "Costs"]].copy()
-        monthly = monthly.rename(columns={month_col: "Month"})
-        monthly = monthly.dropna(subset=["Month"])
-        return monthly.head(12)
+    xl = pd.ExcelFile(io.BytesIO(content), engine=engine)
+    all_sheets = xl.sheet_names
 
-    df["Revenue"] = pd.to_numeric(df[rev_col], errors="coerce").fillna(0)
-    df["Costs"]   = pd.to_numeric(df[cost_col], errors="coerce").fillna(0)
-    total_rev  = df["Revenue"].sum()
-    total_cost = df["Costs"].sum()
-
-    rng = np.random.default_rng(seed=42)
-    rev_weights  = rng.dirichlet(np.ones(12)) * total_rev
-    cost_weights = rng.dirichlet(np.ones(12)) * total_cost
-
-    return pd.DataFrame({
-        "Month":   MONTH_LABELS,
-        "Revenue": rev_weights.round(2),
-        "Costs":   cost_weights.round(2),
-    })
-
-# ---------------------------------------------------------------------------
-# Full upload pipeline
-# ---------------------------------------------------------------------------
-
-async def _run_full_pipeline(
-    file_bytes: bytes,
-    filename: str,
-    current_cash: float,
-    months_ahead: int,
-    z_threshold: float,
-    fixed_cost_pct: float,
-    business_type: str,
-) -> dict[str, Any]:
-    filename_lower = filename.lower()
-    engine_flags = {"e1": True, "e2": False, "e3": False}
-    e2_result: dict | None = None
-    e3_result: dict | None = None
-
-    raw_df: pd.DataFrame | None = None
-    try:
-        if filename_lower.endswith((".xls",)):
-            raw_df = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="xlrd")
-        elif filename_lower.endswith((".xlsx",)):
-            raw_df = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
-        else:
-            raw_df = pd.read_csv(io.BytesIO(file_bytes), header=None)
-    except Exception:
-        pass
-
-    # ── E3 detection ──────────────────────────────────────────────────────
-    if is_engine3_data(raw_df, filename):
-        logger.info("POS format detected — running Engine 3")
-        engine_flags["e3"] = True
-        try:
-            e3_result = run_engine3(file_bytes, filename, business_type)
-        except Exception as e3_err:
-            logger.warning("Engine 3 failed: %s", e3_err)
-            e3_result = None
-            engine_flags["e3"] = False
-
-        if e3_result:
-            net_rev   = e3_result["grand_totals"]["net_revenue"]
-            daily_avg = net_rev / 7
-            ann       = daily_avg * 365
-            monthly_df = pd.DataFrame({
-                "Month":   ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],
-                "Revenue": [ann / 12] * 12,
-                "Costs":   [ann / 12 * 0.72] * 12,
-            })
-        else:
-            monthly_df = pd.DataFrame({"Month": ["Jan"], "Revenue": [0.0], "Costs": [0.0]})
-
+    if sheet_name and sheet_name in all_sheets:
+        selected = sheet_name
     else:
-        # ── Standard E1/E2 ────────────────────────────────────────────────
-        try:
-            if filename_lower.endswith((".xlsx",)):
-                df_raw = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-            elif filename_lower.endswith((".xls",)):
-                df_raw = pd.read_excel(io.BytesIO(file_bytes), engine="xlrd")
-            else:
-                # Try multiple encodings
-                for enc in ("utf-8", "latin-1", "cp1252"):
-                    try:
-                        df_raw = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    raise ValueError("Cannot decode CSV file")
-        except Exception as read_err:
-            raise HTTPException(status_code=422, detail=f"Cannot read file '{filename}': {read_err}")
+        selected = _find_best_sheet(xl)
 
-        df_raw.columns = df_raw.columns.str.strip()
+    df = xl.parse(selected)
 
-        # E2 detection
-        if is_engine2_data(df_raw):
-            logger.info("Transaction format detected — running Engine 2")
-            engine_flags["e2"] = True
-            try:
-                _, sym_detect = _detect_currency(df_raw, filename)
-                e2_result = run_engine2(df_raw, sym=sym_detect)
-            except Exception as e2_err:
-                logger.warning("Engine 2 failed: %s\n%s", e2_err, traceback.format_exc())
-                e2_result = None
-                engine_flags["e2"] = False
+    # Drop rows/cols that are entirely NaN
+    df.dropna(how="all", inplace=True)
+    df.dropna(axis=1, how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-        rev_col, cost_col, month_col = _resolve_columns(df_raw)
+    return df, all_sheets, selected
 
-        if rev_col is None or cost_col is None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Cannot find revenue and cost columns. "
-                    "Expected columns containing: revenue, sales, income / costs, expenses, expenditure. "
-                    f"Got columns: {list(df_raw.columns)}"
-                ),
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FILE TYPE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _detect_file_type(filename: str, df: pd.DataFrame) -> str:
+    """Detect which engine should handle this file."""
+    name_lower = filename.lower()
+
+    # POS files — Engine 3
+    pos_signals = ["pos", "category", "item_sales", "item sales", "menu", "debonairs",
+                   "restaurant pos", "sales_by", "by_category"]
+    if any(s in name_lower for s in pos_signals):
+        return "engine3"
+
+    # Check column signals
+    all_cols = " ".join(df.columns.astype(str).str.lower())
+    if "sku" in all_cols or "units sold" in all_cols or "category" in all_cols:
+        if "month" not in all_cols:
+            return "engine3"
+
+    # Customer data — Engine 2
+    customer_signals = ["customer", "client", "transaction", "order", "purchase", "rfm"]
+    if any(s in name_lower for s in customer_signals):
+        return "engine2"
+    if any(s in all_cols for s in ("customer", "client_id", "transaction", "order_id")):
+        return "engine2"
+
+    # Default — Engine 1
+    return "engine1"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RICH CONTEXT BUILDER FOR AI CFO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_ai_context(
+    analysis: Dict[str, Any],
+    monthly_rows: List[Dict[str, Any]],
+    df: pd.DataFrame,
+    filename: str,
+    sheet_name: Optional[str] = None,
+) -> str:
+    """
+    Build rich context string injected into Groq system prompt.
+    monthly_rows: the normalised [{month, revenue, costs, profit, margin}] list
+    analysis:     the raw engine output dict (forecast, anomalies, breakeven, etc.)
+    df:           original DataFrame for column-level summary
+    """
+    lines = [
+        "=== BUSINESS DATA CONTEXT ===",
+        f"File: {filename}" + (f" | Sheet: {sheet_name}" if sheet_name else ""),
+        "",
+    ]
+
+    # ── Raw column summary ────────────────────────────────────────────────────
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        lines.append("RAW COLUMN SUMMARY:")
+        for col in numeric_cols[:8]:
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(series):
+                lines.append(
+                    f"  {col}: total={series.sum():,.0f} | avg={series.mean():,.0f}"
+                    f" | min={series.min():,.0f} | max={series.max():,.0f}"
+                )
+        lines.append("")
+
+    # ── Normalised monthly P&L ────────────────────────────────────────────────
+    if monthly_rows:
+        total_rev    = sum(m.get("revenue", 0) for m in monthly_rows)
+        total_cost   = sum(m.get("costs",   0) for m in monthly_rows)
+        total_profit = sum(m.get("profit",  0) for m in monthly_rows)
+        avg_margin   = (total_profit / total_rev * 100) if total_rev else 0
+
+        best  = max(monthly_rows, key=lambda m: m.get("revenue", 0))
+        worst = min(monthly_rows, key=lambda m: m.get("revenue", 0))
+
+        lines += [
+            "FINANCIAL PERFORMANCE:",
+            f"  Total Revenue:      K{total_rev:,.0f}",
+            f"  Total Costs:        K{total_cost:,.0f}",
+            f"  Total Profit:       K{total_profit:,.0f}",
+            f"  Avg Profit Margin:  {avg_margin:.1f}%",
+            f"  Best Period:        {best.get('month','?')} — K{best.get('revenue',0):,.0f}",
+            f"  Worst Period:       {worst.get('month','?')} — K{worst.get('revenue',0):,.0f}",
+            "",
+            "MONTH-BY-MONTH BREAKDOWN:",
+        ]
+        for m in monthly_rows:
+            name   = m.get("month", "?")
+            rev    = m.get("revenue", 0)
+            cost   = m.get("costs",   0)
+            profit = m.get("profit",  0)
+            margin = m.get("margin",  0)
+            trend  = "▲" if profit > 0 else "▼"
+            lines.append(
+                f"  {name:<12} Rev K{rev:>10,.0f} | Cost K{cost:>10,.0f}"
+                f" | Profit K{profit:>9,.0f} | Margin {margin:>5.1f}% {trend}"
             )
+        lines.append("")
 
-        is_ts      = _is_time_series(df_raw, month_col)
-        monthly_df = _normalise_to_monthly(df_raw, rev_col, cost_col, month_col, is_ts)
+    # ── Engine analysis extras ────────────────────────────────────────────────
+    if analysis:
+        fc = analysis.get("forecast") or {}
+        if fc:
+            lines.append(f"FORECAST: Next period revenue ≈ K{fc.get('next_revenue', 0):,.0f}")
 
-    # ── Engine 1 ──────────────────────────────────────────────────────────
-    currency, sym = _detect_currency(monthly_df, filename)
+        anomalies = analysis.get("anomalies") or []
+        if anomalies:
+            lines.append(f"ANOMALIES DETECTED ({len(anomalies)}):")
+            for a in anomalies[:5]:
+                lines.append(f"  - {a.get('month','?')}: {a.get('description', str(a))}")
 
-    pnl              = analyse_pnl(monthly_df)
-    alerts           = detect_variances(monthly_df, threshold=0.15)
-    h_score, h_label = health_score(pnl, alerts)
-    recommendations  = get_structured_analysis(pnl, alerts)
-    cashflow         = forecast_cashflow(monthly_df, current_cash, months_ahead)
-    revenue_forecast = forecast_revenue(monthly_df, months_ahead + 3)
-    anomalies        = detect_anomalies(monthly_df, z_threshold)
-    bep              = calculate_breakeven(monthly_df, fixed_cost_pct)
-    monthly_records  = monthly_df.to_dict(orient="records")
+        be = analysis.get("breakeven") or {}
+        if be:
+            lines.append(f"BREAKEVEN REVENUE: K{be.get('breakeven_revenue', 0):,.0f}")
 
-    # ── Intelligence ──────────────────────────────────────────────────────
-    e1_data_for_intel = {
-        **pnl,
-        "health_score": h_score,
-        "health_label": h_label,
-        "alerts":       alerts,
-        "monthly":      monthly_records,
-    }
-    intelligence = run_intelligence(
-        e1_data=e1_data_for_intel,
-        e2_data=e2_result,
-        e3_data=e3_result,
-        business_type=business_type,
-        sym=sym,
-    )
+        cats = analysis.get("categories") or []
+        if cats:
+            lines.append("POS CATEGORIES:")
+            for cat in cats[:8]:
+                lines.append(
+                    f"  {cat.get('name','?')}: {cat.get('units',0):,.0f} units | K{cat.get('value',0):,.0f}"
+                )
 
-    response: dict[str, Any] = {
-        "monthly": monthly_records, "pnl": pnl,
-        "health_score": h_score, "health_label": h_label,
-        "alerts": alerts, "recommendations": recommendations,
-        "cashflow": cashflow, "forecast": revenue_forecast,
-        "anomalies": anomalies, "breakeven": bep,
-        "currency": currency, "currency_symbol": sym,
-        "engine_flags": engine_flags, "business_type": business_type,
-        "intelligence": intelligence,
-    }
-    if e2_result: response["e2"] = e2_result
-    if e3_result: response["e3"] = e3_result
-    return response
+    lines += [
+        "",
+        "=== YOUR ROLE ===",
+        "You are the AI CFO for this business. Answer EVERY question using the specific numbers above.",
+        "Always prefix currency with K (Kwacha). Never use $.",
+        "Cite the actual months and figures in your answers.",
+        "Give actionable CFO-level recommendations, not just observations.",
+        "If the data doesn't cover what's asked, say so and suggest what data would be needed.",
+    ]
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+    return "\n".join(lines)
 
-@app.get("/")
-def root():
-    return {"status": "AI-BOS API v3.0.0 — Engines 1+2+3 active"}
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "version": "3.0.0"}
+# ══════════════════════════════════════════════════════════════════════════════
+# UPLOAD ENDPOINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upload")
-async def upload(
+async def upload_file(
     file: UploadFile = File(...),
-    current_cash: float = Query(50000),
-    months_ahead: int = Query(3),
-    z_threshold: float = Query(2.0),
-    fixed_cost_pct: float = Query(0.40),
-    business_type: str = Query("QSR"),
+    sheet_name: Optional[str] = Query(None),
+    cabinet_id: Optional[str] = Query(None),
 ):
+    """
+    Upload a file and run engine analysis.
+    Returns full analysis + sheet list + cabinet_id for re-use.
+    """
     try:
-        file_bytes = await file.read()
-        filename   = file.filename or "upload.csv"
-        result = await _run_full_pipeline(
-            file_bytes=file_bytes, filename=filename,
-            current_cash=current_cash, months_ahead=months_ahead,
-            z_threshold=z_threshold, fixed_cost_pct=fixed_cost_pct,
-            business_type=business_type,
+        content = await file.read()
+        filename = file.filename or "upload"
+        ext = filename.rsplit(".", 1)[-1].lower()
+
+        logger.info("Upload: %s (%d bytes) | sheet=%s", filename, len(content), sheet_name)
+
+        # ── POS file (XLS Engine 3) ───────────────────────────────────────────
+        if ext == "xls":
+            try:
+                pos_data = parse_pos_report(content)
+                e3_result = run_engine3(pos_data)
+                cab_id = cabinet_id or str(uuid.uuid4())
+                CABINET[cab_id] = {
+                    "name": filename,
+                    "file_type": "xls",
+                    "engine": "engine3",
+                    "sheets": ["Sheet1"],
+                    "active_sheet": "Sheet1",
+                    "content": content,
+                    "analysis": e3_result,
+                    "df_preview": pos_data.get("items", [])[:10],
+                }
+                return {
+                    "success": True,
+                    "engine": "engine3",
+                    "cabinet_id": cab_id,
+                    "filename": filename,
+                    "sheets": ["Sheet1"],
+                    "active_sheet": "Sheet1",
+                    **e3_result,
+                }
+            except Exception as e3_err:
+                logger.warning("Engine3 parse failed, falling through: %s", e3_err)
+
+        # ── Excel multi-sheet ─────────────────────────────────────────────────
+        if ext in ("xlsx", "xlsm", "xls"):
+            df, all_sheets, selected_sheet = _load_sheet(content, filename, sheet_name)
+        elif ext == "csv":
+            all_sheets = []
+            selected_sheet = None
+            # Multi-encoding fallback
+            for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                try:
+                    df = pd.read_csv(io.BytesIO(content), encoding=enc)
+                    break
+                except Exception:
+                    continue
+            else:
+                raise ValueError("Could not decode CSV — try saving as UTF-8")
+        else:
+            raise ValueError(f"Unsupported file type: .{ext}")
+
+        # ── Resolve columns ───────────────────────────────────────────────────
+        rev_col, cost_col, month_col = _resolve_columns(df)
+        if rev_col is None:
+            raise ValueError(
+                f"Cannot find revenue column. Columns found: {list(df.columns)}"
+            )
+        if cost_col is None:
+            raise ValueError(
+                f"Cannot find cost/expense column. Columns found: {list(df.columns)}"
+            )
+
+        # ── Detect engine ─────────────────────────────────────────────────────
+        engine_type = _detect_file_type(filename, df)
+
+        # ── Build normalised monthly data ─────────────────────────────────────
+        monthly_rows = []
+        revenues = pd.to_numeric(df[rev_col], errors="coerce").fillna(0).tolist()
+        costs    = pd.to_numeric(df[cost_col], errors="coerce").fillna(0).tolist()
+        months   = (
+            df[month_col].astype(str).tolist()
+            if month_col
+            else [f"Period {i+1}" for i in range(len(revenues))]
         )
-        return result
+
+        MONTH_ORDER = [
+            "january","february","march","april","may","june",
+            "july","august","september","october","november","december",
+        ]
+
+        for i, (m, r, c) in enumerate(zip(months, revenues, costs)):
+            profit = r - c
+            margin = (profit / r * 100) if r else 0
+            monthly_rows.append({
+                "month": m,
+                "revenue": round(r, 2),
+                "costs": round(c, 2),
+                "profit": round(profit, 2),
+                "margin": round(margin, 2),
+                "sort_key": next(
+                    (j for j, mo in enumerate(MONTH_ORDER) if mo in m.lower()), i
+                ),
+            })
+
+        monthly_rows.sort(key=lambda x: x["sort_key"])
+
+        # ── Run Engine 1 ──────────────────────────────────────────────────────
+        e1_result = run_engine1(monthly_rows)
+
+        # ── Cabinet storage ───────────────────────────────────────────────────
+        cab_id = cabinet_id or str(uuid.uuid4())
+        CABINET[cab_id] = {
+            "name": filename,
+            "file_type": ext,
+            "engine": engine_type,
+            "sheets": all_sheets,
+            "active_sheet": selected_sheet,
+            "content": content,
+            "columns": {
+                "revenue": rev_col,
+                "cost": cost_col,
+                "month": month_col,
+            },
+            "analysis": e1_result,
+            "monthly": monthly_rows,
+            "df_json": df.to_json(orient="records"),
+        }
+
+        logger.info(
+            "Upload success → engine=%s | rev=%s | cost=%s | months=%d | cab=%s",
+            engine_type, rev_col, cost_col, len(monthly_rows), cab_id,
+        )
+
+        return {
+            "success": True,
+            "engine": engine_type,
+            "cabinet_id": cab_id,
+            "filename": filename,
+            "sheets": all_sheets,
+            "active_sheet": selected_sheet,
+            "columns_detected": {
+                "revenue": rev_col,
+                "cost": cost_col,
+                "month": month_col,
+            },
+            "monthly": monthly_rows,
+            **e1_result,
+        }
+
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Upload pipeline error: %s\n%s", exc, traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}")
+        logger.error("Upload error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=400, detail=str(exc))
 
-@app.post("/analyse")
-def analyse(req: AnalyseRequest):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHEET SWITCH — Re-analyse with different sheet
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/upload/switch-sheet")
+async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...)):
+    """Switch to a different sheet in a previously uploaded Excel file."""
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Cabinet entry not found")
+
+    entry = CABINET[cabinet_id]
+    content = entry.get("content")
+    filename = entry.get("name", "upload.xlsx")
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File content not cached")
+
+    df, all_sheets, selected = _load_sheet(content, filename, sheet_name)
+    rev_col, cost_col, month_col = _resolve_columns(df)
+
+    if rev_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sheet '{sheet_name}' has no recognisable revenue column. "
+                   f"Columns: {list(df.columns)}",
+        )
+    if cost_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sheet '{sheet_name}' has no recognisable cost column. "
+                   f"Columns: {list(df.columns)}",
+        )
+
+    revenues = pd.to_numeric(df[rev_col], errors="coerce").fillna(0).tolist()
+    costs    = pd.to_numeric(df[cost_col], errors="coerce").fillna(0).tolist()
+    months   = (
+        df[month_col].astype(str).tolist()
+        if month_col
+        else [f"Period {i+1}" for i in range(len(revenues))]
+    )
+
+    monthly_rows = []
+    for i, (m, r, c) in enumerate(zip(months, revenues, costs)):
+        profit = r - c
+        margin = (profit / r * 100) if r else 0
+        monthly_rows.append({
+            "month": m, "revenue": round(r, 2), "costs": round(c, 2),
+            "profit": round(profit, 2), "margin": round(margin, 2),
+        })
+
+    e1_result = run_engine1(monthly_rows)
+
+    # Update cabinet
+    CABINET[cabinet_id]["active_sheet"] = selected
+    CABINET[cabinet_id]["monthly"] = monthly_rows
+    CABINET[cabinet_id]["analysis"] = e1_result
+    CABINET[cabinet_id]["df_json"] = df.to_json(orient="records")
+
+    return {
+        "success": True,
+        "cabinet_id": cabinet_id,
+        "active_sheet": selected,
+        "sheets": all_sheets,
+        "columns_detected": {"revenue": rev_col, "cost": cost_col, "month": month_col},
+        "monthly": monthly_rows,
+        **e1_result,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CABINET ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/cabinet")
+async def list_cabinet():
+    """List all files in the cabinet."""
+    items = []
+    for cab_id, entry in CABINET.items():
+        items.append({
+            "id": cab_id,
+            "name": entry.get("name"),
+            "file_type": entry.get("file_type"),
+            "engine": entry.get("engine"),
+            "sheets": entry.get("sheets", []),
+            "active_sheet": entry.get("active_sheet"),
+        })
+    return {"cabinet": items}
+
+
+@app.get("/cabinet/{cabinet_id}")
+async def get_cabinet_entry(cabinet_id: str):
+    """Load a previously uploaded file from the cabinet."""
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Not found in cabinet")
+    entry = CABINET[cabinet_id]
+    return {
+        "success": True,
+        "cabinet_id": cabinet_id,
+        "filename": entry.get("name"),
+        "sheets": entry.get("sheets", []),
+        "active_sheet": entry.get("active_sheet"),
+        "engine": entry.get("engine"),
+        "monthly": entry.get("monthly", []),
+        **(entry.get("analysis") or {}),
+    }
+
+
+@app.delete("/cabinet/{cabinet_id}")
+async def delete_cabinet_entry(cabinet_id: str):
+    """Remove a file from the cabinet."""
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Not found")
+    del CABINET[cabinet_id]
+    return {"success": True, "deleted": cabinet_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA STUDIO — Formula computation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StudioRequest(BaseModel):
+    cabinet_id: Optional[str] = None
+    formula: str                      # Excel-like formula or AI prompt
+    column_context: Optional[Dict[str, List[float]]] = None  # name → values
+    ai_mode: bool = False             # True = use AI to interpret natural language
+
+
+@app.post("/data-studio/compute")
+async def data_studio_compute(req: StudioRequest):
+    """
+    Compute Excel-like formulas or AI-powered analysis.
+    Supports: SUM, AVG, MAX, MIN, COUNT, IF, GROWTH, FORECAST, custom AI formulas.
+    """
+    formula = req.formula.strip()
+    data: Dict[str, List[float]] = req.column_context or {}
+
+    # Load data from cabinet if provided
+    if req.cabinet_id and req.cabinet_id in CABINET:
+        entry = CABINET[req.cabinet_id]
+        monthly = entry.get("monthly", [])
+        if monthly:
+            data.setdefault("revenue", [m["revenue"] for m in monthly])
+            data.setdefault("costs", [m["costs"] for m in monthly])
+            data.setdefault("profit", [m["profit"] for m in monthly])
+            data.setdefault("margin", [m["margin"] for m in monthly])
+
+    # ── AI formula mode ───────────────────────────────────────────────────────
+    if req.ai_mode or formula.upper().startswith("AI:"):
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+
+        clean_formula = formula[3:].strip() if formula.upper().startswith("AI:") else formula
+        context_str = "\n".join(
+            f"{k}: {v}" for k, v in data.items()
+        )
+        prompt = (
+            f"You are a financial analyst. Given this data:\n{context_str}\n\n"
+            f"Compute or explain: {clean_formula}\n\n"
+            "Return JSON with keys: result (the computed value or explanation), "
+            "formula_used (what formula/method you applied), insight (one-line business insight). "
+            "JSON only, no markdown."
+        )
+
+        try:
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.1,
+            )
+            raw = resp.choices[0].message.content.strip()
+            # Strip markdown if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            result = json.loads(raw)
+            return {"success": True, "mode": "ai", **result}
+        except json.JSONDecodeError:
+            return {"success": True, "mode": "ai", "result": raw, "formula_used": formula}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"AI formula error: {exc}")
+
+    # ── Built-in formula engine ───────────────────────────────────────────────
+    formula_up = formula.upper()
+
+    def get_col(name: str) -> List[float]:
+        key = name.lower().strip()
+        for k, v in data.items():
+            if k.lower() == key:
+                return [float(x) for x in v if x is not None]
+        raise ValueError(f"Column '{name}' not found. Available: {list(data.keys())}")
+
     try:
-        df               = pd.DataFrame(req.records)
-        pnl              = analyse_pnl(df)
-        alerts           = detect_variances(df, threshold=0.15)
-        h_score, h_label = health_score(pnl, alerts)
-        recommendations  = get_structured_analysis(pnl, alerts)
-        cashflow         = forecast_cashflow(df, req.current_cash, req.months_ahead)
-        revenue_forecast = forecast_revenue(df, req.months_ahead + 3)
-        anomalies        = detect_anomalies(df, req.z_threshold)
-        bep              = calculate_breakeven(df, req.fixed_cost_pct)
+        result = None
+        formula_used = formula
+
+        if formula_up.startswith("SUM("):
+            col = formula[4:-1].strip()
+            vals = get_col(col)
+            result = round(sum(vals), 2)
+
+        elif formula_up.startswith("AVG(") or formula_up.startswith("AVERAGE("):
+            col = formula.split("(", 1)[1][:-1].strip()
+            vals = get_col(col)
+            result = round(sum(vals) / len(vals), 2) if vals else 0
+
+        elif formula_up.startswith("MAX("):
+            col = formula[4:-1].strip()
+            vals = get_col(col)
+            result = max(vals) if vals else 0
+
+        elif formula_up.startswith("MIN("):
+            col = formula[4:-1].strip()
+            vals = get_col(col)
+            result = min(vals) if vals else 0
+
+        elif formula_up.startswith("COUNT("):
+            col = formula[6:-1].strip()
+            vals = get_col(col)
+            result = len([v for v in vals if v != 0])
+
+        elif formula_up.startswith("GROWTH("):
+            col = formula[7:-1].strip()
+            vals = get_col(col)
+            if len(vals) >= 2 and vals[0]:
+                result = round(((vals[-1] - vals[0]) / vals[0]) * 100, 2)
+            else:
+                result = 0
+            formula_used = f"GROWTH({col}) = ({vals[-1]:.0f} - {vals[0]:.0f}) / {vals[0]:.0f} × 100"
+
+        elif formula_up.startswith("MARGIN("):
+            # MARGIN(revenue, profit)
+            args = formula[7:-1].split(",")
+            rev_vals = get_col(args[0].strip())
+            pft_vals = get_col(args[1].strip())
+            margins = [
+                round((p / r * 100), 2) if r else 0
+                for r, p in zip(rev_vals, pft_vals)
+            ]
+            result = margins
+            formula_used = f"MARGIN = profit / revenue × 100"
+
+        elif formula_up.startswith("FORECAST("):
+            col = formula[9:-1].strip()
+            vals = get_col(col)
+            if len(vals) >= 2:
+                x = list(range(len(vals)))
+                coeffs = np.polyfit(x, vals, 1)
+                next_val = round(float(np.polyval(coeffs, len(vals))), 2)
+                result = next_val
+                formula_used = f"FORECAST({col}) — linear regression next period"
+            else:
+                result = vals[-1] if vals else 0
+
+        elif formula_up.startswith("BREAKEVEN("):
+            # BREAKEVEN(fixed_costs, variable_cost_ratio, price)
+            args = [a.strip() for a in formula[10:-1].split(",")]
+            fixed = float(args[0]) if args[0].replace(".", "").isdigit() else get_col(args[0])[0]
+            vcr = float(args[1]) if len(args) > 1 else 0.6
+            result = round(fixed / (1 - vcr), 2)
+            formula_used = f"BREAKEVEN = Fixed Costs / (1 - Variable Cost Ratio)"
+
+        elif formula_up.startswith("YOY("):
+            col = formula[4:-1].strip()
+            vals = get_col(col)
+            if len(vals) >= 13:
+                yoy = [
+                    round(((vals[i] - vals[i - 12]) / vals[i - 12]) * 100, 2)
+                    if vals[i - 12] else 0
+                    for i in range(12, len(vals))
+                ]
+                result = yoy
+            else:
+                result = None
+            formula_used = f"YOY({col}) = (current - prior year) / prior year × 100"
+
+        else:
+            raise ValueError(
+                f"Unknown formula: {formula}. "
+                "Supported: SUM, AVG, MAX, MIN, COUNT, GROWTH, MARGIN, FORECAST, BREAKEVEN, YOY, AI:"
+            )
+
         return {
-            "monthly": req.records, "pnl": pnl,
-            "health_score": h_score, "health_label": h_label,
-            "alerts": alerts, "recommendations": recommendations,
-            "cashflow": cashflow, "forecast": revenue_forecast,
-            "anomalies": anomalies, "breakeven": bep,
+            "success": True,
+            "mode": "formula",
+            "formula": formula,
+            "formula_used": formula_used,
+            "result": result,
         }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
-@app.post("/forecast")
-def forecast(req: ForecastRequest):
-    try:
-        return forecast_revenue(pd.DataFrame(req.records), req.months)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
 
-@app.post("/anomalies")
-def anomalies(req: AnomalyRequest):
-    try:
-        return detect_anomalies(pd.DataFrame(req.records), req.z_threshold)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
-@app.post("/breakeven")
-def breakeven(req: BreakevenRequest):
-    try:
-        return calculate_breakeven(pd.DataFrame(req.records), req.fixed_cost_pct)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/data-studio/schema/{cabinet_id}")
+async def data_studio_schema(cabinet_id: str):
+    """Return available columns/series for formula building."""
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Cabinet entry not found")
+    entry = CABINET[cabinet_id]
+    monthly = entry.get("monthly", [])
+    if not monthly:
+        return {"columns": []}
+    sample = monthly[0]
+    columns = [
+        {"name": k, "type": "number", "values": [m.get(k) for m in monthly]}
+        for k in sample.keys()
+        if k != "sort_key"
+    ]
+    return {
+        "cabinet_id": cabinet_id,
+        "filename": entry.get("name"),
+        "columns": columns,
+        "row_count": len(monthly),
+    }
 
-@app.post("/cashflow")
-def cashflow(req: CashflowRequest):
-    try:
-        return forecast_cashflow(pd.DataFrame(req.records), req.current_cash, req.months_ahead)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI CFO CHAT — GROQ
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    cabinet_id: Optional[str] = None
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    """AI CFO Chat powered by Groq llama-3.3-70b-versatile."""
     try:
-        client   = Groq()
-        history  = await load_chat_history(req.user_id)
-        hist_msg = build_chat_context_from_history(history)
-        ctx      = req.context or {}
-
-        e2_ctx = e3_ctx = intel_ctx = ""
-        if ctx.get("e2"):
-            e2 = ctx["e2"]
-            rfm = e2.get("rfm", [])
-            e2_ctx = (
-                f"\nCUSTOMER: {len(rfm)} customers. "
-                f"{sum(1 for r in rfm if r.get('segment')=='Champion')} Champions, "
-                f"{sum(1 for r in rfm if r.get('segment')=='At Risk')} At Risk. "
-                f"Retention: {e2.get('retention',{}).get('retention_rate',0):.1f}%."
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="GROQ_API_KEY is not configured on the server. "
+                       "Add it to Railway environment variables.",
             )
-        if ctx.get("e3"):
-            e3  = ctx["e3"]
-            gt  = e3.get("grand_totals", {})
-            sym = ctx.get("currency_symbol", "K")
-            e3_ctx = (
-                f"\nOPS: {e3.get('business_name','')} net revenue "
-                f"{sym}{gt.get('net_revenue',0):,.0f}. "
-                f"Drink attach {e3.get('attach_rates',{}).get('drink_attach_pct',0):.1f}%."
-            )
-        if ctx.get("intelligence"):
-            i = ctx["intelligence"]
-            intel_ctx = f"\nOVERALL SCORE: {i.get('overall_score',0)}/100 ({i.get('overall_label','')})."
 
-        sym = ctx.get("currency_symbol", "K")
-        system_prompt = f"""You are AI-BOS — an elite financial and operations intelligence CFO assistant for SME businesses in Zambia.
-You have access to comprehensive business data. Be direct, cite specific numbers, give actionable advice.
-Keep responses to 3-4 sentences unless a detailed breakdown is requested.
-Always use {sym} as the currency symbol (Zambian Kwacha).
-
-FINANCIAL DATA:
-- Total Revenue: {sym}{ctx.get('pnl',{}).get('total_revenue',0):,.0f}
-- Total Profit: {sym}{ctx.get('pnl',{}).get('total_profit',0):,.0f}
-- Avg Margin: {ctx.get('pnl',{}).get('avg_margin',0):.1f}%
-- Health Score: {ctx.get('health_score',0)}/100
-- Active Alerts: {len(ctx.get('alerts',[]))}{e2_ctx}{e3_ctx}{intel_ctx}"""
-
-        messages = [{"role": "system", "content": system_prompt}] + hist_msg + [
-            {"role": "user", "content": req.message}
+        # Build system context
+        system_parts = [
+            "You are the AI CFO (Chief Financial Officer) for AI-BOS, "
+            "a financial intelligence platform serving Zambian SMEs.",
+            "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $.",
+            "You are expert in Zambian business, economics, and SME finance.",
+            "Be direct, insightful, and action-oriented. No fluff.",
         ]
 
-        response = client.chat.completions.create(
+        # Inject business data context if cabinet_id provided
+        if req.cabinet_id and req.cabinet_id in CABINET:
+            entry        = CABINET[req.cabinet_id]
+            df_json      = entry.get("df_json")
+            monthly_rows = entry.get("monthly", [])
+
+            if df_json:
+                df = pd.read_json(io.StringIO(df_json))
+            else:
+                df = pd.DataFrame(monthly_rows) if monthly_rows else pd.DataFrame()
+
+            context = _build_ai_context(
+                analysis=entry.get("analysis", {}),
+                monthly_rows=monthly_rows,
+                df=df,
+                filename=entry.get("name", "uploaded file"),
+                sheet_name=entry.get("active_sheet"),
+            )
+            system_parts.append("\n" + context)
+        else:
+            system_parts.append(
+                "No business data is currently uploaded. "
+                "Ask the user to upload their financial data for specific analysis. "
+                "You can still answer general Zambian business and finance questions."
+            )
+
+        system_prompt = "\n\n".join(system_parts)
+
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            max_tokens=600,
-            timeout=30,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *req.messages,
+            ],
+            max_tokens=1024,
+            temperature=0.7,
+            stream=False,
         )
-        reply = response.choices[0].message.content.strip()
 
-        await save_chat_message(req.user_id, "user",      req.message)
-        await save_chat_message(req.user_id, "assistant", reply)
-        return {"reply": reply}
+        response_text = completion.choices[0].message.content
+        return {
+            "response": response_text,
+            "model": "llama-3.3-70b-versatile",
+            "context_injected": bool(req.cabinet_id and req.cabinet_id in CABINET),
+        }
 
-    except Exception as exc:
-        logger.error("Chat error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-@app.get("/chat/history")
-async def get_chat_history(user_id: str = Query(...)):
-    try:
-        history = await load_chat_history(user_id)
-        return {"messages": history}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-@app.delete("/chat/history")
-async def delete_chat_history(user_id: str = Query(...)):
-    try:
-        await clear_chat_history(user_id)
-        return {"status": "cleared"}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-@app.post("/export/excel")
-def export_excel(req: ExportRequest):
-    try:
-        df        = pd.DataFrame(req.records)
-        xlsx_bytes = export_excel_report(df, req.pnl, req.alerts, req.currency_symbol)
-        return Response(
-            content=xlsx_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=aibos_report.xlsx"},
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-@app.post("/email/send")
-def email_send(req: EmailRequest):
-    try:
-        ok, msg = send_report_email(req.to_email, req.subject, req.pnl, req.alerts, req.currency_symbol)
-        if not ok:
-            raise HTTPException(status_code=500, detail=msg)
-        return {"status": "sent", "message": msg}
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.error("Chat error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Chat error: {type(exc).__name__}: {str(exc)}"
+        )
 
-@app.post("/email/subscribe")
-async def subscribe(req: SubscribeRequest):
-    try:
-        ok = await upsert_subscription(req.user_id, req.email, req.frequency)
-        if not ok:
-            raise HTTPException(status_code=500, detail="Failed to save subscription")
-        return {"status": "subscribed"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
-@app.get("/email/subscribe")
-async def get_subscribe(user_id: str = Query(...)):
-    try:
-        sub = await get_subscription(user_id)
-        return sub or {"subscribed": False}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+# ══════════════════════════════════════════════════════════════════════════════
+# HEALTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+async def health():
+    groq_key = bool(os.environ.get("GROQ_API_KEY"))
+    return {
+        "status": "ok",
+        "groq_configured": groq_key,
+        "cabinet_size": len(CABINET),
+        "version": "3.0.0",
+    }
