@@ -855,13 +855,76 @@ async def data_studio_schema(cabinet_id: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ChatRequest(BaseModel):
-    messages: List[Dict[str, str]]
+    """Accepts BOTH the live frontend contract and the legacy contract.
+
+    Frontend (AICFOChat.tsx) sends: { message, user_id, context }
+    Legacy / data-studio sends:     { messages: [...], cabinet_id }
+    All fields optional so neither shape triggers a 422 validation error.
+    """
+    # Live frontend shape
+    message: Optional[str] = None
+    user_id: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+    # Legacy shape
+    messages: Optional[List[Dict[str, str]]] = None
     cabinet_id: Optional[str] = None
+
+
+def _context_to_text(ctx: Dict[str, Any]) -> str:
+    """Turn the frontend's context object into a readable CFO briefing string."""
+    if not ctx:
+        return ""
+    lines = ["=== CURRENT BUSINESS SNAPSHOT (from the live dashboard) ==="]
+    sym = ctx.get("currency_symbol") or "K"
+
+    # Frontend sends the P&L under "pnl"; also accept "kpi" for safety.
+    kpi = ctx.get("pnl") or ctx.get("kpi") or {}
+    if kpi:
+        tr = kpi.get("total_revenue", 0)
+        tc = kpi.get("total_costs", 0)
+        tp = kpi.get("total_profit", 0)
+        am = kpi.get("avg_margin", 0)
+        try:
+            lines.append(f"Total Revenue: {sym}{float(tr):,.0f}")
+            lines.append(f"Total Costs:   {sym}{float(tc):,.0f}")
+            lines.append(f"Total Profit:  {sym}{float(tp):,.0f}")
+            lines.append(f"Avg Margin:    {float(am):.1f}%")
+        except Exception:
+            pass
+
+    if "health_score" in ctx:
+        lines.append(f"Health Score:  {ctx.get('health_score', 0)}/100 ({ctx.get('health_label','')})")
+
+    monthly = ctx.get("monthly") or []
+    if monthly:
+        lines.append("")
+        lines.append("Monthly performance:")
+        for m in monthly[:24]:
+            mn = m.get("Month") or m.get("month") or "?"
+            rv = m.get("Revenue") or m.get("revenue") or 0
+            cs = m.get("Costs") or m.get("costs") or 0
+            try:
+                lines.append(f"  {mn}: revenue {sym}{float(rv):,.0f} | costs {sym}{float(cs):,.0f} | profit {sym}{float(rv)-float(cs):,.0f}")
+            except Exception:
+                lines.append(f"  {mn}: revenue {rv} | costs {cs}")
+
+    alerts = ctx.get("alerts") or []
+    if alerts:
+        lines.append("")
+        lines.append(f"Active alerts ({len(alerts)}):")
+        for a in alerts[:8]:
+            if isinstance(a, dict):
+                lines.append(f"  - [{a.get('severity','info')}] {a.get('title','')}: {a.get('description','')}")
+
+    return "\n".join(lines)
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """AI CFO Chat powered by Groq llama-3.3-70b-versatile."""
+    """AI CFO Chat powered by Groq llama-3.3-70b-versatile.
+
+    Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
+    """
     try:
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
@@ -871,7 +934,7 @@ async def chat(req: ChatRequest):
                        "Add it to Railway environment variables.",
             )
 
-        # Build system context
+        # ── Build the system context ──────────────────────────────────────────
         system_parts = [
             "You are the AI CFO (Chief Financial Officer) for AI-BOS, "
             "a financial intelligence platform serving Zambian SMEs.",
@@ -880,17 +943,24 @@ async def chat(req: ChatRequest):
             "Be direct, insightful, and action-oriented. No fluff.",
         ]
 
-        # Inject business data context if cabinet_id provided
-        if req.cabinet_id and req.cabinet_id in CABINET:
+        injected = False
+
+        # Priority 1: rich context object sent by the live frontend
+        if req.context:
+            ctx_text = _context_to_text(req.context)
+            if ctx_text:
+                system_parts.append("\n" + ctx_text)
+                injected = True
+
+        # Priority 2: cabinet-backed context (legacy / data-studio)
+        if not injected and req.cabinet_id and req.cabinet_id in CABINET:
             entry        = CABINET[req.cabinet_id]
             df_json      = entry.get("df_json")
             monthly_rows = entry.get("monthly", [])
-
             if df_json:
                 df = pd.read_json(io.StringIO(df_json))
             else:
                 df = pd.DataFrame(monthly_rows) if monthly_rows else pd.DataFrame()
-
             context = _build_ai_context(
                 analysis=entry.get("analysis", {}),
                 monthly_rows=monthly_rows,
@@ -899,21 +969,32 @@ async def chat(req: ChatRequest):
                 sheet_name=entry.get("active_sheet"),
             )
             system_parts.append("\n" + context)
-        else:
+            injected = True
+
+        if not injected:
             system_parts.append(
                 "No business data is currently uploaded. "
-                "Ask the user to upload their financial data for specific analysis. "
-                "You can still answer general Zambian business and finance questions."
+                "Answer general Zambian business and finance questions, and invite "
+                "the user to upload their financial data for specific analysis."
             )
 
         system_prompt = "\n\n".join(system_parts)
+
+        # ── Build the message list ────────────────────────────────────────────
+        # Live frontend: single `message`. Legacy: full `messages` array.
+        if req.messages:
+            chat_messages = list(req.messages)
+        elif req.message:
+            chat_messages = [{"role": "user", "content": req.message}]
+        else:
+            raise HTTPException(status_code=400, detail="No message provided.")
 
         client = Groq(api_key=api_key)
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
-                *req.messages,
+                *chat_messages,
             ],
             max_tokens=1024,
             temperature=0.7,
@@ -921,10 +1002,12 @@ async def chat(req: ChatRequest):
         )
 
         response_text = completion.choices[0].message.content
+        # Return BOTH keys so any frontend contract works
         return {
+            "reply": response_text,
             "response": response_text,
             "model": "llama-3.3-70b-versatile",
-            "context_injected": bool(req.cabinet_id and req.cabinet_id in CABINET),
+            "context_injected": injected,
         }
 
     except HTTPException:
