@@ -229,7 +229,13 @@ def parse_pos_report(raw_bytes: bytes, filename: str = "") -> dict[str, Any]:
     # Look for the header row that contains "units sold" and "value sold"
     header_row_idx = None
     for idx in range(len(raw_df)):
-        row_lower = " ".join(str(v).lower() for v in raw_df.iloc[idx] if pd.notna(v))
+        # Normalise intra-cell whitespace — POS exports wrap headers like
+        # "Units\nSold" and "Value\nSold\nIncl. Disc." across lines, which would
+        # otherwise never match the "units sold" / "value sold" probes below.
+        row_lower = " ".join(
+            re.sub(r"\s+", " ", str(v)).strip().lower()
+            for v in raw_df.iloc[idx] if pd.notna(v)
+        )
         if "units sold" in row_lower and ("value sold" in row_lower or "contr" in row_lower):
             header_row_idx = idx
             break
@@ -339,7 +345,10 @@ def _map_pos_columns(headers: list) -> dict[str, int]:
     """Map semantic names to column indices from the raw header list."""
     mapping: dict[str, int] = {}
     for i, h in enumerate(headers):
-        h_lower = str(h).lower().strip() if pd.notna(h) else ""
+        # Collapse the multi-line whitespace POS exports embed in header cells
+        # (e.g. "Value\nSold\nIncl. Disc." → "value sold incl. disc.") so the
+        # keyword probes below actually match.
+        h_lower = re.sub(r"\s+", " ", str(h)).strip().lower() if pd.notna(h) else ""
         if not h_lower:
             continue
         if any(kw in h_lower for kw in ("sku", "item code", "code")) and "sku" not in mapping:
@@ -350,18 +359,20 @@ def _map_pos_columns(headers: list) -> dict[str, int]:
             mapping["price"] = i
         elif "units sold" in h_lower and "units_sold" not in mapping:
             mapping["units_sold"] = i
-        elif "value sold incl" in h_lower or ("value sold" in h_lower and "excl" not in h_lower):
+        # "excl" must be tested before the generic "disc" probe, because the
+        # excl-disc column header itself contains the word "disc".
+        elif ("value sold incl" in h_lower or ("value sold" in h_lower and "excl" not in h_lower)) and "value_incl_disc" not in mapping:
             mapping["value_incl_disc"] = i
-        elif "disc value" in h_lower or "discount value" in h_lower:
-            mapping["disc_value"] = i
-        elif "value sold excl" in h_lower or ("excl disc" in h_lower):
+        elif ("value sold excl" in h_lower or "excl disc" in h_lower) and "value_excl_disc" not in mapping:
             mapping["value_excl_disc"] = i
-        elif "value contr cat" in h_lower or ("contr" in h_lower and "cat" in h_lower):
-            mapping["contr_pct_cat"] = i
-        elif "value contr tot" in h_lower or ("contr" in h_lower and "tot" in h_lower):
-            mapping["contr_pct_tot"] = i
-        elif "unit contr" in h_lower:
+        elif ("disc" in h_lower and "value" in h_lower and "sold" not in h_lower) and "disc_value" not in mapping:
+            mapping["disc_value"] = i
+        elif "unit contr" in h_lower and "unit_contr" not in mapping:
             mapping["unit_contr"] = i
+        elif ("value contr tot" in h_lower or ("contr" in h_lower and "tot" in h_lower)) and "contr_pct_tot" not in mapping:
+            mapping["contr_pct_tot"] = i
+        elif ("value contr cat" in h_lower or ("contr" in h_lower and "cat" in h_lower)) and "contr_pct_cat" not in mapping:
+            mapping["contr_pct_cat"] = i
 
     # Ensure sku and name are present via positional fallback
     if "sku" not in mapping and 0 not in mapping.values():

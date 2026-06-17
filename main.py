@@ -23,7 +23,7 @@ from groq import Groq
 # ─── Engine imports ──────────────────────────────────────────────────────────
 from engine import run_engine1
 from engine2 import run_engine2
-from engine3 import run_engine3, parse_pos_report
+from engine3 import run_engine3
 from intelligence import run_cross_engine
 
 logging.basicConfig(level=logging.INFO)
@@ -58,25 +58,30 @@ def _resolve_columns(df: pd.DataFrame):
     rev_col = cost_col = month_col = profit_col = None
 
     # ── PASS 1: Exact alias match ─────────────────────────────────────────────
-    REVENUE_EXACT = {
-        "revenue", "sales", "income", "turnover", "takings", "receipts",
-        "total revenue", "gross revenue", "net revenue", "total sales",
-        "gross sales", "net sales", "total income", "gross income",
-        "revenue zmw", "sales zmw", "income zmw", "revenue (zmw)",
-        "revenue_(zmw)", "sales revenue (zmw)", "sales revenue",
-        "sales revenue zmw",
-    }
-    COST_EXACT = {
-        "costs", "expenses", "expenditure", "cost", "expense", "cogs",
-        "total costs", "total expenses", "operating expenses",
-        "operating costs", "cost of sales", "outgoings",
-        "expenses (zmw)", "total expenses (zmw)", "cogs (zmw)",
-        "expenses zmw", "cost (zmw)", "costs (zmw)",
-    }
-    PROFIT_EXACT = {
-        "profit", "net profit", "profit (zmw)", "profit zmw",
-        "net income", "gross profit", "operating profit",
-    }
+    # Ordered by priority (most-specific / most-complete first). These MUST be
+    # ordered sequences, not sets — set iteration order is non-deterministic, so
+    # a workbook with several cost-like columns (e.g. both "COGS" and "Total
+    # Expenses") would otherwise resolve to a different column on each upload.
+    REVENUE_EXACT = (
+        "total revenue", "net revenue", "gross revenue",
+        "total sales", "net sales", "gross sales",
+        "total income", "gross income",
+        "sales revenue (zmw)", "sales revenue zmw", "sales revenue",
+        "revenue (zmw)", "revenue_(zmw)", "revenue zmw", "sales zmw",
+        "income zmw", "revenue", "sales", "income",
+        "turnover", "takings", "receipts",
+    )
+    COST_EXACT = (
+        "total costs", "total expenses", "total expenses (zmw)",
+        "operating expenses", "operating costs", "cost of sales",
+        "expenses (zmw)", "expenses zmw", "costs (zmw)", "cost (zmw)",
+        "cogs (zmw)", "cogs", "costs", "expenses", "expenditure",
+        "outgoings", "cost", "expense",
+    )
+    PROFIT_EXACT = (
+        "net profit", "operating profit", "gross profit",
+        "profit (zmw)", "profit zmw", "net income", "profit",
+    )
 
     for alias in REVENUE_EXACT:
         if alias in cols_lower:
@@ -152,8 +157,17 @@ def _resolve_columns(df: pd.DataFrame):
         "june", "july", "august", "september", "october", "november",
         "december", "q1", "q2", "q3", "q4",
     }
+    # A genuine time column is text/dates, never a money/quantity series. Skip
+    # numeric columns whose name merely *contains* a time word (e.g. "Monthly
+    # Savings (ZMW)") so they aren't mistaken for the period axis.
+    MONEY_TOKENS = (
+        "zmw", "revenue", "cost", "saving", "profit", "price", "value",
+        "sales", "income", "cogs", "margin", "units", "demand", "qty",
+    )
     for cl, orig in cols_lower.items():
         if any(kw in cl for kw in ("month", "date", "period", "quarter", "week", "year")):
+            if pd.api.types.is_numeric_dtype(df[orig]) and any(t in cl for t in MONEY_TOKENS):
+                continue
             month_col = orig
             break
     if month_col is None:
@@ -391,21 +405,36 @@ async def upload_file(
 
         logger.info("Upload: %s (%d bytes) | sheet=%s", filename, len(content), sheet_name)
 
-        # ── POS file (XLS Engine 3) ───────────────────────────────────────────
-        if ext == "xls":
+        # ── POS file (Engine 3) ───────────────────────────────────────────────
+        # Try the POS parser for .xls exports (the Aura/Debonairs format) and for
+        # any file whose name signals a POS report, regardless of extension.
+        pos_name_signals = (
+            "pos", "item sales", "item_sales", "sales by category",
+            "by category", "menu",
+        )
+        looks_like_pos = ext == "xls" or any(s in filename.lower() for s in pos_name_signals)
+        if looks_like_pos:
             try:
-                pos_data = parse_pos_report(content)
-                e3_result = run_engine3(pos_data)
+                # run_engine3 reads the bytes itself and selects the correct
+                # reader from the filename (xlrd for .xls, openpyxl otherwise) —
+                # passing the filename is essential, otherwise .xls files were
+                # read with openpyxl and failed ("File is not a zip file").
+                e3_result = run_engine3(content, filename)
+                gt = e3_result.get("grand_totals", {})
+                # Only accept POS routing if it actually extracted sales — otherwise
+                # fall through so a genuine financial workbook is handled by Engine 1.
+                if not e3_result.get("top_items") or gt.get("gross_revenue", 0) <= 0:
+                    raise ValueError("POS parse produced no sales data")
                 cab_id = cabinet_id or str(uuid.uuid4())
                 CABINET[cab_id] = {
                     "name": filename,
-                    "file_type": "xls",
+                    "file_type": ext,
                     "engine": "engine3",
                     "sheets": ["Sheet1"],
                     "active_sheet": "Sheet1",
                     "content": content,
                     "analysis": e3_result,
-                    "df_preview": pos_data.get("items", [])[:10],
+                    "df_preview": e3_result.get("top_items", [])[:10],
                 }
                 return {
                     "success": True,
@@ -415,6 +444,18 @@ async def upload_file(
                     "sheets": ["Sheet1"],
                     "active_sheet": "Sheet1",
                     **e3_result,
+                    # ── Frontend contract (store reads camelCase + flags) ──────
+                    # Without these the Operations/POS UI stays locked and empty
+                    # even though Engine 3 produced data.
+                    "hasEngine3Data": True,
+                    "engineFlags": {"e1": False, "e2": False, "e3": True},
+                    "posGrandTotals": e3_result.get("grand_totals"),
+                    "posBusinessName": e3_result.get("business_name"),
+                    "posPeriod": e3_result.get("period"),
+                    "topItems": e3_result.get("top_items", []),
+                    "attachRates": e3_result.get("attach_rates"),
+                    "menuGaps": e3_result.get("menu_gaps", []),
+                    "opsIntelBrief": e3_result.get("ops_intel_brief", ""),
                 }
             except Exception as e3_err:
                 logger.warning("Engine3 parse failed, falling through: %s", e3_err)
@@ -466,7 +507,22 @@ async def upload_file(
             "july","august","september","october","november","december",
         ]
 
+        # Summary/total rows that get appended at the bottom of many exports
+        # (e.g. a blank-month "Total" line) must not be ingested as a period —
+        # doing so double-counts revenue. Detect them by label.
+        SUMMARY_LABELS = ("total", "totals", "grand total", "sum", "subtotal",
+                          "average", "avg", "mean", "ytd", "year to date")
+
         for i, (m, r, c) in enumerate(zip(months, revenues, costs)):
+            label = str(m).strip()
+            label_lower = label.lower()
+            is_blank = label_lower in ("", "nan", "none", "nat")
+            is_summary = any(kw == label_lower or kw in label_lower for kw in SUMMARY_LABELS)
+            # Drop a blank/summary label only when it has no real month name in it
+            # (guards against a legitimate month being skipped).
+            if (is_blank or is_summary) and not any(mo in label_lower for mo in MONTH_ORDER):
+                continue
+
             profit = r - c
             margin = (profit / r * 100) if r else 0
             monthly_rows.append({
@@ -476,7 +532,7 @@ async def upload_file(
                 "profit": round(profit, 2),
                 "margin": round(margin, 2),
                 "sort_key": next(
-                    (j for j, mo in enumerate(MONTH_ORDER) if mo in m.lower()), i
+                    (j for j, mo in enumerate(MONTH_ORDER) if mo in label_lower), i
                 ),
             })
 
@@ -523,6 +579,8 @@ async def upload_file(
             },
             "monthly": monthly_rows,
             **e1_result,
+            # Unlock the Financial engine in the UI when monthly data exists.
+            "engineFlags": {"e1": bool(monthly_rows), "e2": False, "e3": False},
         }
 
     except HTTPException:
