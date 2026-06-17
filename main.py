@@ -22,7 +22,7 @@ from groq import Groq
 
 # ─── Engine imports ──────────────────────────────────────────────────────────
 from engine import run_engine1
-from engine2 import run_engine2
+from engine2 import run_engine2, is_engine2_data
 from engine3 import run_engine3
 from intelligence import run_cross_engine
 
@@ -478,6 +478,43 @@ async def upload_file(
         else:
             raise ValueError(f"Unsupported file type: .{ext}")
 
+        # ── Customer transactions (Engine 2) ──────────────────────────────────
+        # Detect BEFORE the revenue/cost resolution below — customer files have
+        # customer_id/date/amount/product columns and no cost column, so they
+        # would otherwise fail with "Cannot find cost/expense column".
+        if is_engine2_data(df):
+            sym_in = "K"
+            e2_result = run_engine2(df, sym_in)
+            cab_id = cabinet_id or str(uuid.uuid4())
+            CABINET[cab_id] = {
+                "name": filename,
+                "file_type": ext,
+                "engine": "engine2",
+                "sheets": all_sheets or ["Sheet1"],
+                "active_sheet": selected_sheet,
+                "content": content,
+                "analysis": e2_result,
+                "df_json": df.to_json(orient="records"),
+            }
+            return {
+                "success": True,
+                "engine": "engine2",
+                "cabinet_id": cab_id,
+                "filename": filename,
+                "sheets": all_sheets or ["Sheet1"],
+                "active_sheet": selected_sheet,
+                # Frontend contract (store reads camelCase + flags)
+                "hasEngine2Data": True,
+                "engineFlags": {"e1": False, "e2": True, "e3": False},
+                "rfm": e2_result.get("rfm", []),
+                "segments": e2_result.get("segments", []),
+                "clvTiers": e2_result.get("clv_tiers", []),
+                "retention": e2_result.get("retention"),
+                "productsE2": e2_result.get("products", []),
+                "basketPairs": e2_result.get("basket_pairs", []),
+                "customerIntelBrief": e2_result.get("customer_intel_brief", ""),
+            }
+
         # ── Resolve columns ───────────────────────────────────────────────────
         rev_col, cost_col, month_col = _resolve_columns(df)
         if rev_col is None:
@@ -679,21 +716,60 @@ async def list_cabinet():
     return {"cabinet": items}
 
 
+def _frontend_payload(engine: str, analysis: Dict[str, Any], monthly: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Map a stored engine analysis to the camelCase contract the frontend store
+    reads, so cabinet loads populate the same way a fresh upload does."""
+    a = analysis or {}
+    if engine == "engine3":
+        return {
+            "hasEngine3Data": True,
+            "engineFlags": {"e1": False, "e2": False, "e3": True},
+            "posGrandTotals": a.get("grand_totals"),
+            "posBusinessName": a.get("business_name"),
+            "posPeriod": a.get("period"),
+            "categories": a.get("categories", []),
+            "topItems": a.get("top_items", []),
+            "benchmarks": a.get("benchmarks", []),
+            "menuGaps": a.get("menu_gaps", []),
+            "attachRates": a.get("attach_rates"),
+            "opsIntelBrief": a.get("ops_intel_brief", ""),
+        }
+    if engine == "engine2":
+        return {
+            "hasEngine2Data": True,
+            "engineFlags": {"e1": False, "e2": True, "e3": False},
+            "rfm": a.get("rfm", []),
+            "segments": a.get("segments", []),
+            "clvTiers": a.get("clv_tiers", []),
+            "retention": a.get("retention"),
+            "productsE2": a.get("products", []),
+            "basketPairs": a.get("basket_pairs", []),
+            "customerIntelBrief": a.get("customer_intel_brief", ""),
+        }
+    # engine1 — frontend derives kpi/health from monthly; analysis carries
+    # forecast/anomalies/variance/breakeven/cashflow.
+    return {
+        "engineFlags": {"e1": bool(monthly), "e2": False, "e3": False},
+        "monthly": monthly,
+        **a,
+    }
+
+
 @app.get("/cabinet/{cabinet_id}")
 async def get_cabinet_entry(cabinet_id: str):
     """Load a previously uploaded file from the cabinet."""
     if cabinet_id not in CABINET:
         raise HTTPException(status_code=404, detail="Not found in cabinet")
     entry = CABINET[cabinet_id]
+    engine = entry.get("engine", "engine1")
     return {
         "success": True,
         "cabinet_id": cabinet_id,
         "filename": entry.get("name"),
         "sheets": entry.get("sheets", []),
         "active_sheet": entry.get("active_sheet"),
-        "engine": entry.get("engine"),
-        "monthly": entry.get("monthly", []),
-        **(entry.get("analysis") or {}),
+        "engine": engine,
+        **_frontend_payload(engine, entry.get("analysis") or {}, entry.get("monthly", [])),
     }
 
 
