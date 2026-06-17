@@ -259,7 +259,23 @@ def parse_pos_report(raw_bytes: bytes, filename: str = "") -> dict[str, Any]:
     col_map = _map_pos_columns(headers)
 
     # --- Parse items by category ------------------------------------------
-    current_category = "Uncategorised"
+    # The first category label usually shares the header row in col 0 (e.g.
+    # "Pizzas" sits next to "Price"/"Units Sold"). Seed current_category from it
+    # so that first section's items aren't dumped into "Uncategorised".
+    _COLUMN_WORDS = (
+        "price", "units", "value", "sold", "disc", "contr",
+        "sku", "item", "code", "name", "description", "qty", "quantity",
+    )
+    _first_header = (
+        re.sub(r"\s+", " ", str(headers[0])).strip()
+        if headers and pd.notna(headers[0]) else ""
+    )
+    current_category = (
+        _first_header
+        if _first_header and len(_first_header) > 1
+        and not any(w in _first_header.lower() for w in _COLUMN_WORDS)
+        else "Uncategorised"
+    )
     items: list[dict[str, Any]] = []
     grand_totals = {"units_sold": 0.0, "gross_revenue": 0.0,
                     "discount_value": 0.0, "net_revenue": 0.0}
