@@ -1238,7 +1238,7 @@ async def chat(req: ChatRequest):
         return {
             "reply": response_text,
             "response": response_text,
-            "model": "llama-3.3-70b-versatile",
+            "model": "AI-BOS Intelligence",
             "context_injected": injected,
         }
 
