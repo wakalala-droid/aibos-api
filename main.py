@@ -974,6 +974,104 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
             if isinstance(a, dict):
                 lines.append(f"  - [{a.get('severity','info')}] {a.get('title','')}: {a.get('description','')}")
 
+    # ── Engine 2 · Customer Intelligence ──────────────────────────────────────
+    cust = ctx.get("customer") or {}
+    if cust:
+        lines.append("")
+        lines.append("CUSTOMER INTELLIGENCE (Engine 2):")
+        lines.append(
+            f"  Customers: {cust.get('total_customers', 0)} | "
+            f"Champions: {cust.get('champions', 0)} | "
+            f"High churn risk: {cust.get('high_churn', 0)} | "
+            f"Retention: {float(cust.get('retention_rate', 0) or 0):.0f}%"
+        )
+        for s in (cust.get("segments") or [])[:8]:
+            if isinstance(s, dict):
+                lines.append(
+                    f"  - Segment {s.get('segment','?')}: {s.get('count',0)} customers, "
+                    f"avg spend {sym}{float(s.get('avg_spend',0) or 0):,.0f}"
+                )
+        top_cust = cust.get("top_customers") or []
+        if top_cust:
+            lines.append("  Top customers by CLV:")
+            for c in top_cust[:5]:
+                if isinstance(c, dict):
+                    lines.append(
+                        f"    {c.get('id','?')}: CLV {sym}{float(c.get('clv',0) or 0):,.0f} "
+                        f"({c.get('segment','?')}, churn risk {c.get('churn_risk',0)})"
+                    )
+
+    # ── Engine 3 · Operations / POS ───────────────────────────────────────────
+    ops = ctx.get("operations") or {}
+    if ops:
+        lines.append("")
+        lines.append("OPERATIONS / POS (Engine 3):")
+        if ops.get("business_name"):
+            lines.append(f"  Business: {ops['business_name']} | Period: {ops.get('period','?')}")
+        gt = ops.get("grand_totals") or {}
+        if gt:
+            lines.append(
+                f"  Gross revenue {sym}{float(gt.get('gross_revenue',0) or 0):,.0f} | "
+                f"Net {sym}{float(gt.get('net_revenue',0) or 0):,.0f} | "
+                f"Units sold {float(gt.get('units_sold',0) or 0):,.0f}"
+            )
+        for cat in (ops.get("categories") or [])[:10]:
+            if isinstance(cat, dict):
+                lines.append(
+                    f"  - {cat.get('category','?')}: {sym}{float(cat.get('revenue',0) or 0):,.0f} "
+                    f"({float(cat.get('units',0) or 0):,.0f} units, {cat.get('pct_of_total',0)}% of sales)"
+                )
+        top_items = ops.get("top_items") or []
+        if top_items:
+            lines.append("  Top items:")
+            for it in top_items[:8]:
+                if isinstance(it, dict):
+                    lines.append(
+                        f"    {it.get('name','?')} ({it.get('category','?')}): "
+                        f"{float(it.get('units_sold',0) or 0):,.0f} units, "
+                        f"{sym}{float(it.get('revenue',0) or 0):,.0f}"
+                    )
+        for b in (ops.get("benchmarks") or [])[:8]:
+            if isinstance(b, dict):
+                lines.append(
+                    f"  Benchmark {b.get('label', b.get('metric','?'))}: "
+                    f"actual {b.get('actual','?')} vs target {b.get('benchmark','?')} "
+                    f"{b.get('unit','')} [{b.get('status','?')}]"
+                )
+        ar = ops.get("attach_rates") or {}
+        if ar:
+            lines.append(
+                f"  Attach rates — drink: {ar.get('drink_attach_pct',0)}% | "
+                f"side: {ar.get('side_attach_pct',0)}%"
+            )
+
+    # ── Cross-engine intelligence ─────────────────────────────────────────────
+    intel = ctx.get("intelligence") or {}
+    if intel:
+        scores = intel.get("scores") or {}
+        if scores:
+            lines.append("")
+            lines.append(
+                f"INTELLIGENCE SCORES — Overall {scores.get('overall_score','?')}/100 "
+                f"({scores.get('overall_label','')}): "
+                f"Financial {scores.get('e1_score','?')}, "
+                f"Customer {scores.get('e2_score','?')}, "
+                f"Operations {scores.get('e3_score','?')}"
+            )
+        cins = intel.get("cross_insights") or []
+        if cins:
+            lines.append("Cross-engine insights:")
+            for ci in cins[:5]:
+                if isinstance(ci, dict):
+                    lines.append(
+                        f"  - [{ci.get('priority','')}] {ci.get('insight','')} "
+                        f"→ {ci.get('action','')}"
+                    )
+        brief = intel.get("unified_brief")
+        if brief:
+            lines.append("Unified brief:")
+            lines.append("  " + str(brief)[:1200])
+
     return "\n".join(lines)
 
 
