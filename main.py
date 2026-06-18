@@ -280,6 +280,131 @@ def _detect_file_type(filename: str, df: pd.DataFrame) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# READ-FIDELITY LAYER  (SAFEGUARD.md — Layer 1)
+# Classifies every column with a confidence, detects whether the file has a real
+# time axis, flags missing/unknown columns, and (for item-level files) produces a
+# per-item breakdown. Purely additive — it never changes how existing time-series
+# files are analysed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _classify_column(name: str, series: "pd.Series", rev_col, cost_col, month_col):
+    """Return (role, confidence, reason) for a single column."""
+    cl = str(name).lower().strip()
+    is_numeric = pd.api.types.is_numeric_dtype(series) or \
+        pd.to_numeric(series, errors="coerce").notna().mean() > 0.6
+
+    # Exact role from the resolver (highest confidence — already validated).
+    if name == rev_col:  return ("revenue", 0.95, "matched the revenue resolver")
+    if name == cost_col: return ("cost",    0.95, "matched the cost resolver")
+    if month_col and name == month_col:
+        return ("period", 0.95, "matched the time/period resolver")
+
+    # Keyword roles.
+    kw = [
+        (("profit margin", "margin (%)", "margin"), "margin", 0.8),
+        (("profit",),                                "profit", 0.8),
+        (("price per unit", "unit price", "price"),  "price", 0.75),
+        (("cost per unit", "unit cost"),             "unit_cost", 0.8),
+        (("units sold", "adjusted units", "quantity", "qty", "volume", "units"), "units", 0.75),
+        (("promotion multiplier", "multiplier", "promo"), "multiplier", 0.7),
+        (("base demand", "demand"),                  "demand", 0.7),
+        (("revenue", "sales", "income", "turnover"), "revenue", 0.6),
+        (("cost", "expense", "cogs", "expenditure", "overhead"), "cost", 0.6),
+        (("date", "month", "period", "quarter", "week", "year"), "period", 0.6),
+        (("customer", "client"),                     "customer", 0.6),
+        (("category", "type", "item", "product", "sku", "name"), "item", 0.65),
+    ]
+    for needles, role, conf in kw:
+        if any(nd in cl for nd in needles):
+            return (role, conf, f"name contains '{next(nd for nd in needles if nd in cl)}'")
+
+    # Dtype-only fallback — low confidence, surfaced as a candidate for a proposal.
+    if not is_numeric:
+        nun = series.nunique(dropna=True)
+        if 1 < nun < max(2, len(series)):
+            return ("item", 0.45, "text column with repeated values")
+    return ("unknown", 0.3, "could not confidently map this column")
+
+
+def _detect_grouping_column(df: "pd.DataFrame"):
+    """A repeated categorical key (e.g. 'Flower Type') that lets us group per-item."""
+    best, best_score = None, 0.0
+    n = len(df)
+    if n == 0:
+        return None
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            continue
+        nun = s.nunique(dropna=True)
+        if nun <= 1 or nun >= n:        # all-same or all-unique → not a grouping key
+            continue
+        score = 1.0 - (nun / n)          # fewer distinct groups → stronger key
+        if any(k in str(c).lower() for k in ("type", "category", "item", "product", "sku", "name")):
+            score += 0.3
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def _build_manifest(df: "pd.DataFrame", rev_col, cost_col, month_col):
+    """The read-fidelity manifest — see SAFEGUARD.md §1.(1)."""
+    columns = []
+    for c in df.columns:
+        role, conf, reason = _classify_column(c, df[c], rev_col, cost_col, month_col)
+        sample = next((str(v) for v in df[c].tolist() if v is not None and str(v) != "nan"), "")
+        columns.append({"name": str(c), "role": role, "confidence": round(conf, 2),
+                        "reason": reason, "sample": sample[:40]})
+
+    data_shape = "time_series" if month_col else "cross_sectional"
+    grouping = None if month_col else _detect_grouping_column(df)
+    unknown = [c["name"] for c in columns if c["role"] == "unknown"]
+
+    flags = []
+    if data_shape == "cross_sectional":
+        flags.append("No date/period column detected — trends and forecasts are NOT "
+                     "shown (they would be fabricated). Add a Month/Date column to unlock them.")
+        if grouping:
+            flags.append(f"Rows are grouped by '{grouping}' — read as per-item economics, "
+                         f"not as a time series.")
+    if unknown:
+        flags.append(f"{len(unknown)} column(s) not mapped to a known engine input "
+                     f"({', '.join(unknown[:4])}) — candidates for a new function.")
+
+    return {
+        "data_shape": data_shape,
+        "columns": columns,
+        "flags": flags,
+        "unknown_columns": unknown,
+        "grouping_column": str(grouping) if grouping is not None else None,
+    }
+
+
+def _build_item_breakdown(df, grouping_col, rev_col, cost_col):
+    """Per-item P&L for cross-sectional/item-level files (feeds the Operations view)."""
+    if not grouping_col or grouping_col not in df.columns:
+        return []
+    rev = pd.to_numeric(df[rev_col], errors="coerce").fillna(0) if rev_col in df.columns else 0
+    cost = pd.to_numeric(df[cost_col], errors="coerce").fillna(0) if cost_col in df.columns else 0
+    work = pd.DataFrame({"_grp": df[grouping_col].astype(str), "_rev": rev, "_cost": cost})
+    rows = []
+    for grp, g in work.groupby("_grp"):
+        r = float(g["_rev"].sum())
+        c = float(g["_cost"].sum())
+        p = r - c
+        rows.append({
+            "item": grp,
+            "revenue": round(r, 2),
+            "costs": round(c, 2),
+            "profit": round(p, 2),
+            "margin": round((p / r * 100) if r else 0, 2),
+            "rows": int(len(g)),
+        })
+    rows.sort(key=lambda x: x["revenue"], reverse=True)
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RICH CONTEXT BUILDER FOR AI CFO
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -580,6 +705,22 @@ async def upload_file(
         # ── Run Engine 1 ──────────────────────────────────────────────────────
         e1_result = run_engine1(monthly_rows)
 
+        # ── Read-fidelity layer (SAFEGUARD.md — Layer 1) ──────────────────────
+        manifest = _build_manifest(df, rev_col, cost_col, month_col)
+        breakdown = (
+            _build_item_breakdown(df, manifest["grouping_column"], rev_col, cost_col)
+            if manifest["data_shape"] == "cross_sectional" else []
+        )
+        # Honesty: with no time axis, a forecast / period-anomalies would be
+        # fabricated over non-time rows. Suppress them and say why.
+        if manifest["data_shape"] == "cross_sectional":
+            e1_result["forecast"] = None
+            e1_result["anomalies"] = []
+            e1_result["forecast_note"] = (
+                "Not available — this file has no time/period column, so a forecast "
+                "would be fabricated. Add a Month/Date column to unlock trends."
+            )
+
         # ── Cabinet storage ───────────────────────────────────────────────────
         cab_id = cabinet_id or str(uuid.uuid4())
         CABINET[cab_id] = {
@@ -596,6 +737,8 @@ async def upload_file(
             },
             "analysis": e1_result,
             "monthly": monthly_rows,
+            "manifest": manifest,
+            "breakdown": breakdown,
             "df_json": df.to_json(orient="records"),
         }
 
@@ -617,6 +760,9 @@ async def upload_file(
                 "month": month_col,
             },
             "monthly": monthly_rows,
+            "manifest": manifest,
+            "breakdown": breakdown,
+            "dataShape": manifest["data_shape"],
             **e1_result,
             # Unlock the Financial engine in the UI when monthly data exists.
             "engineFlags": {"e1": bool(monthly_rows), "e2": False, "e3": False},
