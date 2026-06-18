@@ -6,6 +6,7 @@ Fixes: column detection, multi-sheet Excel, Groq chat, cabinet, data studio
 import os
 import io
 import json
+import time
 import uuid
 import logging
 import traceback
@@ -25,6 +26,7 @@ from engine import run_engine1
 from engine2 import run_engine2, is_engine2_data
 from engine3 import run_engine3
 from intelligence import run_cross_engine
+import payments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aibos")
@@ -1265,3 +1267,103 @@ async def health():
         "cabinet_size": len(CABINET),
         "version": "3.0.0",
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAYMENTS — Mobile Money (MTN MoMo + Airtel Money), ready-for-keys
+# ══════════════════════════════════════════════════════════════════════════════
+
+# In-memory record of collection requests, keyed by reference.
+# Production should persist these (Supabase) and reconcile via the callback.
+PAYMENTS: Dict[str, Dict[str, Any]] = {}
+
+# ZMW prices per plan — must match lib/tiers.ts on the frontend.
+PLAN_PRICES = {
+    "pro":    {"monthly": 450,  "annual": 4500},
+    "growth": {"monthly": 1200, "annual": 12000},
+}
+
+
+class PaymentInitiateRequest(BaseModel):
+    network: str                      # "mtn" | "airtel"
+    plan: str                         # "pro" | "growth"
+    billing: str = "monthly"          # "monthly" | "annual"
+    payer_phone: str
+    user_id: Optional[str] = None
+    currency: str = "ZMW"
+
+
+@app.get("/payments/config")
+async def payments_config():
+    """Which networks are live (real API) vs simulated (no creds yet)."""
+    return {"networks": payments.configured_networks(), "mode": "live" if any(payments.configured_networks().values()) else "simulation"}
+
+
+@app.post("/payments/initiate")
+async def payments_initiate(body: PaymentInitiateRequest):
+    network = (body.network or "").lower()
+    if network not in ("mtn", "airtel"):
+        raise HTTPException(status_code=400, detail="network must be 'mtn' or 'airtel'")
+
+    plan = (body.plan or "").lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="plan must be 'pro' or 'growth'")
+
+    billing = body.billing if body.billing in ("monthly", "annual") else "monthly"
+    amount = PLAN_PRICES[plan][billing]
+
+    if not (body.payer_phone or "").strip():
+        raise HTTPException(status_code=400, detail="payer_phone is required")
+
+    reference = str(uuid.uuid4())
+    note = f"AI-BOS {plan.capitalize()} ({billing})"
+    state = payments.initiate(network, reference, amount, body.currency, body.payer_phone, note)
+
+    PAYMENTS[reference] = {
+        "reference": reference,
+        "network": network,
+        "plan": plan,
+        "billing": billing,
+        "amount": amount,
+        "currency": body.currency,
+        "user_id": body.user_id,
+        "status": state,
+        "created_at": time.time(),
+    }
+
+    if state == "unconfigured":
+        PAYMENTS.pop(reference, None)
+        raise HTTPException(
+            status_code=503,
+            detail="Mobile money isn’t enabled on this server yet. Pay manually to the number shown, or contact support.",
+        )
+    if state == "failed":
+        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
+
+    return {"reference": reference, "status": state, "amount": amount, "network": network, "plan": plan}
+
+
+@app.get("/payments/status/{reference}")
+async def payments_status(reference: str):
+    rec = PAYMENTS.get(reference)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Unknown payment reference")
+
+    # Only re-poll the provider while still pending.
+    if rec["status"] == "pending":
+        rec["status"] = payments.status(rec["network"], reference, rec.get("created_at"))
+
+    return {"reference": reference, "status": rec["status"], "plan": rec["plan"], "billing": rec["billing"]}
+
+
+@app.post("/payments/callback/{network}")
+async def payments_callback(network: str, body: Dict[str, Any]):
+    """Provider webhook — confirms a collection out-of-band (ready-for-keys).
+    MTN/Airtel post the final status here; we mark the reference accordingly."""
+    reference = str(body.get("referenceId") or body.get("reference") or body.get("transaction", {}).get("id") or "")
+    rec = PAYMENTS.get(reference)
+    if not rec:
+        return {"ok": False, "detail": "unknown reference"}
+    raw = str(body.get("status") or body.get("transaction", {}).get("status") or "").upper()
+    rec["status"] = {"SUCCESSFUL": "successful", "TS": "successful", "FAILED": "failed", "TF": "failed"}.get(raw, rec["status"])
+    return {"ok": True, "status": rec["status"]}
