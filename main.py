@@ -26,6 +26,7 @@ from engine import run_engine1
 from engine2 import run_engine2, is_engine2_data
 from engine3 import run_engine3
 from intelligence import run_cross_engine
+from extensions import generate_proposals  # SAFEGUARD Layer 2 (isolated from core)
 import payments
 
 logging.basicConfig(level=logging.INFO)
@@ -842,6 +843,35 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
         "monthly": monthly_rows,
         **e1_result,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE FUNCTION GOVERNANCE — propose new functions from a file (SAFEGUARD L2)
+# Generates + sandboxes + critiques candidate metrics. Returns DATA only; nothing
+# is applied. The owner reviews/approves in the frontend before implementation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/propose")
+async def propose(cabinet_id: str = Query(...)):
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Cabinet entry not found")
+    entry = CABINET[cabinet_id]
+    manifest = entry.get("manifest")
+    df_json = entry.get("df_json")
+    if not df_json or not manifest:
+        raise HTTPException(status_code=400, detail="This file has no analysable tabular data to propose from")
+    try:
+        df = pd.read_json(io.StringIO(df_json), orient="records")
+    except Exception:
+        df = pd.read_json(df_json, orient="records")
+    try:
+        result = generate_proposals(df, manifest, use_llm=True)
+    except Exception as exc:
+        logger.error("Proposal generation failed: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info("Proposals for %s → %d (%d passed)", cabinet_id,
+                len(result["proposals"]), result["passed_count"])
+    return {"success": True, "cabinet_id": cabinet_id, **result}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
