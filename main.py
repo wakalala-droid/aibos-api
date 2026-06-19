@@ -306,9 +306,11 @@ def _classify_column(name: str, series: "pd.Series", rev_col, cost_col, month_co
         (("profit",),                                "profit", 0.8),
         (("price per unit", "unit price", "price"),  "price", 0.75),
         (("cost per unit", "unit cost"),             "unit_cost", 0.8),
-        (("units sold", "adjusted units", "quantity", "qty", "volume", "units"), "units", 0.75),
-        (("promotion multiplier", "multiplier", "promo"), "multiplier", 0.7),
+        # demand BEFORE units — "Base Demand (Units)" must read as demand, not as
+        # the units-sold column (else per-unit/lift metrics grab the wrong column).
         (("base demand", "demand"),                  "demand", 0.7),
+        (("promotion multiplier", "multiplier", "promo"), "multiplier", 0.7),
+        (("units sold", "adjusted units", "quantity", "qty", "volume", "units"), "units", 0.75),
         (("revenue", "sales", "income", "turnover"), "revenue", 0.6),
         (("cost", "expense", "cogs", "expenditure", "overhead"), "cost", 0.6),
         (("date", "month", "period", "quarter", "week", "year"), "period", 0.6),
@@ -872,6 +874,41 @@ async def propose(cabinet_id: str = Query(...)):
     logger.info("Proposals for %s → %d (%d passed)", cabinet_id,
                 len(result["proposals"]), result["passed_count"])
     return {"success": True, "cabinet_id": cabinet_id, **result}
+
+
+class ComputeRequest(BaseModel):
+    metrics: List[Dict[str, Any]]   # [{ "name": str, "formula": str }]
+
+
+@app.post("/compute-metrics")
+async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...)):
+    """Compute APPROVED metric formulas against a file, via the same safe sandbox
+    used to critique them (AST-whitelisted, empty builtins). Returns values only —
+    no formula here can run arbitrary code."""
+    if cabinet_id not in CABINET:
+        raise HTTPException(status_code=404, detail="Cabinet entry not found")
+    entry = CABINET[cabinet_id]
+    df_json = entry.get("df_json")
+    if not df_json:
+        raise HTTPException(status_code=400, detail="No tabular data for this file")
+    try:
+        df = pd.read_json(io.StringIO(df_json), orient="records")
+    except Exception:
+        df = pd.read_json(df_json, orient="records")
+
+    from extensions import _numeric_tokens, safe_eval  # isolated module
+    _tok, arrays = _numeric_tokens(df)
+    results = []
+    for m in req.metrics[:50]:
+        name = str(m.get("name", "metric"))
+        formula = str(m.get("formula", ""))
+        try:
+            val = safe_eval(formula, arrays)
+            num = float(val) if np.isscalar(val) else float(np.nanmean(np.asarray(val, dtype=float)))
+            results.append({"name": name, "value": round(num, 4), "ok": bool(np.isfinite(num))})
+        except Exception as e:  # noqa: BLE001 — sandbox failures are per-metric, never fatal
+            results.append({"name": name, "ok": False, "error": str(e)[:120]})
+    return {"cabinet_id": cabinet_id, "results": results}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

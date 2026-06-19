@@ -115,53 +115,87 @@ def _tok_for_name_contains(token_map, *needles) -> Optional[str]:
 
 # ── Critique gate ─────────────────────────────────────────────────────────────
 
+def _has_self_subtraction(tree: ast.AST) -> bool:
+    """Detect `X - X` (identical operands) — a meaningless metric (always 0)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+            l, r = node.left, node.right
+            if isinstance(l, ast.Name) and isinstance(r, ast.Name) and l.id == r.id:
+                return True
+    return False
+
+
 def critique(formula: str, inputs: List[str], token_map, arrays) -> Dict[str, Any]:
-    """Run every gate check. Returns {passed, checks, critic_notes, preview}."""
+    """Run every gate check. Returns {passed, checks, critic_notes, preview}.
+
+    Beyond safety, the gate now also screens for SEMANTICALLY degenerate metrics
+    (self-subtraction, all-zero results, the same column used for two roles) — the
+    class of error that is safe to run but meaningless to a user.
+    """
     checks = {
         "formula_valid": False,
         "inputs_exist": False,
         "core_immutable": True,   # data-only by construction; no engine import/exec
         "sandbox_ok": False,
         "traceable": False,
+        "distinct_inputs": False,
+        "non_degenerate": False,
     }
     notes, preview = [], None
 
-    # inputs must be real columns
+    # inputs must be real columns, and must not reuse one column for two roles
     checks["inputs_exist"] = all(any(token_map.get(t) == nm for t in token_map) for nm in inputs) \
         if inputs else True
+    checks["distinct_inputs"] = len(set(inputs)) == len(inputs) if len(inputs) > 1 else True
+    if not checks["distinct_inputs"]:
+        notes.append("uses the same column for two different inputs — likely a misread")
 
     try:
         tree = ast.parse(formula, mode="eval")
         _validate_ast(tree, set(arrays.keys()))
         checks["formula_valid"] = True
-        # anti-hallucination: every Name used is a real column token (or func)
         used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         checks["traceable"] = used.issubset(set(arrays.keys()) | set(SAFE_FUNCS.keys()))
+        if _has_self_subtraction(tree):
+            notes.append("subtracts a column from itself (always 0)")
+            tree_degenerate = True
+        else:
+            tree_degenerate = False
     except FormulaError as e:
         notes.append(f"formula rejected: {e}")
         return {"passed": False, "checks": checks, "critic_notes": "; ".join(notes), "preview": None}
 
     # sandbox run
+    degenerate = tree_degenerate
     try:
         val = safe_eval(formula, arrays)
         if np.isscalar(val):
-            ok = np.isfinite(float(val))
-            preview = {"value": round(float(val), 4)}
+            fv = float(val)
+            ok = np.isfinite(fv)
+            preview = {"value": round(fv, 4)}
+            if fv == 0:
+                degenerate = degenerate or True  # a constant-zero scalar metric is useless
         else:
             arr = np.asarray(val, dtype=float)
             ok = bool(np.isfinite(arr).any())
             preview = {"mean": round(float(np.nanmean(arr)), 4),
                        "sum": round(float(np.nansum(arr)), 4),
                        "n": int(arr.size)}
+            if np.allclose(np.nan_to_num(arr), 0):
+                degenerate = True
         checks["sandbox_ok"] = bool(ok)
         if not ok:
             notes.append("produced non-finite values (division by zero / bad data)")
     except Exception as e:  # noqa: BLE001 — sandbox must never crash the caller
         notes.append(f"sandbox error: {e}")
 
+    checks["non_degenerate"] = not degenerate
+    if degenerate and "always 0" not in " ".join(notes):
+        notes.append("metric is constant/zero — not meaningful")
+
     passed = all(checks.values())
     if passed and not notes:
-        notes.append("passes all structural checks; ready for owner review")
+        notes.append("passes all structural and semantic checks; ready for owner review")
     return {"passed": passed, "checks": checks, "critic_notes": "; ".join(notes), "preview": preview}
 
 
@@ -208,7 +242,7 @@ def _rule_proposals(df, manifest, token_map, arrays) -> List[Dict[str, Any]]:
             assumptions=["unit cost is the full direct cost per unit"],
             risks=["ignores fixed/operating overhead"],
         ))
-    if units and demand:
+    if units and demand and units != demand:
         out.append(_wrap(
             "Avg Promotion Lift %",
             "How much promotions raised volume above baseline demand, on average.",
@@ -217,7 +251,7 @@ def _rule_proposals(df, manifest, token_map, arrays) -> List[Dict[str, Any]]:
             assumptions=["baseline demand is the no-promotion volume"],
             risks=["division by zero if any baseline demand is 0"],
         ))
-    if rev and units:
+    if rev and units and rev != units:
         out.append(_wrap(
             "Avg Revenue per Unit",
             "Effective realised price per unit across the catalogue.",
