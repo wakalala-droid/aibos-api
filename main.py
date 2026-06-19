@@ -383,27 +383,38 @@ def _build_manifest(df: "pd.DataFrame", rev_col, cost_col, month_col):
     }
 
 
-def _build_item_breakdown(df, grouping_col, rev_col, cost_col):
-    """Per-item P&L for cross-sectional/item-level files (feeds the Operations view)."""
+def _build_item_breakdown(df, grouping_col, rev_col, cost_col, units_col=None):
+    """Per-item P&L (and units, when present) for item-level files. Feeds both the
+    Operations view and the AI CFO context so it can answer item-level questions
+    like 'which product sold most'."""
     if not grouping_col or grouping_col not in df.columns:
         return []
     rev = pd.to_numeric(df[rev_col], errors="coerce").fillna(0) if rev_col in df.columns else 0
     cost = pd.to_numeric(df[cost_col], errors="coerce").fillna(0) if cost_col in df.columns else 0
-    work = pd.DataFrame({"_grp": df[grouping_col].astype(str), "_rev": rev, "_cost": cost})
+    has_units = bool(units_col and units_col in df.columns)
+    units = pd.to_numeric(df[units_col], errors="coerce").fillna(0) if has_units else 0
+    work = pd.DataFrame({
+        "_grp": df[grouping_col].astype(str), "_rev": rev, "_cost": cost,
+        "_units": units if has_units else 0,
+    })
     rows = []
     for grp, g in work.groupby("_grp"):
         r = float(g["_rev"].sum())
         c = float(g["_cost"].sum())
         p = r - c
-        rows.append({
+        row = {
             "item": grp,
             "revenue": round(r, 2),
             "costs": round(c, 2),
             "profit": round(p, 2),
             "margin": round((p / r * 100) if r else 0, 2),
             "rows": int(len(g)),
-        })
-    rows.sort(key=lambda x: x["revenue"], reverse=True)
+        }
+        if has_units:
+            row["units"] = round(float(g["_units"].sum()), 2)
+        rows.append(row)
+    # Rank by units when we have them (answers "sold most"), else by revenue.
+    rows.sort(key=lambda x: x.get("units", x["revenue"]), reverse=True)
     return rows
 
 
@@ -710,8 +721,9 @@ async def upload_file(
 
         # ── Read-fidelity layer (SAFEGUARD.md — Layer 1) ──────────────────────
         manifest = _build_manifest(df, rev_col, cost_col, month_col)
+        units_col = next((c["name"] for c in manifest["columns"] if c["role"] == "units"), None)
         breakdown = (
-            _build_item_breakdown(df, manifest["grouping_column"], rev_col, cost_col)
+            _build_item_breakdown(df, manifest["grouping_column"], rev_col, cost_col, units_col)
             if manifest["data_shape"] == "cross_sectional" else []
         )
         # Honesty: with no time axis, a forecast / period-anomalies would be
@@ -896,12 +908,19 @@ async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...)):
     except Exception:
         df = pd.read_json(df_json, orient="records")
 
-    from extensions import _numeric_tokens, safe_eval  # isolated module
-    _tok, arrays = _numeric_tokens(df)
+    from extensions import _numeric_tokens, safe_eval, critique  # isolated module
+    token_map, arrays = _numeric_tokens(df)
     results = []
     for m in req.metrics[:50]:
         name = str(m.get("name", "metric"))
         formula = str(m.get("formula", ""))
+        inputs = m.get("inputs") if isinstance(m.get("inputs"), list) else []
+        # Re-critique at COMPUTE time too — even an approved metric is re-screened
+        # so a previously-let-through degenerate formula never displays a bogus value.
+        crit = critique(formula, inputs, token_map, arrays)
+        if not crit["passed"]:
+            results.append({"name": name, "ok": False, "error": crit["critic_notes"][:140]})
+            continue
         try:
             val = safe_eval(formula, arrays)
             num = float(val) if np.isscalar(val) else float(np.nanmean(np.asarray(val, dtype=float)))
@@ -1335,6 +1354,23 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
                 f"  Attach rates — drink: {ar.get('drink_attach_pct',0)}% | "
                 f"side: {ar.get('side_attach_pct',0)}%"
             )
+
+    # ── Per-item breakdown (item-level files, e.g. product/SKU rows) ───────────
+    items = ctx.get("item_breakdown") or []
+    if items:
+        lines.append("")
+        lines.append("PER-ITEM BREAKDOWN (by product/category — ranked by units sold "
+                     "when available, else revenue):")
+        for it in items[:20]:
+            if isinstance(it, dict):
+                u = it.get("units")
+                units_txt = f"{float(u):,.0f} units · " if u is not None else ""
+                lines.append(
+                    f"  - {it.get('item','?')}: {units_txt}"
+                    f"revenue {sym}{float(it.get('revenue',0) or 0):,.0f} | "
+                    f"profit {sym}{float(it.get('profit',0) or 0):,.0f} | "
+                    f"margin {float(it.get('margin',0) or 0):.1f}%"
+                )
 
     # ── Cross-engine intelligence ─────────────────────────────────────────────
     intel = ctx.get("intelligence") or {}

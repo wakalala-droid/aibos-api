@@ -140,6 +140,8 @@ def critique(formula: str, inputs: List[str], token_map, arrays) -> Dict[str, An
         "traceable": False,
         "distinct_inputs": False,
         "non_degenerate": False,
+        "non_trivial": False,     # must combine ≥2 columns or aggregate — not echo one
+        "bounded": False,         # result must be a plausible magnitude
     }
     notes, preview = [], None
 
@@ -156,6 +158,13 @@ def critique(formula: str, inputs: List[str], token_map, arrays) -> Dict[str, An
         checks["formula_valid"] = True
         used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         checks["traceable"] = used.issubset(set(arrays.keys()) | set(SAFE_FUNCS.keys()))
+        # Non-triviality: a real metric combines ≥2 distinct columns OR aggregates.
+        # This blocks "metrics" that just echo or rescale a single column.
+        cols_used = used & set(arrays.keys())
+        uses_agg = any(isinstance(n, ast.Call) for n in ast.walk(tree))
+        checks["non_trivial"] = (len(cols_used) >= 2) or uses_agg
+        if not checks["non_trivial"]:
+            notes.append("trivial — echoes/rescales a single column; not a real metric")
         if _has_self_subtraction(tree):
             notes.append("subtracts a column from itself (always 0)")
             tree_degenerate = True
@@ -167,23 +176,30 @@ def critique(formula: str, inputs: List[str], token_map, arrays) -> Dict[str, An
 
     # sandbox run
     degenerate = tree_degenerate
+    magnitude = 0.0
     try:
         val = safe_eval(formula, arrays)
         if np.isscalar(val):
             fv = float(val)
             ok = np.isfinite(fv)
+            magnitude = abs(fv)
             preview = {"value": round(fv, 4)}
             if fv == 0:
                 degenerate = degenerate or True  # a constant-zero scalar metric is useless
         else:
             arr = np.asarray(val, dtype=float)
             ok = bool(np.isfinite(arr).any())
+            magnitude = abs(float(np.nanmean(arr))) if ok else 0.0
             preview = {"mean": round(float(np.nanmean(arr)), 4),
                        "sum": round(float(np.nansum(arr)), 4),
                        "n": int(arr.size)}
             if np.allclose(np.nan_to_num(arr), 0):
                 degenerate = True
         checks["sandbox_ok"] = bool(ok)
+        # Plausible magnitude — guards against unit/scale mistakes producing absurd numbers.
+        checks["bounded"] = magnitude < 1e12
+        if not checks["bounded"]:
+            notes.append("result magnitude is implausibly large — likely a unit/scale error")
         if not ok:
             notes.append("produced non-finite values (division by zero / bad data)")
     except Exception as e:  # noqa: BLE001 — sandbox must never crash the caller
