@@ -329,8 +329,43 @@ def _llm_proposals(df, manifest, token_map, arrays, max_props=3) -> List[Dict[st
     return out
 
 
+def _llm_critic(name, purpose, formula, inputs, preview) -> Dict[str, Any]:
+    """Independent second-opinion review (Groq). Judges mathematical + real-world
+    soundness. Fails OPEN on infra error (deterministic gate still applies) but
+    records `checked=False` so the owner sees it wasn't double-reviewed."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return {"checked": False, "sound": True, "score": None, "notes": "AI critic unavailable (no key)"}
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        prompt = (
+            "You are a rigorous quantitative reviewer for an SME finance product. "
+            "Judge whether this proposed metric is mathematically sound AND real-world "
+            "meaningful. Be strict.\n"
+            f"Name: {name}\nPurpose: {purpose}\nInput columns: {inputs}\n"
+            f"Formula (tokens c0,c1.. are those columns): {formula}\nSample result: {preview}\n\n"
+            'Return STRICT JSON only: {"sound": true|false, "score": 0.0-1.0, "reason": "one sentence"}. '
+            "Mark sound=false if the math is wrong, it double-counts, mixes incompatible "
+            "units, is trivial, or could mislead a business owner."
+        )
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content.strip()
+        s, e = raw.find("{"), raw.rfind("}")
+        obj = json.loads(raw[s:e + 1])
+        return {"checked": True, "sound": bool(obj.get("sound", False)),
+                "score": round(float(obj.get("score", 0)), 2), "notes": str(obj.get("reason", ""))[:200]}
+    except Exception as ex:  # noqa: BLE001
+        logger.warning("LLM critic error: %s", ex)
+        return {"checked": False, "sound": True, "score": None, "notes": f"AI critic error: {str(ex)[:80]}"}
+
+
 def generate_proposals(df: pd.DataFrame, manifest: Dict[str, Any], use_llm: bool = True) -> Dict[str, Any]:
-    """Top-level entry: build, sandbox, and critique function proposals for a file."""
+    """Top-level entry: build, sandbox, critique, and second-opinion proposals."""
     token_map, arrays = _numeric_tokens(df)
     proposals = _rule_proposals(df, manifest, token_map, arrays)
     if use_llm:
@@ -343,6 +378,22 @@ def generate_proposals(df: pd.DataFrame, manifest: Dict[str, Any], use_llm: bool
         if k not in best or p["confidence"] > best[k]["confidence"]:
             best[k] = p
     final = sorted(best.values(), key=lambda p: p["confidence"], reverse=True)
+
+    # Second-opinion critic — only on structurally-passing proposals (saves calls).
+    # A proposal must pass the deterministic gate AND not be flagged unsound by the
+    # independent reviewer to be "passed" (raise-the-guard requirement).
+    for p in final:
+        if p["critique"]["passed"] and use_llm:
+            verdict = _llm_critic(p["name"], p["purpose"], p["formula"], p["inputs"], p["preview"])
+            p["critique"]["llm"] = verdict
+            if verdict["checked"] and not verdict["sound"]:
+                p["critique"]["passed"] = False
+                p["critique"]["critic_notes"] += f" | AI critic rejected: {verdict['notes']}"
+                p["confidence"] = round(p["confidence"] * 0.5, 2)
+        else:
+            note = "AI critic not run" if p["critique"]["passed"] else "skipped — failed structural gate"
+            p["critique"]["llm"] = {"checked": False, "sound": p["critique"]["passed"], "notes": note}
+
     return {
         "proposals": final,
         "passed_count": sum(1 for p in final if p["critique"]["passed"]),
