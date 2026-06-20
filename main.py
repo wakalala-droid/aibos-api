@@ -1314,10 +1314,19 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
     # ── Engine 3 · Operations / POS ───────────────────────────────────────────
     ops = ctx.get("operations") or {}
     if ops:
+        n_cats = len(ops.get("categories") or [])
+        n_items = len(ops.get("top_items") or [])
+        period_txt = str(ops.get("period") or "").strip() or "the uploaded period"
         lines.append("")
         lines.append("OPERATIONS / POS (Engine 3):")
         if ops.get("business_name"):
-            lines.append(f"  Business: {ops['business_name']} | Period: {ops.get('period','?')}")
+            lines.append(f"  Business: {ops['business_name']}")
+        lines.append(f"  Reporting period: {period_txt}")
+        lines.append(
+            f"  This is point-in-time POS sales covering ONLY that period — across "
+            f"{n_cats} categories and {n_items} top items. It is NOT monthly or "
+            f"time-series data; never describe it as 'months'. Quote the period as given."
+        )
         gt = ops.get("grand_totals") or {}
         if gt:
             lines.append(
@@ -1424,6 +1433,11 @@ async def chat(req: ChatRequest):
             "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $.",
             "You are expert in Zambian business, economics, and SME finance.",
             "Be direct, insightful, and action-oriented. No fluff.",
+            "NEVER fabricate a time range or data span. Describe the data only by the "
+            "period/granularity actually given in the context. POS/operations data is "
+            "point-in-time sales for its stated period — never call it 'months' or imply "
+            "monthly/yearly history unless an explicit time-series with month rows is present. "
+            "If the context gives a reporting period (e.g. '1st-7th March'), quote it verbatim.",
         ]
 
         injected = False
