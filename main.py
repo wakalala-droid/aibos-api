@@ -15,7 +15,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -28,6 +28,19 @@ from engine3 import run_engine3
 from intelligence import run_cross_engine
 from extensions import generate_proposals  # SAFEGUARD Layer 2 (isolated from core)
 import payments
+
+# ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
+# Isolated modules; the existing file-analysis endpoints above are untouched.
+from db import get_db, supabase_enabled
+from auth import require_user
+import nervous_system as nervous
+import digital_twin as twin
+import ingestion
+import business_memory as memory
+import engine_interface as engines_api
+import simulation
+import products as products_api
+import ocr
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aibos")
@@ -1528,7 +1541,9 @@ async def health():
         "status": "ok",
         "groq_configured": groq_key,
         "cabinet_size": len(CABINET),
-        "version": "3.0.0",
+        "supabase_configured": supabase_enabled(),   # Evolution spine persistence
+        "spine": "events+twin" if supabase_enabled() else "disabled",
+        "version": "3.1.0",
     }
 
 
@@ -1630,3 +1645,364 @@ async def payments_callback(network: str, body: Dict[str, Any]):
     raw = str(body.get("status") or body.get("transaction", {}).get("status") or "").upper()
     rec["status"] = {"SUCCESSFUL": "successful", "TS": "successful", "FAILED": "failed", "TF": "failed"}.get(raw, rec["status"])
     return {"ok": True, "status": rec["status"]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EVOLUTION SPINE — Business Events + Digital Twin
+# (Directive Initiatives 5, 11, 12 · ADR-001 · RFC-001)
+#
+# Every endpoint here is tenant-scoped: user_id comes ONLY from the verified
+# Supabase JWT (Depends(require_user)), never from the request body. All inputs
+# flow through the Nervous-System pipeline (nervous.ingest); nothing bypasses it.
+# These routes are additive — the file-analysis endpoints above are unchanged.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _require_db():
+    db = get_db()
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Persistence is not configured (SUPABASE_URL / SUPABASE_SERVICE_KEY). "
+                   "The event pipeline is unavailable.",
+        )
+    return db
+
+
+class ClassifyRequest(BaseModel):
+    text: str
+    currency: str = "ZMW"
+
+
+@app.post("/events/classify")
+async def classify_activity(req: ClassifyRequest, user_id: str = Depends(require_user)):
+    """
+    Record Business Activity (Initiative 1): turn free text into a PROPOSED event.
+    Never persists — returns a proposal the user reviews/edits, then POSTs to /events.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Describe what happened, e.g. 'I sold 15 drinks for K150'.")
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
+    try:
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=nervous.classify_prompt(text, req.currency),
+            max_tokens=400,
+            temperature=0.1,
+            stream=False,
+        )
+        proposal = nervous.parse_classification(completion.choices[0].message.content)
+        return {"ok": True, "proposal": proposal, "input": text}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("classify error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Could not interpret that: {type(exc).__name__}")
+
+
+@app.post("/events")
+async def create_event(ev: nervous.EventIn, user_id: str = Depends(require_user)):
+    """Record one Business Activity. Returns the persisted event (pending or confirmed)."""
+    db = _require_db()
+    try:
+        saved = nervous.ingest(db, user_id, ev)
+        return {"ok": True, "event": saved}
+    except nervous.PipelineError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("create_event error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Event error: {type(exc).__name__}: {exc}")
+
+
+@app.post("/events/batch")
+async def create_events_batch(
+    events: List[nervous.EventIn] = Body(..., embed=True),
+    user_id: str = Depends(require_user),
+):
+    """Bulk ingest (Excel/POS import). Partial success allowed (Initiative 2)."""
+    db = _require_db()
+    try:
+        return {"ok": True, **nervous.ingest_batch(db, user_id, events)}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("create_events_batch error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Batch error: {type(exc).__name__}: {exc}")
+
+
+@app.get("/events")
+async def get_events(
+    user_id: str = Depends(require_user),
+    status: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """Timeline read (Initiative 5): filter by status/type, newest first."""
+    db = _require_db()
+    rows = nervous.list_events(db, user_id, status=status, event_type=event_type, limit=limit, offset=offset)
+    return {"ok": True, "events": rows, "count": len(rows)}
+
+
+@app.post("/events/{event_id}/confirm")
+async def confirm_event(event_id: str, user_id: str = Depends(require_user)):
+    """Promote a pending event to confirmed (it now counts in the twin)."""
+    db = _require_db()
+    try:
+        return {"ok": True, "event": nervous.confirm(db, user_id, event_id)}
+    except nervous.PipelineError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/events/{event_id}")
+async def patch_event(
+    event_id: str,
+    patch: Dict[str, Any] = Body(...),
+    user_id: str = Depends(require_user),
+):
+    """Correct an event (Initiative 5). The diff is recorded for Business Memory."""
+    db = _require_db()
+    try:
+        return {"ok": True, "event": nervous.correct(db, user_id, event_id, patch)}
+    except nervous.PipelineError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/events/{event_id}")
+async def delete_event(event_id: str, user_id: str = Depends(require_user),
+                       reason: Optional[str] = Query(None)):
+    """Soft-delete (void) an event — never hard-deleted (audit trail / rollback)."""
+    db = _require_db()
+    try:
+        return {"ok": True, "event": nervous.void(db, user_id, event_id, reason)}
+    except nervous.PipelineError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── Ingestion: Excel → events & QR (Initiatives 2, 7) ─────────────────────────
+
+@app.post("/events/excel/preview")
+async def excel_preview(
+    file: UploadFile = File(...),
+    sheet: Optional[str] = Query(None),
+    user_id: str = Depends(require_user),
+):
+    """Parse an uploaded spreadsheet and return columns, sample rows, and a
+    suggested column→event-field mapping for the user to review (Initiative 2)."""
+    _require_db()
+    try:
+        content = await file.read()
+        df, all_sheets, selected = _load_sheet(content, file.filename or "upload.xlsx", sheet)
+        df = df.where(pd.notna(df), None)  # JSON-safe (NaN → null)
+        cols = [str(c) for c in df.columns]
+        rows = df.head(2000).to_dict(orient="records")
+        # Prefer a remembered mapping template (Business Memory) when its columns
+        # still fit this file; else fall back to the heuristic suggestion.
+        suggestion = ingestion.excel_suggest_mapping(cols)
+        remembered = (memory.recall(get_db(), user_id, "excel_mapping", "default") or {})
+        if remembered and all(c in cols for c in remembered.values()):
+            suggestion = {**suggestion, **remembered}
+        return {
+            "ok": True,
+            "columns": cols,
+            "rows": rows,
+            "row_count": int(len(df)),
+            "sheets": all_sheets,
+            "active_sheet": selected,
+            "suggestion": suggestion,
+            "event_types": list(nervous.EVENT_TYPES),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("excel_preview error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Could not read that file: {type(exc).__name__}")
+
+
+class ExcelCommitRequest(BaseModel):
+    rows: List[Dict[str, Any]]
+    mapping: Dict[str, str]
+    defaults: Dict[str, Any] = {}
+
+
+@app.post("/events/excel/commit")
+async def excel_commit(req: ExcelCommitRequest, user_id: str = Depends(require_user)):
+    """Map reviewed rows → events and bulk-ingest (partial import; per-row errors)."""
+    db = _require_db()
+    events, map_errors = ingestion.rows_to_events(req.rows, req.mapping, req.defaults)
+    result = nervous.ingest_batch(db, user_id, events)
+    # Surface mapping errors alongside pipeline errors so nothing is silently dropped.
+    result["errors"] = [*map_errors, *result.get("errors", [])]
+    result["error_count"] = len(result["errors"])
+    # Remember this column mapping (Business Memory) so the next import auto-fills it.
+    if req.mapping:
+        memory.remember(db, user_id, "excel_mapping", "default", req.mapping)
+    return {"ok": True, **result}
+
+
+class QrRequest(BaseModel):
+    payload: str
+    currency: str = "ZMW"
+
+
+@app.post("/ingest/qr")
+async def ingest_qr(req: QrRequest, user_id: str = Depends(require_user)):
+    """Decoded QR string → a PROPOSED event (reviewed before saving, like classify)."""
+    _require_db()
+    proposal = ingestion.parse_qr(req.payload, req.currency)
+    return {"ok": True, "proposal": proposal}
+
+
+@app.post("/ingest/receipt")
+async def ingest_receipt(
+    file: UploadFile = File(...),
+    currency: str = Query("ZMW"),
+    user_id: str = Depends(require_user),
+):
+    """Receipt photo/upload → vision-OCR → a PROPOSED Purchase (reviewed before saving)."""
+    _require_db()
+    try:
+        content = await file.read()
+        proposal = ocr.parse_receipt_image(content, file.content_type or "image/jpeg", currency)
+        return {"ok": True, "proposal": proposal}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("ingest_receipt error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=502, detail=f"Could not read the receipt: {type(exc).__name__}")
+
+
+@app.get("/twin")
+async def get_twin(user_id: str = Depends(require_user)):
+    """
+    The Digital Twin — current business state derived from confirmed events.
+    `monthly` is shaped for the existing store/engines (RFC-001 §7 bridge).
+    """
+    db = _require_db()
+    return {"ok": True, "twin": twin.get_state(db, user_id)}
+
+
+@app.post("/twin/rebuild")
+async def rebuild_twin(user_id: str = Depends(require_user)):
+    """Force a full replay of the event log into the twin (idempotent recovery)."""
+    db = _require_db()
+    return {"ok": True, "twin": twin.rebuild(db, user_id)}
+
+
+class TwinSeedRequest(BaseModel):
+    opening_cash: Optional[float] = None
+    currency: Optional[str] = None
+
+
+@app.post("/twin/seed")
+async def seed_twin(req: TwinSeedRequest, user_id: str = Depends(require_user)):
+    """Seed the twin's opening cash + currency (Setup Wizard, Initiative 1)."""
+    db = _require_db()
+    return {"ok": True, "twin": twin.seed(db, user_id, req.opening_cash, req.currency)}
+
+
+# ── Future hooks: engines, recommendations, simulation (Initiatives 10, 12) ───
+
+@app.get("/engines")
+async def list_engines(user_id: str = Depends(require_user)):
+    """The registered intelligence engines + which events each subscribes to."""
+    return {"ok": True, "engines": engines_api.engine_catalog()}
+
+
+@app.get("/recommendations")
+async def get_recommendations(user_id: str = Depends(require_user)):
+    """Run every engine against the Digital Twin → explainable recommendations
+    (Bible 9th Law: each carries what/why/evidence/confidence/alternatives)."""
+    db = _require_db()
+    state = twin.get_state(db, user_id)
+    # Build the engine context once: catalog + derived stock + low-stock list.
+    prods = products_api.list_products(db, user_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=1000) if prods else []
+    stock = products_api.compute_stock(prods, events)
+    context = {"products": prods, "stock": stock, "low_stock": products_api.low_stock(prods, stock)}
+    recs = engines_api.run_all(state, events, context)
+    return {"ok": True, "recommendations": recs, "count": len(recs)}
+
+
+# ── Products catalog (Initiative 3) ───────────────────────────────────────────
+
+@app.get("/products")
+async def get_products(user_id: str = Depends(require_user)):
+    db = _require_db()
+    prods = products_api.list_products(db, user_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=1000) if prods else []
+    stock = products_api.compute_stock(prods, events)
+    # Attach derived on-hand so the catalog can show stock without a second call.
+    for p in prods:
+        p["on_hand"] = stock.get(products_api.normalize_name(p.get("name")), 0)
+    return {"ok": True, "products": prods}
+
+
+@app.post("/products")
+async def create_product(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "product": products_api.create_product(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/products/{product_id}")
+async def patch_product(product_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "product": products_api.update_product(db, user_id, product_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/products/{product_id}")
+async def remove_product(product_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    products_api.delete_product(db, user_id, product_id)
+    return {"ok": True}
+
+
+class SimulateRequest(BaseModel):
+    type: str
+    value: float = 0.0
+    count: Optional[int] = None
+    monthly_salary: Optional[float] = None
+    months: Optional[int] = None
+
+
+@app.post("/simulate")
+async def post_simulate(req: SimulateRequest, user_id: str = Depends(require_user)):
+    """What-if against a COPY of the twin — never touches production (Initiative 12)."""
+    db = _require_db()
+    state = twin.get_state(db, user_id)
+    scenario = {k: v for k, v in req.dict().items() if v is not None}
+    return simulation.simulate(state, scenario)
+
+
+@app.get("/twin/financials")
+async def twin_financials(user_id: str = Depends(require_user)):
+    """
+    Backward-compat bridge (Roadmap 1.6 / Initiative 9): run the EXISTING Engine 1
+    over the Digital Twin's monthly[] — proving the legacy engine reasons against
+    events with zero change to engine.py. Returns the same analysis shape the
+    upload path produces, so the frontend can consume the twin like any upload.
+    """
+    db = _require_db()
+    state = twin.get_state(db, user_id)
+    monthly_rows = twin.monthly_rows_for_engine1(state)
+    analysis = run_engine1(monthly_rows)
+    return {
+        "ok": True,
+        "engine": "engine1",
+        "source": "digital_twin",
+        "monthly": [{"Month": m["month"], "Revenue": m["revenue"], "Costs": m["costs"]}
+                    for m in state.get("monthly", [])],
+        "kpi": {
+            "totalRevenue": state.get("total_revenue", 0),
+            "totalCosts": state.get("total_costs", 0),
+            "totalProfit": state.get("total_profit", 0),
+            "avgMargin": state.get("avg_margin", 0),
+        },
+        "health": {
+            "score": state.get("health_score", 0),
+            "label": state.get("health_label", "No Data"),
+        },
+        "analysis": analysis,
+        "currencySymbol": "K" if state.get("currency") == "ZMW" else state.get("currency", "K"),
+    }
