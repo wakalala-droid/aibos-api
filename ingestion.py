@@ -154,7 +154,6 @@ register_parser("qr", parse_qr)
 # never require a rigid format — Directive Initiative 2).
 _COL_HINTS = {
     "date":         ("date", "day", "when", "period", "month", "time"),
-    "amount":       ("amount", "total", "value", "price", "cost", "paid", "revenue", "sales", "zmw", "k", "sum"),
     "type":         ("type", "category type", "transaction", "kind", "activity"),
     "description":  ("description", "details", "narration", "memo", "note", "item", "product", "particulars"),
     "counterparty": ("customer", "client", "supplier", "vendor", "payee", "name", "who"),
@@ -181,20 +180,70 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9 ]", " ", str(s).lower()).strip()
 
 
+# Words that signal money IN vs OUT — used to (a) rank the amount column and
+# (b) infer the right default event type so a "Revenue" column is never imported
+# as an Expense (and vice-versa).
+_INCOME_WORDS  = ("revenue", "sales", "income", "turnover", "takings", "receipt")
+_EXPENSE_WORDS = ("expense", "cost", "spend", "outflow", "purchase", "payment")
+
+# Amount-column preference, most-specific first: an explicit amount/total/net
+# column beats an income column, which beats an expense column, which beats a
+# bare currency-tagged number. Stops a monthly-summary sheet
+# (Month | Revenue | Expenses | Profit) from grabbing whichever money column is
+# leftmost. 'profit'/'margin' match nothing here, so they're never the amount.
+_AMOUNT_TIERS = (
+    ("amount", "total", "net", "grand total", "subtotal", "value", "paid", "sum", "price"),
+    _INCOME_WORDS,
+    _EXPENSE_WORDS,
+    ("zmw", "zk", "kwacha", "usd", "ngn", "kes", "zar"),
+)
+
+
 def excel_suggest_mapping(columns: list[str]) -> dict:
     """Best-guess mapping of spreadsheet columns to event fields."""
     suggestion: dict = {}
     used: set[str] = set()
+
+    # Amount first, by specificity tier (see _AMOUNT_TIERS).
+    for tier in _AMOUNT_TIERS:
+        hit = next((c for c in columns if c not in used and any(h in _norm(c) for h in tier)), None)
+        if hit:
+            suggestion["amount"] = hit
+            used.add(hit)
+            break
+
+    # Remaining fields by simple substring match, in column order.
     for field, hints in _COL_HINTS.items():
         for col in columns:
             if col in used:
                 continue
-            cl = _norm(col)
-            if any(h in cl for h in hints):
+            if any(h in _norm(col) for h in hints):
                 suggestion[field] = col
                 used.add(col)
                 break
     return suggestion
+
+
+def suggest_default_type(mapping: dict, default: str = "Expense") -> str:
+    """Infer the default EventType from the chosen amount column's header, so
+    'Revenue' defaults to Sale and 'Expenses' to Expense instead of always Expense."""
+    cl = _norm(mapping.get("amount", ""))
+    if any(w in cl for w in _INCOME_WORDS):
+        return "Sale"
+    if any(w in cl for w in _EXPENSE_WORDS):
+        return "Expense"
+    return default if default in EVENT_TYPES else "Expense"
+
+
+def looks_like_summary(columns: list[str]) -> bool:
+    """True when the sheet has BOTH income-like and expense-like money columns
+    (e.g. a monthly P&L: Revenue | Expenses | Profit). That's a summary, not a
+    transaction log — one import maps ONE amount column — so the UI can warn
+    instead of silently booking revenue as an expense."""
+    norm = [_norm(c) for c in columns]
+    has_income  = any(any(w in c for w in _INCOME_WORDS)  for c in norm)
+    has_expense = any(any(w in c for w in _EXPENSE_WORDS) for c in norm)
+    return has_income and has_expense
 
 
 def infer_type(value: str, default: str) -> str:

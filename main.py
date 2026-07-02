@@ -1809,6 +1809,8 @@ async def excel_preview(
             "sheets": all_sheets,
             "active_sheet": selected,
             "suggestion": suggestion,
+            "suggested_type": ingestion.suggest_default_type(suggestion),
+            "summary_like": ingestion.looks_like_summary(cols),
             "event_types": list(nervous.EVENT_TYPES),
         }
     except Exception as exc:  # noqa: BLE001

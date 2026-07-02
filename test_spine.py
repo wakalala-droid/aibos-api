@@ -117,6 +117,22 @@ def test_excel_mapping_and_rows():
     assert events[1].event_type == "Expense" and events[1].payload["category"] == "general"
 
 
+def test_excel_summary_sheet_mapping():
+    """A monthly P&L summary must map Amount to a real money column (not Profit)
+    and default the type to match it — Revenue → Sale, not Expense."""
+    import ingestion
+    cols = ["Month", "Revenue (ZMW)", "Expenses (ZMW)", "Profit (ZMW)", "Profit Margin (%)"]
+    sug = ingestion.excel_suggest_mapping(cols)
+    assert sug["date"] == "Month"
+    assert sug["amount"] == "Revenue (ZMW)"          # income beats leftmost/Profit
+    assert ingestion.suggest_default_type(sug) == "Sale"
+    assert ingestion.looks_like_summary(cols) is True
+    # If the user instead maps Amount to the Expenses column, the type follows.
+    assert ingestion.suggest_default_type({"amount": "Expenses (ZMW)"}) == "Expense"
+    # A plain transaction ledger is not a summary.
+    assert ingestion.looks_like_summary(["Date", "Amount", "Customer"]) is False
+
+
 def test_business_memory_capture():
     import business_memory as memory
     # User corrects an Expense's category; supplier is the signal token.
