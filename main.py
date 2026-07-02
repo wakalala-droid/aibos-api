@@ -15,7 +15,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -47,17 +47,62 @@ logger = logging.getLogger("aibos")
 
 app = FastAPI(title="AI-BOS API", version="3.0.0")
 
+# ─── CORS ────────────────────────────────────────────────────────────────────
+# Browsers never call this API directly — the Next.js app talks to it
+# server-to-server through /api/proxy, which is not subject to CORS. So the only
+# legitimate cross-origin browser callers are our own web origins. Lock the
+# allowlist to those (env-driven) instead of "*". Wildcard + credentials was both
+# invalid per the CORS spec and an open invitation for any site to script us.
+_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if not _origins:
+    # Safe defaults: local dev only. Set ALLOWED_ORIGINS in prod (Railway) to the
+    # real web origin(s), comma-separated, e.g. "https://app.aibos.africa".
+    _origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_origins,
+    allow_credentials=False,          # auth is a Bearer token, never a cookie
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ─── In-memory cabinet (file storage across sessions) ────────────────────────
-# Keyed by cabinet_id → {name, file_type, sheets, active_sheet, df_json, analysis}
+# Keyed by cabinet_id → {user_id, name, file_type, sheets, active_sheet, df_json,
+# analysis}. Every entry is stamped with the owning user_id (from the verified
+# JWT) so one tenant can never read/delete another's files (see _owned_cabinet).
 CABINET: Dict[str, Dict[str, Any]] = {}
+
+# Hard limits — this store is process-global in-memory, so without a cap a few
+# large uploads would exhaust Railway's memory and evict every real user (DoS).
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))  # 15 MB
+MAX_CABINET_ENTRIES = int(os.environ.get("MAX_CABINET_ENTRIES", "500"))
+
+
+def _enforce_upload_size(content: bytes) -> None:
+    """Reject oversized uploads before any parsing work is done."""
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+
+
+def _cabinet_put(cab_id: str, entry: Dict[str, Any], user_id: str) -> None:
+    """Store an entry stamped with its owner, evicting the oldest if over cap."""
+    entry["user_id"] = user_id
+    CABINET[cab_id] = entry
+    while len(CABINET) > MAX_CABINET_ENTRIES:
+        oldest = next(iter(CABINET))
+        CABINET.pop(oldest, None)
+
+
+def _owned_cabinet(cabinet_id: str, user_id: str) -> Dict[str, Any]:
+    """Return the caller's cabinet entry or raise 404. Never leak another
+    tenant's data — a wrong/foreign id is indistinguishable from 'not found'."""
+    entry = CABINET.get(cabinet_id)
+    if not entry or entry.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Not found in cabinet")
+    return entry
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -547,6 +592,7 @@ async def upload_file(
     file: UploadFile = File(...),
     sheet_name: Optional[str] = Query(None),
     cabinet_id: Optional[str] = Query(None),
+    user_id: str = Depends(require_user),
 ):
     """
     Upload a file and run engine analysis.
@@ -554,8 +600,14 @@ async def upload_file(
     """
     try:
         content = await file.read()
+        _enforce_upload_size(content)
         filename = file.filename or "upload"
         ext = filename.rsplit(".", 1)[-1].lower()
+
+        # If re-using a cabinet_id, it must be one the caller already owns —
+        # otherwise a caller could overwrite another tenant's slot.
+        if cabinet_id:
+            _owned_cabinet(cabinet_id, user_id)
 
         logger.info("Upload: %s (%d bytes) | sheet=%s", filename, len(content), sheet_name)
 
@@ -580,7 +632,7 @@ async def upload_file(
                 if not e3_result.get("top_items") or gt.get("gross_revenue", 0) <= 0:
                     raise ValueError("POS parse produced no sales data")
                 cab_id = cabinet_id or str(uuid.uuid4())
-                CABINET[cab_id] = {
+                _cabinet_put(cab_id, {
                     "name": filename,
                     "file_type": ext,
                     "engine": "engine3",
@@ -589,7 +641,7 @@ async def upload_file(
                     "content": content,
                     "analysis": e3_result,
                     "df_preview": e3_result.get("top_items", [])[:10],
-                }
+                }, user_id)
                 return {
                     "success": True,
                     "engine": "engine3",
@@ -640,7 +692,7 @@ async def upload_file(
             sym_in = "K"
             e2_result = run_engine2(df, sym_in)
             cab_id = cabinet_id or str(uuid.uuid4())
-            CABINET[cab_id] = {
+            _cabinet_put(cab_id, {
                 "name": filename,
                 "file_type": ext,
                 "engine": "engine2",
@@ -649,7 +701,7 @@ async def upload_file(
                 "content": content,
                 "analysis": e2_result,
                 "df_json": df.to_json(orient="records"),
-            }
+            }, user_id)
             return {
                 "success": True,
                 "engine": "engine2",
@@ -751,7 +803,7 @@ async def upload_file(
 
         # ── Cabinet storage ───────────────────────────────────────────────────
         cab_id = cabinet_id or str(uuid.uuid4())
-        CABINET[cab_id] = {
+        _cabinet_put(cab_id, {
             "name": filename,
             "file_type": ext,
             "engine": engine_type,
@@ -768,7 +820,7 @@ async def upload_file(
             "manifest": manifest,
             "breakdown": breakdown,
             "df_json": df.to_json(orient="records"),
-        }
+        }, user_id)
 
         logger.info(
             "Upload success → engine=%s | rev=%s | cost=%s | months=%d | cab=%s",
@@ -808,12 +860,10 @@ async def upload_file(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upload/switch-sheet")
-async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...)):
+async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...),
+                       user_id: str = Depends(require_user)):
     """Switch to a different sheet in a previously uploaded Excel file."""
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Cabinet entry not found")
-
-    entry = CABINET[cabinet_id]
+    entry = _owned_cabinet(cabinet_id, user_id)
     content = entry.get("content")
     filename = entry.get("name", "upload.xlsx")
 
@@ -879,10 +929,8 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/propose")
-async def propose(cabinet_id: str = Query(...)):
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Cabinet entry not found")
-    entry = CABINET[cabinet_id]
+async def propose(cabinet_id: str = Query(...), user_id: str = Depends(require_user)):
+    entry = _owned_cabinet(cabinet_id, user_id)
     manifest = entry.get("manifest")
     df_json = entry.get("df_json")
     if not df_json or not manifest:
@@ -906,13 +954,12 @@ class ComputeRequest(BaseModel):
 
 
 @app.post("/compute-metrics")
-async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...)):
+async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...),
+                          user_id: str = Depends(require_user)):
     """Compute APPROVED metric formulas against a file, via the same safe sandbox
     used to critique them (AST-whitelisted, empty builtins). Returns values only —
     no formula here can run arbitrary code."""
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Cabinet entry not found")
-    entry = CABINET[cabinet_id]
+    entry = _owned_cabinet(cabinet_id, user_id)
     df_json = entry.get("df_json")
     if not df_json:
         raise HTTPException(status_code=400, detail="No tabular data for this file")
@@ -948,10 +995,12 @@ async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/cabinet")
-async def list_cabinet():
-    """List all files in the cabinet."""
+async def list_cabinet(user_id: str = Depends(require_user)):
+    """List the CALLER'S files only — never any other tenant's."""
     items = []
     for cab_id, entry in CABINET.items():
+        if entry.get("user_id") != user_id:
+            continue
         items.append({
             "id": cab_id,
             "name": entry.get("name"),
@@ -1003,11 +1052,9 @@ def _frontend_payload(engine: str, analysis: Dict[str, Any], monthly: List[Dict[
 
 
 @app.get("/cabinet/{cabinet_id}")
-async def get_cabinet_entry(cabinet_id: str):
-    """Load a previously uploaded file from the cabinet."""
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Not found in cabinet")
-    entry = CABINET[cabinet_id]
+async def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
+    """Load one of the caller's own files from the cabinet."""
+    entry = _owned_cabinet(cabinet_id, user_id)
     engine = entry.get("engine", "engine1")
     return {
         "success": True,
@@ -1021,10 +1068,9 @@ async def get_cabinet_entry(cabinet_id: str):
 
 
 @app.delete("/cabinet/{cabinet_id}")
-async def delete_cabinet_entry(cabinet_id: str):
-    """Remove a file from the cabinet."""
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Not found")
+async def delete_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
+    """Remove one of the caller's own files from the cabinet."""
+    _owned_cabinet(cabinet_id, user_id)   # 404 if missing or not owned
     del CABINET[cabinet_id]
     return {"success": True, "deleted": cabinet_id}
 
@@ -1041,7 +1087,7 @@ class StudioRequest(BaseModel):
 
 
 @app.post("/data-studio/compute")
-async def data_studio_compute(req: StudioRequest):
+async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require_user)):
     """
     Compute Excel-like formulas or AI-powered analysis.
     Supports: SUM, AVG, MAX, MIN, COUNT, IF, GROWTH, FORECAST, custom AI formulas.
@@ -1049,9 +1095,9 @@ async def data_studio_compute(req: StudioRequest):
     formula = req.formula.strip()
     data: Dict[str, List[float]] = req.column_context or {}
 
-    # Load data from cabinet if provided
-    if req.cabinet_id and req.cabinet_id in CABINET:
-        entry = CABINET[req.cabinet_id]
+    # Load data from cabinet if provided — only the caller's own file.
+    if req.cabinet_id:
+        entry = _owned_cabinet(req.cabinet_id, user_id)
         monthly = entry.get("monthly", [])
         if monthly:
             data.setdefault("revenue", [m["revenue"] for m in monthly])
@@ -1209,11 +1255,9 @@ async def data_studio_compute(req: StudioRequest):
 
 
 @app.get("/data-studio/schema/{cabinet_id}")
-async def data_studio_schema(cabinet_id: str):
-    """Return available columns/series for formula building."""
-    if cabinet_id not in CABINET:
-        raise HTTPException(status_code=404, detail="Cabinet entry not found")
-    entry = CABINET[cabinet_id]
+async def data_studio_schema(cabinet_id: str, user_id: str = Depends(require_user)):
+    """Return available columns/series for formula building (caller's file only)."""
+    entry = _owned_cabinet(cabinet_id, user_id)
     monthly = entry.get("monthly", [])
     if not monthly:
         return {"columns": []}
@@ -1425,7 +1469,7 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
     """AI CFO Chat powered by Groq llama-3.3-70b-versatile.
 
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
@@ -1462,8 +1506,8 @@ async def chat(req: ChatRequest):
                 system_parts.append("\n" + ctx_text)
                 injected = True
 
-        # Priority 2: cabinet-backed context (legacy / data-studio)
-        if not injected and req.cabinet_id and req.cabinet_id in CABINET:
+        # Priority 2: cabinet-backed context (legacy / data-studio) — caller's own file only.
+        if not injected and req.cabinet_id and CABINET.get(req.cabinet_id, {}).get("user_id") == user_id:
             entry        = CABINET[req.cabinet_id]
             df_json      = entry.get("df_json")
             monthly_rows = entry.get("monthly", [])
@@ -1554,6 +1598,7 @@ async def health():
 # In-memory record of collection requests, keyed by reference.
 # Production should persist these (Supabase) and reconcile via the callback.
 PAYMENTS: Dict[str, Dict[str, Any]] = {}
+MAX_PAYMENTS = int(os.environ.get("MAX_PAYMENTS", "5000"))
 
 # ZMW prices per plan — must match lib/tiers.ts on the frontend.
 PLAN_PRICES = {
@@ -1561,14 +1606,44 @@ PLAN_PRICES = {
     "growth": {"monthly": 1200, "annual": 12000},
 }
 
+# Shared secret a provider must present on the webhook. Without it the callback
+# is REJECTED — otherwise anyone could POST "successful" and grant themselves a
+# paid tier. Set PAYMENTS_CALLBACK_SECRET in Railway alongside the provider keys.
+CALLBACK_SECRET = os.environ.get("PAYMENTS_CALLBACK_SECRET")
 
-class PaymentInitiateRequest(BaseModel):
-    network: str                      # "mtn" | "airtel"
-    plan: str                         # "pro" | "growth"
-    billing: str = "monthly"          # "monthly" | "annual"
-    payer_phone: str
-    user_id: Optional[str] = None
-    currency: str = "ZMW"
+
+def _grant_tier(user_id: Optional[str], plan: str) -> None:
+    """Server-authoritative tier grant. Writes profiles via the service-role
+    client (the ONLY path allowed to set a tier — the client can't, see the
+    profiles guard trigger). Best-effort: never breaks the payment response."""
+    if not user_id:
+        return
+    tier = "growth" if plan == "growth" else "pro"
+    db = get_db()
+    if db is None:
+        log.warning("[payments] tier grant skipped — Supabase not configured (user=%s)", user_id)
+        return
+    try:
+        from datetime import datetime, timezone
+        db.table("profiles").update({
+            "tier": tier,
+            "subscription_tier": tier,
+            "tier_source": "payment",
+            "tier_granted_by": "payment",
+            "tier_granted_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", user_id).execute()
+        log.info("[payments] granted %s to user %s", tier, user_id)
+    except Exception as e:  # noqa: BLE001
+        log.error("[payments] tier grant failed (user=%s): %s", user_id, e)
+
+
+def _settle(rec: Dict[str, Any], new_status: str) -> None:
+    """Apply a resolved status once. On first transition to 'successful', grant
+    the paid tier. Idempotent via the 'granted' flag so re-polls never double-grant."""
+    rec["status"] = new_status
+    if new_status == "successful" and not rec.get("granted"):
+        rec["granted"] = True
+        _grant_tier(rec.get("user_id"), rec.get("plan", ""))
 
 
 @app.get("/payments/config")
@@ -1578,7 +1653,9 @@ async def payments_config():
 
 
 @app.post("/payments/initiate")
-async def payments_initiate(body: PaymentInitiateRequest):
+async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(require_user)):
+    # The account to upgrade is ALWAYS the authenticated caller — never a
+    # user_id from the request body (which any client could forge).
     network = (body.network or "").lower()
     if network not in ("mtn", "airtel"):
         raise HTTPException(status_code=400, detail="network must be 'mtn' or 'airtel'")
@@ -1597,6 +1674,10 @@ async def payments_initiate(body: PaymentInitiateRequest):
     note = f"AI-BOS {plan.capitalize()} ({billing})"
     state = payments.initiate(network, reference, amount, body.currency, body.payer_phone, note)
 
+    # Bound the store so a flood of initiations can't exhaust memory.
+    while len(PAYMENTS) >= MAX_PAYMENTS:
+        PAYMENTS.pop(next(iter(PAYMENTS)), None)
+
     PAYMENTS[reference] = {
         "reference": reference,
         "network": network,
@@ -1604,8 +1685,9 @@ async def payments_initiate(body: PaymentInitiateRequest):
         "billing": billing,
         "amount": amount,
         "currency": body.currency,
-        "user_id": body.user_id,
+        "user_id": user_id,           # from the verified JWT, not the body
         "status": state,
+        "granted": False,
         "created_at": time.time(),
     }
 
@@ -1622,28 +1704,37 @@ async def payments_initiate(body: PaymentInitiateRequest):
 
 
 @app.get("/payments/status/{reference}")
-async def payments_status(reference: str):
+async def payments_status(reference: str, user_id: str = Depends(require_user)):
     rec = PAYMENTS.get(reference)
-    if not rec:
+    # Only the owner may poll a reference (and existence isn't leaked to others).
+    if not rec or rec.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Unknown payment reference")
 
-    # Only re-poll the provider while still pending.
+    # Only re-poll the provider while still pending. When it resolves to
+    # 'successful' the tier is granted server-side inside _settle.
     if rec["status"] == "pending":
-        rec["status"] = payments.status(rec["network"], reference, rec.get("created_at"))
+        _settle(rec, payments.status(rec["network"], reference, rec.get("created_at")))
 
     return {"reference": reference, "status": rec["status"], "plan": rec["plan"], "billing": rec["billing"]}
 
 
 @app.post("/payments/callback/{network}")
-async def payments_callback(network: str, body: Dict[str, Any]):
-    """Provider webhook — confirms a collection out-of-band (ready-for-keys).
-    MTN/Airtel post the final status here; we mark the reference accordingly."""
+async def payments_callback(network: str, body: Dict[str, Any],
+                            x_callback_secret: Optional[str] = Header(default=None)):
+    """Provider webhook — confirms a collection out-of-band. MUST present the
+    shared secret; without it (or if none is configured) the call is rejected so
+    the tier-grant path can't be triggered by an anonymous POST."""
+    if not CALLBACK_SECRET or x_callback_secret != CALLBACK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid callback signature")
+
     reference = str(body.get("referenceId") or body.get("reference") or body.get("transaction", {}).get("id") or "")
     rec = PAYMENTS.get(reference)
     if not rec:
         return {"ok": False, "detail": "unknown reference"}
     raw = str(body.get("status") or body.get("transaction", {}).get("status") or "").upper()
-    rec["status"] = {"SUCCESSFUL": "successful", "TS": "successful", "FAILED": "failed", "TF": "failed"}.get(raw, rec["status"])
+    resolved = {"SUCCESSFUL": "successful", "TS": "successful", "FAILED": "failed", "TF": "failed"}.get(raw)
+    if resolved:
+        _settle(rec, resolved)
     return {"ok": True, "status": rec["status"]}
 
 
@@ -1791,6 +1882,7 @@ async def excel_preview(
     _require_db()
     try:
         content = await file.read()
+        _enforce_upload_size(content)
         df, all_sheets, selected = _load_sheet(content, file.filename or "upload.xlsx", sheet)
         df = df.where(pd.notna(df), None)  # JSON-safe (NaN → null)
         cols = [str(c) for c in df.columns]
@@ -1813,6 +1905,8 @@ async def excel_preview(
             "summary_like": ingestion.looks_like_summary(cols),
             "event_types": list(nervous.EVENT_TYPES),
         }
+    except HTTPException:
+        raise                     # preserve 413 (too large) etc.
     except Exception as exc:  # noqa: BLE001
         logger.error("excel_preview error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=400, detail=f"Could not read that file: {type(exc).__name__}")
@@ -1862,8 +1956,11 @@ async def ingest_receipt(
     _require_db()
     try:
         content = await file.read()
+        _enforce_upload_size(content)
         proposal = ocr.parse_receipt_image(content, file.content_type or "image/jpeg", currency)
         return {"ok": True, "proposal": proposal}
+    except HTTPException:
+        raise                     # preserve 413 (too large) etc.
     except Exception as exc:  # noqa: BLE001
         logger.error("ingest_receipt error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=502, detail=f"Could not read the receipt: {type(exc).__name__}")
