@@ -33,6 +33,7 @@ import payments
 # Isolated modules; the existing file-analysis endpoints above are untouched.
 from db import get_db, supabase_enabled
 from auth import require_user
+import entitlements
 import nervous_system as nervous
 import digital_twin as twin
 import ingestion
@@ -631,6 +632,9 @@ async def upload_file(
                 # fall through so a genuine financial workbook is handled by Engine 1.
                 if not e3_result.get("top_items") or gt.get("gross_revenue", 0) <= 0:
                     raise ValueError("POS parse produced no sales data")
+                # Operations intelligence (Engine 3) is a paid capability with no
+                # free preview — enforce the tier before returning any of it.
+                entitlements.require_feature(user_id, "engine3")
                 cab_id = cabinet_id or str(uuid.uuid4())
                 _cabinet_put(cab_id, {
                     "name": filename,
@@ -663,6 +667,9 @@ async def upload_file(
                     "menuGaps": e3_result.get("menu_gaps", []),
                     "opsIntelBrief": e3_result.get("ops_intel_brief", ""),
                 }
+            except HTTPException:
+                # A tier gate (402) is a real answer — don't fall through to E1.
+                raise
             except Exception as e3_err:
                 logger.warning("Engine3 parse failed, falling through: %s", e3_err)
 
@@ -689,6 +696,9 @@ async def upload_file(
         # customer_id/date/amount/product columns and no cost column, so they
         # would otherwise fail with "Cannot find cost/expense column".
         if is_engine2_data(df):
+            # Customer intelligence (Engine 2) is a paid capability with no free
+            # preview — enforce the tier before running/returning any of it.
+            entitlements.require_feature(user_id, "engine2")
             sym_in = "K"
             e2_result = run_engine2(df, sym_in)
             cab_id = cabinet_id or str(uuid.uuid4())
@@ -1475,6 +1485,9 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
     """
     try:
+        # AI CFO chat is a paid capability (Pro+) — enforce before any work.
+        entitlements.require_feature(user_id, "ai_chat")
+
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise HTTPException(
@@ -1632,6 +1645,7 @@ def _grant_tier(user_id: Optional[str], plan: str) -> None:
             "tier_granted_by": "payment",
             "tier_granted_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", user_id).execute()
+        entitlements.invalidate(user_id)   # upgrade takes effect immediately
         log.info("[payments] granted %s to user %s", tier, user_id)
     except Exception as e:  # noqa: BLE001
         log.error("[payments] tier grant failed (user=%s): %s", user_id, e)
