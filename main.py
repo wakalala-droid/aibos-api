@@ -1106,6 +1106,10 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
     data: Dict[str, List[float]] = req.column_context or {}
 
     # Load data from cabinet if provided — only the caller's own file.
+    # Honesty gate (SAFEGUARD §0.1): when the cabinet file is cross-sectional its
+    # "monthly" rows are ITEMS, not periods — time-based formulas over columns
+    # sourced from it would fabricate a trend, so they are blocked below.
+    no_time_axis_cols: set = set()
     if req.cabinet_id:
         entry = _owned_cabinet(req.cabinet_id, user_id)
         monthly = entry.get("monthly", [])
@@ -1114,6 +1118,10 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
             data.setdefault("costs", [m["costs"] for m in monthly])
             data.setdefault("profit", [m["profit"] for m in monthly])
             data.setdefault("margin", [m["margin"] for m in monthly])
+        if (entry.get("manifest") or {}).get("data_shape") == "cross_sectional":
+            no_time_axis_cols = {"revenue", "costs", "profit", "margin"} - {
+                k.lower().strip() for k in (req.column_context or {})
+            }
 
     # ── AI formula mode ───────────────────────────────────────────────────────
     if req.ai_mode or formula.upper().startswith("AI:"):
@@ -1162,6 +1170,13 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
                 return [float(x) for x in v if x is not None]
         raise ValueError(f"Column '{name}' not found. Available: {list(data.keys())}")
 
+    def require_time_axis(col: str, fn: str) -> None:
+        if col.lower().strip() in no_time_axis_cols:
+            raise ValueError(
+                f"{fn} needs a time axis — this file has no date/period column, so its "
+                "rows are items, not periods. Add a Month/Date column to unlock trends."
+            )
+
     try:
         result = None
         formula_used = formula
@@ -1193,12 +1208,14 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
 
         elif formula_up.startswith("GROWTH("):
             col = formula[7:-1].strip()
+            require_time_axis(col, "GROWTH()")
             vals = get_col(col)
             if len(vals) >= 2 and vals[0]:
                 result = round(((vals[-1] - vals[0]) / vals[0]) * 100, 2)
+                formula_used = f"GROWTH({col}) = ({vals[-1]:.0f} - {vals[0]:.0f}) / {vals[0]:.0f} × 100"
             else:
                 result = 0
-            formula_used = f"GROWTH({col}) = ({vals[-1]:.0f} - {vals[0]:.0f}) / {vals[0]:.0f} × 100"
+                formula_used = f"GROWTH({col}) — needs at least 2 periods with a non-zero start"
 
         elif formula_up.startswith("MARGIN("):
             # MARGIN(revenue, profit)
@@ -1214,6 +1231,7 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
 
         elif formula_up.startswith("FORECAST("):
             col = formula[9:-1].strip()
+            require_time_axis(col, "FORECAST()")
             vals = get_col(col)
             if len(vals) >= 2:
                 x = list(range(len(vals)))
@@ -1227,13 +1245,24 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
         elif formula_up.startswith("BREAKEVEN("):
             # BREAKEVEN(fixed_costs, variable_cost_ratio, price)
             args = [a.strip() for a in formula[10:-1].split(",")]
-            fixed = float(args[0]) if args[0].replace(".", "").isdigit() else get_col(args[0])[0]
+            if args[0].replace(".", "").isdigit():
+                fixed = float(args[0])
+            else:
+                fixed_vals = get_col(args[0])
+                if not fixed_vals:
+                    raise ValueError(f"BREAKEVEN: column '{args[0]}' has no values.")
+                fixed = fixed_vals[0]
             vcr = float(args[1]) if len(args) > 1 else 0.6
+            if not (0 <= vcr < 1):
+                raise ValueError(
+                    "BREAKEVEN: variable cost ratio must be a fraction between 0 and 1 (e.g. 0.6)."
+                )
             result = round(fixed / (1 - vcr), 2)
             formula_used = f"BREAKEVEN = Fixed Costs / (1 - Variable Cost Ratio)"
 
         elif formula_up.startswith("YOY("):
             col = formula[4:-1].strip()
+            require_time_axis(col, "YOY()")
             vals = get_col(col)
             if len(vals) >= 13:
                 yoy = [

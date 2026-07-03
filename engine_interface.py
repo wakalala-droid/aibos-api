@@ -104,9 +104,13 @@ def run_all(twin: dict, events: list | None = None, context: dict | None = None)
     out: list[dict] = []
     for e in _ENGINES:
         try:
+            batch: list[dict] = []
             for rec in e.analyze(twin, events, context) or []:
                 validate_recommendation(rec)        # 9th Law gate
-                out.append(rec.to_dict())
+                batch.append(rec.to_dict())
+            # All-or-nothing per engine: one unexplained rec disqualifies the
+            # whole engine for this run, not just that rec.
+            out.extend(batch)
         except Exception as exc:  # noqa: BLE001
             log.warning("[engines] %s skipped: %s", getattr(e, "name", "?"), exc)
     # Highest-priority first.
@@ -137,13 +141,21 @@ class CashRunwayEngine(Engine):
         cash = _f(twin.get("cash"))
         if avg_burn <= 0:
             return []
-        runway = cash / avg_burn
+        # Runway is never negative — a negative balance means you're already out.
+        runway = max(cash, 0.0) / avg_burn
         if runway >= 3:
             return []
+        out_of_cash = cash <= 0
+        rationale = (
+            f"Your cash balance is {cash:,.0f} while you burn about {avg_burn:,.0f}/month — "
+            "you're already out of runway."
+            if out_of_cash else
+            f"At the current burn of about {avg_burn:,.0f}/month you have "
+            f"roughly {runway:.1f} months of cash left."
+        )
         return [Recommendation(
             title="Extend your cash runway",
-            rationale=(f"At the current burn of about {avg_burn:,.0f}/month you have "
-                       f"roughly {runway:.1f} months of cash left."),
+            rationale=rationale,
             expected_outcome="Avoid a cash shortfall by acting before reserves run low.",
             downside="Cutting costs too aggressively can hurt sales or service.",
             confidence=0.8,
@@ -156,7 +168,7 @@ class CashRunwayEngine(Engine):
             alternatives=["Accelerate receivables collection", "Defer non-essential purchases",
                           "Negotiate supplier payment terms"],
             impact={"metric": "runway_months", "delta": round(3 - runway, 1), "unit": "months"},
-            priority="high" if runway < 1.5 else "medium",
+            priority="high" if (out_of_cash or runway < 1.5) else "medium",
         )]
 
 

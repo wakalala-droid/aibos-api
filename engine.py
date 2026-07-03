@@ -7,6 +7,16 @@ import logging
 logger = logging.getLogger("aibos.engine1")
 
 
+def _num(v, default=0.0) -> float:
+    """None/garbage-safe float — twin rows and cabinet JSON can carry nulls."""
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def run_engine1(monthly_rows: list) -> dict:
     """
     Engine 1 — Financial Intelligence.
@@ -23,10 +33,10 @@ def run_engine1(monthly_rows: list) -> dict:
             "brief":     {},
         }
 
-    revenues = [float(m.get("revenue", 0)) for m in monthly_rows]
-    costs    = [float(m.get("costs",   0)) for m in monthly_rows]
-    profits  = [float(m.get("profit",  0)) for m in monthly_rows]
-    margins  = [float(m.get("margin",  0)) for m in monthly_rows]
+    revenues = [_num(m.get("revenue")) for m in monthly_rows]
+    costs    = [_num(m.get("costs"))   for m in monthly_rows]
+    profits  = [_num(m.get("profit"))  for m in monthly_rows]
+    margins  = [_num(m.get("margin"))  for m in monthly_rows]
 
     total_rev    = sum(revenues)
     total_cost   = sum(costs)
@@ -46,11 +56,20 @@ def run_engine1(monthly_rows: list) -> dict:
         next_r = revenues[-1] if revenues else 0
         next_c = costs[-1]    if costs    else 0
 
+    next_revenue = round(max(next_r, 0), 2)
+    next_costs   = round(max(next_c, 0), 2)
     forecast = {
-        "next_revenue": round(max(next_r, 0), 2),
-        "next_costs":   round(max(next_c, 0), 2),
-        "next_profit":  round(max(next_r - next_c, 0), 2),
+        "next_revenue": next_revenue,
+        "next_costs":   next_costs,
+        # A projected loss stays negative — clamping it to zero would hide
+        # what the data says (SAFEGUARD §0.1).
+        "next_profit":  round(next_revenue - next_costs, 2),
     }
+    if n_periods < 3:
+        forecast["note"] = (
+            f"Based on only {n_periods} period(s) — directional at best. "
+            "Three or more periods make this forecast trustworthy."
+        )
 
     # ── Anomalies — z-score on revenue ───────────────────────────────────────
     anomalies = []
@@ -60,7 +79,7 @@ def run_engine1(monthly_rows: list) -> dict:
             std  = float(np.std(revenues))
             if std > 0:
                 for m in monthly_rows:
-                    rev = float(m.get("revenue", 0))
+                    rev = _num(m.get("revenue"))
                     z   = abs(rev - mean) / std
                     if z > 2:
                         direction = "+" if rev > mean else "-"
@@ -76,8 +95,8 @@ def run_engine1(monthly_rows: list) -> dict:
     # ── Variance — month-on-month changes ────────────────────────────────────
     variance_rows = []
     for i in range(1, n_periods):
-        prev_r = float(monthly_rows[i - 1].get("revenue", 0))
-        curr_r = float(monthly_rows[i].get("revenue", 0))
+        prev_r = _num(monthly_rows[i - 1].get("revenue"))
+        curr_r = _num(monthly_rows[i].get("revenue"))
         change = ((curr_r - prev_r) / prev_r * 100) if prev_r else 0
         variance_rows.append({
             "month":          monthly_rows[i].get("month", "?"),
@@ -114,7 +133,7 @@ def run_engine1(monthly_rows: list) -> dict:
     running = 0.0
     cashflow_rows = []
     for m in monthly_rows:
-        p = float(m.get("profit", 0))
+        p = _num(m.get("profit"))
         running += p
         cashflow_rows.append({
             "month":           m.get("month", "?"),
@@ -131,8 +150,8 @@ def run_engine1(monthly_rows: list) -> dict:
 
     # ── Executive brief ───────────────────────────────────────────────────────
     health_score  = min(100, max(0, int(avg_margin * 2.5)))
-    best_month    = max(monthly_rows, key=lambda m: float(m.get("revenue", 0))).get("month", "?")
-    worst_month   = min(monthly_rows, key=lambda m: float(m.get("revenue", 0))).get("month", "?")
+    best_month    = max(monthly_rows, key=lambda m: _num(m.get("revenue"))).get("month", "?")
+    worst_month   = min(monthly_rows, key=lambda m: _num(m.get("revenue"))).get("month", "?")
 
     brief = {
         "total_revenue": round(total_rev, 2),

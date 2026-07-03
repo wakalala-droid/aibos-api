@@ -266,6 +266,73 @@ def test_low_stock_engine_via_context():
     assert not any(r["source_engine"] == "low_stock" for r in ei.run_all(twin, [], {}))
 
 
+def test_engine1_forecast_honesty():
+    from engine import run_engine1
+    # Declining business → the projected loss must stay negative, never clamp to 0
+    # (SAFEGUARD §0.1 — the forecast can't hide what the data says).
+    rows = [{"month": f"2026-0{i+1}", "revenue": r, "costs": 900.0,
+             "profit": r - 900.0, "margin": (r - 900.0) / r * 100}
+            for i, r in enumerate([1200.0, 1000.0, 800.0, 600.0])]
+    fc = run_engine1(rows)["forecast"]
+    assert fc["next_profit"] < 0
+    assert fc["next_revenue"] >= 0 and fc["next_costs"] >= 0
+    assert "note" not in fc                       # 4 periods → no caveat needed
+    # Short history → carries an honesty caveat.
+    assert "note" in run_engine1(rows[:2])["forecast"]
+    # None/garbage values never crash the engine.
+    weird = run_engine1([{"month": "2026-01", "revenue": None, "costs": None,
+                          "profit": None, "margin": None}])
+    assert weird["brief"]["total_revenue"] == 0
+
+
+def test_simulation_validation():
+    import simulation
+    twin = {"total_revenue": 1000, "total_costs": 800, "cash": 500}
+    # Percentages below -100% (negative revenue) or absurd multiples are rejected.
+    assert simulation.simulate(twin, {"type": "price_change", "value": -150})["ok"] is False
+    assert simulation.simulate(twin, {"type": "volume_change", "value": 9999})["ok"] is False
+    # Hire scenario: zero/negative counts, negative salary, silly durations rejected.
+    assert simulation.simulate(twin, {"type": "hire", "count": 0, "monthly_salary": 100})["ok"] is False
+    assert simulation.simulate(twin, {"type": "hire", "count": 1, "monthly_salary": -5})["ok"] is False
+    assert simulation.simulate(twin, {"type": "hire", "count": 1, "monthly_salary": 100, "months": 0})["ok"] is False
+    # Sane inputs still work, including the default months=12.
+    ok = simulation.simulate(twin, {"type": "hire", "count": 1, "monthly_salary": 100})
+    assert ok["ok"] is True and ok["deltas"]["costs"] == 1200
+
+
+def test_run_all_skips_engine_atomically():
+    import engine_interface as ei
+    # An engine that emits one valid and one unexplained rec contributes NOTHING —
+    # all-or-nothing per engine (9th Law gate covers the engine's whole batch).
+    class Rogue(ei.Engine):
+        name = "rogue"
+        def analyze(self, twin, events, context=None):
+            good = ei.Recommendation(title="t", rationale="r", expected_outcome="e",
+                                     downside="d", confidence=0.5, source_engine="rogue",
+                                     evidence=[{"label": "a", "value": "b"}])
+            bad = ei.Recommendation(title="", rationale="", expected_outcome="",
+                                    downside="", confidence=0.5, source_engine="rogue")
+            return [good, bad]
+    saved = ei._ENGINES[:]
+    try:
+        ei._ENGINES[:] = [Rogue()]
+        assert ei.run_all({"monthly": []}, []) == []
+    finally:
+        ei._ENGINES[:] = saved
+
+
+def test_cash_runway_out_of_cash():
+    import engine_interface as ei
+    # Negative balance → runway reported as 0, never "-2.0 months"; priority high.
+    twin = {"cash": -200, "total_costs": 3000, "total_revenue": 3100, "total_profit": 100,
+            "avg_margin": 3, "monthly": [{"month": "2026-01"}]}
+    rec = next(r for r in ei.run_all(twin, []) if r["source_engine"] == "cash_runway")
+    assert rec["priority"] == "high"
+    assert "out of runway" in rec["rationale"]
+    runway_evidence = next(e for e in rec["evidence"] if e["label"] == "Runway")
+    assert not runway_evidence["value"].startswith("-")
+
+
 def test_ocr_vision_parser():
     import ocr
     raw = ('```json\n{"event_type":"Purchase","payload":{"amount":"1,250.50","currency":"ZMW",'

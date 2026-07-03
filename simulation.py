@@ -19,6 +19,12 @@ breakeven (engine.py), so the simulation is consistent with existing analysis.
 VARIABLE_COST_RATIO = 0.60
 FIXED_COST_RATIO = 0.40
 
+# Guardrails — a percentage below -100 or an absurd multiple produces negative
+# revenue/costs, which is nonsense the user would rightly distrust.
+PCT_MIN, PCT_MAX = -100.0, 500.0
+MAX_HIRES = 1000
+MAX_MONTHS = 120
+
 
 def _f(v) -> float:
     try:
@@ -53,6 +59,10 @@ def simulate(twin: dict, scenario: dict) -> dict:
     value = _f(scenario.get("value"))
     assumptions: list[str] = []
 
+    if stype in ("price_change", "volume_change", "cost_change") and not (PCT_MIN <= value <= PCT_MAX):
+        return {"ok": False,
+                "error": f"Percentage must be between {PCT_MIN:g}% and {PCT_MAX:g}%."}
+
     new_revenue, new_costs = revenue, costs
 
     if stype == "price_change":
@@ -77,7 +87,13 @@ def simulate(twin: dict, scenario: dict) -> dict:
     elif stype == "hire":
         count = int(_f(scenario.get("count", 1)))
         monthly_salary = _f(scenario.get("monthly_salary"))
-        months = int(_f(scenario.get("months", 12)) or 12)
+        months = int(_f(scenario.get("months", 12)))
+        if not (1 <= count <= MAX_HIRES):
+            return {"ok": False, "error": f"Hire count must be between 1 and {MAX_HIRES}."}
+        if monthly_salary < 0:
+            return {"ok": False, "error": "Monthly salary cannot be negative."}
+        if not (1 <= months <= MAX_MONTHS):
+            return {"ok": False, "error": f"Months must be between 1 and {MAX_MONTHS}."}
         added = count * monthly_salary * months
         new_costs = costs + added
         assumptions.append(f"{count} hire(s) at {monthly_salary:,.0f}/month over {months} months "
