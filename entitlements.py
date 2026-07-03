@@ -29,18 +29,27 @@ from db import get_db
 log = logging.getLogger("aibos.entitlements")
 
 # Mirror of lib/tiers.ts ACCESS. Keep in lock-step with the frontend.
+# Each paid tier is a strict superset of the one below.
+_PRO: set[str] = {
+    "forecast", "anomaly", "variance", "breakeven",
+    "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
+}
+_PROPLUS: set[str] = _PRO | {
+    "morning_brief", "chat_actions", "deliveries", "automation",
+}
+_GROWTH: set[str] = _PROPLUS | {
+    "cross_engine", "multi_location", "api_access",
+}
+
 _ACCESS: dict[str, set[str]] = {
     "free": set(),
-    "pro": {
-        "forecast", "anomaly", "variance", "breakeven",
-        "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
-    },
-    "growth": {
-        "forecast", "anomaly", "variance", "breakeven",
-        "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
-        "cross_engine", "multi_location",
-    },
+    "pro": _PRO,
+    "proplus": _PROPLUS,
+    "growth": _GROWTH,
 }
+
+# Lowest-first, used to find the cheapest tier that unlocks a feature.
+_PAID_ORDER = ["pro", "proplus", "growth"]
 
 _VALID_TIERS = set(_ACCESS.keys())
 
@@ -94,9 +103,14 @@ def can_access(tier: str, feature: str) -> bool:
 
 def _required_tier(feature: str) -> str:
     """Lowest paid tier that unlocks a feature (for the upgrade message)."""
-    if feature in _ACCESS["pro"]:
-        return "pro"
+    for t in _PAID_ORDER:
+        if feature in _ACCESS[t]:
+            return t
     return "growth"
+
+
+# Display names for the 402 message ("proplus" is not a word an owner reads).
+_TIER_LABEL = {"free": "Free", "pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 
 
 # Human labels for the paid capabilities, used in the 402 message.
@@ -112,6 +126,11 @@ _FEATURE_LABEL = {
     "breakeven": "breakeven analysis",
     "full_history":   "complete history",
     "scheduled_brief": "the scheduled AI brief",
+    "morning_brief":  "the Morning Brief",
+    "chat_actions":   "recording from the chat",
+    "deliveries":     "expected-delivery tracking",
+    "automation":     "automation proposals",
+    "api_access":     "API access",
 }
 
 
@@ -120,10 +139,11 @@ def require_feature(user_id: str, feature: str) -> str:
     tier = user_tier(user_id)
     if not can_access(tier, feature):
         need = _required_tier(feature)
+        need_label = _TIER_LABEL.get(need, need.capitalize())
         label = _FEATURE_LABEL.get(feature, feature)
         raise HTTPException(
             status_code=402,
-            detail=f"{label.capitalize()} is a {need.capitalize()} feature. "
-                   f"Upgrade to {need.capitalize()} to unlock it.",
+            detail=f"{label.capitalize()} is a {need_label} feature. "
+                   f"Upgrade to {need_label} to unlock it.",
         )
     return tier

@@ -1615,9 +1615,13 @@ MAX_PAYMENTS = int(os.environ.get("MAX_PAYMENTS", "5000"))
 
 # ZMW prices per plan — must match lib/tiers.ts on the frontend.
 PLAN_PRICES = {
-    "pro":    {"monthly": 450,  "annual": 4500},
-    "growth": {"monthly": 1200, "annual": 12000},
+    "pro":     {"monthly": 500,  "annual": 5000},
+    "proplus": {"monthly": 750,  "annual": 7500},
+    "growth":  {"monthly": 1499, "annual": 14990},
 }
+
+# Human plan names for payment notes/messages ("proplus" is internal only).
+PLAN_LABEL = {"pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 
 # Shared secret a provider must present on the webhook. Without it the callback
 # is REJECTED — otherwise anyone could POST "successful" and grant themselves a
@@ -1631,7 +1635,9 @@ def _grant_tier(user_id: Optional[str], plan: str) -> None:
     profiles guard trigger). Best-effort: never breaks the payment response."""
     if not user_id:
         return
-    tier = "growth" if plan == "growth" else "pro"
+    # Only known paid plans may be granted; anything unrecognised falls back to
+    # the cheapest paid tier rather than silently escalating.
+    tier = plan if plan in PLAN_PRICES else "pro"
     db = get_db()
     if db is None:
         log.warning("[payments] tier grant skipped — Supabase not configured (user=%s)", user_id)
@@ -1676,7 +1682,7 @@ async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends
 
     plan = (body.plan or "").lower()
     if plan not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="plan must be 'pro' or 'growth'")
+        raise HTTPException(status_code=400, detail="plan must be 'pro', 'proplus' or 'growth'")
 
     billing = body.billing if body.billing in ("monthly", "annual") else "monthly"
     amount = PLAN_PRICES[plan][billing]
@@ -1685,7 +1691,7 @@ async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends
         raise HTTPException(status_code=400, detail="payer_phone is required")
 
     reference = str(uuid.uuid4())
-    note = f"AI-BOS {plan.capitalize()} ({billing})"
+    note = f"AI-BOS {PLAN_LABEL.get(plan, plan.capitalize())} ({billing})"
     state = payments.initiate(network, reference, amount, body.currency, body.payer_phone, note)
 
     # Bound the store so a flood of initiations can't exhaust memory.
