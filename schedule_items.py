@@ -7,10 +7,11 @@ it lives beside the event spine, and completing a pick-up/payment can create the
 matching Business Event (linked via linked_event_id, the record bridge).
 
 Recurrence is RRULE-lite jsonb on the row ({freq, interval, until}) expanded at
-READ time — no materialised occurrence rows. Completing a recurring item rolls
-starts_at forward to the next occurrence and appends the outcome to `history`,
-so the row is always "the next upcoming instance" (how an owner thinks about
-NAPSA: paid this month → next one 10 Aug).
+READ time. Completing a recurring item materialises the finished occurrence as
+its own child row (parent_id → the template) and rolls the template's starts_at
+forward — the template is always "the next upcoming instance" (how an owner
+thinks about NAPSA: paid this month → next one 10 Aug) while past occurrences
+stay queryable rows, each with its own linked_event_id.
 
 CRUD is tenant-scoped on user_id; the backend writes via service role (auth.py
 verifies the caller). Pure helpers (validate_recurrence/next_occurrence/
@@ -196,7 +197,9 @@ def wants_paid_features(body: dict) -> bool:
 def list_items(db, user_id: str, horizon_days: int = 60, limit: int = 500) -> list:
     """
     Active + recently finished items, each annotated with `next_occurrences`
-    (ISO strings, up to 3) inside [now − 14d overdue window, now + horizon].
+    (ISO strings, every hit within [now − 14d overdue window, now + horizon],
+    capped at MAX_OCCURRENCES — the month grid needs the full set, the agenda
+    reads the head).
     """
     res = (db.table("schedule_items").select("*").eq("user_id", user_id)
            .neq("status", "cancelled").order("starts_at").limit(limit).execute())
@@ -217,7 +220,7 @@ def list_items(db, user_id: str, horizon_days: int = 60, limit: int = 500) -> li
             out.append(row)
             continue
         occ = expand_occurrences(row, min(range_start, parse_ts(row["starts_at"]) or range_start), range_end)
-        row["next_occurrences"] = [o.isoformat() for o in occ[:3]]
+        row["next_occurrences"] = [o.isoformat() for o in occ]
         out.append(row)
     return out
 
@@ -240,13 +243,20 @@ def update_item(db, user_id: str, item_id: str, patch: dict) -> dict:
     return rows[0]
 
 
+# Fields a materialised occurrence inherits from its recurring template.
+_OCCURRENCE_FIELDS = ("kind", "title", "notes", "location", "with_whom",
+                      "amount", "starts_at", "ends_at", "all_day")
+
+
 def set_status(db, user_id: str, item_id: str, status: str,
                linked_event_id: str | None = None) -> dict:
     """
-    Resolve an item. Non-recurring: status flips. Recurring + done/missed:
-    the outcome is appended to `history` and starts_at rolls to the next
-    occurrence (status stays 'scheduled'); when the rule is exhausted the
-    item finishes with the given status.
+    Resolve an item. Non-recurring: status flips in place. Recurring +
+    done/missed: the finished occurrence becomes its own child row
+    (parent_id → template) and the template rolls forward to the next
+    occurrence; when the rule is exhausted the template itself finishes.
+    Returns the row representing the RESOLVED occurrence (the child for
+    recurring items) so callers — the record bridge — link events to it.
     """
     if status not in STATUSES:
         raise ValueError(f"status must be one of {', '.join(STATUSES)}.")
@@ -258,28 +268,31 @@ def set_status(db, user_id: str, item_id: str, status: str,
         raise ValueError("Schedule item not found.")
     item = rows[0]
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    patch: dict = {"status": status}
-    if linked_event_id:
-        patch["linked_event_id"] = linked_event_id
-
     rec = item.get("recurrence")
     if rec and status in ("done", "missed"):
         start = parse_ts(item["starts_at"])
         nxt = next_occurrence(start, rec, start.day)
         until = parse_ts(rec.get("until"))
-        history = list(item.get("history") or [])
-        history.append({"occurred": item["starts_at"], "status": status, "at": now_iso})
-        patch["history"] = history
-        if until and nxt > until.replace(hour=23, minute=59, second=59):
-            pass  # rule exhausted — the final status stands
-        else:
-            patch["status"] = "scheduled"
-            patch["starts_at"] = nxt.isoformat()
+        exhausted = until is not None and nxt > until.replace(hour=23, minute=59, second=59)
+        if not exhausted:
+            child = {k: item.get(k) for k in _OCCURRENCE_FIELDS}
+            child.update({"user_id": user_id, "parent_id": item["id"],
+                          "status": status, "linked_event_id": linked_event_id})
+            ins = db.table("schedule_items").insert(child).execute()
+            child_row = (getattr(ins, "data", None) or [child])[0]
+
+            patch: dict = {"starts_at": nxt.isoformat()}
             end = parse_ts(item.get("ends_at"))
             if end and start:
                 patch["ends_at"] = (nxt + (end - start)).isoformat()
+            (db.table("schedule_items").update(patch)
+             .eq("id", item_id).eq("user_id", user_id).execute())
+            return child_row
+        # Rule exhausted — fall through: the template itself finishes.
 
+    patch = {"status": status}
+    if linked_event_id:
+        patch["linked_event_id"] = linked_event_id
     upd = (db.table("schedule_items").update(patch)
            .eq("id", item_id).eq("user_id", user_id).execute())
     urows = getattr(upd, "data", None) or []
