@@ -41,6 +41,7 @@ import business_memory as memory
 import engine_interface as engines_api
 import simulation
 import products as products_api
+import schedule_items as schedule_api
 import ocr
 
 logging.basicConfig(level=logging.INFO)
@@ -2103,6 +2104,64 @@ async def patch_product(product_id: str, body: Dict[str, Any] = Body(...), user_
 async def remove_product(product_id: str, user_id: str = Depends(require_user)):
     db = _require_db()
     products_api.delete_product(db, user_id, product_id)
+    return {"ok": True}
+
+
+# ── Scheduler (meetings, pick-ups, deadlines) ─────────────────────────────────
+# Core CRUD is free (like recording — commitments are how AIBOS learns the
+# owner's week). The paid layer is recurrence + reminders, enforced here via
+# entitlements so a Free caller can't obtain it by hitting the API directly.
+
+@app.get("/schedule")
+async def get_schedule(horizon_days: int = Query(60, ge=1, le=366),
+                       user_id: str = Depends(require_user)):
+    db = _require_db()
+    items = schedule_api.list_items(db, user_id, horizon_days=horizon_days)
+    return {"ok": True, "items": items}
+
+
+@app.post("/schedule")
+async def create_schedule_item(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    if schedule_api.wants_paid_features(body):
+        entitlements.require_feature(user_id, "schedule")
+    try:
+        return {"ok": True, "item": schedule_api.create_item(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/schedule/{item_id}")
+async def patch_schedule_item(item_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    if schedule_api.wants_paid_features(body):
+        entitlements.require_feature(user_id, "schedule")
+    try:
+        return {"ok": True, "item": schedule_api.update_item(db, user_id, item_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ScheduleStatusRequest(BaseModel):
+    status: str
+    linked_event_id: Optional[str] = None
+
+
+@app.post("/schedule/{item_id}/status")
+async def set_schedule_status(item_id: str, req: ScheduleStatusRequest, user_id: str = Depends(require_user)):
+    """Resolve an item (done/missed/cancelled). Recurring items roll forward to
+    their next occurrence; linked_event_id is the record bridge to the spine."""
+    db = _require_db()
+    try:
+        return {"ok": True, "item": schedule_api.set_status(db, user_id, item_id, req.status, req.linked_event_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/schedule/{item_id}")
+async def remove_schedule_item(item_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    schedule_api.delete_item(db, user_id, item_id)
     return {"ok": True}
 
 

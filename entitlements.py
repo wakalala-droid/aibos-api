@@ -33,6 +33,7 @@ log = logging.getLogger("aibos.entitlements")
 _PRO: set[str] = {
     "forecast", "anomaly", "variance", "breakeven",
     "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
+    "schedule",
 }
 _PROPLUS: set[str] = _PRO | {
     "morning_brief", "chat_actions", "deliveries", "automation",
@@ -126,6 +127,7 @@ _FEATURE_LABEL = {
     "breakeven": "breakeven analysis",
     "full_history":   "complete history",
     "scheduled_brief": "the scheduled AI brief",
+    "schedule":       "recurring schedules & reminders",
     "morning_brief":  "the Morning Brief",
     "chat_actions":   "recording from the chat",
     "deliveries":     "expected-delivery tracking",
