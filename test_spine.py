@@ -352,6 +352,110 @@ def test_ocr_vision_parser():
     assert ocr.parse_vision_json("not json")["confidence"] == 0.0
 
 
+# ── Start-afresh reset (hard flush + twin replay) ──────────────────────────────
+# Minimal in-memory stand-in for the supabase-py query chain, enough to exercise
+# reset_business() + the rebuild it triggers — offline, like everything above.
+
+class _FakeQuery:
+    def __init__(self, db, name, op, payload=None):
+        self.db, self.name, self.op, self.payload = db, name, op, payload
+        self.filters = {}
+
+    def eq(self, k, v):
+        self.filters[k] = v
+        return self
+
+    def order(self, *a, **k): return self
+    def limit(self, n): return self
+    def range(self, a, b): return self
+
+    def execute(self):
+        class R:  # mirrors supabase-py's .data attribute
+            data: list = []
+        rows = self.db.rows[self.name]
+        match = [r for r in rows if all(r.get(k) == v for k, v in self.filters.items())]
+        out = R()
+        if self.op == "select":
+            out.data = [dict(r) for r in match]
+        elif self.op == "delete":
+            keep = [r for r in rows if not all(r.get(k) == v for k, v in self.filters.items())]
+            self.db.rows[self.name] = keep
+            out.data = [dict(r) for r in match]
+        elif self.op == "update":
+            for r in match:
+                r.update(self.payload)
+            out.data = [dict(r) for r in match]
+        return out
+
+
+class _FakeTable:
+    def __init__(self, db, name): self.db, self.name = db, name
+    def select(self, *_): return _FakeQuery(self.db, self.name, "select")
+    def delete(self): return _FakeQuery(self.db, self.name, "delete")
+    def update(self, patch): return _FakeQuery(self.db, self.name, "update", patch)
+
+    def insert(self, row):
+        self.db.rows[self.name].append(dict(row))
+        return _FakeQuery(self.db, self.name, "select")
+
+    def upsert(self, row, on_conflict="user_id"):
+        rows = self.db.rows[self.name]
+        for r in rows:
+            if r.get(on_conflict) == row.get(on_conflict):
+                r.update(row)
+                break
+        else:
+            rows.append(dict(row))
+        return _FakeQuery(self.db, self.name, "select")
+
+
+class _FakeDB:
+    def __init__(self):
+        self.rows = {"business_events": [], "business_memory": [], "products": [],
+                     "schedule_items": [], "business_state": []}
+    def table(self, name): return _FakeTable(self, name)
+
+
+def test_reset_business():
+    db = _FakeDB()
+    # A bad excel import (2 events), one hand-recorded event, learned memory, a product —
+    # plus a second tenant who must be untouched by every flush.
+    db.rows["business_events"] = [
+        {"id": "1", "user_id": "u1", "source": "excel", "status": "confirmed",
+         "event_type": "Sale", "occurred_at": "2026-06-01", "payload": {"amount": 900}},
+        {"id": "2", "user_id": "u1", "source": "excel", "status": "confirmed",
+         "event_type": "Purchase", "occurred_at": "2026-06-02", "payload": {"amount": 400}},
+        {"id": "3", "user_id": "u1", "source": "manual", "status": "confirmed",
+         "event_type": "Sale", "occurred_at": "2026-06-03", "payload": {"amount": 100}},
+        {"id": "4", "user_id": "u2", "source": "excel", "status": "confirmed",
+         "event_type": "Sale", "occurred_at": "2026-06-03", "payload": {"amount": 777}},
+    ]
+    db.rows["business_memory"] = [{"id": "m1", "user_id": "u1", "kind": "excel_mapping", "key": "default"}]
+    db.rows["products"] = [{"id": "p1", "user_id": "u1", "name": "Bread"}]
+    db.rows["business_state"] = [{"user_id": "u1", "opening_cash": 500, "currency": "ZMW"}]
+
+    # 1) Source-scoped flush: undo only the bad file import.
+    out = nervous.reset_business(db, "u1", source="excel")
+    assert out["deleted_events"] == 2 and out["deleted_memory"] == 0
+    assert out["twin"]["event_count"] == 1                 # manual event survived
+    assert out["twin"]["cash"] == 600                      # 500 opening + 100 sale
+    assert len(db.rows["business_memory"]) == 1            # memory kept unless asked
+
+    # 2) Full flush + forget learned mappings; opening cash preserved.
+    out = nervous.reset_business(db, "u1", wipe_memory=True, wipe_products=True)
+    assert out["deleted_events"] == 1 and out["deleted_memory"] == 1 and out["deleted_products"] == 1
+    assert out["twin"]["event_count"] == 0
+    assert out["twin"]["cash"] == 500                      # seeded opening balance kept
+    assert out["twin"]["health_label"] == "No Data"
+
+    # 3) Opening cash reset → true zero state.
+    out = nervous.reset_business(db, "u1", reset_opening_cash=True)
+    assert out["twin"]["cash"] == 0 and out["twin"]["opening_cash"] == 0
+
+    # Tenant isolation: u2's event never touched.
+    assert [r["id"] for r in db.rows["business_events"]] == ["4"]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

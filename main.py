@@ -1919,6 +1919,40 @@ async def delete_event(event_id: str, user_id: str = Depends(require_user),
         raise HTTPException(status_code=404, detail=str(e))
 
 
+class ResetRequest(BaseModel):
+    confirm: str = ""                      # must be the literal word RESET
+    source: Optional[str] = None           # e.g. 'excel' — flush only that producer's events
+    wipe_memory: bool = False              # forget learned mappings/aliases too
+    wipe_products: bool = False
+    wipe_schedule: bool = False
+    reset_opening_cash: bool = False
+
+
+@app.post("/events/reset")
+async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)):
+    """
+    Start afresh: permanently delete the user's timeline (optionally scoped to one
+    source, e.g. a bad Excel import) and rebuild the twin from what remains. Unlike
+    per-event void, this is a hard delete — hence the typed RESET confirmation.
+    """
+    db = _require_db()
+    if (req.confirm or "").strip().upper() != "RESET":
+        raise HTTPException(status_code=400,
+                            detail="Type RESET to confirm — this permanently deletes recorded data.")
+    if req.source is not None and req.source not in nervous.SOURCES:
+        raise HTTPException(status_code=400, detail=f"Unknown source '{req.source}'.")
+    try:
+        result = nervous.reset_business(
+            db, user_id, source=req.source, wipe_memory=req.wipe_memory,
+            wipe_products=req.wipe_products, wipe_schedule=req.wipe_schedule,
+            reset_opening_cash=req.reset_opening_cash,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("reset_timeline error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Reset error: {type(exc).__name__}: {exc}")
+
+
 # ── Ingestion: Excel → events & QR (Initiatives 2, 7) ─────────────────────────
 
 @app.post("/events/excel/preview")

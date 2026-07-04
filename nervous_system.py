@@ -344,6 +344,52 @@ def void(db, user_id: str, event_id: str, reason: str | None = None) -> dict:
     return (getattr(res, "data", None) or [ev])[0]
 
 
+def reset_business(db, user_id: str, *, source: str | None = None,
+                   wipe_memory: bool = False, wipe_products: bool = False,
+                   wipe_schedule: bool = False, reset_opening_cash: bool = False) -> dict:
+    """
+    START AFRESH — permanently delete this user's recorded data and replay what's
+    left into the twin. This is the ONE sanctioned hard-delete in the spine: void()
+    covers single mistakes with an audit trail; this covers "the wrong file was
+    imported / everything is mapped wrong, flush it". The route gates it behind a
+    typed confirmation, and every delete here is scoped to user_id (tenant-safe).
+
+      source           — only delete events from one producer (e.g. 'excel' to undo
+                         a bad file import); None = all events.
+      wipe_memory      — also forget learned mappings/aliases/categories, so a bad
+                         import can't re-teach itself on the next file.
+      wipe_products    — also delete the product catalog.
+      wipe_schedule    — also delete scheduled items.
+      reset_opening_cash — zero the operator-seeded opening balance too.
+
+    Returns {deleted_events, deleted_memory, deleted_products, deleted_schedule, twin}.
+    """
+    if db is None:
+        raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
+
+    def _wipe(table: str, **filters) -> int:
+        q = db.table(table).delete().eq("user_id", user_id)
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        res = q.execute()
+        return len(getattr(res, "data", None) or [])
+
+    summary = {
+        "deleted_events": _wipe("business_events", **({"source": source} if source else {})),
+        "deleted_memory": _wipe("business_memory") if wipe_memory else 0,
+        "deleted_products": _wipe("products") if wipe_products else 0,
+        "deleted_schedule": _wipe("schedule_items") if wipe_schedule else 0,
+    }
+    if reset_opening_cash:
+        db.table("business_state").update({"opening_cash": 0}).eq("user_id", user_id).execute()
+
+    state = twin.rebuild(db, user_id)  # replay whatever survived (empty log → opening cash only)
+    log.warning("[nervous] %s RESET source=%s events=%d memory=%d products=%d schedule=%d",
+                user_id, source or "all", summary["deleted_events"], summary["deleted_memory"],
+                summary["deleted_products"], summary["deleted_schedule"])
+    return {**summary, "twin": state}
+
+
 def list_events(db, user_id: str, *, status: str | None = None, event_type: str | None = None,
                 limit: int = 200, offset: int = 0) -> list:
     q = db.table("business_events").select("*").eq("user_id", user_id)
