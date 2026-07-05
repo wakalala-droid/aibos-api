@@ -1703,6 +1703,14 @@ async def payments_config():
     return {"networks": payments.configured_networks(), "mode": "live" if any(payments.configured_networks().values()) else "simulation"}
 
 
+class PaymentInitiateRequest(BaseModel):
+    network: str                      # "mtn" | "airtel"
+    plan: str                         # "pro" | "proplus" | "growth"
+    billing: str = "monthly"          # "monthly" | "annual"
+    payer_phone: str
+    currency: str = "ZMW"
+
+
 @app.post("/payments/initiate")
 async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(require_user)):
     # The account to upgrade is ALWAYS the authenticated caller — never a
