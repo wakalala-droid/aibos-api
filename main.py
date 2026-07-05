@@ -42,6 +42,7 @@ import engine_interface as engines_api
 import simulation
 import products as products_api
 import schedule_items as schedule_api
+import notify
 import ocr
 
 logging.basicConfig(level=logging.INFO)
@@ -1786,6 +1787,30 @@ async def payments_callback(network: str, body: Dict[str, Any],
     if resolved:
         _settle(rec, resolved)
     return {"ok": True, "status": rec["status"]}
+
+
+# ── Morning Brief delivery (notify.py — ready-for-keys like payments) ────────
+
+@app.get("/notify/config")
+async def notify_config():
+    """Which delivery channels are live. Booleans only — safe to expose."""
+    return {"email": notify.email_enabled(), "whatsapp": notify.whatsapp_enabled()}
+
+
+@app.post("/notify/dispatch-briefs")
+async def notify_dispatch(x_cron_secret: Optional[str] = Header(default=None)):
+    """
+    Send the Morning Brief to every opted-in, entitled user. Called by the
+    scheduled cron ONLY — must present CRON_SECRET; without it (or if none is
+    configured) the call is rejected, so nobody can trigger a mass send.
+    """
+    secret = os.environ.get("CRON_SECRET")
+    if not secret or x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Persistence is not configured")
+    return notify.dispatch_briefs(db)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
