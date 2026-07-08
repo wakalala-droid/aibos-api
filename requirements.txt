@@ -15,3 +15,8 @@ httpx==0.27.0
 # Evolution spine — optional fast local JWT verification (auth.py). When
 # SUPABASE_JWT_SECRET is unset, auth falls back to supabase.auth.get_user().
 PyJWT==2.8.0
+
+# Hospitality — application-level Fernet encryption for guests.id_document_number
+# (migration 0015). Supabase at-rest encryption does not protect against a leaked
+# service-role key, which the whole API runs on, so PII is sealed before write.
+cryptography==42.0.5

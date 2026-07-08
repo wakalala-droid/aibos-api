@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from groq import Groq
 
@@ -42,6 +42,8 @@ import engine_interface as engines_api
 import simulation
 import products as products_api
 import schedule_items as schedule_api
+import payroll as payroll_api
+import hospitality as hospitality_api
 import notify
 import ocr
 
@@ -2230,6 +2232,455 @@ async def remove_schedule_item(item_id: str, user_id: str = Depends(require_user
     db = _require_db()
     schedule_api.delete_item(db, user_id, item_id)
     return {"ok": True}
+
+
+# ── Employees & Payroll (Zambian statutory engine) ────────────────────────────
+# The employee register is master data (free, like the product catalog). Running
+# a pay period — the statutory calculation + posting Salary events — is the paid
+# capability, enforced server-side via entitlements ("payroll" → Pro).
+
+@app.get("/employees")
+async def get_employees(user_id: str = Depends(require_user)):
+    db = _require_db()
+    return {"ok": True, "employees": payroll_api.list_employees(db, user_id)}
+
+
+@app.post("/employees")
+async def create_employee(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "employee": payroll_api.create_employee(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/employees/{employee_id}")
+async def patch_employee(employee_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "employee": payroll_api.update_employee(db, user_id, employee_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/employees/{employee_id}")
+async def remove_employee(employee_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    payroll_api.delete_employee(db, user_id, employee_id)
+    return {"ok": True}
+
+
+@app.get("/payroll/rates")
+async def get_payroll_rates(user_id: str = Depends(require_user)):
+    """The statutory rates AI-BOS applies (transparency — the owner reads, never edits)."""
+    return {"ok": True, "rates": payroll_api.public_rates(payroll_api.current_rates(None, "ZMW"))}
+
+
+@app.get("/payroll/runs")
+async def get_payroll_runs(user_id: str = Depends(require_user)):
+    db = _require_db()
+    return {"ok": True, "runs": payroll_api.list_runs(db, user_id)}
+
+
+@app.get("/payroll/runs/{run_id}")
+async def get_payroll_run(run_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "run": payroll_api.get_run(db, user_id, run_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+class PayrollRunRequest(BaseModel):
+    period: str                             # 'YYYY-MM'
+    pay_date: Optional[str] = None
+    preview: bool = False                   # compute-only, no persistence, no events
+
+
+@app.post("/payroll/run")
+async def run_payroll(req: PayrollRunRequest, user_id: str = Depends(require_user)):
+    """Compute a pay period. Preview is free (the on-screen table); committing —
+    which posts Salary events into the books — is the Pro payroll capability."""
+    db = _require_db()
+    try:
+        if req.preview:
+            return {"ok": True, "preview": payroll_api.preview_run(db, user_id, req.period, req.pay_date)}
+        entitlements.require_feature(user_id, "payroll")
+        return {"ok": True, "run": payroll_api.run_payroll(db, user_id, req.period, req.pay_date)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ── Hospitality (short-let PMS) — Phase 1: properties & units ─────────────────
+# Hospitality is a distinct paid vertical (not core finance master data), so the
+# WHOLE module is gated on the "hospitality" capability — a Free finance user
+# does not get a free PMS. One guard, applied on every route below.
+def _require_hospitality(user_id: str):
+    entitlements.require_feature(user_id, "hospitality")
+
+
+@app.get("/hospitality/properties")
+async def hospitality_list_properties(user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "properties": hospitality_api.list_properties(db, user_id)}
+
+
+@app.post("/hospitality/properties")
+async def hospitality_create_property(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "property": hospitality_api.create_property(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hospitality/properties/{property_id}")
+async def hospitality_get_property(property_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "property": hospitality_api.get_property(db, user_id, property_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/hospitality/properties/{property_id}")
+async def hospitality_patch_property(property_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "property": hospitality_api.update_property(db, user_id, property_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/properties/{property_id}")
+async def hospitality_delete_property(property_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    hospitality_api.delete_property(db, user_id, property_id)
+    return {"ok": True}
+
+
+@app.get("/hospitality/units")
+async def hospitality_list_units(property_id: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "units": hospitality_api.list_units(db, user_id, property_id)}
+
+
+@app.post("/hospitality/units")
+async def hospitality_create_unit(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "unit": hospitality_api.create_unit(db, user_id, body.get("property_id"), body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hospitality/units/{unit_id}")
+async def hospitality_get_unit(unit_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "unit": hospitality_api.get_unit(db, user_id, unit_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/hospitality/units/{unit_id}")
+async def hospitality_patch_unit(unit_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "unit": hospitality_api.update_unit(db, user_id, unit_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/units/{unit_id}")
+async def hospitality_delete_unit(unit_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    hospitality_api.delete_unit(db, user_id, unit_id)
+    return {"ok": True}
+
+
+# ── Hospitality Phase 2: guests, bookings, availability, expenses ─────────────
+
+# Guests — id_document_number is sealed at rest; the raw value is only ever
+# returned on an explicit ?reveal=true single-guest read (owner path).
+@app.get("/hospitality/guests")
+async def hospitality_list_guests(search: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "guests": hospitality_api.list_guests(db, user_id, search)}
+
+
+@app.post("/hospitality/guests")
+async def hospitality_create_guest(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "guest": hospitality_api.create_guest(db, user_id, body)}
+    except hospitality_api.field_crypto.FieldCryptoUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hospitality/guests/{guest_id}")
+async def hospitality_get_guest(guest_id: str, reveal: bool = Query(False), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "guest": hospitality_api.get_guest(db, user_id, guest_id, reveal=reveal)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/hospitality/guests/{guest_id}")
+async def hospitality_patch_guest(guest_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "guest": hospitality_api.update_guest(db, user_id, guest_id, body)}
+    except hospitality_api.field_crypto.FieldCryptoUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/guests/{guest_id}")
+async def hospitality_delete_guest(guest_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    hospitality_api.delete_guest(db, user_id, guest_id)
+    return {"ok": True}
+
+
+@app.get("/hospitality/guests/{guest_id}/bookings")
+async def hospitality_guest_bookings(guest_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "bookings": hospitality_api.list_guest_bookings(db, user_id, guest_id)}
+
+
+# Bookings — the P0 core loop. A confirmed booking posts a Sale to the spine and
+# a double-booking is blocked at write time.
+@app.get("/hospitality/bookings")
+async def hospitality_list_bookings(
+    unit_id: Optional[str] = Query(None), status: Optional[str] = Query(None),
+    from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
+    user_id: str = Depends(require_user),
+):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "bookings": hospitality_api.list_bookings(db, user_id, unit_id, status, from_, to)}
+
+
+@app.post("/hospitality/bookings")
+async def hospitality_create_booking(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.create_booking(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hospitality/availability")
+async def hospitality_availability(
+    unit_id: str = Query(...),
+    from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
+    user_id: str = Depends(require_user),
+):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, **hospitality_api.availability(db, user_id, unit_id, from_, to)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/hospitality/bookings/{booking_id}")
+async def hospitality_get_booking(booking_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.get_booking(db, user_id, booking_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/hospitality/bookings/{booking_id}")
+async def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.update_booking(db, user_id, booking_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/hospitality/bookings/{booking_id}/cancel")
+async def hospitality_cancel_booking(booking_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.cancel_booking(db, user_id, booking_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# Expenses — every cost posts an Expense to the spine, feeding engine.py P&L.
+@app.get("/hospitality/expenses")
+async def hospitality_list_expenses(
+    property_id: Optional[str] = Query(None), unit_id: Optional[str] = Query(None),
+    from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
+    category: Optional[str] = Query(None), user_id: str = Depends(require_user),
+):
+    _require_hospitality(user_id)
+    db = _require_db()
+    return {"ok": True, "expenses": hospitality_api.list_expenses(db, user_id, property_id, unit_id, from_, to, category)}
+
+
+@app.post("/hospitality/expenses")
+async def hospitality_create_expense(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "expense": hospitality_api.create_expense(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/hospitality/expenses/{expense_id}")
+async def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "expense": hospitality_api.update_expense(db, user_id, expense_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/expenses/{expense_id}")
+async def hospitality_delete_expense(expense_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    hospitality_api.delete_expense(db, user_id, expense_id)
+    return {"ok": True}
+
+
+# ── Hospitality Phase 3: iCal channel sync ───────────────────────────────────
+# Channels carry a unit's OTA links: an import URL we pull nightly, and an export
+# token that serves a public .ics feed every OTA imports — the interim channel
+# manager that fixes "conflicting availability" without full OTA API partnership.
+@app.get("/hospitality/units/{unit_id}/channels")
+async def hospitality_list_channels(unit_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "channels": hospitality_api.list_channels(db, user_id, unit_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/hospitality/units/{unit_id}/channels")
+async def hospitality_create_channel(unit_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "channel": hospitality_api.create_channel(db, user_id, unit_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/hospitality/channels/{channel_id}")
+async def hospitality_patch_channel(channel_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "channel": hospitality_api.update_channel(db, user_id, channel_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/channels/{channel_id}")
+async def hospitality_delete_channel(channel_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    hospitality_api.delete_channel(db, user_id, channel_id)
+    return {"ok": True}
+
+
+@app.post("/hospitality/channels/{channel_id}/rotate-token")
+async def hospitality_rotate_token(channel_id: str, user_id: str = Depends(require_user)):
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "channel": hospitality_api.rotate_export_token(db, user_id, channel_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/hospitality/channels/{channel_id}/sync")
+async def hospitality_sync_channel(channel_id: str, user_id: str = Depends(require_user)):
+    """Manual 'sync now' — pull this channel's OTA feed into the calendar."""
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        return {"ok": True, "result": hospitality_api.sync_channel(db, user_id, channel_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/hospitality/units/{unit_id}/ical-export.ics")
+async def hospitality_ical_export_authed(unit_id: str, user_id: str = Depends(require_user)):
+    """Authenticated export — owner preview of a unit's outbound feed."""
+    _require_hospitality(user_id)
+    db = _require_db()
+    try:
+        ics = hospitality_api.ical_export_for_unit(db, user_id, unit_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return Response(content=ics, media_type="text/calendar")
+
+
+@app.get("/hospitality/ical/{token}.ics")
+async def hospitality_ical_public_feed(token: str):
+    """
+    PUBLIC iCal feed for OTAs to import — no auth, no entitlement gate: the
+    unguessable token is the capability. Exposes only occupied dates + "Reserved",
+    never guest PII. This is the endpoint an OTA's "import calendar" field points at.
+    """
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Persistence is not configured")
+    try:
+        ics = hospitality_api.ical_export_by_token(db, token)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Feed not found.")
+    return Response(content=ics, media_type="text/calendar")
+
+
+@app.post("/hospitality/sync-all")
+async def hospitality_sync_all(x_cron_secret: Optional[str] = Header(default=None)):
+    """
+    Nightly iCal pull across ALL tenants. Cron-only — must present CRON_SECRET,
+    mirroring /notify/dispatch-briefs. Point a Vercel cron route at this.
+    """
+    secret = os.environ.get("CRON_SECRET")
+    if not secret or x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Persistence is not configured")
+    return {"ok": True, **hospitality_api.sync_all_channels(db)}
 
 
 class SimulateRequest(BaseModel):

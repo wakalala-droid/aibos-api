@@ -33,7 +33,12 @@ log = logging.getLogger("aibos.entitlements")
 _PRO: set[str] = {
     "forecast", "anomaly", "variance", "breakeven",
     "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
-    "schedule",
+    "schedule", "payroll",
+    # PROVISIONAL: the Hospitality (short-let PMS) vertical. Parked in Pro so it
+    # is enforced (Free cannot obtain it) and the v1 client (Dunslim, on a paid
+    # tier) can use it today. When it becomes its own add-on SKU, MOVE this out
+    # of _PRO into a dedicated grant path — a one-line change. See lib/tiers.ts.
+    "hospitality",
 }
 _PROPLUS: set[str] = _PRO | {
     "morning_brief", "chat_actions", "deliveries", "automation",
@@ -128,6 +133,8 @@ _FEATURE_LABEL = {
     "full_history":   "complete history",
     "scheduled_brief": "the scheduled AI brief",
     "schedule":       "recurring schedules & reminders",
+    "payroll":        "payroll (PAYE, NAPSA & net pay)",
+    "hospitality":    "the Hospitality property-management module",
     "morning_brief":  "the Morning Brief",
     "chat_actions":   "recording from the chat",
     "deliveries":     "expected-delivery tracking",
