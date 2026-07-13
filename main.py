@@ -41,6 +41,8 @@ import business_memory as memory
 import engine_interface as engines_api
 import simulation
 import products as products_api
+import parties as parties_api
+import customer_intel
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1970,6 +1972,7 @@ class ResetRequest(BaseModel):
     wipe_memory: bool = False              # forget learned mappings/aliases too
     wipe_products: bool = False
     wipe_schedule: bool = False
+    wipe_parties: bool = False             # forget auto-created customers/suppliers too
     reset_opening_cash: bool = False
 
 
@@ -1992,7 +1995,7 @@ async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)
         result = nervous.reset_business(
             db, user_id, source=req.source, wipe_memory=req.wipe_memory,
             wipe_products=req.wipe_products, wipe_schedule=req.wipe_schedule,
-            reset_opening_cash=req.reset_opening_cash,
+            wipe_parties=req.wipe_parties, reset_opening_cash=req.reset_opening_cash,
         )
         return {"ok": True, **result}
     except Exception as exc:  # noqa: BLE001
@@ -2186,6 +2189,79 @@ async def remove_product(product_id: str, user_id: str = Depends(require_user)):
     db = _require_db()
     products_api.delete_product(db, user_id, product_id)
     return {"ok": True}
+
+
+# ── Parties: customers & suppliers (audit #6) ─────────────────────────────────
+# CRUD is free, like recording — parties are how AIBOS learns who the business
+# deals with. The paid layer is the intelligence computed OVER them (engine2).
+
+@app.get("/parties")
+async def get_parties(kind: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+    db = _require_db()
+    rows = parties_api.list_parties(db, user_id, kind=kind)
+    if rows:
+        events = nervous.list_events(db, user_id, limit=2000)
+        stats = parties_api.party_stats(events)
+        for r in rows:
+            r["stats"] = stats.get(r.get("normalized_key"), None)
+    return {"ok": True, "parties": rows}
+
+
+@app.post("/parties")
+async def create_party(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "party": parties_api.create_party(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/parties/{party_id}")
+async def patch_party(party_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "party": parties_api.update_party(db, user_id, party_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/parties/{party_id}")
+async def remove_party(party_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    parties_api.delete_party(db, user_id, party_id)
+    return {"ok": True}
+
+
+@app.post("/parties/backfill")
+async def backfill_parties(user_id: str = Depends(require_user)):
+    """Create parties from every existing event — idempotent, run-once bridge
+    for accounts that recorded history before migration 0018."""
+    db = _require_db()
+    events = nervous.list_events(db, user_id, limit=10000)
+    try:
+        return {"ok": True, **parties_api.backfill(db, user_id, events)}
+    except Exception as exc:  # noqa: BLE001 — most likely: migration 0018 not run
+        logger.error("parties backfill error: %s", exc)
+        raise HTTPException(status_code=500,
+                            detail="Backfill failed — has migration 0018 been run?")
+
+
+# ── Live customer intelligence: Engine 2 over the spine (audit #5) ────────────
+
+@app.get("/intelligence/customers")
+async def customers_intelligence(user_id: str = Depends(require_user)):
+    """Engine 2 (RFM/CLV/churn/basket) computed from recorded events — the
+    living-model counterpart of the upload flow. Pro feature, same gate."""
+    entitlements.require_feature(user_id, "engine2")
+    db = _require_db()
+    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
+    state = twin.get_state(db, user_id)
+    sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
+    try:
+        return {"ok": True, **customer_intel.run_from_events(events, sym)}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("customers_intelligence error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Customer intelligence error: {type(exc).__name__}")
 
 
 # ── Scheduler (meetings, pick-ups, deadlines) ─────────────────────────────────

@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import digital_twin as twin
 import business_memory as memory
+import parties as parties_api
 
 log = logging.getLogger("aibos.nervous")
 
@@ -215,6 +216,10 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW") -> dict
     res = db.table("business_events").insert(row).execute()
     saved = (getattr(res, "data", None) or [row])[0]
 
+    # Named customers/suppliers become entities (audit #6). Best-effort — the
+    # event always wins.
+    parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"])
+
     if status == "confirmed":
         twin.rebuild(db, user_id)
 
@@ -248,6 +253,7 @@ def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str 
             }
             res = db.table("business_events").insert(row).execute()
             saved.append((getattr(res, "data", None) or [row])[0])
+            parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"])
             any_confirmed = any_confirmed or status == "confirmed"
         except Exception as e:  # noqa: BLE001
             errors.append({"index": i, "error": str(e)})
@@ -392,7 +398,8 @@ def _archive_events(db, user_id: str, source: str | None) -> int:
 
 def reset_business(db, user_id: str, *, source: str | None = None,
                    wipe_memory: bool = False, wipe_products: bool = False,
-                   wipe_schedule: bool = False, reset_opening_cash: bool = False) -> dict:
+                   wipe_schedule: bool = False, wipe_parties: bool = False,
+                   reset_opening_cash: bool = False) -> dict:
     """
     START AFRESH — delete this user's recorded data and replay what's left into
     the twin. This is the ONE sanctioned hard-delete in the spine: void() covers
@@ -431,6 +438,7 @@ def reset_business(db, user_id: str, *, source: str | None = None,
         "deleted_memory": _wipe("business_memory") if wipe_memory else 0,
         "deleted_products": _wipe("products") if wipe_products else 0,
         "deleted_schedule": _wipe("schedule_items") if wipe_schedule else 0,
+        "deleted_parties": _wipe("parties") if wipe_parties else 0,
     }
     if reset_opening_cash:
         db.table("business_state").update({"opening_cash": 0}).eq("user_id", user_id).execute()

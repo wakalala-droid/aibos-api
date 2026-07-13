@@ -34,3 +34,6 @@ jobs:
 
       - name: Payroll tests
         run: python test_payroll.py
+
+      - name: Parties & customer-intel tests
+        run: python test_parties.py
