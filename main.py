@@ -1530,10 +1530,20 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
             )
 
         # ── Build the system context ──────────────────────────────────────────
+        # The universal currency selector (lib/currency.ts) flows through the
+        # live context as currency_symbol — the prompt must follow it, not
+        # assume Kwacha (audit item 23). ZMW stays the default when unstated.
+        ctx_sym = str((req.context or {}).get("currency_symbol") or "").strip()
+        currency_line = (
+            "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $."
+            if not ctx_sym or ctx_sym.upper() in ("K", "ZMW")
+            else f"Currency: this business reports in '{ctx_sym}'. ALWAYS use '{ctx_sym}' "
+                 "exactly as given. NEVER substitute $, K or any other symbol."
+        )
         system_parts = [
             "You are the AI CFO (Chief Financial Officer) for AI-BOS, "
             "a financial intelligence platform serving Zambian SMEs.",
-            "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $.",
+            currency_line,
             "You are expert in Zambian business, economics, and SME finance.",
             "Be direct, insightful, and action-oriented. No fluff.",
             "NEVER fabricate a time range or data span. Describe the data only by the "
