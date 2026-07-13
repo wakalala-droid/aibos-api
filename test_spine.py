@@ -365,20 +365,33 @@ class _FakeQuery:
         self.filters[k] = v
         return self
 
+    def lt(self, k, v):
+        self.lt_filters = getattr(self, "lt_filters", {})
+        self.lt_filters[k] = v
+        return self
+
     def order(self, *a, **k): return self
     def limit(self, n): return self
     def range(self, a, b): return self
+
+    def _match(self, r):
+        if not all(r.get(k) == v for k, v in self.filters.items()):
+            return False
+        for k, v in getattr(self, "lt_filters", {}).items():
+            if not (r.get(k) is not None and str(r.get(k)) < str(v)):
+                return False
+        return True
 
     def execute(self):
         class R:  # mirrors supabase-py's .data attribute
             data: list = []
         rows = self.db.rows[self.name]
-        match = [r for r in rows if all(r.get(k) == v for k, v in self.filters.items())]
+        match = [r for r in rows if self._match(r)]
         out = R()
         if self.op == "select":
             out.data = [dict(r) for r in match]
         elif self.op == "delete":
-            keep = [r for r in rows if not all(r.get(k) == v for k, v in self.filters.items())]
+            keep = [r for r in rows if not self._match(r)]
             self.db.rows[self.name] = keep
             out.data = [dict(r) for r in match]
         elif self.op == "update":
@@ -395,7 +408,8 @@ class _FakeTable:
     def update(self, patch): return _FakeQuery(self.db, self.name, "update", patch)
 
     def insert(self, row):
-        self.db.rows[self.name].append(dict(row))
+        rows = row if isinstance(row, list) else [row]   # supabase-py takes both
+        self.db.rows[self.name].extend(dict(r) for r in rows)
         return _FakeQuery(self.db, self.name, "select")
 
     def upsert(self, row, on_conflict="user_id"):
@@ -412,8 +426,22 @@ class _FakeTable:
 class _FakeDB:
     def __init__(self):
         self.rows = {"business_events": [], "business_memory": [], "products": [],
-                     "schedule_items": [], "business_state": []}
+                     "schedule_items": [], "business_state": [],
+                     "business_events_archive": []}
     def table(self, name): return _FakeTable(self, name)
+
+
+class _FakeDBNoArchive(_FakeDB):
+    """Environment where migration 0017 hasn't run — PostgREST-style error."""
+    def table(self, name):
+        if name == "business_events_archive":
+            class _Boom:
+                def __getattr__(self, _):
+                    raise Exception(
+                        "Could not find the table 'public.business_events_archive' "
+                        "in the schema cache (PGRST205)")
+            return _Boom()
+        return super().table(name)
 
 
 def test_reset_business():
@@ -437,23 +465,43 @@ def test_reset_business():
     # 1) Source-scoped flush: undo only the bad file import.
     out = nervous.reset_business(db, "u1", source="excel")
     assert out["deleted_events"] == 2 and out["deleted_memory"] == 0
+    assert out["archived_events"] == 2                     # recoverable copy taken first
     assert out["twin"]["event_count"] == 1                 # manual event survived
     assert out["twin"]["cash"] == 600                      # 500 opening + 100 sale
     assert len(db.rows["business_memory"]) == 1            # memory kept unless asked
+    arch = db.rows["business_events_archive"]
+    assert len(arch) == 2 and all(a["user_id"] == "u1" for a in arch)
+    assert all(a["archive_reason"] == "reset:excel" for a in arch)
 
     # 2) Full flush + forget learned mappings; opening cash preserved.
     out = nervous.reset_business(db, "u1", wipe_memory=True, wipe_products=True)
     assert out["deleted_events"] == 1 and out["deleted_memory"] == 1 and out["deleted_products"] == 1
+    assert out["archived_events"] == 1
     assert out["twin"]["event_count"] == 0
     assert out["twin"]["cash"] == 500                      # seeded opening balance kept
     assert out["twin"]["health_label"] == "No Data"
+    assert len(db.rows["business_events_archive"]) == 3    # archive accumulates
 
     # 3) Opening cash reset → true zero state.
     out = nervous.reset_business(db, "u1", reset_opening_cash=True)
     assert out["twin"]["cash"] == 0 and out["twin"]["opening_cash"] == 0
 
-    # Tenant isolation: u2's event never touched.
+    # Tenant isolation: u2's event never touched, in the live log or the archive.
     assert [r["id"] for r in db.rows["business_events"]] == ["4"]
+    assert all(a["user_id"] == "u1" for a in db.rows["business_events_archive"])
+
+
+def test_reset_without_archive_table():
+    """Migration 0017 not run → reset proceeds the pre-archive way, no outage."""
+    db = _FakeDBNoArchive()
+    db.rows["business_events"] = [
+        {"id": "1", "user_id": "u1", "source": "manual", "status": "confirmed",
+         "event_type": "Sale", "occurred_at": "2026-06-01", "payload": {"amount": 50}},
+    ]
+    db.rows["business_state"] = [{"user_id": "u1", "opening_cash": 0, "currency": "ZMW"}]
+    out = nervous.reset_business(db, "u1")
+    assert out["archived_events"] == 0 and out["deleted_events"] == 1
+    assert out["twin"]["event_count"] == 0
 
 
 if __name__ == "__main__":
