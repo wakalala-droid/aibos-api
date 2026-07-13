@@ -89,6 +89,12 @@ TOOLS = [
         }, "required": ["type", "value"]},
     }},
     {"type": "function", "function": {
+        "name": "who_owes_me",
+        "description": "AR aging: which customers owe money, how much, and for how long — "
+                       "sent invoices plus the loose credit book, bucketed current/1-30/31-60/60+.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
         "name": "investigate_month",
         "description": "WHY did a month's money move? Names the drivers (category/party) vs the "
                        "prior-months baseline, with the events behind each driver. Omit `month` "
@@ -246,9 +252,21 @@ def _investigate(db, user_id, args):
             if month else investigate.auto_investigation(events))
 
 
+def _who_owes(db, user_id, args):
+    import invoices as invoices_api
+    import debtors
+    invs = invoices_api.list_invoices(db, user_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP)
+    report = debtors.aging_report(invs, events)
+    return {"as_of": report["as_of"], "totals": report["totals"],
+            "customers": [{k: c[k] for k in ("name", "total", "buckets", "oldest_days")}
+                          for c in report["customers"][:15]]}
+
+
 _EXECUTORS = {
     "get_business_snapshot": lambda db, uid, a: _snapshot(db, uid),
     "investigate_month": _investigate,
+    "who_owes_me": _who_owes,
     "query_events": _query_events,
     "list_products": _list_products,
     "upcoming_schedule": _upcoming_schedule,

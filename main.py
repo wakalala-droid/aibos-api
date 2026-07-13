@@ -48,6 +48,7 @@ import cfo_tools
 import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
+import debtors as debtors_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2410,6 +2411,24 @@ async def cancel_invoice(invoice_id: str, user_id: str = Depends(require_user)):
         return {"ok": True, "invoice": invoices_api.cancel_invoice(db, user_id, invoice_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/debtors")
+async def get_debtors(business_name: Optional[str] = Query(None),
+                      user_id: str = Depends(require_user)):
+    """AR aging per customer (audit #15): sent invoices (exact) + the loose
+    credit book (credit Sales net of untied payments, oldest-first). Each
+    debtor ships with a ready-to-send WhatsApp nudge draft — the owner sends
+    it from their own phone."""
+    db = _require_db()
+    invoices = invoices_api.list_invoices(db, user_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
+    state = twin.get_state(db, user_id)
+    sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
+    report = debtors_api.aging_report(invoices, events)
+    for c in report["customers"]:
+        c["nudge"] = debtors_api.nudge_text(c, sym=sym, business_name=business_name)
+    return {"ok": True, **report}
 
 
 @app.get("/invoices/{invoice_id}/share-text")

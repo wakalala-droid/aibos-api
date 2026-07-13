@@ -52,3 +52,6 @@ jobs:
 
       - name: Investigate tests
         run: python test_investigate.py
+
+      - name: Debtors tests
+        run: python test_debtors.py
