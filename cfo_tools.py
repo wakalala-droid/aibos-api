@@ -89,6 +89,15 @@ TOOLS = [
         }, "required": ["type", "value"]},
     }},
     {"type": "function", "function": {
+        "name": "investigate_month",
+        "description": "WHY did a month's money move? Names the drivers (category/party) vs the "
+                       "prior-months baseline, with the events behind each driver. Omit `month` "
+                       "to auto-detect and explain the worst recent anomaly.",
+        "parameters": {"type": "object", "properties": {
+            "month": {"type": "string", "description": "YYYY-MM, e.g. 2026-06"},
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "customer_summary",
         "description": "Live customer intelligence from recorded sales: segments, top customers, "
                        "at-risk count. Reports honest coverage when too sparse to analyse.",
@@ -229,8 +238,17 @@ def _customer_summary(db, user_id, args):
     }
 
 
+def _investigate(db, user_id, args):
+    import investigate
+    events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP)
+    month = args.get("month")
+    return (investigate.investigate_month(events, month)
+            if month else investigate.auto_investigation(events))
+
+
 _EXECUTORS = {
     "get_business_snapshot": lambda db, uid, a: _snapshot(db, uid),
+    "investigate_month": _investigate,
     "query_events": _query_events,
     "list_products": _list_products,
     "upcoming_schedule": _upcoming_schedule,

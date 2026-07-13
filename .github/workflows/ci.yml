@@ -49,3 +49,6 @@ jobs:
 
       - name: WhatsApp bot tests
         run: python test_whatsapp_bot.py
+
+      - name: Investigate tests
+        run: python test_investigate.py

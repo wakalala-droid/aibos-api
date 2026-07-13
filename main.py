@@ -47,6 +47,7 @@ import invoices as invoices_api
 import cfo_tools
 import cabinet_store
 import whatsapp_bot
+import investigate as investigate_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2423,6 +2424,19 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"ok": True, "text": invoices_api.share_text(inv, business_name, pay_note)}
+
+
+# ── Anomaly auto-investigation (audit #13) ────────────────────────────────────
+# Deterministic "what changed" over the caller's own events. Ungated like the
+# rest of the Engine-1 sub-features' free preview (see entitlements.py note).
+
+@app.get("/investigate")
+async def investigate_anomaly(month: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+    db = _require_db()
+    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
+    result = (investigate_api.investigate_month(events, month)
+              if month else investigate_api.auto_investigation(events))
+    return {"ok": True, "investigation": result}
 
 
 # ── Live customer intelligence: Engine 2 over the spine (audit #5) ────────────
