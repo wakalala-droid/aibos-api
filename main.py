@@ -1976,9 +1976,11 @@ class ResetRequest(BaseModel):
 @app.post("/events/reset")
 async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)):
     """
-    Start afresh: permanently delete the user's timeline (optionally scoped to one
-    source, e.g. a bad Excel import) and rebuild the twin from what remains. Unlike
-    per-event void, this is a hard delete — hence the typed RESET confirmation.
+    Start afresh: delete the user's timeline (optionally scoped to one source,
+    e.g. a bad Excel import) and rebuild the twin from what remains. Unlike
+    per-event void this removes rows from the live log — hence the typed RESET
+    confirmation — but they are first copied to business_events_archive
+    (migration 0017) and recoverable by support for 30 days.
     """
     db = _require_db()
     if (req.confirm or "").strip().upper() != "RESET":

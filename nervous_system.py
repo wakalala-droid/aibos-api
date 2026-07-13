@@ -344,15 +344,63 @@ def void(db, user_id: str, event_id: str, reason: str | None = None) -> dict:
     return (getattr(res, "data", None) or [ev])[0]
 
 
+ARCHIVE_RETENTION_DAYS = 30
+
+
+def _archive_events(db, user_id: str, source: str | None) -> int:
+    """Copy the rows a reset is about to delete into business_events_archive
+    (migration 0017), making an intentional reset recoverable for 30 days.
+
+    A failure here ABORTS the reset (nothing has been deleted yet) — with one
+    exception: if the archive table itself doesn't exist (migration 0017 not
+    run in this environment), the reset proceeds the pre-0017 way with a loud
+    warning. Blocking Start Fresh on a pending migration would trade a safety
+    net for an outage.
+    """
+    from datetime import timedelta
+
+    try:
+        # Rolling retention: this user's archive rows past 30 days are purged.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_RETENTION_DAYS)).isoformat()
+        db.table("business_events_archive").delete().eq("user_id", user_id) \
+            .lt("archived_at", cutoff).execute()
+
+        q = db.table("business_events").select("*").eq("user_id", user_id)
+        if source:
+            q = q.eq("source", source)
+        rows = getattr(q.execute(), "data", None) or []
+        if not rows:
+            return 0
+
+        stamp = datetime.now(timezone.utc).isoformat()
+        reason = f"reset:{source or 'all'}"
+        copies = [{**row, "archived_at": stamp, "archive_reason": reason} for row in rows]
+        for i in range(0, len(copies), 500):
+            db.table("business_events_archive").insert(copies[i:i + 500]).execute()
+        return len(copies)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        missing_table = "business_events_archive" in msg and (
+            "not find" in msg.lower() or "does not exist" in msg.lower() or "PGRST205" in msg
+        )
+        if missing_table:
+            log.warning("[nervous] %s RESET without archive copy — run migration 0017 (%s)",
+                        user_id, msg)
+            return 0
+        raise
+
+
 def reset_business(db, user_id: str, *, source: str | None = None,
                    wipe_memory: bool = False, wipe_products: bool = False,
                    wipe_schedule: bool = False, reset_opening_cash: bool = False) -> dict:
     """
-    START AFRESH — permanently delete this user's recorded data and replay what's
-    left into the twin. This is the ONE sanctioned hard-delete in the spine: void()
-    covers single mistakes with an audit trail; this covers "the wrong file was
+    START AFRESH — delete this user's recorded data and replay what's left into
+    the twin. This is the ONE sanctioned hard-delete in the spine: void() covers
+    single mistakes with an audit trail; this covers "the wrong file was
     imported / everything is mapped wrong, flush it". The route gates it behind a
-    typed confirmation, and every delete here is scoped to user_id (tenant-safe).
+    typed confirmation, every delete is scoped to user_id (tenant-safe), and the
+    deleted events are first copied to business_events_archive so support can
+    restore an intentional-but-regretted reset within ARCHIVE_RETENTION_DAYS.
 
       source           — only delete events from one producer (e.g. 'excel' to undo
                          a bad file import); None = all events.
@@ -362,7 +410,8 @@ def reset_business(db, user_id: str, *, source: str | None = None,
       wipe_schedule    — also delete scheduled items.
       reset_opening_cash — zero the operator-seeded opening balance too.
 
-    Returns {deleted_events, deleted_memory, deleted_products, deleted_schedule, twin}.
+    Returns {archived_events, deleted_events, deleted_memory, deleted_products,
+    deleted_schedule, twin}.
     """
     if db is None:
         raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
@@ -374,7 +423,10 @@ def reset_business(db, user_id: str, *, source: str | None = None,
         res = q.execute()
         return len(getattr(res, "data", None) or [])
 
+    archived = _archive_events(db, user_id, source)  # abort-on-failure, before any delete
+
     summary = {
+        "archived_events": archived,
         "deleted_events": _wipe("business_events", **({"source": source} if source else {})),
         "deleted_memory": _wipe("business_memory") if wipe_memory else 0,
         "deleted_products": _wipe("products") if wipe_products else 0,
