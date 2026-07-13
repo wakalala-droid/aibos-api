@@ -15,7 +15,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -46,6 +46,7 @@ import customer_intel
 import invoices as invoices_api
 import cfo_tools
 import cabinet_store
+import whatsapp_bot
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2311,6 +2312,38 @@ async def backfill_parties(user_id: str = Depends(require_user)):
         logger.error("parties backfill error: %s", exc)
         raise HTTPException(status_code=500,
                             detail="Backfill failed — has migration 0018 been run?")
+
+
+# ── WhatsApp recording bot (audit #11) — ready-for-keys ──────────────────────
+# No user auth: Meta calls these. GET is the subscribe handshake (verify
+# token); POST is HMAC-gated (deny-by-default without WHATSAPP_APP_SECRET).
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_verify(request: Request):
+    challenge = whatsapp_bot.verify_challenge(dict(request.query_params))
+    if challenge is None:
+        raise HTTPException(status_code=403, detail="Verification failed.")
+    return Response(content=challenge, media_type="text/plain")
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    body = await request.body()
+    if not whatsapp_bot.valid_signature(
+        os.environ.get("WHATSAPP_APP_SECRET"), body,
+        request.headers.get("X-Hub-Signature-256"),
+    ):
+        raise HTTPException(status_code=403, detail="Bad signature.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {"ok": True}                        # 200 — never make Meta retry junk
+    db = get_db()
+    if db is None:
+        return {"ok": True, "skipped": "no database configured"}
+    api_key = os.environ.get("GROQ_API_KEY")
+    client = Groq(api_key=api_key) if api_key else None
+    return {"ok": True, **whatsapp_bot.process_webhook(db, payload, client)}
 
 
 # ── Invoices: the get-paid loop (audit #7) ────────────────────────────────────
