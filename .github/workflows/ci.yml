@@ -1,0 +1,36 @@
+# CI gate — audit item #12.
+# Railway pins the last good image when a deploy crashes, so a broken push
+# LOOKS live while serving old code (bitten 2026-07-05). This workflow is the
+# red/green truth: if it's red, the push never really shipped.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # matches runtime.txt (python-3.11.9)
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Import gate
+        # The same pre-push ritual, enforced: if main.py cannot import,
+        # uvicorn cannot boot and Railway will silently keep the old image.
+        run: python -c "import main"
+
+      - name: Spine tests
+        run: python test_spine.py
+
+      - name: Payroll tests
+        run: python test_payroll.py
