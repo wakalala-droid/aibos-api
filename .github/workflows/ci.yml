@@ -43,3 +43,6 @@ jobs:
 
       - name: CFO tools tests
         run: python test_cfo_tools.py
+
+      - name: Cabinet store tests
+        run: python test_cabinet_store.py

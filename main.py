@@ -45,6 +45,7 @@ import parties as parties_api
 import customer_intel
 import invoices as invoices_api
 import cfo_tools
+import cabinet_store
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -97,18 +98,26 @@ def _enforce_upload_size(content: bytes) -> None:
 
 
 def _cabinet_put(cab_id: str, entry: Dict[str, Any], user_id: str) -> None:
-    """Store an entry stamped with its owner, evicting the oldest if over cap."""
+    """Store an entry stamped with its owner, evicting the oldest if over cap.
+    Write-through to Supabase Storage (audit #10) so uploads survive deploys —
+    the dict stays as the hot cache, cabinet_store is the durability."""
     entry["user_id"] = user_id
     CABINET[cab_id] = entry
     while len(CABINET) > MAX_CABINET_ENTRIES:
         oldest = next(iter(CABINET))
         CABINET.pop(oldest, None)
+    cabinet_store.persist(get_db(), cab_id, entry)   # best-effort, never raises
 
 
 def _owned_cabinet(cabinet_id: str, user_id: str) -> Dict[str, Any]:
     """Return the caller's cabinet entry or raise 404. Never leak another
-    tenant's data — a wrong/foreign id is indistinguishable from 'not found'."""
+    tenant's data — a wrong/foreign id is indistinguishable from 'not found'.
+    On a memory miss (fresh process after a deploy) falls through to Storage."""
     entry = CABINET.get(cabinet_id)
+    if not entry or entry.get("user_id") != user_id:
+        entry = cabinet_store.load(get_db(), cabinet_id, user_id)
+        if entry:
+            CABINET[cabinet_id] = entry              # warm the cache, no re-persist
     if not entry or entry.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Not found in cabinet")
     return entry
@@ -923,11 +932,12 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
 
     e1_result = run_engine1(monthly_rows)
 
-    # Update cabinet
+    # Update cabinet (+ re-persist so the sheet switch survives a deploy)
     CABINET[cabinet_id]["active_sheet"] = selected
     CABINET[cabinet_id]["monthly"] = monthly_rows
     CABINET[cabinet_id]["analysis"] = e1_result
     CABINET[cabinet_id]["df_json"] = df.to_json(orient="records")
+    cabinet_store.persist(get_db(), cabinet_id, CABINET[cabinet_id])
 
     return {
         "success": True,
@@ -1014,10 +1024,23 @@ async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...),
 
 @app.get("/cabinet")
 async def list_cabinet(user_id: str = Depends(require_user)):
-    """List the CALLER'S files only — never any other tenant's."""
-    items = []
+    """List the CALLER'S files only — never any other tenant's. The durable
+    metadata table is authoritative (survives deploys); memory fills in
+    anything persisted before migration 0020 or while Storage is down."""
+    items, seen = [], set()
+    rows = cabinet_store.list_rows(get_db(), user_id)
+    for r in rows or []:
+        seen.add(r["id"])
+        items.append({
+            "id": r["id"],
+            "name": r.get("name"),
+            "file_type": r.get("file_type"),
+            "engine": r.get("engine"),
+            "sheets": r.get("sheets") or [],
+            "active_sheet": r.get("active_sheet"),
+        })
     for cab_id, entry in CABINET.items():
-        if entry.get("user_id") != user_id:
+        if entry.get("user_id") != user_id or cab_id in seen:
             continue
         items.append({
             "id": cab_id,
@@ -1089,7 +1112,8 @@ async def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user
 async def delete_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
     """Remove one of the caller's own files from the cabinet."""
     _owned_cabinet(cabinet_id, user_id)   # 404 if missing or not owned
-    del CABINET[cabinet_id]
+    CABINET.pop(cabinet_id, None)
+    cabinet_store.delete(get_db(), cabinet_id, user_id)
     return {"success": True, "deleted": cabinet_id}
 
 
@@ -1566,9 +1590,16 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
                 system_parts.append("\n" + ctx_text)
                 injected = True
 
-        # Priority 2: cabinet-backed context (legacy / data-studio) — caller's own file only.
-        if not injected and req.cabinet_id and CABINET.get(req.cabinet_id, {}).get("user_id") == user_id:
-            entry        = CABINET[req.cabinet_id]
+        # Priority 2: cabinet-backed context (legacy / data-studio) — caller's own
+        # file only, read through the cache→Storage helper so it works after a deploy.
+        cab_entry = None
+        if not injected and req.cabinet_id:
+            try:
+                cab_entry = _owned_cabinet(req.cabinet_id, user_id)
+            except HTTPException:
+                cab_entry = None
+        if cab_entry is not None:
+            entry        = cab_entry
             df_json      = entry.get("df_json")
             monthly_rows = entry.get("monthly", [])
             if df_json:
