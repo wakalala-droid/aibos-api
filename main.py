@@ -44,6 +44,7 @@ import products as products_api
 import parties as parties_api
 import customer_intel
 import invoices as invoices_api
+import cfo_tools
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1603,6 +1604,40 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
             raise HTTPException(status_code=400, detail="No message provided.")
 
         client = Groq(api_key=api_key)
+
+        # ── Primary path: tool loop over the REAL recorded data (audit #8) ────
+        # The client-sent context above stays as a hint; tools are the source
+        # of record. Any loop failure falls back to the single-shot behaviour
+        # below — the chat never degrades past what it was before tools.
+        db = get_db()
+        if db is not None:
+            tool_system = "\n\n".join(system_parts + [
+                "You have TOOLS over this business's real recorded data — the source of "
+                "record. Look figures up before answering, and prefer tool results over "
+                "any snapshot above when they disagree. When you cite figures from "
+                "query_events, mention the dates and amounts of the events behind them. "
+                "If the recorded data doesn't cover the question, say so plainly — never "
+                "invent numbers. Tools are read-only: to record something, point the "
+                "owner at the Record page (or chat recording on Pro+).",
+            ])
+            try:
+                out = cfo_tools.run_agent_loop(
+                    client, "llama-3.3-70b-versatile",
+                    [{"role": "system", "content": tool_system}, *chat_messages],
+                    db, user_id,
+                )
+                if (out.get("reply") or "").strip():
+                    return {
+                        "reply": out["reply"],
+                        "response": out["reply"],
+                        "model": "AI-BOS Intelligence",
+                        "context_injected": injected,
+                        "tools_used": out["tools_used"],
+                    }
+                logger.warning("chat tool-loop returned empty reply — using single-shot fallback")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chat tool-loop failed (%s) — using single-shot fallback", exc)
+
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
