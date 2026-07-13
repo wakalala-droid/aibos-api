@@ -37,3 +37,6 @@ jobs:
 
       - name: Parties & customer-intel tests
         run: python test_parties.py
+
+      - name: Invoice tests
+        run: python test_invoices.py

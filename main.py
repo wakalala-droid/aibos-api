@@ -43,6 +43,7 @@ import simulation
 import products as products_api
 import parties as parties_api
 import customer_intel
+import invoices as invoices_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2244,6 +2245,85 @@ async def backfill_parties(user_id: str = Depends(require_user)):
         logger.error("parties backfill error: %s", exc)
         raise HTTPException(status_code=500,
                             detail="Backfill failed — has migration 0018 been run?")
+
+
+# ── Invoices: the get-paid loop (audit #7) ────────────────────────────────────
+# Free, like recording — an invoice is data capture wearing a suit. Send posts
+# a confirmed credit Sale (+receivables); mark-paid posts the CustomerPayment.
+
+@app.get("/invoices")
+async def get_invoices(status: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+    db = _require_db()
+    return {"ok": True, "invoices": invoices_api.list_invoices(db, user_id, status=status)}
+
+
+@app.post("/invoices")
+async def create_invoice(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "invoice": invoices_api.create_invoice(db, user_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/invoices/{invoice_id}")
+async def patch_invoice(invoice_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "invoice": invoices_api.update_invoice(db, user_id, invoice_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/invoices/{invoice_id}")
+async def remove_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        invoices_api.delete_invoice(db, user_id, invoice_id)
+        return {"ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/invoices/{invoice_id}/send")
+async def send_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "invoice": invoices_api.send_invoice(db, user_id, invoice_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/invoices/{invoice_id}/mark-paid")
+async def mark_invoice_paid(invoice_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "invoice": invoices_api.mark_paid(db, user_id, invoice_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/invoices/{invoice_id}/cancel")
+async def cancel_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+    db = _require_db()
+    try:
+        return {"ok": True, "invoice": invoices_api.cancel_invoice(db, user_id, invoice_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/invoices/{invoice_id}/share-text")
+async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(None),
+                             pay_note: Optional[str] = Query(None),
+                             user_id: str = Depends(require_user)):
+    """WhatsApp-ready message for the OWNER to send from their own phone —
+    AIBOS never messages a customer itself (automation.ts precedent)."""
+    db = _require_db()
+    try:
+        inv = invoices_api._get(db, user_id, invoice_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, "text": invoices_api.share_text(inv, business_name, pay_note)}
 
 
 # ── Live customer intelligence: Engine 2 over the spine (audit #5) ────────────
