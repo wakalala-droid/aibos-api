@@ -2296,6 +2296,46 @@ async def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Conte
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/products/stock-take")
+async def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    """Guided stock count (audit #49): the owner enters the ACTUAL on-hand for
+    each product; AIBOS posts one InventoryAdjustment per discrepancy (delta =
+    counted − current), through the spine like every other event. Nothing is
+    adjusted where the count matches."""
+    db = _require_db()
+    counts = body.get("counts") or []
+    if not isinstance(counts, list) or not counts:
+        raise HTTPException(status_code=400, detail="Provide counts: [{name, counted}].")
+
+    prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=2000, business_id=ctx.business_id)
+    stock = products_api.compute_stock(prods, events)
+
+    adjusted, skipped = 0, 0
+    for c in counts:
+        name = str(c.get("name") or "").strip()
+        if not name or c.get("counted") in (None, ""):
+            skipped += 1
+            continue
+        try:
+            counted = float(c["counted"])
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        current = stock.get(products_api.normalize_name(name), 0.0)
+        delta = round(counted - current, 4)
+        if abs(delta) < 0.0001:
+            continue                                   # count matches — no event
+        nervous.ingest(db, ctx.tenant, nervous.EventIn(
+            event_type="InventoryAdjustment",
+            payload={"item": name, "delta_qty": delta,
+                     "note": f"Stock-take: counted {counted:g}, system had {current:g}"},
+            source="manual", status="confirmed",
+        ), actor_role=ctx.role, actor_id=ctx.actor, business_id=ctx.business_id)
+        adjusted += 1
+    return {"ok": True, "adjusted": adjusted, "skipped": skipped}
+
+
 @app.post("/products/import/loyverse")
 async def import_loyverse_items(file: UploadFile = File(...), ctx: membership.Context = Depends(membership.require_write)):
     """Loyverse items export → the product catalog in one upload (audit #29).
@@ -2417,6 +2457,17 @@ async def revoke_member(member_row_id: str,
     db = _require_db()
     membership.revoke_member(db, ctx.tenant, member_row_id)
     return {"ok": True}
+
+
+# ── What AIBOS has learned (audit #57) ────────────────────────────────────────
+
+@app.get("/memory/summary")
+async def memory_summary(ctx: membership.Context = Depends(membership.require_context)):
+    """The corrections-learning loop, made visible: how many supplier/customer
+    aliases and category rules AIBOS has picked up (Bible 8th Law: nothing
+    entered twice)."""
+    db = _require_db()
+    return {"ok": True, **memory.summary(db, ctx.tenant)}
 
 
 # ── Budgets & targets (audit #37) ─────────────────────────────────────────────

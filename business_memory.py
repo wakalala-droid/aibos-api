@@ -150,6 +150,35 @@ def recall_all(db, user_id: str, kind: str) -> dict:
         return {}
 
 
+def summary(db, user_id: str) -> dict:
+    """What AIBOS has learned about this business, for the owner to SEE (audit
+    #57). Counts per kind + a few sample aliases. Best-effort; never raises."""
+    if db is None:
+        return {"available": False}
+    try:
+        res = db.table("business_memory").select("kind,key,value,hits").eq("user_id", user_id).execute()
+        rows = getattr(res, "data", None) or []
+    except Exception:  # noqa: BLE001
+        return {"available": False}
+
+    counts: dict = {}
+    aliases = []
+    for r in rows:
+        counts[r.get("kind", "?")] = counts.get(r.get("kind", "?"), 0) + 1
+        if r.get("kind") == "alias" and len(aliases) < 8:
+            name = (r.get("value") or {}).get("name")
+            if name:
+                aliases.append({"from": r.get("key"), "to": name, "hits": r.get("hits", 1)})
+    return {
+        "available": True,
+        "total": len(rows),
+        "aliases": counts.get("alias", 0),
+        "category_rules": counts.get("category_for_party", 0),
+        "type_rules": counts.get("type_for_keyword", 0),
+        "sample_aliases": aliases,
+    }
+
+
 def capture_from_correction(db, user_id: str, event: dict, changes: dict) -> None:
     """Persist every memory derivable from a correction (Capture hook 5.2)."""
     for m in derive_memories(event, changes):
