@@ -57,6 +57,7 @@ import loyverse
 import membership
 import businesses as businesses_api
 import budgets as budgets_api
+import rate_limit
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1551,7 +1552,7 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
+async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
     """AI CFO Chat powered by Groq llama-3.3-70b-versatile.
 
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
@@ -1955,7 +1956,8 @@ class ClassifyRequest(BaseModel):
 
 
 @app.post("/events/classify")
-async def classify_activity(req: ClassifyRequest, user_id: str = Depends(require_user)):
+async def classify_activity(req: ClassifyRequest,
+                            user_id: str = Depends(rate_limit.limiter("classify", 40, 60))):
     """
     Record Business Activity (Initiative 1): turn free text into a PROPOSED event.
     Never persists — returns a proposal the user reviews/edits, then POSTs to /events.
@@ -2706,7 +2708,8 @@ MAX_VOICE_BYTES = 6 * 1024 * 1024
 
 
 @app.post("/transcribe")
-async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(require_user)):
+async def transcribe_voice(file: UploadFile = File(...),
+                           user_id: str = Depends(rate_limit.limiter("transcribe", 30, 60))):
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="Voice transcription isn't configured on the server.")
