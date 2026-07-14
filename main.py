@@ -51,6 +51,7 @@ import investigate as investigate_api
 import debtors as debtors_api
 import cash_forecast as cash_forecast_api
 import rec_store
+import llm
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1180,8 +1181,8 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
 
         try:
             client = Groq(api_key=api_key)
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            resp = llm.chat_create(
+                client,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=500,
                 temperature=0.1,
@@ -1658,7 +1659,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
             ])
             try:
                 out = cfo_tools.run_agent_loop(
-                    client, "llama-3.3-70b-versatile",
+                    client, llm.chat_model(),
                     [{"role": "system", "content": tool_system}, *chat_messages],
                     db, user_id,
                 )
@@ -1674,8 +1675,8 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("chat tool-loop failed (%s) — using single-shot fallback", exc)
 
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        completion = llm.chat_create(
+            client,
             messages=[
                 {"role": "system", "content": system_prompt},
                 *chat_messages,
@@ -1947,8 +1948,8 @@ async def classify_activity(req: ClassifyRequest, user_id: str = Depends(require
         raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
     try:
         client = Groq(api_key=api_key)
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        completion = llm.chat_create(
+            client,
             messages=nervous.classify_prompt(text, req.currency),
             max_tokens=400,
             temperature=0.1,
@@ -2460,7 +2461,7 @@ async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(
         client = Groq(api_key=api_key)
         result = client.audio.transcriptions.create(
             file=(file.filename or "note.webm", content),
-            model="whisper-large-v3",
+            model=llm.whisper_model(),
         )
         text = (getattr(result, "text", None) or "").strip()
     except Exception as exc:  # noqa: BLE001

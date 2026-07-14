@@ -27,12 +27,11 @@ import logging
 import os
 import re
 
+import llm
 import nervous_system as nervous
 from notify import whatsapp_enabled
 
 log = logging.getLogger("aibos.whatsapp")
-
-CLASSIFY_MODEL = "llama-3.3-70b-versatile"
 
 
 # ── Pure helpers (offline-tested) ─────────────────────────────────────────────
@@ -112,8 +111,8 @@ _UNKNOWN = ("This number isn't linked to an AIBOS account yet. In the app: "
 
 def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW") -> str:
     """Classify one message into a proposed event. Returns the reply text."""
-    completion = client.chat.completions.create(
-        model=CLASSIFY_MODEL,
+    completion = llm.chat_create(
+        client,
         messages=nervous.classify_prompt(text, currency),
         max_tokens=400, temperature=0.1,
     )

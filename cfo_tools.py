@@ -27,6 +27,7 @@ import products as products_api
 import simulation
 import customer_intel
 import cash_forecast
+import llm
 
 log = logging.getLogger("aibos.cfo_tools")
 
@@ -312,7 +313,8 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
 
     for round_no in range(max_rounds + 1):
         force_prose = round_no == max_rounds
-        completion = client.chat.completions.create(
+        completion = llm.chat_create(
+            client,
             model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
             **({} if force_prose else {"tools": TOOLS, "tool_choice": "auto"}),
         )
