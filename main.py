@@ -56,6 +56,7 @@ import compliance as compliance_api
 import loyverse
 import membership
 import businesses as businesses_api
+import budgets as budgets_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2415,6 +2416,37 @@ async def revoke_member(member_row_id: str,
                         ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     membership.revoke_member(db, ctx.tenant, member_row_id)
+    return {"ok": True}
+
+
+# ── Budgets & targets (audit #37) ─────────────────────────────────────────────
+# Actuals vs the owner's PLAN. Targets are stored; actuals derive from the twin.
+
+@app.get("/budgets")
+async def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    rows = budgets_api.list_budgets(db, ctx.tenant, month=month, business_id=ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
+    var = budgets_api.variance(state.get("monthly", []), rows, month)
+    return {"ok": True, "budgets": rows, **var}
+
+
+@app.post("/budgets")
+async def set_budget(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    db = _require_db()
+    try:
+        row = budgets_api.set_budget(db, ctx.tenant, str(body.get("month") or ""),
+                                     str(body.get("metric") or ""), body.get("target"),
+                                     business_id=ctx.business_id)
+        return {"ok": True, "budget": row}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/budgets/{budget_id}")
+async def remove_budget(budget_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    db = _require_db()
+    budgets_api.delete_budget(db, ctx.tenant, budget_id, business_id=ctx.business_id)
     return {"ok": True}
 
 
