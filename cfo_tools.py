@@ -26,6 +26,7 @@ import nervous_system as nervous
 import products as products_api
 import simulation
 import customer_intel
+import cash_forecast
 
 log = logging.getLogger("aibos.cfo_tools")
 
@@ -87,6 +88,12 @@ TOOLS = [
             "value": {"type": "number"},
             "count": {"type": "integer", "description": "hires (hire scenario only)"},
         }, "required": ["type", "value"]},
+    }},
+    {"type": "function", "function": {
+        "name": "cash_forecast",
+        "description": "P10/P50/P90 cash projection for the next 3 months from the business's "
+                       "own monthly net history, plus the cautious (P10) runway.",
+        "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
         "name": "who_owes_me",
@@ -267,6 +274,7 @@ _EXECUTORS = {
     "get_business_snapshot": lambda db, uid, a: _snapshot(db, uid),
     "investigate_month": _investigate,
     "who_owes_me": _who_owes,
+    "cash_forecast": lambda db, uid, a: cash_forecast.forecast_cash(twin.get_state(db, uid)),
     "query_events": _query_events,
     "list_products": _list_products,
     "upcoming_schedule": _upcoming_schedule,
