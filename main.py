@@ -54,6 +54,7 @@ import rec_store
 import llm
 import compliance as compliance_api
 import loyverse
+import membership
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1980,11 +1981,12 @@ async def classify_activity(req: ClassifyRequest, user_id: str = Depends(require
 
 
 @app.post("/events")
-async def create_event(ev: nervous.EventIn, user_id: str = Depends(require_user)):
-    """Record one Business Activity. Returns the persisted event (pending or confirmed)."""
+async def create_event(ev: nervous.EventIn, ctx: membership.Context = Depends(membership.require_write)):
+    """Record one Business Activity into the tenant's books. Owner/staff only
+    (accountants are read-only); staff events land pending (audit #27)."""
     db = _require_db()
     try:
-        saved = nervous.ingest(db, user_id, ev)
+        saved = nervous.ingest(db, ctx.tenant, ev, actor_role=ctx.role, actor_id=ctx.actor)
         return {"ok": True, "event": saved}
     except nervous.PipelineError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2009,24 +2011,26 @@ async def create_events_batch(
 
 @app.get("/events")
 async def get_events(
-    user_id: str = Depends(require_user),
+    ctx: membership.Context = Depends(membership.require_context),
     status: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    """Timeline read (Initiative 5): filter by status/type, newest first."""
+    """Timeline read (Initiative 5): filter by status/type, newest first.
+    Members read the tenant they belong to."""
     db = _require_db()
-    rows = nervous.list_events(db, user_id, status=status, event_type=event_type, limit=limit, offset=offset)
+    rows = nervous.list_events(db, ctx.tenant, status=status, event_type=event_type, limit=limit, offset=offset)
     return {"ok": True, "events": rows, "count": len(rows)}
 
 
 @app.post("/events/{event_id}/confirm")
-async def confirm_event(event_id: str, user_id: str = Depends(require_user)):
-    """Promote a pending event to confirmed (it now counts in the twin)."""
+async def confirm_event(event_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """Promote a pending event to confirmed. OWNER only — this is the trust
+    gate: staff propose, the owner confirms (audit #27)."""
     db = _require_db()
     try:
-        return {"ok": True, "event": nervous.confirm(db, user_id, event_id)}
+        return {"ok": True, "event": nervous.confirm(db, ctx.tenant, event_id)}
     except nervous.PipelineError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -2191,13 +2195,14 @@ async def ingest_receipt(
 
 
 @app.get("/twin")
-async def get_twin(user_id: str = Depends(require_user)):
+async def get_twin(ctx: membership.Context = Depends(membership.require_context)):
     """
     The Digital Twin — current business state derived from confirmed events.
+    Members read the tenant they belong to (staff/accountant see the owner's).
     `monthly` is shaped for the existing store/engines (RFC-001 §7 bridge).
     """
     db = _require_db()
-    return {"ok": True, "twin": twin.get_state(db, user_id)}
+    return {"ok": True, "twin": twin.get_state(db, ctx.tenant)}
 
 
 @app.post("/twin/rebuild")
@@ -2354,6 +2359,61 @@ async def seed_statutory_calendar(user_id: str = Depends(require_user)):
 # ── Parties: customers & suppliers (audit #6) ─────────────────────────────────
 # CRUD is free, like recording — parties are how AIBOS learns who the business
 # deals with. The paid layer is the intelligence computed OVER them (engine2).
+
+@app.get("/members/me")
+async def my_membership(ctx: membership.Context = Depends(membership.require_context)):
+    """The caller's own role + tenant — the frontend gates nav on this."""
+    return {"ok": True, "role": ctx.role, "tenant": ctx.tenant, "is_owner": ctx.is_owner}
+
+
+@app.post("/members/accept")
+async def accept_memberships(ctx_user: str = Depends(require_user)):
+    """On login: bind any pending invites for the caller's email to this
+    account and activate them. Email is read from the caller's OWN profile
+    (never the request body)."""
+    db = _require_db()
+    prof = db.table("profiles").select("email").eq("id", ctx_user).limit(1).execute()
+    rows = getattr(prof, "data", None) or []
+    email = (rows[0].get("email") if rows else None)
+    activated = membership.accept_pending(db, ctx_user, email) if email else 0
+    return {"ok": True, "activated": activated}
+
+
+@app.get("/members")
+async def list_members(ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    return {"ok": True, "members": membership.list_members(db, ctx.tenant)}
+
+
+@app.post("/members")
+async def invite_member(body: Dict[str, Any] = Body(...),
+                        ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    try:
+        member = membership.invite_member(db, ctx.tenant, body.get("email"),
+                                          body.get("role"), invited_by=ctx.actor)
+        return {"ok": True, "member": member}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/members/{member_row_id}")
+async def patch_member(member_row_id: str, body: Dict[str, Any] = Body(...),
+                       ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    try:
+        return {"ok": True, "member": membership.update_member(db, ctx.tenant, member_row_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/members/{member_row_id}")
+async def revoke_member(member_row_id: str,
+                        ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    membership.revoke_member(db, ctx.tenant, member_row_id)
+    return {"ok": True}
+
 
 @app.get("/parties")
 async def get_parties(kind: Optional[str] = Query(None), user_id: str = Depends(require_user)):
@@ -3154,7 +3214,7 @@ async def post_simulate(req: SimulateRequest, user_id: str = Depends(require_use
 
 
 @app.get("/twin/financials")
-async def twin_financials(user_id: str = Depends(require_user)):
+async def twin_financials(ctx: membership.Context = Depends(membership.require_context)):
     """
     Backward-compat bridge (Roadmap 1.6 / Initiative 9): run the EXISTING Engine 1
     over the Digital Twin's monthly[] — proving the legacy engine reasons against
@@ -3162,7 +3222,7 @@ async def twin_financials(user_id: str = Depends(require_user)):
     upload path produces, so the frontend can consume the twin like any upload.
     """
     db = _require_db()
-    state = twin.get_state(db, user_id)
+    state = twin.get_state(db, ctx.tenant)
     monthly_rows = twin.monthly_rows_for_engine1(state)
     analysis = run_engine1(monthly_rows)
     return {

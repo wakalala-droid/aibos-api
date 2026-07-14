@@ -73,3 +73,6 @@ jobs:
 
       - name: Loyverse importer tests
         run: python test_loyverse.py
+
+      - name: Membership / team-roles tests
+        run: python test_membership.py

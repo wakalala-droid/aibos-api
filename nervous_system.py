@@ -162,7 +162,12 @@ def decide_confidence(ev: EventIn) -> float:
     return 1.0 if ev.source == "manual" else 0.7  # AI-extracted defaults mid
 
 
-def decide_status(ev: EventIn, confidence: float) -> str:
+def decide_status(ev: EventIn, confidence: float, actor_role: str = "owner") -> str:
+    # Staff-recorded events are PROPOSALS the owner confirms (audit #27): a
+    # cashier can capture a sale, but confirmation authority stays with the
+    # owner. This overrides even a caller-requested 'confirmed'.
+    if actor_role == "staff":
+        return "pending"
     if ev.status:                       # caller-requested (only 'pending'/'confirmed' allowed)
         if ev.status == "confirmed" and ev.source != "manual" and confidence < AUTO_CONFIRM_THRESHOLD:
             return "pending"            # never let a client force-confirm a low-confidence extraction
@@ -185,10 +190,15 @@ def _audit_entry(actor: str, action: str, note: str | None = None) -> dict:
     return e
 
 
-def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW") -> dict:
+def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
+           actor_role: str = "owner", actor_id: str | None = None) -> dict:
     """
     Run the full pipeline for one event and return the persisted row.
     Rebuilds the Digital Twin when the resulting event is confirmed.
+
+    `user_id` is the TENANT (whose books). `actor_role`/`actor_id` identify WHO
+    recorded it — staff events stay pending (audit #27) and the audit trail
+    names the actual actor, not the tenant.
     """
     if db is None:
         raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
@@ -196,8 +206,11 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW") -> dict
     validate(ev)
     payload = normalize(ev, default_currency=default_currency, db=db, user_id=user_id)
     confidence = decide_confidence(ev)
-    status = decide_status(ev, confidence)
+    status = decide_status(ev, confidence, actor_role=actor_role)
+    actor = actor_id or user_id
 
+    audit = [_audit_entry(actor, "created",
+                          note=f"by {actor_role}" if actor_role != "owner" else None)]
     row = {
         "schema_version": 1,
         "user_id": user_id,
@@ -209,8 +222,8 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW") -> dict
         "status": status,
         "payload": payload,
         "corrections": {},
-        "audit": [_audit_entry(user_id, "created")],
-        "created_by": user_id,
+        "audit": audit,
+        "created_by": actor,
     }
 
     res = db.table("business_events").insert(row).execute()
