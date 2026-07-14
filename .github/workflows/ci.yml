@@ -76,3 +76,6 @@ jobs:
 
       - name: Membership / team-roles tests
         run: python test_membership.py
+
+      - name: Multi-business tests
+        run: python test_businesses.py

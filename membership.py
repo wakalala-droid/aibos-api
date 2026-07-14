@@ -30,8 +30,9 @@ someone else's tenant.
 import logging
 from dataclasses import dataclass
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, Header, HTTPException
 
+import businesses
 from auth import require_user
 from db import get_db
 
@@ -44,9 +45,10 @@ EDITABLE = ("email", "role")
 
 @dataclass
 class Context:
-    tenant: str        # whose data — the user_id everything is scoped by
-    actor: str         # who is acting (== tenant for an owner)
-    role: str          # owner | staff | accountant
+    tenant: str                       # whose data — the user_id everything is scoped by
+    actor: str                        # who is acting (== tenant for an owner)
+    role: str                         # owner | staff | accountant
+    business_id: str | None = None    # active business within the tenant (audit #16)
 
     @property
     def is_owner(self) -> bool:
@@ -83,9 +85,15 @@ def resolve_context(caller_uid: str, db=None) -> Context:
 # ── FastAPI dependencies ──────────────────────────────────────────────────────
 
 
-def require_context(user_id: str = Depends(require_user)) -> Context:
-    """Any authenticated member. Scope data by ctx.tenant, not user_id."""
-    return resolve_context(user_id)
+def require_context(user_id: str = Depends(require_user),
+                    x_business_id: str | None = Header(default=None)) -> Context:
+    """Any authenticated member. Scope data by ctx.tenant + ctx.business_id.
+    The active business comes from the X-Business-Id header, VALIDATED to belong
+    to the tenant (never trusted raw); defaults to the tenant's default
+    business, or None pre-migration-0023 (single-book behaviour)."""
+    ctx = resolve_context(user_id)
+    ctx.business_id = businesses.resolve_business_id(get_db(), ctx.tenant, x_business_id)
+    return ctx
 
 
 def require_write(ctx: Context = Depends(require_context)) -> Context:

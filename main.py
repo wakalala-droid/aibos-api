@@ -55,6 +55,7 @@ import llm
 import compliance as compliance_api
 import loyverse
 import membership
+import businesses as businesses_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1986,7 +1987,8 @@ async def create_event(ev: nervous.EventIn, ctx: membership.Context = Depends(me
     (accountants are read-only); staff events land pending (audit #27)."""
     db = _require_db()
     try:
-        saved = nervous.ingest(db, ctx.tenant, ev, actor_role=ctx.role, actor_id=ctx.actor)
+        saved = nervous.ingest(db, ctx.tenant, ev, actor_role=ctx.role, actor_id=ctx.actor,
+                               business_id=ctx.business_id)
         return {"ok": True, "event": saved}
     except nervous.PipelineError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2020,7 +2022,8 @@ async def get_events(
     """Timeline read (Initiative 5): filter by status/type, newest first.
     Members read the tenant they belong to."""
     db = _require_db()
-    rows = nervous.list_events(db, ctx.tenant, status=status, event_type=event_type, limit=limit, offset=offset)
+    rows = nervous.list_events(db, ctx.tenant, status=status, event_type=event_type,
+                               limit=limit, offset=offset, business_id=ctx.business_id)
     return {"ok": True, "events": rows, "count": len(rows)}
 
 
@@ -2202,14 +2205,14 @@ async def get_twin(ctx: membership.Context = Depends(membership.require_context)
     `monthly` is shaped for the existing store/engines (RFC-001 §7 bridge).
     """
     db = _require_db()
-    return {"ok": True, "twin": twin.get_state(db, ctx.tenant)}
+    return {"ok": True, "twin": twin.get_state(db, ctx.tenant, ctx.business_id)}
 
 
 @app.post("/twin/rebuild")
-async def rebuild_twin(user_id: str = Depends(require_user)):
+async def rebuild_twin(ctx: membership.Context = Depends(membership.require_context)):
     """Force a full replay of the event log into the twin (idempotent recovery)."""
     db = _require_db()
-    return {"ok": True, "twin": twin.rebuild(db, user_id)}
+    return {"ok": True, "twin": twin.rebuild(db, ctx.tenant, ctx.business_id)}
 
 
 class TwinSeedRequest(BaseModel):
@@ -2218,10 +2221,10 @@ class TwinSeedRequest(BaseModel):
 
 
 @app.post("/twin/seed")
-async def seed_twin(req: TwinSeedRequest, user_id: str = Depends(require_user)):
+async def seed_twin(req: TwinSeedRequest, ctx: membership.Context = Depends(membership.require_write)):
     """Seed the twin's opening cash + currency (Setup Wizard, Initiative 1)."""
     db = _require_db()
-    return {"ok": True, "twin": twin.seed(db, user_id, req.opening_cash, req.currency)}
+    return {"ok": True, "twin": twin.seed(db, ctx.tenant, req.opening_cash, req.currency, ctx.business_id)}
 
 
 # ── Future hooks: engines, recommendations, simulation (Initiatives 10, 12) ───
@@ -2233,20 +2236,20 @@ async def list_engines(user_id: str = Depends(require_user)):
 
 
 @app.get("/recommendations")
-async def get_recommendations(user_id: str = Depends(require_user)):
+async def get_recommendations(ctx: membership.Context = Depends(membership.require_context)):
     """Run every engine against the Digital Twin → explainable recommendations
     (Bible 9th Law: each carries what/why/evidence/confidence/alternatives)."""
     db = _require_db()
-    state = twin.get_state(db, user_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     # Build the engine context once: catalog + derived stock + low-stock list.
-    prods = products_api.list_products(db, user_id)
-    events = nervous.list_events(db, user_id, status="confirmed", limit=1000) if prods else []
+    prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=1000, business_id=ctx.business_id) if prods else []
     stock = products_api.compute_stock(prods, events)
     context = {"products": prods, "stock": stock, "low_stock": products_api.low_stock(prods, stock)}
     recs = engines_api.run_all(state, events, context)
     # Ledger the batch (audit #20): annotates each rec with rec_id/status/
     # times_shown so the UI can take feedback. Best-effort pre-migration-0021.
-    rec_store.record_shown(db, user_id, recs)
+    rec_store.record_shown(db, ctx.tenant, recs)
     return {"ok": True, "recommendations": recs, "count": len(recs)}
 
 
@@ -2272,10 +2275,10 @@ async def recommendations_track_record(user_id: str = Depends(require_user)):
 # ── Products catalog (Initiative 3) ───────────────────────────────────────────
 
 @app.get("/products")
-async def get_products(user_id: str = Depends(require_user)):
+async def get_products(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    prods = products_api.list_products(db, user_id)
-    events = nervous.list_events(db, user_id, status="confirmed", limit=1000) if prods else []
+    prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=1000, business_id=ctx.business_id) if prods else []
     stock = products_api.compute_stock(prods, events)
     # Attach derived on-hand so the catalog can show stock without a second call.
     for p in prods:
@@ -2284,16 +2287,16 @@ async def get_products(user_id: str = Depends(require_user)):
 
 
 @app.post("/products")
-async def create_product(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+async def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "product": products_api.create_product(db, user_id, body)}
+        return {"ok": True, "product": products_api.create_product(db, ctx.tenant, body, business_id=ctx.business_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/products/import/loyverse")
-async def import_loyverse_items(file: UploadFile = File(...), user_id: str = Depends(require_user)):
+async def import_loyverse_items(file: UploadFile = File(...), ctx: membership.Context = Depends(membership.require_write)):
     """Loyverse items export → the product catalog in one upload (audit #29).
     Idempotent by product name: re-importing refreshes nothing and duplicates
     nothing — existing names are skipped."""
@@ -2306,14 +2309,14 @@ async def import_loyverse_items(file: UploadFile = File(...), user_id: str = Dep
         raise HTTPException(status_code=400, detail=str(e))
 
     existing = {products_api.normalize_name(p.get("name"))
-                for p in products_api.list_products(db, user_id)}
+                for p in products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)}
     created, skipped_existing = [], 0
     for body in parsed["products"]:
         if products_api.normalize_name(body["name"]) in existing:
             skipped_existing += 1
             continue
         try:
-            created.append(products_api.create_product(db, user_id, body))
+            created.append(products_api.create_product(db, ctx.tenant, body, business_id=ctx.business_id))
         except ValueError as e:
             parsed["skipped"].append(f"{body['name']}: {e}")
     return {"ok": True, "store": parsed["store"], "created_count": len(created),
@@ -2339,17 +2342,17 @@ async def remove_product(product_id: str, user_id: str = Depends(require_user)):
 # ── Statutory compliance calendar (audit #25) ─────────────────────────────────
 
 @app.post("/schedule/statutory")
-async def seed_statutory_calendar(user_id: str = Depends(require_user)):
+async def seed_statutory_calendar(ctx: membership.Context = Depends(membership.require_write)):
     """One tap: recurring PAYE/NAPSA/NHIMA reminders on the 10th, pre-filled
     from the latest payroll run. Idempotent by title. Recurrence is the paid
     Scheduler layer — same gate."""
-    entitlements.require_feature(user_id, "schedule")
+    entitlements.require_feature(ctx.tenant, "schedule")
     db = _require_db()
-    runs = payroll_api.list_runs(db, user_id, limit=1)
+    runs = payroll_api.list_runs(db, ctx.tenant, limit=1)
     totals = (runs[0].get("totals") if runs else None) or None
     candidates = compliance_api.statutory_items(totals)
-    existing = schedule_api.list_items(db, user_id, horizon_days=60)
-    created = [schedule_api.create_item(db, user_id, item)
+    existing = schedule_api.list_items(db, ctx.tenant, horizon_days=60, business_id=ctx.business_id)
+    created = [schedule_api.create_item(db, ctx.tenant, item, business_id=ctx.business_id)
                for item in compliance_api.missing_items(
                    [r.get("title") for r in existing], candidates)]
     return {"ok": True, "created": created, "created_count": len(created),
@@ -2415,12 +2418,58 @@ async def revoke_member(member_row_id: str,
     return {"ok": True}
 
 
-@app.get("/parties")
-async def get_parties(kind: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+# ── Businesses: portfolios under one login (audit #16) ────────────────────────
+# The first business is free (backfilled for every account). Creating a SECOND
+# is the Growth capability — so a portfolio owner sees separate books per venture.
+
+@app.get("/businesses")
+async def get_businesses(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    rows = parties_api.list_parties(db, user_id, kind=kind)
+    return {"ok": True, "businesses": businesses_api.list_businesses(db, ctx.tenant),
+            "active": ctx.business_id}
+
+
+@app.post("/businesses")
+async def create_business(body: Dict[str, Any] = Body(...),
+                          ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    existing = businesses_api.list_businesses(db, ctx.tenant)
+    if len(existing) >= 1:                            # 2nd+ business = Growth
+        entitlements.require_feature(ctx.tenant, "multi_business")
+    try:
+        return {"ok": True, "business": businesses_api.create_business(db, ctx.tenant, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/businesses/{business_id}")
+async def patch_business(business_id: str, body: Dict[str, Any] = Body(...),
+                         ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    try:
+        return {"ok": True, "business": businesses_api.update_business(db, ctx.tenant, business_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/businesses/{business_id}/default")
+async def set_default_business(business_id: str,
+                               ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    try:
+        businesses_api.set_default(db, ctx.tenant, business_id)
+        return {"ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/parties")
+async def get_parties(kind: Optional[str] = Query(None),
+                      ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    rows = parties_api.list_parties(db, ctx.tenant, kind=kind, business_id=ctx.business_id)
     if rows:
-        events = nervous.list_events(db, user_id, limit=2000)
+        events = nervous.list_events(db, ctx.tenant, limit=2000, business_id=ctx.business_id)
         stats = parties_api.party_stats(events)
         for r in rows:
             r["stats"] = stats.get(r.get("normalized_key"), None)
@@ -2428,10 +2477,10 @@ async def get_parties(kind: Optional[str] = Query(None), user_id: str = Depends(
 
 
 @app.post("/parties")
-async def create_party(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+async def create_party(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "party": parties_api.create_party(db, user_id, body)}
+        return {"ok": True, "party": parties_api.create_party(db, ctx.tenant, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2503,16 +2552,17 @@ async def whatsapp_webhook(request: Request):
 # a confirmed credit Sale (+receivables); mark-paid posts the CustomerPayment.
 
 @app.get("/invoices")
-async def get_invoices(status: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+async def get_invoices(status: Optional[str] = Query(None),
+                       ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    return {"ok": True, "invoices": invoices_api.list_invoices(db, user_id, status=status)}
+    return {"ok": True, "invoices": invoices_api.list_invoices(db, ctx.tenant, status=status, business_id=ctx.business_id)}
 
 
 @app.post("/invoices")
-async def create_invoice(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+async def create_invoice(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "invoice": invoices_api.create_invoice(db, user_id, body)}
+        return {"ok": True, "invoice": invoices_api.create_invoice(db, ctx.tenant, body, business_id=ctx.business_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2599,15 +2649,15 @@ async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(
 
 @app.get("/debtors")
 async def get_debtors(business_name: Optional[str] = Query(None),
-                      user_id: str = Depends(require_user)):
+                      ctx: membership.Context = Depends(membership.require_context)):
     """AR aging per customer (audit #15): sent invoices (exact) + the loose
     credit book (credit Sales net of untied payments, oldest-first). Each
     debtor ships with a ready-to-send WhatsApp nudge draft — the owner sends
     it from their own phone."""
     db = _require_db()
-    invoices = invoices_api.list_invoices(db, user_id)
-    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
-    state = twin.get_state(db, user_id)
+    invoices = invoices_api.list_invoices(db, ctx.tenant, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
     report = debtors_api.aging_report(invoices, events)
     for c in report["customers"]:
@@ -2634,18 +2684,19 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
 # rest of the Engine-1 sub-features' free preview (see entitlements.py note).
 
 @app.get("/forecast/cash")
-async def cash_forecast_route(user_id: str = Depends(require_user)):
+async def cash_forecast_route(ctx: membership.Context = Depends(membership.require_context)):
     """P10/P50/P90 cash bands from the caller's own monthly history (audit
     #19). Ungated like the other Engine-1 sub-features' free preview."""
     db = _require_db()
-    state = twin.get_state(db, user_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     return {"ok": True, "forecast": cash_forecast_api.forecast_cash(state)}
 
 
 @app.get("/investigate")
-async def investigate_anomaly(month: Optional[str] = Query(None), user_id: str = Depends(require_user)):
+async def investigate_anomaly(month: Optional[str] = Query(None),
+                              ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
     result = (investigate_api.investigate_month(events, month)
               if month else investigate_api.auto_investigation(events))
     return {"ok": True, "investigation": result}
@@ -2654,13 +2705,13 @@ async def investigate_anomaly(month: Optional[str] = Query(None), user_id: str =
 # ── Live customer intelligence: Engine 2 over the spine (audit #5) ────────────
 
 @app.get("/intelligence/customers")
-async def customers_intelligence(user_id: str = Depends(require_user)):
+async def customers_intelligence(ctx: membership.Context = Depends(membership.require_context)):
     """Engine 2 (RFM/CLV/churn/basket) computed from recorded events — the
     living-model counterpart of the upload flow. Pro feature, same gate."""
-    entitlements.require_feature(user_id, "engine2")
+    entitlements.require_feature(ctx.tenant, "engine2")
     db = _require_db()
-    events = nervous.list_events(db, user_id, status="confirmed", limit=10000)
-    state = twin.get_state(db, user_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
     try:
         return {"ok": True, **customer_intel.run_from_events(events, sym)}
@@ -2676,19 +2727,19 @@ async def customers_intelligence(user_id: str = Depends(require_user)):
 
 @app.get("/schedule")
 async def get_schedule(horizon_days: int = Query(60, ge=1, le=366),
-                       user_id: str = Depends(require_user)):
+                       ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    items = schedule_api.list_items(db, user_id, horizon_days=horizon_days)
+    items = schedule_api.list_items(db, ctx.tenant, horizon_days=horizon_days, business_id=ctx.business_id)
     return {"ok": True, "items": items}
 
 
 @app.post("/schedule")
-async def create_schedule_item(body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+async def create_schedule_item(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     if schedule_api.wants_paid_features(body):
-        entitlements.require_feature(user_id, "schedule")
+        entitlements.require_feature(ctx.tenant, "schedule")
     try:
-        return {"ok": True, "item": schedule_api.create_item(db, user_id, body)}
+        return {"ok": True, "item": schedule_api.create_item(db, ctx.tenant, body, business_id=ctx.business_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3222,7 +3273,7 @@ async def twin_financials(ctx: membership.Context = Depends(membership.require_c
     upload path produces, so the frontend can consume the twin like any upload.
     """
     db = _require_db()
-    state = twin.get_state(db, ctx.tenant)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     monthly_rows = twin.monthly_rows_for_engine1(state)
     analysis = run_engine1(monthly_rows)
     return {

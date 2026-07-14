@@ -120,22 +120,27 @@ def _get(db, user_id: str, invoice_id: str) -> dict:
     return rows[0]
 
 
-def list_invoices(db, user_id: str, status: str | None = None) -> list:
+def list_invoices(db, user_id: str, status: str | None = None, business_id: str | None = None) -> list:
     q = db.table("invoices").select("*").eq("user_id", user_id)
+    if business_id is not None:                       # multi-business (audit #16)
+        q = q.eq("business_id", business_id)
     if status in STATUSES:
         q = q.eq("status", status)
     res = q.order("created_at", desc=True).execute()
     return getattr(res, "data", None) or []
 
 
-def create_invoice(db, user_id: str, data: dict) -> dict:
+def create_invoice(db, user_id: str, data: dict, business_id: str | None = None) -> dict:
     customer = str(data.get("customer_name") or "").strip()
     if not customer:
         raise ValueError("customer_name is required.")
     lines = validate_lines(data.get("lines"))
 
-    res = db.table("invoices").select("number").eq("user_id", user_id).execute()
-    numbers = [r["number"] for r in (getattr(res, "data", None) or [])]
+    # Invoice numbers sequence per business (each set of books its own INV-####).
+    numq = db.table("invoices").select("number").eq("user_id", user_id)
+    if business_id is not None:
+        numq = numq.eq("business_id", business_id)
+    numbers = [r["number"] for r in (getattr(numq.execute(), "data", None) or [])]
 
     row = {
         "user_id": user_id,
@@ -148,6 +153,8 @@ def create_invoice(db, user_id: str, data: dict) -> dict:
         "notes": data.get("notes"),
         "status": "draft",
     }
+    if business_id is not None:
+        row["business_id"] = business_id
     out = db.table("invoices").insert(row).execute()
     return (getattr(out, "data", None) or [row])[0]
 
@@ -195,7 +202,7 @@ def send_invoice(db, user_id: str, invoice_id: str) -> dict:
             "note": f"Invoice {inv['number']} issued",
         },
         source="manual", status="confirmed",
-    ))
+    ), business_id=inv.get("business_id"))
 
     patch = {"status": "sent", "issued_at": _now_iso(), "sale_event_id": ev.get("id")}
     res = (db.table("invoices").update(patch)
@@ -219,7 +226,7 @@ def mark_paid(db, user_id: str, invoice_id: str) -> dict:
             "note": f"Payment for invoice {inv['number']}",
         },
         source="manual", status="confirmed",
-    ))
+    ), business_id=inv.get("business_id"))
 
     patch = {"status": "paid", "paid_at": _now_iso(), "payment_event_id": ev.get("id")}
     res = (db.table("invoices").update(patch)

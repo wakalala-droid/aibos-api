@@ -194,15 +194,18 @@ def wants_paid_features(body: dict) -> bool:
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────────
 
-def list_items(db, user_id: str, horizon_days: int = 60, limit: int = 500) -> list:
+def list_items(db, user_id: str, horizon_days: int = 60, limit: int = 500,
+               business_id: str | None = None) -> list:
     """
     Active + recently finished items, each annotated with `next_occurrences`
     (ISO strings, every hit within [now − 14d overdue window, now + horizon],
     capped at MAX_OCCURRENCES — the month grid needs the full set, the agenda
     reads the head).
     """
-    res = (db.table("schedule_items").select("*").eq("user_id", user_id)
-           .neq("status", "cancelled").order("starts_at").limit(limit).execute())
+    q = db.table("schedule_items").select("*").eq("user_id", user_id)
+    if business_id is not None:                       # multi-business (audit #16)
+        q = q.eq("business_id", business_id)
+    res = q.neq("status", "cancelled").order("starts_at").limit(limit).execute()
     rows = getattr(res, "data", None) or []
 
     now = datetime.now(timezone.utc)
@@ -225,8 +228,10 @@ def list_items(db, user_id: str, horizon_days: int = 60, limit: int = 500) -> li
     return out
 
 
-def create_item(db, user_id: str, data: dict) -> dict:
+def create_item(db, user_id: str, data: dict, business_id: str | None = None) -> dict:
     row = {"user_id": user_id, **_clean(data)}
+    if business_id is not None:
+        row["business_id"] = business_id
     res = db.table("schedule_items").insert(row).execute()
     return (getattr(res, "data", None) or [row])[0]
 

@@ -125,7 +125,8 @@ def _clean(data: dict) -> dict:
 # ── Pipeline hook (best-effort, never breaks recording) ──────────────────────
 
 
-def upsert_from_event(db, user_id: str, payload: dict, occurred_at=None) -> None:
+def upsert_from_event(db, user_id: str, payload: dict, occurred_at=None,
+                      business_id: str | None = None) -> None:
     """
     Auto-create/refresh parties named in an event. Called from the nervous
     system after persist; a missing table (migration 0018 not run) or any
@@ -135,24 +136,28 @@ def upsert_from_event(db, user_id: str, payload: dict, occurred_at=None) -> None
         return
     for mention in extract_parties(payload):
         try:
-            res = (db.table("parties").select("id,kind,last_seen_at")
-                   .eq("user_id", user_id).eq("normalized_key", mention["key"])
-                   .limit(1).execute())
-            rows = getattr(res, "data", None) or []
+            q = (db.table("parties").select("id,kind,last_seen_at")
+                 .eq("user_id", user_id).eq("normalized_key", mention["key"]))
+            if business_id is not None:
+                q = q.eq("business_id", business_id)
+            rows = getattr(q.limit(1).execute(), "data", None) or []
             if rows:
                 patch = {"kind": merge_kind(rows[0].get("kind", mention["kind"]), mention["kind"])}
                 if occurred_at and str(occurred_at) > str(rows[0].get("last_seen_at") or ""):
                     patch["last_seen_at"] = occurred_at
                 db.table("parties").update(patch).eq("id", rows[0]["id"]).execute()
             else:
-                db.table("parties").insert({
+                new_row = {
                     "user_id": user_id,
                     "name": mention["name"],           # as the owner typed it
                     "normalized_key": mention["key"],
                     "kind": mention["kind"],
                     "first_seen_at": occurred_at,
                     "last_seen_at": occurred_at,
-                }).execute()
+                }
+                if business_id is not None:
+                    new_row["business_id"] = business_id
+                db.table("parties").insert(new_row).execute()
         except Exception as e:  # noqa: BLE001 — parties must never break the pipeline
             log.info("[parties] upsert skipped (%s): %s", mention["key"], e)
             return  # table missing/unreachable — no point trying the next mention
@@ -161,8 +166,10 @@ def upsert_from_event(db, user_id: str, payload: dict, occurred_at=None) -> None
 # ── CRUD (tenant-scoped) ──────────────────────────────────────────────────────
 
 
-def list_parties(db, user_id: str, kind: str | None = None) -> list:
+def list_parties(db, user_id: str, kind: str | None = None, business_id: str | None = None) -> list:
     q = db.table("parties").select("*").eq("user_id", user_id)
+    if business_id is not None:                       # multi-business (audit #16)
+        q = q.eq("business_id", business_id)
     if kind in ("customer", "supplier"):
         # 'both' rows belong to either filtered view.
         q = q.in_("kind", [kind, "both"])
@@ -170,7 +177,7 @@ def list_parties(db, user_id: str, kind: str | None = None) -> list:
     return getattr(res, "data", None) or []
 
 
-def create_party(db, user_id: str, data: dict) -> dict:
+def create_party(db, user_id: str, data: dict, business_id: str | None = None) -> dict:
     clean = _clean(data)
     if not clean.get("name"):
         raise ValueError("Party name is required.")
@@ -180,9 +187,12 @@ def create_party(db, user_id: str, data: dict) -> dict:
         **clean,
         "normalized_key": normalize_key(clean["name"]),
     }
-    existing = (db.table("parties").select("id").eq("user_id", user_id)
-                .eq("normalized_key", row["normalized_key"]).limit(1).execute())
-    if getattr(existing, "data", None):
+    if business_id is not None:
+        row["business_id"] = business_id
+    dup = db.table("parties").select("id").eq("user_id", user_id).eq("normalized_key", row["normalized_key"])
+    if business_id is not None:
+        dup = dup.eq("business_id", business_id)
+    if getattr(dup.limit(1).execute(), "data", None):
         raise ValueError(f"'{clean['name']}' already exists.")
     res = db.table("parties").insert(row).execute()
     return (getattr(res, "data", None) or [row])[0]

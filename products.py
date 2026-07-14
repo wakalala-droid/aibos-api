@@ -46,15 +46,20 @@ def _clean(data: dict) -> dict:
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────────
 
-def list_products(db, user_id: str) -> list:
-    res = db.table("products").select("*").eq("user_id", user_id).order("name").execute()
+def list_products(db, user_id: str, business_id: str | None = None) -> list:
+    q = db.table("products").select("*").eq("user_id", user_id)
+    if business_id is not None:                       # multi-business (audit #16)
+        q = q.eq("business_id", business_id)
+    res = q.order("name").execute()
     return getattr(res, "data", None) or []
 
 
-def create_product(db, user_id: str, data: dict) -> dict:
+def create_product(db, user_id: str, data: dict, business_id: str | None = None) -> dict:
     row = {"user_id": user_id, **_clean(data)}
     if not row.get("name"):
         raise ValueError("Product name is required.")
+    if business_id is not None:
+        row["business_id"] = business_id
     res = db.table("products").insert(row).execute()
     return (getattr(res, "data", None) or [row])[0]
 

@@ -44,7 +44,7 @@ _PROPLUS: set[str] = _PRO | {
     "morning_brief", "chat_actions", "deliveries", "automation",
 }
 _GROWTH: set[str] = _PROPLUS | {
-    "cross_engine", "multi_location", "api_access",
+    "cross_engine", "multi_location", "multi_business", "api_access",
 }
 
 _ACCESS: dict[str, set[str]] = {
@@ -126,6 +126,7 @@ _FEATURE_LABEL = {
     "engine3":   "Operations intelligence (Engine 3)",
     "cross_engine":   "the cross-engine composite score",
     "multi_location": "multiple locations",
+    "multi_business": "running multiple businesses",
     "forecast":  "forecasting",
     "anomaly":   "anomaly detection",
     "variance":  "variance analysis",

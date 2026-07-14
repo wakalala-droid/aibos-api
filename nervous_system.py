@@ -191,7 +191,8 @@ def _audit_entry(actor: str, action: str, note: str | None = None) -> dict:
 
 
 def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
-           actor_role: str = "owner", actor_id: str | None = None) -> dict:
+           actor_role: str = "owner", actor_id: str | None = None,
+           business_id: str | None = None) -> dict:
     """
     Run the full pipeline for one event and return the persisted row.
     Rebuilds the Digital Twin when the resulting event is confirmed.
@@ -225,22 +226,25 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
         "audit": audit,
         "created_by": actor,
     }
+    if business_id is not None:                       # multi-business (audit #16)
+        row["business_id"] = business_id
 
     res = db.table("business_events").insert(row).execute()
     saved = (getattr(res, "data", None) or [row])[0]
 
     # Named customers/suppliers become entities (audit #6). Best-effort — the
     # event always wins.
-    parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"])
+    parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"], business_id)
 
     if status == "confirmed":
-        twin.rebuild(db, user_id)
+        twin.rebuild(db, user_id, business_id)
 
     log.info("[nervous] %s ingested type=%s status=%s conf=%.2f", user_id, ev.event_type, status, confidence)
     return saved
 
 
-def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str = "ZMW") -> dict:
+def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str = "ZMW",
+                 business_id: str | None = None) -> dict:
     """
     Validate+publish many events, rebuilding the twin once at the end (efficient for
     Excel/POS imports). Per-row failures are collected, not fatal — partial import is
@@ -264,6 +268,8 @@ def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str 
                 "payload": payload, "corrections": {},
                 "audit": [_audit_entry(user_id, "created")], "created_by": user_id,
             }
+            if business_id is not None:
+                row["business_id"] = business_id
             res = db.table("business_events").insert(row).execute()
             saved.append((getattr(res, "data", None) or [row])[0])
             parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"])
@@ -272,7 +278,7 @@ def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str 
             errors.append({"index": i, "error": str(e)})
 
     if any_confirmed:
-        twin.rebuild(db, user_id)
+        twin.rebuild(db, user_id, business_id)
     return {"saved": saved, "errors": errors, "saved_count": len(saved), "error_count": len(errors)}
 
 
@@ -296,7 +302,7 @@ def confirm(db, user_id: str, event_id: str) -> dict:
         .update({"status": "confirmed", "audit": audit})
         .eq("id", event_id).eq("user_id", user_id).execute()
     )
-    twin.rebuild(db, user_id)
+    twin.rebuild(db, user_id, ev.get("business_id"))   # this event's business
     return (getattr(res, "data", None) or [ev])[0]
 
 
@@ -342,7 +348,7 @@ def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
         .update(update).eq("id", event_id).eq("user_id", user_id).execute()
     )
     if ev["status"] == "confirmed":
-        twin.rebuild(db, user_id)
+        twin.rebuild(db, user_id, ev.get("business_id"))
     # Capture Business Memory (Phase 5) — turn this correction into reusable intel.
     if changes:
         memory.capture_from_correction(db, user_id, ev, changes)
@@ -359,7 +365,7 @@ def void(db, user_id: str, event_id: str, reason: str | None = None) -> dict:
         .eq("id", event_id).eq("user_id", user_id).execute()
     )
     if ev["status"] == "confirmed":
-        twin.rebuild(db, user_id)  # removing a confirmed event changes reality
+        twin.rebuild(db, user_id, ev.get("business_id"))  # removing a confirmed event changes reality
     return (getattr(res, "data", None) or [ev])[0]
 
 
@@ -464,8 +470,10 @@ def reset_business(db, user_id: str, *, source: str | None = None,
 
 
 def list_events(db, user_id: str, *, status: str | None = None, event_type: str | None = None,
-                limit: int = 200, offset: int = 0) -> list:
+                limit: int = 200, offset: int = 0, business_id: str | None = None) -> list:
     q = db.table("business_events").select("*").eq("user_id", user_id)
+    if business_id is not None:                       # multi-business scope (audit #16)
+        q = q.eq("business_id", business_id)
     if status:
         q = q.eq("status", status)
     if event_type:

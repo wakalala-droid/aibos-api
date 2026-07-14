@@ -280,13 +280,25 @@ def monthly_rows_for_engine1(state: dict) -> list:
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
-def _load_state_row(db, user_id: str) -> dict | None:
-    res = db.table("business_state").select("*").eq("user_id", user_id).limit(1).execute()
+# Multi-business (audit #16): every twin function accepts an optional
+# business_id. When None (single-business accounts, or pre-migration-0023),
+# behaviour is EXACTLY as before — scoped by user_id alone. When provided, the
+# twin is keyed by (user_id, business_id) so each venture keeps separate books.
+
+def _scoped(query, user_id: str, business_id: str | None):
+    query = query.eq("user_id", user_id)
+    if business_id is not None:
+        query = query.eq("business_id", business_id)
+    return query
+
+
+def _load_state_row(db, user_id: str, business_id: str | None = None) -> dict | None:
+    res = _scoped(db.table("business_state").select("*"), user_id, business_id).limit(1).execute()
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
 
 
-def rebuild(db, user_id: str) -> dict:
+def rebuild(db, user_id: str, business_id: str | None = None) -> dict:
     """
     Replay the user's confirmed events into business_state and persist it.
     Returns the new state dict. Idempotent: calling it repeatedly yields the same
@@ -296,42 +308,40 @@ def rebuild(db, user_id: str) -> dict:
         raise RuntimeError("Supabase not configured — cannot rebuild the Digital Twin.")
 
     # Preserve operator-seeded fields (opening cash, currency) across rebuilds.
-    existing = _load_state_row(db, user_id) or {}
+    existing = _load_state_row(db, user_id, business_id) or {}
     opening_cash = _num(existing.get("opening_cash"))
     currency = existing.get("currency") or "ZMW"
 
-    res = (
-        db.table("business_events")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("status", "confirmed")
-        .order("occurred_at", desc=False)
-        .execute()
-    )
+    res = _scoped(
+        db.table("business_events").select("*"), user_id, business_id
+    ).eq("status", "confirmed").order("occurred_at", desc=False).execute()
     events = getattr(res, "data", None) or []
 
     state = project(events, opening_cash=opening_cash, currency=currency)
 
     row = {"user_id": user_id, **state}
-    row["rebuilt_at"] = "now()"  # let Postgres stamp via default? use explicit below
-    # supabase-py can't send now(); drop the sentinel and let updated_at trigger run.
-    row.pop("rebuilt_at", None)
+    if business_id is not None:
+        row["business_id"] = business_id
+        on_conflict = "user_id,business_id"
+    else:
+        on_conflict = "user_id"
 
-    db.table("business_state").upsert(row, on_conflict="user_id").execute()
-    log.info("[twin] rebuilt user=%s events=%d cash=%.2f profit=%.2f",
-             user_id, state["event_count"], state["cash"], state["total_profit"])
+    db.table("business_state").upsert(row, on_conflict=on_conflict).execute()
+    log.info("[twin] rebuilt user=%s biz=%s events=%d cash=%.2f profit=%.2f",
+             user_id, business_id, state["event_count"], state["cash"], state["total_profit"])
     return state
 
 
-def get_state(db, user_id: str) -> dict:
+def get_state(db, user_id: str, business_id: str | None = None) -> dict:
     """Return the persisted twin row, or an empty state if none exists yet."""
     if db is None:
         return {"user_id": user_id, **_empty_state()}
-    row = _load_state_row(db, user_id)
+    row = _load_state_row(db, user_id, business_id)
     return row if row else {"user_id": user_id, **_empty_state()}
 
 
-def seed(db, user_id: str, opening_cash: float | None = None, currency: str | None = None) -> dict:
+def seed(db, user_id: str, opening_cash: float | None = None, currency: str | None = None,
+         business_id: str | None = None) -> dict:
     """
     Seed operator-provided baseline (Setup Wizard "initial cash" + currency), then
     rebuild so cash = opening_cash + net flow of events. Creates the twin row if it
@@ -339,9 +349,11 @@ def seed(db, user_id: str, opening_cash: float | None = None, currency: str | No
     """
     if db is None:
         raise RuntimeError("Supabase not configured — cannot seed the Digital Twin.")
-    existing = _load_state_row(db, user_id) or {}
+    existing = _load_state_row(db, user_id, business_id) or {}
     patch = {"user_id": user_id}
+    if business_id is not None:
+        patch["business_id"] = business_id
     patch["opening_cash"] = _num(opening_cash) if opening_cash is not None else _num(existing.get("opening_cash"))
     patch["currency"] = currency or existing.get("currency") or "ZMW"
-    db.table("business_state").upsert(patch, on_conflict="user_id").execute()
-    return rebuild(db, user_id)  # recompute cash off the new opening balance
+    db.table("business_state").upsert(patch, on_conflict="user_id,business_id" if business_id is not None else "user_id").execute()
+    return rebuild(db, user_id, business_id)  # recompute cash off the new opening balance
