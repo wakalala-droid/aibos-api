@@ -2921,6 +2921,20 @@ async def get_payroll_run(run_id: str, user_id: str = Depends(require_user)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/payroll/runs/{run_id}/compliance-text")
+async def payroll_compliance_text(run_id: str, business_name: Optional[str] = Query(None),
+                                  user_id: str = Depends(require_user)):
+    """A shareable monthly statutory summary — PAYE/NAPSA/NHIMA owed for the
+    period (audit #66). Owner sends/keeps it; nothing is auto-filed."""
+    entitlements.require_feature(user_id, "payroll")
+    db = _require_db()
+    try:
+        run = payroll_api.get_run(db, user_id, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, "text": payroll_api.compliance_text(run, business_name)}
+
+
 @app.get("/payroll/runs/{run_id}/payslip-text")
 async def payslip_share_text(run_id: str, employee_id: str = Query(...),
                              business_name: Optional[str] = Query(None),

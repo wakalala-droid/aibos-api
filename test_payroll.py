@@ -113,6 +113,20 @@ def test_payslip_text():
     assert "Loan repayment" not in no_loan and "K33.50" in no_loan
 
 
+def test_compliance_text():
+    run = {"period": "2026-07", "totals": {
+        "headcount": 3, "gross": 24000, "napsa_employee": 1200, "napsa_employer": 1200,
+        "nhima_employee": 240, "paye": 3600}}
+    txt = payroll.compliance_text(run, business_name="Zoe's Kitchen")
+    assert "*Statutory summary — 2026-07*" in txt and "Zoe's Kitchen" in txt
+    assert "Staff paid: 3" in txt
+    assert "PAYE → ZRA:    K3,600.00" in txt
+    assert "NAPSA:         K2,400.00" in txt          # both sides
+    assert "NHIMA:         K480.00" in txt            # employer matches
+    assert "*Total statutory: K6,480.00*" in txt
+    assert "due 2026-08-10" in txt
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

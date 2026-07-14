@@ -299,6 +299,44 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
     return "\n".join(lines)
 
 
+def compliance_text(run: dict, business_name: str | None = None, sym: str = "K") -> str:
+    """A monthly statutory summary the owner can share/keep (audit #66):
+    what's owed to ZRA/NAPSA/NHIMA for the period, from the run's own totals.
+    Pure; renders only lines with a real amount."""
+    def money(v) -> str:
+        try:
+            return f"{sym}{float(v):,.2f}"
+        except (TypeError, ValueError):
+            return f"{sym}0.00"
+
+    totals = run.get("totals") or {}
+    period = run.get("period") or "?"
+    napsa = _num(totals.get("napsa_employee")) + _num(totals.get("napsa_employer"))
+    nhima = _num(totals.get("nhima_employee")) * 2      # employer matches 1%
+    paye = _num(totals.get("paye"))
+    due = _due_date(period).isoformat()
+
+    lines = [
+        f"*Statutory summary — {period}*" + (f"\n{business_name}" if business_name else ""),
+        f"Staff paid: {int(_num(totals.get('headcount')))}",
+        f"Total gross: {money(totals.get('gross'))}",
+        "",
+        "*Due to authorities (by the 10th next month):*",
+    ]
+    if paye > 0:
+        lines.append(f"  PAYE → ZRA:    {money(paye)}")
+    if napsa > 0:
+        lines.append(f"  NAPSA:         {money(napsa)}")
+    if nhima > 0:
+        lines.append(f"  NHIMA:         {money(nhima)}")
+    lines += [
+        "",
+        f"*Total statutory: {money(paye + napsa + nhima)}* — due {due}.",
+        "\nComputed by AIBOS at current Zambian rates.",
+    ]
+    return "\n".join(lines)
+
+
 def create_employee(db, user_id: str, data: dict) -> dict:
     row = {"user_id": user_id, **_clean_employee(data)}
     res = db.table("employees").insert(row).execute()
