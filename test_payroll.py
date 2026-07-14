@@ -98,6 +98,21 @@ def test_non_zmw_is_register_only():
     assert s["net"] == 5_000.0
 
 
+def test_payslip_text():
+    slip = {"period": "2026-07", "employee_name": "Mwansa Banda", "gross": 8000,
+            "napsa_employee": 400, "nhima_employee": 80, "paye": 1200,
+            "loan_deduction": 250, "net": 6070, "gratuity_accrued": 0}
+    txt = payroll.payslip_text(slip, business_name="Zoe's Kitchen")
+    assert "*Payslip — 2026-07*" in txt and "Zoe's Kitchen" in txt
+    assert "Mwansa Banda" in txt and "K8,000.00" in txt
+    assert "Loan repayment: −K250.00" in txt
+    assert "*Net pay:        K6,070.00*" in txt
+    assert "Gratuity" not in txt                       # zero → line omitted
+
+    no_loan = payroll.payslip_text({**slip, "loan_deduction": 0, "gratuity_accrued": 33.5})
+    assert "Loan repayment" not in no_loan and "K33.50" in no_loan
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -2695,6 +2695,26 @@ async def get_payroll_run(run_id: str, user_id: str = Depends(require_user)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/payroll/runs/{run_id}/payslip-text")
+async def payslip_share_text(run_id: str, employee_id: str = Query(...),
+                             business_name: Optional[str] = Query(None),
+                             user_id: str = Depends(require_user)):
+    """WhatsApp-ready payslip for one employee (audit #26) — the owner sends
+    it from their own phone, like invoice and debtor sharing."""
+    entitlements.require_feature(user_id, "payroll")
+    db = _require_db()
+    try:
+        run = payroll_api.get_run(db, user_id, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    slip = next((s for s in run.get("payslips") or []
+                 if str(s.get("employee_id")) == employee_id), None)
+    if slip is None:
+        raise HTTPException(status_code=404, detail="No payslip for that employee in this run.")
+    slip = {**slip, "period": slip.get("period") or run.get("period")}
+    return {"ok": True, "text": payroll_api.payslip_text(slip, business_name)}
+
+
 class PayrollRunRequest(BaseModel):
     period: str                             # 'YYYY-MM'
     pay_date: Optional[str] = None
