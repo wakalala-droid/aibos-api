@@ -52,6 +52,7 @@ import debtors as debtors_api
 import cash_forecast as cash_forecast_api
 import rec_store
 import llm
+import compliance as compliance_api
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2299,6 +2300,26 @@ async def remove_product(product_id: str, user_id: str = Depends(require_user)):
     db = _require_db()
     products_api.delete_product(db, user_id, product_id)
     return {"ok": True}
+
+
+# ── Statutory compliance calendar (audit #25) ─────────────────────────────────
+
+@app.post("/schedule/statutory")
+async def seed_statutory_calendar(user_id: str = Depends(require_user)):
+    """One tap: recurring PAYE/NAPSA/NHIMA reminders on the 10th, pre-filled
+    from the latest payroll run. Idempotent by title. Recurrence is the paid
+    Scheduler layer — same gate."""
+    entitlements.require_feature(user_id, "schedule")
+    db = _require_db()
+    runs = payroll_api.list_runs(db, user_id, limit=1)
+    totals = (runs[0].get("totals") if runs else None) or None
+    candidates = compliance_api.statutory_items(totals)
+    existing = schedule_api.list_items(db, user_id, horizon_days=60)
+    created = [schedule_api.create_item(db, user_id, item)
+               for item in compliance_api.missing_items(
+                   [r.get("title") for r in existing], candidates)]
+    return {"ok": True, "created": created, "created_count": len(created),
+            "skipped_existing": len(candidates) - len(created)}
 
 
 # ── Parties: customers & suppliers (audit #6) ─────────────────────────────────

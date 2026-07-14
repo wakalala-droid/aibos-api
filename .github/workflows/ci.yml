@@ -67,3 +67,6 @@ jobs:
 
       - name: Entitlements tests
         run: python test_entitlements.py
+
+      - name: Compliance calendar tests
+        run: python test_compliance.py
