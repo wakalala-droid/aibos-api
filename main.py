@@ -49,6 +49,8 @@ import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
 import debtors as debtors_api
+import cash_forecast as cash_forecast_api
+import rec_store
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2219,7 +2221,29 @@ async def get_recommendations(user_id: str = Depends(require_user)):
     stock = products_api.compute_stock(prods, events)
     context = {"products": prods, "stock": stock, "low_stock": products_api.low_stock(prods, stock)}
     recs = engines_api.run_all(state, events, context)
+    # Ledger the batch (audit #20): annotates each rec with rec_id/status/
+    # times_shown so the UI can take feedback. Best-effort pre-migration-0021.
+    rec_store.record_shown(db, user_id, recs)
     return {"ok": True, "recommendations": recs, "count": len(recs)}
+
+
+@app.post("/recommendations/{rec_id}/status")
+async def recommendation_feedback(rec_id: str, body: Dict[str, Any] = Body(...),
+                                  user_id: str = Depends(require_user)):
+    """Owner feedback on advice: accepted ('did this') or dismissed."""
+    db = _require_db()
+    try:
+        row = rec_store.set_status(db, user_id, rec_id, str(body.get("status") or ""))
+        return {"ok": True, "recommendation": row}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/recommendations/track-record")
+async def recommendations_track_record(user_id: str = Depends(require_user)):
+    """AIBOS's own advice scoreboard — self-auditing intelligence."""
+    db = _require_db()
+    return {"ok": True, **rec_store.track_record(db, user_id)}
 
 
 # ── Products catalog (Initiative 3) ───────────────────────────────────────────
@@ -2413,6 +2437,40 @@ async def cancel_invoice(invoice_id: str, user_id: str = Depends(require_user)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# ── Voice transcription (audit #17) ───────────────────────────────────────────
+# Server-side Whisper fallback for phones without the Web Speech API — the
+# transcript rides the SAME classify → propose → confirm flow as typed text,
+# so the trust gate is untouched. Voice notes are small; 6 MB ≈ several
+# minutes of opus, far beyond a "sold 3 crates" utterance.
+
+MAX_VOICE_BYTES = 6 * 1024 * 1024
+
+
+@app.post("/transcribe")
+async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(require_user)):
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Voice transcription isn't configured on the server.")
+    content = await file.read()
+    if len(content) > MAX_VOICE_BYTES:
+        raise HTTPException(status_code=413, detail="Voice note too long — keep it under a minute or two.")
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty audio.")
+    try:
+        client = Groq(api_key=api_key)
+        result = client.audio.transcriptions.create(
+            file=(file.filename or "note.webm", content),
+            model="whisper-large-v3",
+        )
+        text = (getattr(result, "text", None) or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("transcribe error: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not transcribe that — try again or type it.")
+    if not text:
+        raise HTTPException(status_code=422, detail="Didn't catch any speech — try again or type it.")
+    return {"ok": True, "text": text}
+
+
 @app.get("/debtors")
 async def get_debtors(business_name: Optional[str] = Query(None),
                       user_id: str = Depends(require_user)):
@@ -2448,6 +2506,15 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
 # ── Anomaly auto-investigation (audit #13) ────────────────────────────────────
 # Deterministic "what changed" over the caller's own events. Ungated like the
 # rest of the Engine-1 sub-features' free preview (see entitlements.py note).
+
+@app.get("/forecast/cash")
+async def cash_forecast_route(user_id: str = Depends(require_user)):
+    """P10/P50/P90 cash bands from the caller's own monthly history (audit
+    #19). Ungated like the other Engine-1 sub-features' free preview."""
+    db = _require_db()
+    state = twin.get_state(db, user_id)
+    return {"ok": True, "forecast": cash_forecast_api.forecast_cash(state)}
+
 
 @app.get("/investigate")
 async def investigate_anomaly(month: Optional[str] = Query(None), user_id: str = Depends(require_user)):
