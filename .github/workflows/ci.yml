@@ -70,3 +70,6 @@ jobs:
 
       - name: Compliance calendar tests
         run: python test_compliance.py
+
+      - name: Loyverse importer tests
+        run: python test_loyverse.py

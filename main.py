@@ -53,6 +53,7 @@ import cash_forecast as cash_forecast_api
 import rec_store
 import llm
 import compliance as compliance_api
+import loyverse
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -2284,6 +2285,34 @@ async def create_product(body: Dict[str, Any] = Body(...), user_id: str = Depend
         return {"ok": True, "product": products_api.create_product(db, user_id, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/products/import/loyverse")
+async def import_loyverse_items(file: UploadFile = File(...), user_id: str = Depends(require_user)):
+    """Loyverse items export → the product catalog in one upload (audit #29).
+    Idempotent by product name: re-importing refreshes nothing and duplicates
+    nothing — existing names are skipped."""
+    db = _require_db()
+    content = await file.read()
+    _enforce_upload_size(content)
+    try:
+        parsed = loyverse.parse_items_csv(content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    existing = {products_api.normalize_name(p.get("name"))
+                for p in products_api.list_products(db, user_id)}
+    created, skipped_existing = [], 0
+    for body in parsed["products"]:
+        if products_api.normalize_name(body["name"]) in existing:
+            skipped_existing += 1
+            continue
+        try:
+            created.append(products_api.create_product(db, user_id, body))
+        except ValueError as e:
+            parsed["skipped"].append(f"{body['name']}: {e}")
+    return {"ok": True, "store": parsed["store"], "created_count": len(created),
+            "skipped_existing": skipped_existing, "warnings": parsed["skipped"][:20]}
 
 
 @app.patch("/products/{product_id}")
