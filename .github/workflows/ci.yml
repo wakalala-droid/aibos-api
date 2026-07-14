@@ -64,3 +64,6 @@ jobs:
 
       - name: LLM fallback tests
         run: python test_llm.py
+
+      - name: Entitlements tests
+        run: python test_entitlements.py

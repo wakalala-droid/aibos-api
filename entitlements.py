@@ -143,6 +143,37 @@ _FEATURE_LABEL = {
 }
 
 
+# ── Free-tier chat taster (audit #24) ─────────────────────────────────────────
+# Free gets a taste of the flagship: N questions per UTC day, counted
+# server-side in usage_events (event='chat_taster', service-role writes).
+# Deny-safe: if the count can't be established, the taster is NOT granted —
+# the paid gate stays authoritative.
+
+CHAT_TASTER_PER_DAY = 3
+
+
+def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY) -> tuple[bool, int]:
+    """Try to consume one taster question. Returns (allowed, used_today_after).
+    Counts before writing so the limit can never be raced far past."""
+    if db is None or not user_id:
+        return False, 0
+    try:
+        from datetime import datetime, timezone
+        day_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+        res = (db.table("usage_events").select("id", count="exact", head=True)
+               .eq("user_id", user_id).eq("event", "chat_taster")
+               .gte("created_at", day_start).execute())
+        used = int(getattr(res, "count", None) or 0)
+        if used >= limit:
+            return False, used
+        db.table("usage_events").insert(
+            {"user_id": user_id, "event": "chat_taster", "meta": {}}).execute()
+        return True, used + 1
+    except Exception as e:  # noqa: BLE001 — infra error → no free ride, gate stands
+        log.warning("[entitlements] chat taster check failed for %s: %s", user_id, e)
+        return False, 0
+
+
 def require_feature(user_id: str, feature: str) -> str:
     """Raise 402 unless the caller's tier unlocks `feature`. Returns the tier."""
     tier = user_tier(user_id)

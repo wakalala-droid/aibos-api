@@ -1551,9 +1551,23 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
 
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
     """
+    taster_note = None
     try:
-        # AI CFO chat is a paid capability (Pro+) — enforce before any work.
-        entitlements.require_feature(user_id, "ai_chat")
+        # AI CFO chat is a paid capability — but Free gets a daily taster
+        # (audit #24): 3 questions/day, counted server-side. Exhausted or
+        # uncountable → the original paid gate stands.
+        try:
+            entitlements.require_feature(user_id, "ai_chat")
+        except HTTPException as gate:
+            allowed, used = entitlements.chat_taster(get_db(), user_id)
+            if not allowed:
+                raise gate
+            remaining = entitlements.CHAT_TASTER_PER_DAY - used
+            taster_note = (
+                "\n\n_(That was your last free question today — Pro makes this unlimited.)_"
+                if remaining == 0 else
+                f"\n\n_({remaining} free question{'s' if remaining != 1 else ''} left today.)_"
+            )
 
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
@@ -1664,9 +1678,10 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
                     db, user_id,
                 )
                 if (out.get("reply") or "").strip():
+                    reply = out["reply"] + (taster_note or "")
                     return {
-                        "reply": out["reply"],
-                        "response": out["reply"],
+                        "reply": reply,
+                        "response": reply,
                         "model": "AI-BOS Intelligence",
                         "context_injected": injected,
                         "tools_used": out["tools_used"],
@@ -1686,7 +1701,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(require_user)):
             stream=False,
         )
 
-        response_text = completion.choices[0].message.content
+        response_text = (completion.choices[0].message.content or "") + (taster_note or "")
         # Return BOTH keys so any frontend contract works
         return {
             "reply": response_text,
