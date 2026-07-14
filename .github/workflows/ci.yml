@@ -55,3 +55,9 @@ jobs:
 
       - name: Debtors tests
         run: python test_debtors.py
+
+      - name: Cash forecast tests
+        run: python test_cash_forecast.py
+
+      - name: Recommendations ledger tests
+        run: python test_rec_store.py
