@@ -173,6 +173,75 @@ def test_agent_loop_no_tools_needed():
     assert out["reply"] == "Hello!" and out["tools_used"] == [] and out["rounds"] == 0
 
 
+# ── Streaming loop (audit #21) ───────────────────────────────────────────────
+
+def _chunk(content=None, tool_calls=None):
+    """One streamed chunk in the OpenAI/Groq delta shape."""
+    return NS(choices=[NS(delta=NS(content=content, tool_calls=tool_calls))])
+
+
+def _tc_delta(index, id=None, name=None, arguments=None):
+    return NS(index=index, id=id, function=NS(name=name, arguments=arguments))
+
+
+class _FakeStreamClient:
+    """Yields scripted streams in order; records the kwargs of each call."""
+    def __init__(self, streams):
+        self.streams = list(streams)
+        self.calls = []
+        self.chat = NS(completions=NS(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self.streams.pop(0))
+
+
+def test_stream_prose_only():
+    client = _FakeStreamClient([[_chunk("Hello"), _chunk(" there"), _chunk("!")]])
+    out = list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "hi"}], _seeded_db(), "u1"))
+    assert [d for k, d in out if k == "token"] == ["Hello", " there", "!"]
+    assert out[-1][0] == "done" and out[-1][1]["tools_used"] == []
+    assert client.calls[0]["stream"] is True
+
+
+def test_stream_tool_then_prose():
+    # Round 1: a tool call arrives in fragments (name first, args split).
+    round1 = [
+        _chunk(tool_calls=[_tc_delta(0, id="c1", name="query_events", arguments='{"cat')]),
+        _chunk(tool_calls=[_tc_delta(0, arguments='egory": "fuel"}')]),
+    ]
+    round2 = [_chunk("Fuel is "), _chunk("K1,000.")]
+    client = _FakeStreamClient([round1, round2])
+    out = list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "fuel?"}], _seeded_db(), "u1"))
+
+    kinds = [k for k, _ in out]
+    assert "tool" in kinds
+    assert [d for k, d in out if k == "tool"] == ["query_events"]
+    assert "".join(d for k, d in out if k == "token") == "Fuel is K1,000."
+    assert out[-1][1]["tools_used"] == ["query_events"]
+
+    # The second call must carry the assistant tool-call turn + the tool result,
+    # with the fragmented arguments reassembled into valid JSON.
+    convo = client.calls[1]["messages"]
+    assert convo[-2]["role"] == "assistant"
+    assert json.loads(convo[-2]["tool_calls"][0]["function"]["arguments"]) == {"category": "fuel"}
+    assert convo[-1]["role"] == "tool"
+    assert json.loads(convo[-1]["content"])["total_amount"] == 1000
+
+
+def test_stream_round_budget_forces_prose():
+    endless = [[_chunk(tool_calls=[_tc_delta(0, id=f"c{i}", name="get_business_snapshot", arguments="{}")])]
+               for i in range(cfo_tools.MAX_TOOL_ROUNDS)]
+    endless.append([_chunk("Best I can do.")])
+    client = _FakeStreamClient(endless)
+    out = list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "hi"}], _seeded_db(), "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Best I can do."
+    assert "tools" not in client.calls[-1]        # final call forces prose
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

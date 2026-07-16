@@ -300,6 +300,97 @@ def run_tool(db, user_id: str, name: str, args: dict) -> dict:
 # ── Agent loop (client-injected → offline-testable) ───────────────────────────
 
 
+def _accumulate_tool_deltas(acc: dict, deltas) -> None:
+    """Fold streamed tool_call deltas into {index: {id, name, arguments}}.
+    Streaming sends a tool call in pieces: the id/name arrive first, then the
+    JSON arguments in fragments that must be concatenated in order."""
+    for d in deltas or []:
+        i = getattr(d, "index", 0) or 0
+        slot = acc.setdefault(i, {"id": None, "name": None, "arguments": ""})
+        if getattr(d, "id", None):
+            slot["id"] = d.id
+        fn = getattr(d, "function", None)
+        if fn is not None:
+            if getattr(fn, "name", None):
+                slot["name"] = fn.name
+            if getattr(fn, "arguments", None):
+                slot["arguments"] += fn.arguments
+
+
+def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
+                          max_rounds: int = MAX_TOOL_ROUNDS,
+                          temperature: float = 0.4, max_tokens: int = 1024):
+    """
+    Streaming twin of run_agent_loop (audit #21). Yields (kind, data) tuples:
+
+        ("tool",  name)   — a lookup started (the UI can show "checking …")
+        ("token", text)   — a piece of the answer, as the model writes it
+        ("done",  {...})  — finished; carries tools_used
+
+    Tool rounds and the prose stream through the SAME call: the model's deltas
+    carry either content (yield it immediately) or tool_calls (accumulate,
+    execute, loop). So an answer that needs no lookup starts typing at once,
+    and one that does starts typing the moment the lookups land — no wasted
+    extra round-trip either way.
+    """
+    convo = list(messages)
+    tools_used: list[str] = []
+
+    for round_no in range(max_rounds + 1):
+        force_prose = round_no == max_rounds
+        kwargs = dict(model=model, messages=convo, temperature=temperature,
+                      max_tokens=max_tokens, stream=True)
+        if not force_prose:
+            kwargs.update(tools=TOOLS, tool_choice="auto")
+
+        stream = client.chat.completions.create(**kwargs)
+
+        pending: dict = {}
+        said_anything = False
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            text = getattr(delta, "content", None)
+            if text:
+                said_anything = True
+                yield ("token", text)
+            _accumulate_tool_deltas(pending, getattr(delta, "tool_calls", None))
+
+        if not pending:                    # the model answered in prose — done
+            yield ("done", {"tools_used": tools_used})
+            return
+
+        # Echo the assistant turn (with its tool calls), then answer each call.
+        convo.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": c["id"] or f"call_{i}", "type": "function",
+                "function": {"name": c["name"] or "", "arguments": c["arguments"] or "{}"},
+            } for i, c in sorted(pending.items())],
+        })
+        for i, c in sorted(pending.items()):
+            name = c["name"] or ""
+            try:
+                args = json.loads(c["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            tools_used.append(name)
+            yield ("tool", name)
+            result = run_tool(db, user_id, name, args)
+            convo.append({
+                "role": "tool",
+                "tool_call_id": c["id"] or f"call_{i}",
+                "content": json.dumps(result, default=str)[:6000],
+            })
+
+    yield ("done", {"tools_used": tools_used})
+
+
 def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                    max_rounds: int = MAX_TOOL_ROUNDS,
                    temperature: float = 0.4, max_tokens: int = 1024) -> dict:

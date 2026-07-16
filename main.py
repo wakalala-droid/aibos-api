@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from groq import Groq
 
@@ -1551,6 +1551,188 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
             lines.append("  " + str(brief)[:1200])
 
     return "\n".join(lines)
+
+
+def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
+    """
+    Shared setup for /chat and /chat/stream (audit #21): the paid gate + free
+    taster, the system prompt (context, currency, anti-fabrication), the tool
+    prompt, the message list and the Groq client. ONE place so the streaming
+    and non-streaming paths can never drift apart.
+
+    Returns {taster_note, system_prompt, tool_system, chat_messages, client,
+    injected, db}. Raises HTTPException exactly as before.
+    """
+    taster_note = None
+    # AI CFO chat is a paid capability — but Free gets a daily taster
+    # (audit #24): 3 questions/day, counted server-side. Exhausted or
+    # uncountable → the original paid gate stands.
+    try:
+        entitlements.require_feature(user_id, "ai_chat")
+    except HTTPException as gate:
+        allowed, used = entitlements.chat_taster(get_db(), user_id)
+        if not allowed:
+            raise gate
+        remaining = entitlements.CHAT_TASTER_PER_DAY - used
+        taster_note = (
+            "\n\n_(That was your last free question today — Pro makes this unlimited.)_"
+            if remaining == 0 else
+            f"\n\n_({remaining} free question{'s' if remaining != 1 else ''} left today.)_"
+        )
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured on the server. "
+                   "Add it to Railway environment variables.",
+        )
+
+    # The universal currency selector (lib/currency.ts) flows through the live
+    # context as currency_symbol — the prompt must follow it, not assume Kwacha
+    # (audit item 23). ZMW stays the default when unstated.
+    ctx_sym = str((req.context or {}).get("currency_symbol") or "").strip()
+    currency_line = (
+        "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $."
+        if not ctx_sym or ctx_sym.upper() in ("K", "ZMW")
+        else f"Currency: this business reports in '{ctx_sym}'. ALWAYS use '{ctx_sym}' "
+             "exactly as given. NEVER substitute $, K or any other symbol."
+    )
+    system_parts = [
+        "You are the AI CFO (Chief Financial Officer) for AIBOS, "
+        "a financial intelligence platform serving Zambian SMEs.",
+        currency_line,
+        "You are expert in Zambian business, economics, and SME finance.",
+        "Be direct, insightful, and action-oriented. No fluff.",
+        "NEVER fabricate a time range or data span. Describe the data only by the "
+        "period/granularity actually given in the context. POS/operations data is "
+        "point-in-time sales for its stated period — never call it 'months' or imply "
+        "monthly/yearly history unless an explicit time-series with month rows is present. "
+        "If the context gives a reporting period (e.g. '1st-7th March'), quote it verbatim.",
+    ]
+
+    injected = False
+    if req.context:                                  # rich context from the live frontend
+        ctx_text = _context_to_text(req.context)
+        if ctx_text:
+            system_parts.append("\n" + ctx_text)
+            injected = True
+
+    # Cabinet-backed context (legacy / data-studio) — caller's own file only,
+    # read through the cache→Storage helper so it works after a deploy.
+    cab_entry = None
+    if not injected and req.cabinet_id:
+        try:
+            cab_entry = _owned_cabinet(req.cabinet_id, user_id)
+        except HTTPException:
+            cab_entry = None
+    if cab_entry is not None:
+        df_json = cab_entry.get("df_json")
+        monthly_rows = cab_entry.get("monthly", [])
+        df = pd.read_json(io.StringIO(df_json)) if df_json else (
+            pd.DataFrame(monthly_rows) if monthly_rows else pd.DataFrame())
+        system_parts.append("\n" + _build_ai_context(
+            analysis=cab_entry.get("analysis", {}), monthly_rows=monthly_rows, df=df,
+            filename=cab_entry.get("name", "uploaded file"),
+            sheet_name=cab_entry.get("active_sheet"),
+        ))
+        injected = True
+
+    if not injected:
+        system_parts.append(
+            "No business data is currently uploaded. "
+            "Answer general Zambian business and finance questions, and invite "
+            "the user to upload their financial data for specific analysis."
+        )
+
+    # Live frontend: single `message`. Legacy: full `messages` array.
+    if req.messages:
+        chat_messages = list(req.messages)
+    elif req.message:
+        chat_messages = [{"role": "user", "content": req.message}]
+    else:
+        raise HTTPException(status_code=400, detail="No message provided.")
+
+    tool_system = "\n\n".join(system_parts + [
+        "You have TOOLS over this business's real recorded data — the source of "
+        "record. ALWAYS look figures up with a tool before stating them, and "
+        "prefer tool results over any snapshot above when they disagree. "
+        "CITE YOUR EVIDENCE: whenever you give a figure that came from "
+        "query_events or investigate_month, name the specific events behind it — "
+        "their dates and amounts — e.g. 'K1,860 across 3 fuel expenses (5 Jun "
+        "K620, 15 Jun K620, 25 Jun K620)'. Never give a number without the "
+        "records that back it. If the recorded data doesn't cover the question, "
+        "say so plainly — never invent numbers. Tools are read-only: to record "
+        "something, point the owner at the Record page (or chat recording on Pro+).",
+    ])
+
+    return {
+        "taster_note": taster_note,
+        "system_prompt": "\n\n".join(system_parts),
+        "tool_system": tool_system,
+        "chat_messages": chat_messages,
+        "client": Groq(api_key=api_key),
+        "injected": injected,
+        "db": get_db(),
+    }
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
+    """
+    The AI CFO, streamed (audit #21). Server-Sent Events: the answer arrives as
+    the model writes it instead of after a 3–5s pause. Same gate, same tools,
+    same citations as /chat — which stays as the non-streaming fallback for any
+    client that can't stream.
+
+    Frames: {"tool": name} · {"t": "…"} · {"done": true, "tools_used": [...]}
+    """
+    prep = _prepare_chat(req, user_id)          # raises 402/500 before any stream
+    db = prep["db"]
+    taster_note = prep["taster_note"]
+
+    def events():
+        try:
+            if db is not None:
+                for kind, data in cfo_tools.run_agent_loop_stream(
+                    prep["client"], llm.chat_model(),
+                    [{"role": "system", "content": prep["tool_system"]}, *prep["chat_messages"]],
+                    db, user_id,
+                ):
+                    if kind == "token":
+                        yield f"data: {json.dumps({'t': data})}\n\n"
+                    elif kind == "tool":
+                        yield f"data: {json.dumps({'tool': data})}\n\n"
+                    elif kind == "done":
+                        if taster_note:
+                            yield f"data: {json.dumps({'t': taster_note})}\n\n"
+                        yield f"data: {json.dumps({'done': True, **data})}\n\n"
+                return
+
+            # No persistence configured → single-shot, still streamed.
+            stream = prep["client"].chat.completions.create(
+                model=llm.chat_model(),
+                messages=[{"role": "system", "content": prep["system_prompt"]}, *prep["chat_messages"]],
+                max_tokens=1024, temperature=0.7, stream=True,
+            )
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                text = getattr(delta, "content", None) if delta else None
+                if text:
+                    yield f"data: {json.dumps({'t': text})}\n\n"
+            if taster_note:
+                yield f"data: {json.dumps({'t': taster_note})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'tools_used': []})}\n\n"
+        except Exception as exc:  # noqa: BLE001 — a mid-stream failure must be told, not hang
+            logger.error("chat stream error: %s\n%s", exc, traceback.format_exc())
+            yield f"data: {json.dumps({'error': 'The answer stopped early. Please try again.'})}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",          # tell any proxy not to buffer us
+        "Connection": "keep-alive",
+    })
 
 
 @app.post("/chat")
