@@ -1387,6 +1387,30 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
     lines = ["=== CURRENT BUSINESS SNAPSHOT (from the live dashboard) ==="]
     sym = ctx.get("currency_symbol") or "K"
 
+    # Nothing recorded yet. The frontend states this outright via has_data, and
+    # we MUST pass it on: this header renders even for an empty account, so
+    # without these lines the model is handed a "snapshot" with nothing under it
+    # and left to guess what it's looking at. (The `if not injected` branch below
+    # never fires for a live client — the header alone makes ctx_text truthy.)
+    # Saying the empty state out loud is what lets the chat answer a brand-new
+    # owner conversationally instead of the client refusing to call it at all.
+    if ctx.get("has_data") is False:
+        lines.append("")
+        lines.append(
+            "THIS OWNER HAS RECORDED NO BUSINESS DATA YET. There are no figures "
+            "for this business and your tools will come back empty — that is "
+            "expected, not an error."
+        )
+        lines.append(
+            "Do NOT state, estimate or invent ANY figure about their business, "
+            "and do not imply you can see one. Otherwise answer the question "
+            "normally — general business and finance questions are fair game, "
+            "and so is ordinary conversation. When they want their own numbers, "
+            "the way to get them is the Record page (say what happened in plain "
+            "words) or a CSV/Excel upload on Overview."
+        )
+        return "\n".join(lines)
+
     # Frontend sends the P&L under "pnl"; also accept "kpi" for safety.
     kpi = ctx.get("pnl") or ctx.get("kpi") or {}
     if kpi:
@@ -1572,6 +1596,16 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     except HTTPException as gate:
         allowed, used = entitlements.chat_taster(get_db(), user_id)
         if not allowed:
+            # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
+            # feature" reads as a lie to someone who just asked three questions,
+            # so say what actually happened. used==0 means we couldn't count them
+            # at all (deny-safe on infra failure) — there the plain gate stands.
+            if used >= entitlements.CHAT_TASTER_PER_DAY:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"That's all {entitlements.CHAT_TASTER_PER_DAY} of your free "
+                           "questions for today — they reset overnight. Pro makes them unlimited.",
+                ) from gate
             raise gate
         remaining = entitlements.CHAT_TASTER_PER_DAY - used
         taster_note = (
@@ -1740,134 +1774,29 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
     """AI CFO Chat powered by Groq llama-3.3-70b-versatile.
 
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
+
+    Shares ALL setup with /chat/stream via _prepare_chat — the gate, the taster,
+    the prompts and the tool instructions. This endpoint used to keep its own
+    copy of every one of those, which is exactly how the two paths drift: a fix
+    to one silently leaves the other behind.
     """
-    taster_note = None
     try:
-        # AI CFO chat is a paid capability — but Free gets a daily taster
-        # (audit #24): 3 questions/day, counted server-side. Exhausted or
-        # uncountable → the original paid gate stands.
-        try:
-            entitlements.require_feature(user_id, "ai_chat")
-        except HTTPException as gate:
-            allowed, used = entitlements.chat_taster(get_db(), user_id)
-            if not allowed:
-                raise gate
-            remaining = entitlements.CHAT_TASTER_PER_DAY - used
-            taster_note = (
-                "\n\n_(That was your last free question today — Pro makes this unlimited.)_"
-                if remaining == 0 else
-                f"\n\n_({remaining} free question{'s' if remaining != 1 else ''} left today.)_"
-            )
-
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=500,
-                detail="GROQ_API_KEY is not configured on the server. "
-                       "Add it to Railway environment variables.",
-            )
-
-        # ── Build the system context ──────────────────────────────────────────
-        # The universal currency selector (lib/currency.ts) flows through the
-        # live context as currency_symbol — the prompt must follow it, not
-        # assume Kwacha (audit item 23). ZMW stays the default when unstated.
-        ctx_sym = str((req.context or {}).get("currency_symbol") or "").strip()
-        currency_line = (
-            "Currency is ALWAYS Zambian Kwacha — symbol K, code ZMW. NEVER use $."
-            if not ctx_sym or ctx_sym.upper() in ("K", "ZMW")
-            else f"Currency: this business reports in '{ctx_sym}'. ALWAYS use '{ctx_sym}' "
-                 "exactly as given. NEVER substitute $, K or any other symbol."
-        )
-        system_parts = [
-            "You are the AI CFO (Chief Financial Officer) for AIBOS, "
-            "a financial intelligence platform serving Zambian SMEs.",
-            currency_line,
-            "You are expert in Zambian business, economics, and SME finance.",
-            "Be direct, insightful, and action-oriented. No fluff.",
-            "NEVER fabricate a time range or data span. Describe the data only by the "
-            "period/granularity actually given in the context. POS/operations data is "
-            "point-in-time sales for its stated period — never call it 'months' or imply "
-            "monthly/yearly history unless an explicit time-series with month rows is present. "
-            "If the context gives a reporting period (e.g. '1st-7th March'), quote it verbatim.",
-        ]
-
-        injected = False
-
-        # Priority 1: rich context object sent by the live frontend
-        if req.context:
-            ctx_text = _context_to_text(req.context)
-            if ctx_text:
-                system_parts.append("\n" + ctx_text)
-                injected = True
-
-        # Priority 2: cabinet-backed context (legacy / data-studio) — caller's own
-        # file only, read through the cache→Storage helper so it works after a deploy.
-        cab_entry = None
-        if not injected and req.cabinet_id:
-            try:
-                cab_entry = _owned_cabinet(req.cabinet_id, user_id)
-            except HTTPException:
-                cab_entry = None
-        if cab_entry is not None:
-            entry        = cab_entry
-            df_json      = entry.get("df_json")
-            monthly_rows = entry.get("monthly", [])
-            if df_json:
-                df = pd.read_json(io.StringIO(df_json))
-            else:
-                df = pd.DataFrame(monthly_rows) if monthly_rows else pd.DataFrame()
-            context = _build_ai_context(
-                analysis=entry.get("analysis", {}),
-                monthly_rows=monthly_rows,
-                df=df,
-                filename=entry.get("name", "uploaded file"),
-                sheet_name=entry.get("active_sheet"),
-            )
-            system_parts.append("\n" + context)
-            injected = True
-
-        if not injected:
-            system_parts.append(
-                "No business data is currently uploaded. "
-                "Answer general Zambian business and finance questions, and invite "
-                "the user to upload their financial data for specific analysis."
-            )
-
-        system_prompt = "\n\n".join(system_parts)
-
-        # ── Build the message list ────────────────────────────────────────────
-        # Live frontend: single `message`. Legacy: full `messages` array.
-        if req.messages:
-            chat_messages = list(req.messages)
-        elif req.message:
-            chat_messages = [{"role": "user", "content": req.message}]
-        else:
-            raise HTTPException(status_code=400, detail="No message provided.")
-
-        client = Groq(api_key=api_key)
+        prep = _prepare_chat(req, user_id)
+        taster_note = prep["taster_note"]
+        injected = prep["injected"]
+        chat_messages = prep["chat_messages"]
+        client = prep["client"]
+        db = prep["db"]
 
         # ── Primary path: tool loop over the REAL recorded data (audit #8) ────
-        # The client-sent context above stays as a hint; tools are the source
-        # of record. Any loop failure falls back to the single-shot behaviour
+        # The client-sent context stays as a hint; tools are the source of
+        # record. Any loop failure falls back to the single-shot behaviour
         # below — the chat never degrades past what it was before tools.
-        db = get_db()
         if db is not None:
-            tool_system = "\n\n".join(system_parts + [
-                "You have TOOLS over this business's real recorded data — the source of "
-                "record. ALWAYS look figures up with a tool before stating them, and "
-                "prefer tool results over any snapshot above when they disagree. "
-                "CITE YOUR EVIDENCE: whenever you give a figure that came from "
-                "query_events or investigate_month, name the specific events behind it — "
-                "their dates and amounts — e.g. 'K1,860 across 3 fuel expenses (5 Jun "
-                "K620, 15 Jun K620, 25 Jun K620)'. Never give a number without the "
-                "records that back it. If the recorded data doesn't cover the question, "
-                "say so plainly — never invent numbers. Tools are read-only: to record "
-                "something, point the owner at the Record page (or chat recording on Pro+).",
-            ])
             try:
                 out = cfo_tools.run_agent_loop(
                     client, llm.chat_model(),
-                    [{"role": "system", "content": tool_system}, *chat_messages],
+                    [{"role": "system", "content": prep["tool_system"]}, *chat_messages],
                     db, user_id,
                 )
                 if (out.get("reply") or "").strip():
@@ -1886,7 +1815,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
         completion = llm.chat_create(
             client,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": prep["system_prompt"]},
                 *chat_messages,
             ],
             max_tokens=1024,

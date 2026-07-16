@@ -88,3 +88,6 @@ jobs:
 
       - name: Multi-business tests
         run: python test_businesses.py
+
+      - name: Chat context tests
+        run: python test_chat_context.py
