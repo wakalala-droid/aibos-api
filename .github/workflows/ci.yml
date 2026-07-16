@@ -91,3 +91,9 @@ jobs:
 
       - name: Chat context tests
         run: python test_chat_context.py
+
+      - name: Tier contract tests
+        # Asserts entitlements.py + main.py PLAN_PRICES match tier_contract.json,
+        # which the aibos repo checks lib/tiers.ts against. The two repos cannot
+        # deploy atomically and used to drift silently — see tier_contract.json.
+        run: python test_tier_contract.py

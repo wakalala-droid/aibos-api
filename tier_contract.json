@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "AUTHORITATIVE tier contract — the one place the frontend and backend agree.",
+    "",
+    "AIBOS runs as two repos that cannot be deployed atomically, and each used to",
+    "keep its own copy of what a plan unlocks. Nothing checked them against each",
+    "other, so they drifted silently and shipped real bugs: 'multi_business' was",
+    "granted by entitlements.py but missing from tiers.ts (paying Growth owners",
+    "locked out of the switcher they'd bought), and the Free chat taster existed",
+    "only server-side while the pricing page advertised it (unreachable for a whole",
+    "release).",
+    "",
+    "This file is the contract both sides are checked against:",
+    "  aibos-api  test_tier_contract.py   — asserts entitlements.py + main.py match.",
+    "  aibos      scripts/check_tier_contract.py — fetches THIS file from main and",
+    "                                     asserts lib/tiers.ts matches it.",
+    "",
+    "Changing what a plan unlocks = edit the code, edit this file, push aibos-api",
+    "FIRST, then aibos. Pushing the frontend first just means its check is red",
+    "until the backend lands — that redness is the feature working."
+  ],
+
+  "access": {
+    "free": [],
+    "pro": [
+      "ai_chat",
+      "anomaly",
+      "breakeven",
+      "engine2",
+      "engine3",
+      "forecast",
+      "full_history",
+      "hospitality",
+      "payroll",
+      "schedule",
+      "scheduled_brief",
+      "variance"
+    ],
+    "proplus": [
+      "ai_chat",
+      "anomaly",
+      "automation",
+      "breakeven",
+      "chat_actions",
+      "deliveries",
+      "engine2",
+      "engine3",
+      "forecast",
+      "full_history",
+      "hospitality",
+      "morning_brief",
+      "payroll",
+      "schedule",
+      "scheduled_brief",
+      "variance"
+    ],
+    "growth": [
+      "ai_chat",
+      "anomaly",
+      "api_access",
+      "automation",
+      "breakeven",
+      "chat_actions",
+      "cross_engine",
+      "deliveries",
+      "engine2",
+      "engine3",
+      "forecast",
+      "full_history",
+      "hospitality",
+      "morning_brief",
+      "multi_business",
+      "multi_location",
+      "payroll",
+      "schedule",
+      "scheduled_brief",
+      "variance"
+    ]
+  },
+
+  "taster": {
+    "ai_chat": 3
+  },
+
+  "prices": {
+    "pro": { "monthly": 500, "annual": 5000 },
+    "proplus": { "monthly": 750, "annual": 7500 },
+    "growth": { "monthly": 1499, "annual": 14990 }
+  }
+}
