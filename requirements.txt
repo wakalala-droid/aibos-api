@@ -20,3 +20,7 @@ PyJWT==2.8.0
 # (migration 0015). Supabase at-rest encryption does not protect against a leaked
 # service-role key, which the whole API runs on, so PII is sealed before write.
 cryptography==42.0.5
+
+# PDF generation for payslips + statutory compliance packs (audit #26/#66).
+# Imported lazily in pdfdoc.py so a missing lib never breaks `import main`.
+reportlab==4.2.0

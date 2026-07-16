@@ -150,6 +150,25 @@ def recall_all(db, user_id: str, kind: str) -> dict:
         return {}
 
 
+def list_mappings(db, user_id: str) -> list:
+    """All learned mappings with their ids, for the manage/correct UI (audit #57)."""
+    if db is None:
+        return []
+    try:
+        res = (db.table("business_memory").select("id,kind,key,value,hits")
+               .eq("user_id", user_id).order("hits", desc=True).execute())
+        return getattr(res, "data", None) or []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def forget(db, user_id: str, mapping_id: str) -> None:
+    """Delete one learned mapping — the owner corrects AIBOS (audit #57)."""
+    if db is None:
+        return
+    db.table("business_memory").delete().eq("id", mapping_id).eq("user_id", user_id).execute()
+
+
 def summary(db, user_id: str) -> dict:
     """What AIBOS has learned about this business, for the owner to SEE (audit
     #57). Counts per kind + a few sample aliases. Best-effort; never raises."""

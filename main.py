@@ -58,6 +58,8 @@ import membership
 import businesses as businesses_api
 import budgets as budgets_api
 import rate_limit
+import exports as exports_api
+import pdfdoc
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
@@ -1670,12 +1672,15 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
         if db is not None:
             tool_system = "\n\n".join(system_parts + [
                 "You have TOOLS over this business's real recorded data — the source of "
-                "record. Look figures up before answering, and prefer tool results over "
-                "any snapshot above when they disagree. When you cite figures from "
-                "query_events, mention the dates and amounts of the events behind them. "
-                "If the recorded data doesn't cover the question, say so plainly — never "
-                "invent numbers. Tools are read-only: to record something, point the "
-                "owner at the Record page (or chat recording on Pro+).",
+                "record. ALWAYS look figures up with a tool before stating them, and "
+                "prefer tool results over any snapshot above when they disagree. "
+                "CITE YOUR EVIDENCE: whenever you give a figure that came from "
+                "query_events or investigate_month, name the specific events behind it — "
+                "their dates and amounts — e.g. 'K1,860 across 3 fuel expenses (5 Jun "
+                "K620, 15 Jun K620, 25 Jun K620)'. Never give a number without the "
+                "records that back it. If the recorded data doesn't cover the question, "
+                "say so plainly — never invent numbers. Tools are read-only: to record "
+                "something, point the owner at the Record page (or chat recording on Pro+).",
             ])
             try:
                 out = cfo_tools.run_agent_loop(
@@ -1732,6 +1737,10 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 
 @app.get("/health")
 async def health():
+    """Deploy-verification at a glance (audit #12/#106): build SHA + the
+    highest migration the code expects, so a green /health after a deploy
+    proves the NEW image is actually live (Railway pins the last good image
+    on a crash, which used to look green while serving old code)."""
     groq_key = bool(os.environ.get("GROQ_API_KEY"))
     return {
         "status": "ok",
@@ -1739,7 +1748,10 @@ async def health():
         "cabinet_size": len(CABINET),
         "supabase_configured": supabase_enabled(),   # Evolution spine persistence
         "spine": "events+twin" if supabase_enabled() else "disabled",
-        "version": "3.1.0",
+        "version": "3.2.0",
+        # RAILWAY_GIT_COMMIT_SHA is injected by Railway on every deploy.
+        "build_sha": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "dev")[:8],
+        "expects_migration": 24,                      # highest migration this code needs
     }
 
 
@@ -2472,6 +2484,40 @@ async def memory_summary(ctx: membership.Context = Depends(membership.require_co
     return {"ok": True, **memory.summary(db, ctx.tenant)}
 
 
+@app.get("/memory/mappings")
+async def memory_mappings(ctx: membership.Context = Depends(membership.require_context)):
+    """Every learned mapping, so the owner can review and correct them (audit #57)."""
+    db = _require_db()
+    return {"ok": True, "mappings": memory.list_mappings(db, ctx.tenant)}
+
+
+@app.delete("/memory/mappings/{mapping_id}")
+async def forget_mapping(mapping_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    """Owner corrects AIBOS by deleting a wrong mapping (audit #57)."""
+    db = _require_db()
+    memory.forget(db, ctx.tenant, mapping_id)
+    return {"ok": True}
+
+
+# ── Accountant export pack (audit #27/#28) ────────────────────────────────────
+# Owner or accountant may pull the books out as CSV (read-only, so any role).
+
+@app.get("/export/events.csv")
+async def export_events(ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    events = nervous.list_events(db, ctx.tenant, limit=100000, business_id=ctx.business_id)
+    return Response(content=exports_api.events_csv(events), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=aibos_events.csv"})
+
+
+@app.get("/export/pnl.csv")
+async def export_pnl(ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
+    return Response(content=exports_api.pnl_csv(state.get("monthly", [])), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=aibos_pnl.csv"})
+
+
 # ── Budgets & targets (audit #37) ─────────────────────────────────────────────
 # Actuals vs the owner's PLAN. Targets are stored; actuals derive from the twin.
 
@@ -2584,6 +2630,26 @@ async def remove_party(party_id: str, user_id: str = Depends(require_user)):
     db = _require_db()
     parties_api.delete_party(db, user_id, party_id)
     return {"ok": True}
+
+
+@app.post("/parties/{keep_id}/merge/{remove_id}")
+async def merge_parties(keep_id: str, remove_id: str,
+                        ctx: membership.Context = Depends(membership.require_write)):
+    """Merge two duplicate parties (audit #6): keep one, fold the other in.
+    Records an alias (removed name → kept name) in Business Memory so future
+    recordings resolve to the survivor, then deletes the duplicate."""
+    db = _require_db()
+    rows = parties_api.list_parties(db, ctx.tenant, business_id=ctx.business_id)
+    keep = next((p for p in rows if p.get("id") == keep_id), None)
+    drop = next((p for p in rows if p.get("id") == remove_id), None)
+    if not keep or not drop:
+        raise HTTPException(status_code=404, detail="One or both parties not found.")
+    if keep_id == remove_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a party into itself.")
+    memory.remember(db, ctx.tenant, "alias", drop.get("normalized_key"),
+                    {"name": keep.get("name")})
+    parties_api.delete_party(db, ctx.tenant, remove_id)
+    return {"ok": True, "kept": keep.get("name"), "merged": drop.get("name")}
 
 
 @app.post("/parties/backfill")
@@ -2933,6 +2999,50 @@ async def payroll_compliance_text(run_id: str, business_name: Optional[str] = Qu
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"ok": True, "text": payroll_api.compliance_text(run, business_name)}
+
+
+@app.get("/payroll/runs/{run_id}/payslip.pdf")
+async def payslip_pdf(run_id: str, employee_id: str = Query(...),
+                      business_name: Optional[str] = Query(None),
+                      user_id: str = Depends(require_user)):
+    """Printable payslip PDF (audit #26). Falls back to .txt if the PDF lib
+    isn't available in this environment."""
+    entitlements.require_feature(user_id, "payroll")
+    db = _require_db()
+    try:
+        run = payroll_api.get_run(db, user_id, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    slip = next((s for s in run.get("payslips") or [] if str(s.get("employee_id")) == employee_id), None)
+    if slip is None:
+        raise HTTPException(status_code=404, detail="No payslip for that employee in this run.")
+    slip = {**slip, "period": slip.get("period") or run.get("period")}
+    text = payroll_api.payslip_text(slip, business_name)
+    if pdfdoc.available():
+        pdf = pdfdoc.render(f"Payslip — {slip.get('period')}", text)
+        return Response(content=pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename=payslip_{slip.get('period')}.pdf"})
+    return Response(content=text, media_type="text/plain",
+                    headers={"Content-Disposition": f"attachment; filename=payslip_{slip.get('period')}.txt"})
+
+
+@app.get("/payroll/runs/{run_id}/compliance.pdf")
+async def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
+                         user_id: str = Depends(require_user)):
+    """Printable statutory compliance pack PDF (audit #66)."""
+    entitlements.require_feature(user_id, "payroll")
+    db = _require_db()
+    try:
+        run = payroll_api.get_run(db, user_id, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    text = payroll_api.compliance_text(run, business_name)
+    if pdfdoc.available():
+        pdf = pdfdoc.render(f"Statutory summary — {run.get('period')}", text)
+        return Response(content=pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename=statutory_{run.get('period')}.pdf"})
+    return Response(content=text, media_type="text/plain",
+                    headers={"Content-Disposition": f"attachment; filename=statutory_{run.get('period')}.txt"})
 
 
 @app.get("/payroll/runs/{run_id}/payslip-text")

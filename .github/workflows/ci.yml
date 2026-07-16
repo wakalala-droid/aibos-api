@@ -80,6 +80,9 @@ jobs:
       - name: Budgets tests
         run: python test_budgets.py
 
+      - name: Exports tests
+        run: python test_exports.py
+
       - name: Rate-limit tests
         run: python test_rate_limit.py
 
