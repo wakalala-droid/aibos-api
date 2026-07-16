@@ -1,5 +1,5 @@
 """
-AI-BOS — Lightweight in-process rate limiting (audit 2026-07 item #45).
+AIBOS — Lightweight in-process rate limiting (audit 2026-07 item #45).
 
 The expensive/abusable endpoints (LLM chat, classify, transcribe) need a
 throttle so one caller can't run up the Groq bill or starve everyone else.

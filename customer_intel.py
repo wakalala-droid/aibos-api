@@ -1,5 +1,5 @@
 """
-AI-BOS — Live customer intelligence: Engine 2 reads the spine
+AIBOS — Live customer intelligence: Engine 2 reads the spine
 (audit 2026-07 item #5 — THE data-unification move).
 
 Until now Engine 2 (RFM / segments / CLV / churn / market basket) only ran

@@ -1,5 +1,5 @@
 """
-AI-BOS — Hospitality (short-let PMS) module.
+AIBOS — Hospitality (short-let PMS) module.
 
 Same discipline as payroll.py / schedule_items.py: a thin, tenant-scoped CRUD
 layer over the Supabase tables in migration 0015, writing via the service-role
@@ -761,11 +761,11 @@ def delete_expense(db, user_id: str, expense_id: str) -> None:
 #
 # Full two-way OTA API access is a partner-approval process a 3-unit host can't
 # count on, but every OTA supports iCal import/export even for small hosts. So:
-#   • EXPORT — AI-BOS publishes one .ics feed per unit (behind an unguessable
+#   • EXPORT — AIBOS publishes one .ics feed per unit (behind an unguessable
 #     token) that every OTA imports; a booking taken on ANY channel blocks the
 #     dates everywhere. This alone fixes the "conflicting availability" audit
 #     finding without any API partnership.
-#   • IMPORT — AI-BOS pulls each OTA's feed nightly (or on demand) and writes the
+#   • IMPORT — AIBOS pulls each OTA's feed nightly (or on demand) and writes the
 #     blocks back as bookings, so the one calendar screen is the whole truth.
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -807,10 +807,10 @@ def build_ical(calendar_name: str, blocks: list[dict], now: datetime | None = No
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//AI-BOS//Hospitality//EN",
+        "PRODID:-//AIBOS//Hospitality//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        _fold("X-WR-CALNAME:" + _esc(calendar_name or "AI-BOS")),
+        _fold("X-WR-CALNAME:" + _esc(calendar_name or "AIBOS")),
     ]
     for b in blocks:
         ci = str(b["check_in"]).replace("-", "")
@@ -982,7 +982,7 @@ def rotate_export_token(db, user_id: str, channel_id: str) -> dict:
 # ── Export: build a unit's public feed ───────────────────────────────────────
 
 def _blocks_for_unit(db, user_id: str, unit_id: str) -> list[dict]:
-    """Every occupying booking on a unit, as export blocks. UID = the AI-BOS booking
+    """Every occupying booking on a unit, as export blocks. UID = the AIBOS booking
     id so an OTA re-import is recognised as ours (skipped) rather than duplicated."""
     res = (db.table("bookings").select("id,check_in,check_out,status")
            .eq("user_id", user_id).eq("unit_id", unit_id)
@@ -1030,7 +1030,7 @@ def _fetch_ical(url: str) -> str:
     """Fetch a remote .ics over HTTPS. Small, bounded, no redirects surprise."""
     import httpx
     with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-        resp = client.get(url, headers={"User-Agent": "AI-BOS-Hospitality/1.0"})
+        resp = client.get(url, headers={"User-Agent": "AIBOS-Hospitality/1.0"})
         resp.raise_for_status()
         return resp.text
 

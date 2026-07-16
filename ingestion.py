@@ -1,5 +1,5 @@
 """
-AI-BOS — Ingestion (Evolution Initiative 7).
+AIBOS — Ingestion (Evolution Initiative 7).
 
 A modular layer that turns non-conversational inputs (Excel rows, QR payloads, and
 later receipt images / PDFs) into proposed Business Events, all converging on the

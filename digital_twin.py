@@ -1,5 +1,5 @@
 """
-AI-BOS — Digital Twin projector  (Directive Initiative 12, Bible 2nd Law).
+AIBOS — Digital Twin projector  (Directive Initiative 12, Bible 2nd Law).
 
 The Digital Twin is a DERIVED representation of the current state of the business.
 `business_events` is the source of record; the twin is a fold over it. This module:

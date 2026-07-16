@@ -1,5 +1,5 @@
 """
-AI-BOS — Payroll engine + employee register (Zambian statutory).
+AIBOS — Payroll engine + employee register (Zambian statutory).
 
 Two halves, deliberately separated so the maths is trustable:
 

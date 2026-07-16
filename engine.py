@@ -1,4 +1,4 @@
-# engine.py — AI-BOS Engine 1: Financial Intelligence
+# engine.py — AIBOS Engine 1: Financial Intelligence
 # Contains run_engine1() wrapper called by main.py
 
 import numpy as np

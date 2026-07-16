@@ -1,5 +1,5 @@
 """
-AI-BOS — Backend authentication (P1-AUTH).
+AIBOS — Backend authentication (P1-AUTH).
 
 Until the Evolution spine, the FastAPI backend authenticated NO callers (it only
 did stateless file analysis). Writing tenant-scoped Business Events through the

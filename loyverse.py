@@ -1,5 +1,5 @@
 """
-AI-BOS — Loyverse items-export importer (audit 2026-07 item #29).
+AIBOS — Loyverse items-export importer (audit 2026-07 item #29).
 
 Loyverse is the free POS half this market already runs on. Its items export
 (the owner-provided sample: export_items.csv) becomes the AIBOS product

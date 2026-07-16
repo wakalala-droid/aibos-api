@@ -1,5 +1,5 @@
 """
-AI-BOS — Probabilistic cash forecast (audit 2026-07 item #19).
+AIBOS — Probabilistic cash forecast (audit 2026-07 item #19).
 
 The trend line becomes a fan: from the owner's OWN monthly net history the
 next three months of cash are projected as P10 / P50 / P90 bands — honest

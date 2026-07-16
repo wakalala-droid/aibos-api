@@ -1,5 +1,5 @@
 """
-AI-BOS — Adaptive Function Governance engine  (SAFEGUARD.md — Layer 2)
+AIBOS — Adaptive Function Governance engine  (SAFEGUARD.md — Layer 2)
 
 This module lets the system PROPOSE new derived-metric functions from an uploaded
 file, run them safely, critique them, and hand them to the owner for approval.
@@ -288,7 +288,7 @@ def _llm_proposals(df, manifest, token_map, arrays, max_props=3) -> List[Dict[st
         client = Groq(api_key=api_key)
         cols_desc = "\n".join(f"  {t} = \"{token_map[t]}\"" for t in token_map)
         prompt = (
-            "You are a careful financial-data analyst for AI-BOS. Propose up to "
+            "You are a careful financial-data analyst for AIBOS. Propose up to "
             f"{max_props} NEW derived business metrics from these numeric columns "
             "(reference columns ONLY by their token like c0, c1):\n"
             f"{cols_desc}\n\n"

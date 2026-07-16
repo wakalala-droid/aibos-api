@@ -1,5 +1,5 @@
 """
-AI-BOS — Invoices: the get-paid loop (audit 2026-07 item #7).
+AIBOS — Invoices: the get-paid loop (audit 2026-07 item #7).
 
 AIBOS recorded the past; this is the first feature that helps the owner
 COLLECT. An invoice is a commitment, not a fact — the facts flow through the

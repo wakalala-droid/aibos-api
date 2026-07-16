@@ -1,5 +1,5 @@
 """
-AI-BOS — Business Nervous System  (Directive Initiative 11).
+AIBOS — Business Nervous System  (Directive Initiative 11).
 
 The single pipeline every business input flows through. Nothing bypasses it
 (Directive: "No feature should bypass this pipeline."). It is NOT another engine —
@@ -490,7 +490,7 @@ def list_events(db, user_id: str, *, status: str | None = None, event_type: str 
 # via the normal ingest() path.
 
 CLASSIFY_SYSTEM = (
-    "You are the data-entry brain of AI-BOS, a business operating system for Zambian SMEs. "
+    "You are the data-entry brain of AIBOS, a business operating system for Zambian SMEs. "
     "Convert ONE plain-language description of something that happened in a business into a "
     "single structured Business Event. Respond with STRICT JSON only — no prose, no markdown.\n\n"
     "Schema:\n"

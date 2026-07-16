@@ -1,5 +1,5 @@
 """
-AI-BOS — Accountant export pack (audit 2026-07 items #27/#28).
+AIBOS — Accountant export pack (audit 2026-07 items #27/#28).
 
 The read-only accountant seat needs to get data OUT: a general-ledger-style
 events CSV and a monthly P&L CSV, both derived from the spine (the source of

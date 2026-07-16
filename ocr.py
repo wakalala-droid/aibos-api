@@ -1,5 +1,5 @@
 """
-AI-BOS — Receipt OCR (Evolution Initiative 7, the vision parser).
+AIBOS — Receipt OCR (Evolution Initiative 7, the vision parser).
 
 Turns a photographed/uploaded receipt into a PROPOSED Purchase event using a
 Groq vision model — the same provider/key the rest of the platform uses. It plugs

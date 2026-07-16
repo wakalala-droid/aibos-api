@@ -1,5 +1,5 @@
 """
-AI-BOS Backend — FastAPI
+AIBOS Backend — FastAPI
 Fixes: column detection, multi-sheet Excel, Groq chat, cabinet, data studio
 """
 
@@ -69,7 +69,7 @@ import ocr
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aibos")
 
-app = FastAPI(title="AI-BOS API", version="3.0.0")
+app = FastAPI(title="AIBOS API", version="3.0.0")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 # Browsers never call this API directly — the Next.js app talks to it
@@ -1597,7 +1597,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
                  "exactly as given. NEVER substitute $, K or any other symbol."
         )
         system_parts = [
-            "You are the AI CFO (Chief Financial Officer) for AI-BOS, "
+            "You are the AI CFO (Chief Financial Officer) for AIBOS, "
             "a financial intelligence platform serving Zambian SMEs.",
             currency_line,
             "You are expert in Zambian business, economics, and SME finance.",
@@ -1693,7 +1693,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
                     return {
                         "reply": reply,
                         "response": reply,
-                        "model": "AI-BOS Intelligence",
+                        "model": "AIBOS Intelligence",
                         "context_injected": injected,
                         "tools_used": out["tools_used"],
                     }
@@ -1717,7 +1717,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
         return {
             "reply": response_text,
             "response": response_text,
-            "model": "AI-BOS Intelligence",
+            "model": "AIBOS Intelligence",
             "context_injected": injected,
         }
 
@@ -1850,7 +1850,7 @@ async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends
         raise HTTPException(status_code=400, detail="payer_phone is required")
 
     reference = str(uuid.uuid4())
-    note = f"AI-BOS {PLAN_LABEL.get(plan, plan.capitalize())} ({billing})"
+    note = f"AIBOS {PLAN_LABEL.get(plan, plan.capitalize())} ({billing})"
     state = payments.initiate(network, reference, amount, body.currency, body.payer_phone, note)
 
     # Bound the store so a flood of initiations can't exhaust memory.
@@ -2968,7 +2968,7 @@ async def remove_employee(employee_id: str, user_id: str = Depends(require_user)
 
 @app.get("/payroll/rates")
 async def get_payroll_rates(user_id: str = Depends(require_user)):
-    """The statutory rates AI-BOS applies (transparency — the owner reads, never edits)."""
+    """The statutory rates AIBOS applies (transparency — the owner reads, never edits)."""
     return {"ok": True, "rates": payroll_api.public_rates(payroll_api.current_rates(None, "ZMW"))}
 
 

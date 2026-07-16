@@ -1,5 +1,5 @@
 """
-AI-BOS — Evolution spine regression tests (offline, no DB).
+AIBOS — Evolution spine regression tests (offline, no DB).
 
 Covers the pure Digital-Twin projector fold and the Nervous-System validation +
 trust gate. Run: `python -m pytest test_spine.py` or `python test_spine.py`.

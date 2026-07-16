@@ -1,5 +1,5 @@
 """
-AI-BOS — Anomaly auto-investigation (audit 2026-07 item #13).
+AIBOS — Anomaly auto-investigation (audit 2026-07 item #13).
 
 The mission statement, literally: "What changed? Why?" answered BEFORE the
 owner asks. When a month's money moves abnormally, this module drills into

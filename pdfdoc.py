@@ -1,5 +1,5 @@
 """
-AI-BOS — PDF rendering for payslips + compliance packs (audit #26/#66).
+AIBOS — PDF rendering for payslips + compliance packs (audit #26/#66).
 
 A tiny wrapper over reportlab that turns the SAME text documents payroll.py
 already produces (payslip_text / compliance_text) into a clean A5/A4 PDF. The

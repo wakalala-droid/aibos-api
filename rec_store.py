@@ -1,5 +1,5 @@
 """
-AI-BOS — Recommendations ledger (audit 2026-07 item #20).
+AIBOS — Recommendations ledger (audit 2026-07 item #20).
 
 The Advisor's recommendations become rows (migration 0021) so AIBOS can audit
 ITSELF: what it advised, when, how often, and whether the owner acted.

@@ -1,5 +1,5 @@
 """
-AI-BOS — Budgets & targets (audit 2026-07 item #37).
+AIBOS — Budgets & targets (audit 2026-07 item #37).
 
 The owner sets a monthly PLAN (revenue / costs / profit target); AIBOS shows
 actuals vs plan so "am I on track?" is answered against intent, not just last

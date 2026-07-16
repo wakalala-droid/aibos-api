@@ -1,5 +1,5 @@
 """
-AI-BOS — Supabase service-role client (backend persistence).
+AIBOS — Supabase service-role client (backend persistence).
 
 The FastAPI backend was historically stateless (in-memory CABINET only). The
 Evolution spine (Business Events + Digital Twin) needs durable storage, and

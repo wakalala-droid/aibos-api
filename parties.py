@@ -1,5 +1,5 @@
 """
-AI-BOS — Parties: the customers & suppliers a business actually deals with
+AIBOS — Parties: the customers & suppliers a business actually deals with
 (audit 2026-07 item #6, the schema gap blocking live customer intelligence).
 
 Until now party names lived only as free text inside event payloads —

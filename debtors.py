@@ -1,5 +1,5 @@
 """
-AI-BOS — Debtors ledger + AR aging (audit 2026-07 item #15).
+AIBOS — Debtors ledger + AR aging (audit 2026-07 item #15).
 
 "Who owes me, how much, and for how long?" — answered per customer with
 aging buckets, from two honest sources:

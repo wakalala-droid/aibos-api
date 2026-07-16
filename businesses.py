@@ -1,5 +1,5 @@
 """
-AI-BOS — Multiple businesses under one login (audit 2026-07 item #16).
+AIBOS — Multiple businesses under one login (audit 2026-07 item #16).
 
 Lusaka owners run PORTFOLIOS (a shop + a salon + two flats), not branch
 networks — so the Growth anchor is multi-BUSINESS (separate books, one login),

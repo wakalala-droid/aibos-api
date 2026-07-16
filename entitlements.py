@@ -1,5 +1,5 @@
 """
-AI-BOS — Server-side tier entitlements.
+AIBOS — Server-side tier entitlements.
 
 The frontend gates features on `profiles.tier` (lib/tiers.ts `canAccess`), but a
 client gate is only UX — a determined caller can hit the API directly. This

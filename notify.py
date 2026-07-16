@@ -1,5 +1,5 @@
 """
-AI-BOS — Morning Brief delivery (email + WhatsApp).
+AIBOS — Morning Brief delivery (email + WhatsApp).
 
 Ready-for-keys, exactly like payments.py: fully implemented, dormant until the
 env keys exist, never fakes a send. The brief itself is composed server-side
@@ -17,7 +17,7 @@ Channels:
 
 Env:
   RESEND_API_KEY      — Resend API key
-  BRIEF_FROM_EMAIL    — verified sender, e.g. "AI-BOS <brief@yourdomain>"
+  BRIEF_FROM_EMAIL    — verified sender, e.g. "AIBOS <brief@yourdomain>"
                         (defaults to Resend's test sender for first smoke test)
   WHATSAPP_TOKEN      — Meta Cloud API access token
   WHATSAPP_PHONE_ID   — sending phone-number id
@@ -185,7 +185,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {os.environ['RESEND_API_KEY']}"},
         json={
-            "from": os.environ.get("BRIEF_FROM_EMAIL", "AI-BOS <onboarding@resend.dev>"),
+            "from": os.environ.get("BRIEF_FROM_EMAIL", "AIBOS <onboarding@resend.dev>"),
             "to": [to],
             "subject": subject,
             "text": body,

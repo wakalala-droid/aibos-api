@@ -1,5 +1,5 @@
 """
-AI-BOS — Cabinet persistence (audit 2026-07 item #10, the worst trust bug).
+AIBOS — Cabinet persistence (audit 2026-07 item #10, the worst trust bug).
 
 The CABINET dict in main.py is a single-process in-memory store: every Railway
 deploy silently deleted every customer's uploaded analysis. This module is the

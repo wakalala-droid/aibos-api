@@ -1,5 +1,5 @@
 """
-AI-BOS — Schedule items (the Scheduler).
+AIBOS — Schedule items (the Scheduler).
 
 Time-bound commitments: meetings, pick-ups, deliveries, deadlines (ZRA/NAPSA),
 payments due, reminders. A schedule item is a COMMITMENT, not a business fact —

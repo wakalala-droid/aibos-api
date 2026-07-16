@@ -1,5 +1,5 @@
 """
-AI-BOS — Products catalog + stock (Evolution Initiative 3).
+AIBOS — Products catalog + stock (Evolution Initiative 3).
 
 The product master list (CRUD) plus per-SKU on-hand. On-hand is DERIVED — the
 catalog stores opening stock; movements come from Business Events. Two slices:

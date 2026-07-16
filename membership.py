@@ -1,5 +1,5 @@
 """
-AI-BOS — Team membership + role resolution (audit 2026-07 items #27, #28).
+AIBOS — Team membership + role resolution (audit 2026-07 items #27, #28).
 
 Turns one-login tenancy into a membership model WITHOUT breaking the
 user_id-scoped world everything already lives in. The whole design rests on

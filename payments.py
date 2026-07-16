@@ -1,5 +1,5 @@
 """
-AI-BOS — Mobile Money payments (MTN MoMo + Airtel Money).
+AIBOS — Mobile Money payments (MTN MoMo + Airtel Money).
 
 Ready-for-keys: when the provider credentials are present in the environment,
 real collection requests are sent to MTN MoMo Collections / Airtel Money
@@ -184,7 +184,7 @@ def _airtel_status(reference: str) -> str:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def initiate(network: str, reference: str, amount: float, currency: str, phone: str,
-             note: str = "AI-BOS subscription") -> str:
+             note: str = "AIBOS subscription") -> str:
     """Kick off a collection. Returns 'pending' | 'failed' | 'unconfigured'."""
     if not provider_configured(network):
         if SIMULATION_ENABLED:

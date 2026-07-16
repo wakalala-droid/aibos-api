@@ -1,5 +1,5 @@
 """
-AI-BOS — Simulation (Evolution Initiative 12, future capabilities).
+AIBOS — Simulation (Evolution Initiative 12, future capabilities).
 
 "What happens if…" run against a COPY of the Digital Twin — never production data
 (Initiative 12 architectural rule). Pure functions: given the current twin and a

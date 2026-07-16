@@ -1,5 +1,5 @@
 """
-AI-BOS — WhatsApp recording bot (audit 2026-07 item #11).
+AIBOS — WhatsApp recording bot (audit 2026-07 item #11).
 
 The data-collection unlock for this market: the owner texts their business
 ("sold 3 bags of mealie meal 450") to the AIBOS WhatsApp number and it becomes

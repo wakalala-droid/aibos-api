@@ -1,5 +1,5 @@
 """
-AI-BOS — Payroll engine regression tests (offline, no DB).
+AIBOS — Payroll engine regression tests (offline, no DB).
 
 Exercises the pure statutory core: NAPSA cap, progressive PAYE, NHIMA, gratuity
 accrual, loan decrement and net = gross − deductions, on worked 2026 examples.

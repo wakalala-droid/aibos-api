@@ -1,5 +1,5 @@
 """
-AI-BOS — CFO chat tools + agent loop (audit 2026-07 items #8/#21).
+AIBOS — CFO chat tools + agent loop (audit 2026-07 items #8/#21).
 
 Until now the AI CFO knew only what the browser tab sent it — a chat skin.
 This module gives the model tenant-scoped, READ-ONLY tools over the data

@@ -1,5 +1,5 @@
 """
-AI-BOS — Statutory compliance calendar (audit 2026-07 item #25).
+AIBOS — Statutory compliance calendar (audit 2026-07 item #25).
 
 "Never miss a statutory deadline again": one tap seeds recurring Scheduler
 items for the Zambian trio — PAYE (ZRA), NAPSA, NHIMA — due on the 10th of

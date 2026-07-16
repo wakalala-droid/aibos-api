@@ -1,5 +1,5 @@
 """
-AI-BOS — LLM model configuration + fallback (audit 2026-07 item #22).
+AIBOS — LLM model configuration + fallback (audit 2026-07 item #22).
 
 One provider (Groq), one point of failure: a deprecated model id or a
 capacity error used to take the flagship paid feature down with it. Model

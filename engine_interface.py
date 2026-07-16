@@ -1,5 +1,5 @@
 """
-AI-BOS — Engine interface & explainability contract (Evolution Initiatives 9, 10, 13).
+AIBOS — Engine interface & explainability contract (Evolution Initiatives 9, 10, 13).
 
 The clean seam every FUTURE intelligence engine plugs into (Promotion, Inventory
 Forecast, Demand, Supplier Intel, CLV, Cash-Flow Prediction, Strategy, Pricing,

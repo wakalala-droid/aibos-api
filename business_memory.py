@@ -1,5 +1,5 @@
 """
-AI-BOS — Business Memory (Evolution Initiatives 8 & 13).
+AIBOS — Business Memory (Evolution Initiatives 8 & 13).
 
 Every user correction becomes reusable intelligence so future inputs need less
 work (Bible 8th Law: nothing entered twice). Two halves:

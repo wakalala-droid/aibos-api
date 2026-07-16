@@ -1,4 +1,4 @@
-# intelligence.py — AI-BOS Cross-Engine Intelligence Layer
+# intelligence.py — AIBOS Cross-Engine Intelligence Layer
 # Contains run_cross_engine() called by main.py after all engine runs.
 
 import logging
