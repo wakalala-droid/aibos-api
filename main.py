@@ -1375,6 +1375,11 @@ class ChatRequest(BaseModel):
     message: Optional[str] = None
     user_id: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
+    # One id per QUESTION the owner typed, not per HTTP request. The client
+    # tries /chat/stream and falls back to /chat on any streaming failure, so a
+    # single question reaches this server twice — without this the free taster
+    # was charged both times and 3 questions/day became 1 or 2 (audit #24).
+    qid: Optional[str] = None
     # Legacy shape
     messages: Optional[List[Dict[str, str]]] = None
     cabinet_id: Optional[str] = None
@@ -1587,6 +1592,17 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     Returns {taster_note, system_prompt, tool_system, chat_messages, client,
     injected, db}. Raises HTTPException exactly as before.
     """
+    # Checked BEFORE the taster is charged: without a key nothing can be
+    # answered, and burning one of a Free owner's three daily questions on a
+    # request the server was never going to serve is theft of the allowance.
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured on the server. "
+                   "Add it to Railway environment variables.",
+        )
+
     taster_note = None
     # AI CFO chat is a paid capability — but Free gets a daily taster
     # (audit #24): 3 questions/day, counted server-side. Exhausted or
@@ -1594,7 +1610,7 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     try:
         entitlements.require_feature(user_id, "ai_chat")
     except HTTPException as gate:
-        allowed, used = entitlements.chat_taster(get_db(), user_id)
+        allowed, used = entitlements.chat_taster(get_db(), user_id, qid=req.qid)
         if not allowed:
             # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
             # feature" reads as a lie to someone who just asked three questions,
@@ -1612,14 +1628,6 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
             "\n\n_(That was your last free question today — Pro makes this unlimited.)_"
             if remaining == 0 else
             f"\n\n_({remaining} free question{'s' if remaining != 1 else ''} left today.)_"
-        )
-
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured on the server. "
-                   "Add it to Railway environment variables.",
         )
 
     # The universal currency selector (lib/currency.ts) flows through the live

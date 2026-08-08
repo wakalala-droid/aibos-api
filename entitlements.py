@@ -153,9 +153,17 @@ _FEATURE_LABEL = {
 CHAT_TASTER_PER_DAY = 3
 
 
-def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY) -> tuple[bool, int]:
+def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY,
+                qid: str | None = None) -> tuple[bool, int]:
     """Try to consume one taster question. Returns (allowed, used_today_after).
-    Counts before writing so the limit can never be raced far past."""
+    Counts before writing so the limit can never be raced far past.
+
+    `qid` identifies the QUESTION the owner typed, not the HTTP request. The
+    client POSTs /chat/stream and falls back to /chat whenever streaming fails,
+    so one question arrives here twice; charging both turned "3 free questions
+    a day" into 1–2 and told owners their questions were spent after two. A
+    repeat of a qid already counted today is allowed WITHOUT charging again.
+    """
     if db is None or not user_id:
         return False, 0
     try:
@@ -165,10 +173,23 @@ def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY) -> tuple[boo
                .eq("user_id", user_id).eq("event", "chat_taster")
                .gte("created_at", day_start).execute())
         used = int(getattr(res, "count", None) or 0)
+
+        # Already charged for this same question (the streaming retry) → let it
+        # through free. Checked before the limit so the fallback still works on
+        # the question that spent the last allowance.
+        if qid:
+            dup = (db.table("usage_events").select("id", count="exact", head=True)
+                   .eq("user_id", user_id).eq("event", "chat_taster")
+                   .eq("meta->>qid", qid)
+                   .gte("created_at", day_start).execute())
+            if int(getattr(dup, "count", None) or 0) > 0:
+                return True, used
+
         if used >= limit:
             return False, used
         db.table("usage_events").insert(
-            {"user_id": user_id, "event": "chat_taster", "meta": {}}).execute()
+            {"user_id": user_id, "event": "chat_taster",
+             "meta": {"qid": qid} if qid else {}}).execute()
         return True, used + 1
     except Exception as e:  # noqa: BLE001 — infra error → no free ride, gate stands
         log.warning("[entitlements] chat taster check failed for %s: %s", user_id, e)

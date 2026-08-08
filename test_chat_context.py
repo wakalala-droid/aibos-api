@@ -15,10 +15,17 @@ figures, and must leave a populated account completely untouched.
 Run as a plain script like the other suites.
 """
 
+import os
+
 from fastapi import HTTPException
 
 import entitlements
 import main
+
+# _prepare_chat now refuses (500) before charging a taster question when there
+# is no Groq key, so the gate/taster tests below must look like a working
+# server. test_a_missing_groq_key_does_not_burn_a_free_question removes it.
+os.environ.setdefault("GROQ_API_KEY", "test-key-never-called")
 
 
 def test_empty_account_states_it_outright():
@@ -124,6 +131,57 @@ def test_uncountable_taster_keeps_the_plain_gate():
     )
     assert exc.status_code == 402
     assert "is a pro feature" in exc.detail.lower()
+
+
+def test_one_question_costs_one_taster_across_the_streaming_fallback():
+    # THE BUG THIS PINS: sendMessage() POSTs /chat/stream and falls back to
+    # /chat on ANY streaming failure, and BOTH call _prepare_chat. Charging
+    # each HTTP request turned "3 free questions a day" into 1-2, and told the
+    # owner their questions were spent after asking two. One question = one
+    # charge, identified by qid.
+    charged = []
+
+    def taster(db, user_id, limit=entitlements.CHAT_TASTER_PER_DAY, qid=None):
+        if qid is not None and qid in charged:
+            return True, len(charged)          # same question, already paid for
+        charged.append(qid)
+        return True, len(charged)
+
+    def go():
+        req = main.ChatRequest(message="what is my cash runway?", qid="q-1")
+        main._prepare_chat(req, "u1")          # hop 1: /chat/stream
+        main._prepare_chat(req, "u1")          # hop 2: buffered /chat fallback
+
+    _with_patched(lambda *_a, **_k: (_ for _ in ()).throw(_gate_exc()), taster, go)
+    assert len(charged) == 1, f"one question charged {len(charged)} taster questions"
+
+
+def test_a_missing_groq_key_does_not_burn_a_free_question():
+    # The key check used to sit AFTER the taster was consumed, so a server with
+    # no key charged the owner a question and then 500'd — and the client's
+    # fallback charged a second. Never bill for an answer that cannot be given.
+    charged = []
+
+    def taster(db, user_id, limit=entitlements.CHAT_TASTER_PER_DAY, qid=None):
+        charged.append(qid)
+        return True, len(charged)
+
+    def go():
+        try:
+            main._prepare_chat(main.ChatRequest(message="hi", qid="q-2"), "u1")
+        except HTTPException as e:
+            return e
+        raise AssertionError("expected a 500 for the missing key")
+
+    key = os.environ.pop("GROQ_API_KEY", None)
+    try:
+        exc = _with_patched(
+            lambda *_a, **_k: (_ for _ in ()).throw(_gate_exc()), taster, go)
+    finally:
+        if key is not None:
+            os.environ["GROQ_API_KEY"] = key
+    assert exc.status_code == 500
+    assert charged == [], "a taster question was spent on an unservable request"
 
 
 def test_the_gate_lives_in_exactly_one_place():
