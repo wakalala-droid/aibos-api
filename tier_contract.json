@@ -17,7 +17,13 @@
     "",
     "Changing what a plan unlocks = edit the code, edit this file, push aibos-api",
     "FIRST, then aibos. Pushing the frontend first just means its check is red",
-    "until the backend lands — that redness is the feature working."
+    "until the backend lands — that redness is the feature working.",
+    "",
+    "'unbuilt' lists flags that appear in the ladder above but grant NOTHING:",
+    "features that are reserved and not yet written. can_access() / canAccess()",
+    "deny them to every tier, including Growth, so no gate can ever hand a",
+    "customer a feature with no implementation behind it. Shipping one = remove",
+    "it from this list, from entitlements._UNBUILT and from tiers.ts UNBUILT."
   ],
 
   "access": {
@@ -77,6 +83,11 @@
       "variance"
     ]
   },
+
+  "unbuilt": [
+    "api_access",
+    "multi_location"
+  ],
 
   "taster": {
     "ai_chat": 3

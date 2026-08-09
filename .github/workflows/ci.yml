@@ -92,6 +92,12 @@ jobs:
       - name: Chat context tests
         run: python test_chat_context.py
 
+      - name: Schema (migration) contract tests
+        # Asserts main.EXPECTS_MIGRATION — what /health reports after a deploy —
+        # matches schema_contract.json, which the aibos repo checks against the
+        # migrations actually on disk. See schema_contract.json.
+        run: python test_schema_contract.py
+
       - name: Tier contract tests
         # Asserts entitlements.py + main.py PLAN_PRICES match tier_contract.json,
         # which the aibos repo checks lib/tiers.ts against. The two repos cannot

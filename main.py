@@ -1854,6 +1854,25 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
+# The highest migration this code needs in order to run correctly.
+#
+# The migration FILES live in the other repo (aibos/supabase/migrations/), so
+# this number cannot be derived here — it is a declaration, and declarations
+# drift. It used to be an inline literal in /health with nothing checking it
+# against the migrations that actually exist, which is the same
+# duplicated-knowledge shape as every tier bug in docs/AUDIT_VERIFICATION.
+#
+# It is now guarded from both sides:
+#   aibos-api  test_schema_contract.py        — asserts this matches
+#                                               schema_contract.json.
+#   aibos      scripts/check_migration_contract.py — fetches that file and
+#              asserts it equals the highest 00NN_*.sql actually on disk.
+#
+# Adding a migration = add the .sql in aibos, bump this AND
+# schema_contract.json, push aibos-api first.
+EXPECTS_MIGRATION = 24
+
+
 @app.get("/health")
 async def health():
     """Deploy-verification at a glance (audit #12/#106): build SHA + the
@@ -1870,7 +1889,7 @@ async def health():
         "version": "3.2.0",
         # RAILWAY_GIT_COMMIT_SHA is injected by Railway on every deploy.
         "build_sha": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "dev")[:8],
-        "expects_migration": 24,                      # highest migration this code needs
+        "expects_migration": EXPECTS_MIGRATION,
     }
 
 

@@ -54,6 +54,22 @@ _ACCESS: dict[str, set[str]] = {
     "growth": _GROWTH,
 }
 
+# Flags reserved for features that DO NOT EXIST YET. They stay in the ladder
+# above so the plan structure is documented in one place, but they grant
+# nothing: can_access() denies them to every tier, including Growth.
+#
+# Why fail closed. Before this, can_access("growth", "multi_location") returned
+# True. Nothing consumed it, so nothing was broken — but the first gate anyone
+# wired on one of these would have silently handed Growth customers a feature
+# with no implementation behind it. The reverse mistake (building it and
+# forgetting to unlist it here) is caught loudly instead: the aibos guard
+# scripts/check_unbuilt_features.py goes red the moment any UI references a
+# flag that is still listed as unbuilt.
+#
+# Building one of these = delete it from this set, delete it from tiers.ts
+# UNBUILT, delete it from tier_contract.json "unbuilt", push aibos-api first.
+_UNBUILT: set[str] = {"multi_location", "api_access"}
+
 # Lowest-first, used to find the cheapest tier that unlocks a feature.
 _PAID_ORDER = ["pro", "proplus", "growth"]
 
@@ -104,6 +120,8 @@ def user_tier(user_id: str) -> str:
 
 
 def can_access(tier: str, feature: str) -> bool:
+    if feature in _UNBUILT:
+        return False
     return feature in _ACCESS.get(tier, set())
 
 
@@ -199,6 +217,16 @@ def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY,
 def require_feature(user_id: str, feature: str) -> str:
     """Raise 402 unless the caller's tier unlocks `feature`. Returns the tier."""
     tier = user_tier(user_id)
+    # An unbuilt feature is not an upsell. Telling a Growth customer to
+    # "upgrade to Growth" for something nobody has written is the same class of
+    # lie as telling a Free owner their spent taster "is a Pro feature".
+    if feature in _UNBUILT:
+        label = _FEATURE_LABEL.get(feature, feature)
+        raise HTTPException(
+            status_code=501,
+            detail=f"{label.capitalize()} is not built yet — it is on the roadmap, "
+                   "not in your plan. You have not been charged for it.",
+        )
     if not can_access(tier, feature):
         need = _required_tier(feature)
         need_label = _TIER_LABEL.get(need, need.capitalize())

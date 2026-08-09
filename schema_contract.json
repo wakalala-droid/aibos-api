@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "AUTHORITATIVE database-schema contract between the two AIBOS repos.",
+    "",
+    "The migration FILES live in the frontend repo (aibos/supabase/migrations/).",
+    "The BACKEND is what breaks when one has not been run. So the backend has to",
+    "declare which migration it needs, and that declaration cannot be derived —",
+    "it is hand-maintained, and hand-maintained numbers drift.",
+    "",
+    "It used to be an inline literal inside /health with nothing comparing it to",
+    "the migrations that actually exist. Bump the code without adding the .sql",
+    "(or add the .sql without bumping the code) and nothing said a word — the",
+    "same duplicated-knowledge shape as the tier bugs in",
+    "docs/AUDIT_VERIFICATION_2026-07.md.",
+    "",
+    "Checked from both sides:",
+    "  aibos-api  test_schema_contract.py            — main.EXPECTS_MIGRATION",
+    "                                                  matches this file.",
+    "  aibos      scripts/check_migration_contract.py — fetches THIS file from",
+    "                                                  main and asserts it equals",
+    "                                                  the highest 00NN_*.sql on",
+    "                                                  disk.",
+    "",
+    "Adding a migration = add the .sql in aibos, bump expects_migration here AND",
+    "in main.py, push aibos-api FIRST. The owner runs migrations by hand, so a",
+    "green /health after a deploy is how they know the new image is really live."
+  ],
+
+  "expects_migration": 24
+}

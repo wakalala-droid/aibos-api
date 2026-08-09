@@ -77,6 +77,53 @@ def test_reserved_flags_are_growth_only_and_unbuilt():
         assert flag not in CONTRACT["access"]["proplus"]
 
 
+def test_unbuilt_flags_grant_nothing_to_anyone():
+    # can_access("growth", "multi_location") used to return True. Nothing
+    # consumed it, so nothing broke — but the first gate wired on a reserved
+    # flag would have handed a paying Growth customer a feature with no
+    # implementation behind it. Unbuilt means unbuilt, for every tier.
+    assert entitlements._UNBUILT, "the unbuilt set went empty — did a rename break it?"
+    for flag in entitlements._UNBUILT:
+        for tier in ("free", "pro", "proplus", "growth"):
+            assert not entitlements.can_access(tier, flag), (
+                f"{tier} can access {flag!r}, which is not built"
+            )
+
+
+def test_unbuilt_set_matches_the_contract():
+    # Both repos deny the same flags, or one grants what the other refuses.
+    assert sorted(entitlements._UNBUILT) == sorted(CONTRACT["unbuilt"]), (
+        f"entitlements._UNBUILT {sorted(entitlements._UNBUILT)} != "
+        f"tier_contract.json unbuilt {sorted(CONTRACT['unbuilt'])}"
+    )
+    # A reserved flag must still be declared where it will eventually live,
+    # otherwise "unbuilt" quietly becomes a list of typos.
+    for flag in CONTRACT["unbuilt"]:
+        assert flag in CONTRACT["access"]["growth"]
+
+
+def test_unbuilt_feature_is_a_501_not_an_upsell():
+    # Telling a Growth customer to "upgrade to Growth" for something nobody has
+    # written is the same lie as telling a Free owner their spent taster is a
+    # Pro feature. It must read as "not built", and never as a payment prompt.
+    from fastapi import HTTPException
+    original = entitlements.user_tier
+    entitlements.user_tier = lambda _uid: "growth"
+    try:
+        raised = None
+        try:
+            entitlements.require_feature("u1", "multi_location")
+        except HTTPException as e:
+            raised = e
+        assert raised is not None, "expected an error for an unbuilt feature"
+        assert raised.status_code == 501, f"got {raised.status_code}, wanted 501"
+        low = raised.detail.lower()
+        assert "not built" in low
+        assert "upgrade" not in low
+    finally:
+        entitlements.user_tier = original
+
+
 def test_hospitality_is_still_provisionally_in_pro():
     # PROVISIONAL by decision, not accident: parked in Pro so the v1 client can
     # use it, and it moves to its own add-on SKU later. If this fails, that move
