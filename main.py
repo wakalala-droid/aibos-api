@@ -1870,7 +1870,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 24
+EXPECTS_MIGRATION = 25
 
 
 @app.get("/health")
@@ -1916,6 +1916,11 @@ PLAN_LABEL = {"pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 # is REJECTED — otherwise anyone could POST "successful" and grant themselves a
 # paid tier. Set PAYMENTS_CALLBACK_SECRET in Railway alongside the provider keys.
 CALLBACK_SECRET = os.environ.get("PAYMENTS_CALLBACK_SECRET")
+
+# Where the customer-facing app lives — used to build invoice payment links.
+# Set this on Railway if the frontend ever moves off the Vercel domain, or every
+# link AIBOS hands a paying customer points at the wrong host.
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://aibos.vercel.app")
 
 
 def _grant_tier(user_id: Optional[str], plan: str) -> None:
@@ -2045,14 +2050,34 @@ async def payments_callback(network: str, body: Dict[str, Any],
         raise HTTPException(status_code=403, detail="Invalid callback signature")
 
     reference = str(body.get("referenceId") or body.get("reference") or body.get("transaction", {}).get("id") or "")
-    rec = PAYMENTS.get(reference)
-    if not rec:
-        return {"ok": False, "detail": "unknown reference"}
     raw = str(body.get("status") or body.get("transaction", {}).get("status") or "").upper()
     resolved = {"SUCCESSFUL": "successful", "TS": "successful", "FAILED": "failed", "TF": "failed"}.get(raw)
-    if resolved:
-        _settle(rec, resolved)
-    return {"ok": True, "status": rec["status"]}
+
+    # Two kinds of collection share this webhook: a subscription checkout (kept
+    # in memory, the buyer is watching the page) and an invoice payment link
+    # (persisted, because the payer may approve minutes later and this callback
+    # may arrive after a deploy). Subscriptions are checked first — that store
+    # is a dict lookup — then the invoice table.
+    rec = PAYMENTS.get(reference)
+    if rec:
+        if resolved:
+            _settle(rec, resolved)
+        return {"ok": True, "status": rec["status"]}
+
+    db = get_db()
+    if db is not None and reference:
+        try:
+            res = (db.table("invoice_payments").select("*")
+                   .eq("reference", reference).limit(1).execute())
+            rows = getattr(res, "data", None) or []
+            if rows:
+                status = _settle_invoice_payment(db, rows[0], resolved) if resolved else rows[0]["status"]
+                return {"ok": True, "status": status}
+        except Exception as e:  # noqa: BLE001 — a webhook must not 500 at the provider
+            log.error("[payments] invoice callback failed (ref=%s): %s", reference, e)
+            return {"ok": False, "detail": "settlement error"}
+
+    return {"ok": False, "detail": "unknown reference"}
 
 
 # ── Morning Brief delivery (notify.py — ready-for-keys like payments) ────────
@@ -2960,13 +2985,251 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
                              pay_note: Optional[str] = Query(None),
                              user_id: str = Depends(require_user)):
     """WhatsApp-ready message for the OWNER to send from their own phone —
-    AIBOS never messages a customer itself (automation.ts precedent)."""
+    AIBOS never messages a customer itself (automation.ts precedent).
+
+    A sent invoice carries its tap-to-pay link in the message. The token is
+    minted lazily here too, so invoices issued before migration 0025 get one the
+    first time they are shared instead of silently going out without a link.
+    """
     db = _require_db()
     try:
         inv = invoices_api._get(db, user_id, invoice_id)
+        if inv.get("status") == "sent" and not inv.get("pay_token"):
+            inv = invoices_api.ensure_pay_token(db, user_id, invoice_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return {"ok": True, "text": invoices_api.share_text(inv, business_name, pay_note)}
+
+    url = (invoices_api.build_pay_url(PUBLIC_APP_URL, inv["pay_token"])
+           if inv.get("pay_token") and inv.get("status") == "sent" else None)
+    return {"ok": True, "text": invoices_api.share_text(inv, business_name, pay_note, url),
+            "pay_url": url}
+
+
+@app.post("/invoices/{invoice_id}/pay-link")
+async def invoice_pay_link(invoice_id: str, user_id: str = Depends(require_user)):
+    """Mint (or return) the invoice's public payment link, for the owner to copy
+    anywhere — SMS, email, a printed QR. Sent invoices only."""
+    db = _require_db()
+    try:
+        inv = invoices_api.ensure_pay_token(db, user_id, invoice_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "url": invoices_api.build_pay_url(PUBLIC_APP_URL, inv["pay_token"])}
+
+
+# ── The public payment page (migration 0025) ─────────────────────────────────
+# Anonymous routes. The token in the path is the ONLY credential, so every one
+# of these is throttled and returns invoices_api.public_view() — never a raw
+# invoice row. Nothing here trusts a number from the request body: the amount
+# charged is always read from the invoice server-side.
+#
+# THROTTLING IS BY TOKEN AS WELL AS BY IP, and the token limit is the strict
+# one. Two reasons IP alone is the wrong axis here:
+#   · Zambian mobile carriers sit behind CGNAT, so a whole neighbourhood of
+#     legitimate payers can share one address — a tight per-IP limit locks out
+#     real customers trying to pay.
+#   · The abuse worth stopping is prompt-bombing: `payer_phone` is whatever the
+#     caller types, so a valid token could be used to fire repeated mobile-money
+#     prompts at someone else's handset. An attacker rotates IPs; they cannot
+#     rotate the token, and one invoice has no honest reason to see many payment
+#     attempts a minute.
+
+def _client_ip(request: Request) -> str:
+    """Best-effort caller identity for throttling. Vercel/Railway put the real
+    client first in X-Forwarded-For; fall back to the socket peer."""
+    fwd = request.headers.get("x-forwarded-for") or ""
+    return (fwd.split(",")[0].strip() or (request.client.host if request.client else "anon"))
+
+
+def _throttle_public(request: Request, bucket: str, limit: int, window_s: int,
+                     token: Optional[str] = None, token_limit: int = 0) -> None:
+    """Throttle an anonymous pay route. rate_limit.limiter() can't be used here —
+    it keys on an authenticated user, and there isn't one."""
+    for identity, cap in ((_client_ip(request), limit),
+                          (f"tok:{token}", token_limit) if token and token_limit else (None, 0)):
+        if not identity or not cap:
+            continue
+        try:
+            allowed, retry = rate_limit.check(identity, bucket, cap, window_s)
+        except Exception as exc:  # noqa: BLE001
+            # Fail OPEN, matching rate_limit.py's stated contract: a limiter bug
+            # must never stand between a customer and paying an invoice.
+            log.warning("[pay] throttle check failed (%s) — allowing", exc)
+            continue
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many attempts — please wait about {retry}s and try again.",
+                headers={"Retry-After": str(retry)})
+
+
+def _pay_invoice_or_404(db, token: str) -> Dict[str, Any]:
+    inv = invoices_api.get_by_pay_token(db, token)
+    # One message for "no such token" and "token exists but isn't payable" would
+    # be tidier, but an owner debugging a link needs to tell them apart, and a
+    # 404 here leaks nothing an attacker could use — they already need the token.
+    if not inv:
+        raise HTTPException(status_code=404, detail="This payment link is not valid.")
+    return inv
+
+
+def _business_name_for(db, user_id: str) -> Optional[str]:
+    """Whose invoice the payer is looking at. Best-effort — a missing name just
+    renders the page without it rather than failing the payment."""
+    try:
+        res = (db.table("profiles").select("business_name")
+               .eq("id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        return (rows[0].get("business_name") if rows else None) or None
+    except Exception as e:  # noqa: BLE001
+        log.warning("[pay] business name lookup failed: %s", e)
+        return None
+
+
+@app.get("/pay/{token}")
+async def public_invoice(token: str, request: Request):
+    """What the customer sees. Whitelisted fields only (public_view)."""
+    # Generous: a customer refreshing, or a shared carrier IP, must not be locked
+    # out of simply LOOKING at what they owe.
+    _throttle_public(request, "pay_view", 240, 60, token=token, token_limit=120)
+    db = _require_db()
+    inv = _pay_invoice_or_404(db, token)
+    return {
+        "ok": True,
+        "invoice": invoices_api.public_view(inv, _business_name_for(db, inv["user_id"])),
+        "networks": payments.configured_networks(),
+    }
+
+
+class PublicPayRequest(BaseModel):
+    network: str                      # "mtn" | "airtel"
+    payer_phone: str
+
+
+@app.post("/pay/{token}/initiate")
+async def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
+    """Start a mobile-money collection against this invoice."""
+    # The token limit is the real guard against prompt-bombing (see the section
+    # note above): 5 attempts a minute is more than any honest payer needs, and
+    # it holds however many IPs the caller comes from. The IP cap stays loose so
+    # CGNAT doesn't punish a street full of real customers.
+    _throttle_public(request, "pay_initiate", 60, 60, token=token, token_limit=5)
+    db = _require_db()
+    inv = _pay_invoice_or_404(db, token)
+
+    if inv.get("status") == "paid":
+        raise HTTPException(status_code=409, detail="This invoice has already been paid. Thank you!")
+    if inv.get("status") != "sent":
+        raise HTTPException(status_code=409, detail="This invoice is not awaiting payment.")
+
+    network = (body.network or "").lower()
+    if network not in ("mtn", "airtel"):
+        raise HTTPException(status_code=400, detail="Choose MTN or Airtel.")
+    if not (body.payer_phone or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the phone number to charge.")
+
+    # The amount is the INVOICE's, read server-side. The payer's request carries
+    # no number a client could tamper with.
+    amount = float(inv.get("total") or 0)
+    if amount <= 0:
+        raise HTTPException(status_code=409, detail="This invoice has nothing to pay.")
+    currency = inv.get("currency") or "ZMW"
+
+    reference = str(uuid.uuid4())
+    note = f"Invoice {inv.get('number')}"
+    state = payments.initiate(network, reference, amount, currency, body.payer_phone, note)
+
+    if state == "unconfigured":
+        raise HTTPException(
+            status_code=503,
+            detail="Mobile money payment isn’t switched on yet. Please pay the business directly — they can mark this invoice paid.",
+        )
+    if state == "failed":
+        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
+
+    # PERSISTED, unlike the subscription flow's in-memory dict: the customer may
+    # approve the prompt minutes from now and the webhook may land after a
+    # deploy. A reference the server forgot is money taken with no invoice
+    # settled. See migration 0025.
+    db.table("invoice_payments").insert({
+        "invoice_id": inv["id"],
+        "user_id": inv["user_id"],
+        "reference": reference,
+        "network": network,
+        "payer_phone": body.payer_phone.strip(),
+        "amount": amount,
+        "currency": currency,
+        "status": state,
+    }).execute()
+
+    return {"ok": True, "reference": reference, "status": state, "amount": amount, "currency": currency}
+
+
+def _settle_invoice_payment(db, row: Dict[str, Any], new_status: str) -> str:
+    """Apply a resolved collection status once, and settle the invoice on success.
+
+    `settled` is flipped BEFORE the spine event is posted, so a re-poll racing
+    the provider webhook cannot post two CustomerPayments for one collection.
+    """
+    if new_status not in ("successful", "failed") or new_status == row.get("status"):
+        return row.get("status", "pending")
+
+    db.table("invoice_payments").update({"status": new_status}).eq("id", row["id"]).execute()
+    row["status"] = new_status
+
+    if new_status == "successful" and not row.get("settled"):
+        db.table("invoice_payments").update({"settled": True}).eq("id", row["id"]).execute()
+        row["settled"] = True
+        try:
+            invoices_api.mark_paid(db, row["user_id"], row["invoice_id"],
+                                   method=row["network"], reference=row["reference"])
+            log.info("[pay] invoice %s settled by %s %s",
+                     row["invoice_id"], row["network"], row["reference"])
+        except ValueError as e:
+            # Most likely the owner already pressed "Mark paid" between the
+            # prompt and the confirmation. The money is real either way, and the
+            # invoice is already settled — log it, don't fail the payer's page.
+            log.warning("[pay] collection %s succeeded but invoice %s was not in "
+                        "'sent' state: %s", row["reference"], row["invoice_id"], e)
+    return new_status
+
+
+def _payment_row(db, token: str, reference: str) -> Dict[str, Any]:
+    """Fetch a collection, scoped to the invoice the token addresses — so one
+    invoice's token can never be used to poll another invoice's payment."""
+    inv = _pay_invoice_or_404(db, token)
+    res = (db.table("invoice_payments").select("*")
+           .eq("reference", reference).eq("invoice_id", inv["id"]).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Unknown payment reference")
+    return rows[0]
+
+
+@app.get("/pay/{token}/status/{reference}")
+async def public_pay_status(token: str, reference: str, request: Request):
+    """Poll a collection. The page calls this every few seconds while the
+    customer approves the prompt on their handset."""
+    # The page polls every 3s for up to ~3 minutes = ~60 calls per payment. This
+    # must never throttle a customer mid-payment, so it is the loosest of the three.
+    _throttle_public(request, "pay_status", 600, 60, token=token, token_limit=200)
+    db = _require_db()
+    row = _payment_row(db, token, reference)
+
+    status = row["status"]
+    if status == "pending":
+        created = row.get("created_at")
+        ts = None
+        if created:
+            try:
+                from datetime import datetime as _dt
+                ts = _dt.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        status = _settle_invoice_payment(
+            db, row, payments.status(row["network"], reference, ts))
+
+    return {"ok": True, "reference": reference, "status": status}
 
 
 # ── Anomaly auto-investigation (audit #13) ────────────────────────────────────

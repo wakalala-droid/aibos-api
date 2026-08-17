@@ -26,5 +26,5 @@
     "green /health after a deploy is how they know the new image is really live."
   ],
 
-  "expects_migration": 24
+  "expects_migration": 25
 }

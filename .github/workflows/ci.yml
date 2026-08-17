@@ -41,6 +41,9 @@ jobs:
       - name: Invoice tests
         run: python test_invoices.py
 
+      - name: Invoice payment-link tests
+        run: python test_invoice_payments.py
+
       - name: CFO tools tests
         run: python test_cfo_tools.py
 
