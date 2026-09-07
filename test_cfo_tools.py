@@ -248,3 +248,61 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} cfo-tools tests passed ===")
+
+
+# ── The shape the provider is actually sent ──────────────────────────────────
+# Four tools take no arguments and were declared as
+# {"type": "object", "properties": {}}. OpenAI and Groq accept that; Google
+# rejects an OBJECT schema with no properties, and the rejection kills the whole
+# request. Every chat message failed on the first call, before a word was
+# written, and the owner was told "the answer stopped early, please try again".
+
+def test_no_tool_ships_an_empty_properties_object():
+    for t in cfo_tools.tool_schemas():
+        fn = t["function"]
+        params = fn.get("parameters")
+        assert params is None or params.get("properties"), \
+            f"{fn['name']} declares an object schema with no properties"
+
+
+def test_argument_taking_tools_keep_their_schema():
+    by_name = {t["function"]["name"]: t["function"] for t in cfo_tools.tool_schemas()}
+    assert by_name["query_events"]["parameters"]["properties"]["customer"]
+    assert by_name["simulate_scenario"]["parameters"]["required"] == ["type", "value"]
+    # And the no-argument ones are still offered, just without a parameters block.
+    assert "parameters" not in by_name["get_business_snapshot"]
+    assert len(by_name) == len(cfo_tools.TOOLS)
+
+
+def test_a_refused_tool_declaration_still_answers():
+    """A provider that will not accept the tools must not cost the owner the
+    whole answer. The loop drops the tools and asks again."""
+    calls = []
+
+    class _Msg:
+        content = "Roughly K12,000 last month."
+        tool_calls = None
+
+    class _Completion:
+        choices = [type("C", (), {"message": _Msg()})()]
+
+    class _Client:
+        pass
+
+    def fake_chat_create(client, **kwargs):
+        calls.append("tools" in kwargs)
+        if "tools" in kwargs:
+            raise Exception("400 properties: should be non-empty for OBJECT type")
+        return _Completion()
+
+    original = cfo_tools.llm.chat_create
+    cfo_tools.llm.chat_create = fake_chat_create
+    try:
+        out = cfo_tools.run_agent_loop(_Client(), "m", [{"role": "user", "content": "hi"}],
+                                       db=None, user_id="u1")
+    finally:
+        cfo_tools.llm.chat_create = original
+
+    assert calls == [True, False]                 # tried with tools, then without
+    assert out["reply"] == "Roughly K12,000 last month."
+    assert out["tools_used"] == []

@@ -4,6 +4,7 @@ Fixes: column detection, multi-sheet Excel, AI chat, cabinet, data studio
 """
 
 import os
+import re
 import io
 import json
 import time
@@ -1717,6 +1718,21 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     }
 
 
+def _safe_error(exc: Exception, limit: int = 240) -> str:
+    """A provider error, short enough to show and with no credential left in it.
+
+    Provider errors carry the request URL, and a URL can carry a key in its
+    query string. Nothing here is meant to be secret, so strip anything that
+    looks like one rather than trusting that it never happens.
+    """
+    text = " ".join(str(exc).split()) or exc.__class__.__name__
+    text = re.sub(r"(?i)(key|token|secret|password)=[^&\s]+", '\\1=***', text)
+    text = re.sub(r"(sk|gsk|AIza)[A-Za-z0-9_-]{8,}", "***", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
     """
@@ -1766,7 +1782,12 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limite
             yield f"data: {json.dumps({'done': True, 'tools_used': []})}\n\n"
         except Exception as exc:  # noqa: BLE001 — a mid-stream failure must be told, not hang
             logger.error("chat stream error: %s\n%s", exc, traceback.format_exc())
-            yield f"data: {json.dumps({'error': 'The answer stopped early. Please try again.'})}\n\n"
+            # "Please try again" was advice for a problem retrying cannot fix.
+            # Every message failed identically because the provider was refusing
+            # the tool declarations, and the owner was told to do the one thing
+            # guaranteed not to work. Say what actually went wrong.
+            detail = 'The answer stopped early. ' + _safe_error(exc)
+            yield f"data: {json.dumps({'error': detail})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
@@ -1933,6 +1954,74 @@ async def health():
         "build_sha": _build_sha(),
         "host": _host_name(),
         "expects_migration": EXPECTS_MIGRATION,
+    }
+
+
+@app.get("/health/ai")
+async def health_ai(user_id: str = Depends(require_user)):
+    """Which calls to the AI provider actually work.
+
+    "The answer stopped early. Please try again." was the whole of what an owner
+    was told when the chat broke, and retrying could never fix it: the provider
+    was rejecting the tool declarations, so every message failed on the first
+    call before a word was written. Nothing in the product could be asked which
+    part had failed.
+
+    Three probes, smallest first, so the answer says WHERE it breaks rather than
+    that it breaks: a plain reply, a reply with the tools declared, and the
+    streaming call the chat actually makes. Signed-in only and a few tokens a
+    run, so it is cheap to ask and not worth abusing.
+    """
+    if not llm.configured():
+        return {"ok": False, "provider": "none", "model": None,
+                "verdict": "No AI key is set on the API, so the chat cannot answer.",
+                "probes": {}}
+
+    client = llm.client()
+    model = llm.chat_model()
+    msgs = [{"role": "user", "content": "Reply with the single word: ok"}]
+    probes = {}
+
+    def probe(name, fn):
+        try:
+            fn()
+            probes[name] = {"ok": True, "error": ""}
+        except Exception as e:  # noqa: BLE001 — reporting failure IS the job here
+            probes[name] = {"ok": False, "error": _safe_error(e)}
+
+    probe("plain", lambda: client.chat.completions.create(
+        model=model, messages=msgs, max_tokens=5))
+
+    probe("with_tools", lambda: client.chat.completions.create(
+        model=model, messages=msgs, max_tokens=5,
+        tools=cfo_tools.tool_schemas(), tool_choice="auto"))
+
+    def _stream():
+        st = client.chat.completions.create(
+            model=model, messages=msgs, max_tokens=5, stream=True,
+            tools=cfo_tools.tool_schemas(), tool_choice="auto")
+        for _ in st:
+            break
+    probe("streaming_with_tools", _stream)
+
+    if not probes["plain"]["ok"]:
+        verdict = ("The provider will not answer at all. Usually the key or the model id: "
+                   + probes["plain"]["error"])
+    elif not probes["with_tools"]["ok"]:
+        verdict = ("Plain answers work, but the provider rejects the tool declarations, so "
+                   "the chat cannot look anything up: " + probes["with_tools"]["error"])
+    elif not probes["streaming_with_tools"]["ok"]:
+        verdict = ("Answers work but streaming does not, so the chat falls back to waiting "
+                   "for the whole reply: " + probes["streaming_with_tools"]["error"])
+    else:
+        verdict = "The AI chat is working."
+
+    return {
+        "ok": all(p["ok"] for p in probes.values()),
+        "provider": llm.provider(),
+        "model": model,
+        "probes": probes,
+        "verdict": verdict,
     }
 
 

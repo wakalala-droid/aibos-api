@@ -300,6 +300,31 @@ def run_tool(db, user_id: str, name: str, args: dict) -> dict:
 # ── Agent loop (client-injected → offline-testable) ───────────────────────────
 
 
+def tool_schemas() -> list:
+    """TOOLS in the shape the provider is actually sent.
+
+    A tool that takes no arguments was declared as
+    `{"type": "object", "properties": {}}`. OpenAI and Groq accept that. Google
+    does not: an OBJECT schema with no properties is rejected outright, and the
+    rejection kills the WHOLE request, so every chat message failed on the first
+    call with "The answer stopped early. Please try again." Four tools were
+    declared that way, which is why it failed for everybody, every time, before
+    a single word was written.
+
+    `parameters` is optional in the OpenAI schema, so omitting it for a tool
+    with no arguments is valid everywhere rather than a special case for one
+    provider. Guarded by test_cfo_tools.
+    """
+    out = []
+    for t in TOOLS:
+        fn = dict(t["function"])
+        params = fn.get("parameters") or {}
+        if not params.get("properties"):
+            fn.pop("parameters", None)
+        out.append({"type": "function", "function": fn})
+    return out
+
+
 def _accumulate_tool_deltas(acc: dict, deltas) -> None:
     """Fold streamed tool_call deltas into {index: {id, name, arguments}}.
     Streaming sends a tool call in pieces: the id/name arrive first, then the
@@ -341,9 +366,23 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         kwargs = dict(model=model, messages=convo, temperature=temperature,
                       max_tokens=max_tokens, stream=True)
         if not force_prose:
-            kwargs.update(tools=TOOLS, tool_choice="auto")
+            kwargs.update(tools=tool_schemas(), tool_choice="auto")
 
-        stream = client.chat.completions.create(**kwargs)
+        try:
+            stream = client.chat.completions.create(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            # A provider that refuses the TOOL declarations refuses the whole
+            # request, so the owner got nothing at all. An answer without
+            # lookups is worth far more than "the answer stopped early", and
+            # the log line names the provider's own words so the cause is
+            # findable rather than guessed at.
+            if force_prose or "tools" not in kwargs:
+                raise
+            log.warning("[cfo] the provider refused the tool declarations, "
+                        "answering without lookups: %s", e)
+            kwargs.pop("tools", None)
+            kwargs.pop("tool_choice", None)
+            stream = client.chat.completions.create(**kwargs)
 
         pending: dict = {}
         said_anything = False
@@ -404,11 +443,22 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
 
     for round_no in range(max_rounds + 1):
         force_prose = round_no == max_rounds
-        completion = llm.chat_create(
-            client,
-            model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
-            **({} if force_prose else {"tools": TOOLS, "tool_choice": "auto"}),
-        )
+        tool_kwargs = {} if force_prose else {"tools": tool_schemas(), "tool_choice": "auto"}
+        try:
+            completion = llm.chat_create(
+                client,
+                model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
+                **tool_kwargs,
+            )
+        except Exception as e:  # noqa: BLE001 — see the streaming twin above
+            if not tool_kwargs:
+                raise
+            log.warning("[cfo] the provider refused the tool declarations, "
+                        "answering without lookups: %s", e)
+            completion = llm.chat_create(
+                client,
+                model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
+            )
         msg = completion.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None) or []
 
