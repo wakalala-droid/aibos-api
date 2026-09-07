@@ -143,6 +143,17 @@ def test_public_view_is_a_whitelist():
         assert leaked not in pub, f"public_view leaks {leaked!r}"
 
 
+def test_public_view_carries_the_business_logo_when_there_is_one():
+    """The payer should see the mark they recognise — and never an empty string
+    the page would try to render as a broken image."""
+    db = _DB()
+    inv = _sent(db)
+    with_logo = invoices.public_view(inv, "Zoe's Kitchen", "https://cdn.x/logo.png")
+    assert with_logo["business_logo_url"] == "https://cdn.x/logo.png"
+    assert invoices.public_view(inv, "Zoe's Kitchen")["business_logo_url"] is None
+    assert invoices.public_view(inv, "Zoe's Kitchen", "")["business_logo_url"] is None
+
+
 def test_public_view_marks_a_paid_invoice_unpayable():
     db = _DB()
     inv = _sent(db)

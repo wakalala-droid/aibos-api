@@ -1,4 +1,10 @@
 fastapi==0.111.0
+# Pinned because fastapi only constrains it loosely (>=0.37.2,<0.38.0) and a
+# resolver free to pick inside that range is a resolver free to pick outside it
+# on a machine that already has a newer one. A stray starlette 1.6.0 is exactly
+# how `import main` broke locally while every AI-BOS module imported fine: the
+# failure is inside fastapi/routing.py, on `on_startup`, and reads like our bug.
+starlette==0.37.2
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 pydantic==2.7.1

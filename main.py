@@ -65,6 +65,7 @@ import payroll as payroll_api
 import hospitality as hospitality_api
 import notify
 import ocr
+import identity as identity_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aibos")
@@ -1873,6 +1874,40 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 EXPECTS_MIGRATION = 25
 
 
+# The commit each host injects, in the order we are likely to be on them.
+# This used to read RAILWAY_GIT_COMMIT_SHA and nothing else, which was fine
+# while Railway was the only host. It is not any more, and a build_sha that
+# silently reads "dev" forever would quietly disable the one check that proves
+# a deploy actually landed — the reason /health reports it at all.
+_BUILD_SHA_VARS = (
+    ("render", "RENDER_GIT_COMMIT"),
+    ("railway", "RAILWAY_GIT_COMMIT_SHA"),
+    ("fly", "FLY_MACHINE_VERSION"),
+    ("koyeb", "KOYEB_GIT_SHA"),
+    ("heroku", "SOURCE_VERSION"),
+    ("vercel", "VERCEL_GIT_COMMIT_SHA"),
+    # Set this by hand anywhere else, e.g. in a Dockerfile ARG.
+    ("manual", "GIT_COMMIT_SHA"),
+)
+
+
+def _build_sha() -> str:
+    for _, var in _BUILD_SHA_VARS:
+        value = os.environ.get(var)
+        if value:
+            return value[:8]
+    return "dev"
+
+
+def _host_name() -> str:
+    """Which platform this is running on, as far as it can tell. Useful when
+    two hosts are briefly live at once during a move."""
+    for name, var in _BUILD_SHA_VARS:
+        if os.environ.get(var):
+            return name
+    return "local"
+
+
 @app.get("/health")
 async def health():
     """Deploy-verification at a glance (audit #12/#106): build SHA + the
@@ -1887,8 +1922,8 @@ async def health():
         "supabase_configured": supabase_enabled(),   # Evolution spine persistence
         "spine": "events+twin" if supabase_enabled() else "disabled",
         "version": "3.2.0",
-        # RAILWAY_GIT_COMMIT_SHA is injected by Railway on every deploy.
-        "build_sha": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "dev")[:8],
+        "build_sha": _build_sha(),
+        "host": _host_name(),
         "expects_migration": EXPECTS_MIGRATION,
     }
 
@@ -3073,17 +3108,24 @@ def _pay_invoice_or_404(db, token: str) -> Dict[str, Any]:
     return inv
 
 
-def _business_name_for(db, user_id: str) -> Optional[str]:
-    """Whose invoice the payer is looking at. Best-effort — a missing name just
-    renders the page without it rather than failing the payment."""
+def _business_brand_for(db, user_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Who the payer is being asked to pay, and their mark. Best-effort — a
+    missing name or logo just renders the page without it rather than failing
+    the payment."""
     try:
-        res = (db.table("profiles").select("business_name")
+        res = (db.table("profiles").select("business_name,logo_url")
                .eq("id", user_id).limit(1).execute())
         rows = getattr(res, "data", None) or []
-        return (rows[0].get("business_name") if rows else None) or None
+        row = rows[0] if rows else {}
+        return (row.get("business_name") or None), (row.get("logo_url") or None)
     except Exception as e:  # noqa: BLE001
-        log.warning("[pay] business name lookup failed: %s", e)
-        return None
+        log.warning("[pay] business brand lookup failed: %s", e)
+        return None, None
+
+
+def _business_name_for(db, user_id: str) -> Optional[str]:
+    """Name only — kept for the WhatsApp share text, which has no use for a logo."""
+    return _business_brand_for(db, user_id)[0]
 
 
 @app.get("/pay/{token}")
@@ -3094,9 +3136,10 @@ async def public_invoice(token: str, request: Request):
     _throttle_public(request, "pay_view", 240, 60, token=token, token_limit=120)
     db = _require_db()
     inv = _pay_invoice_or_404(db, token)
+    name, logo = _business_brand_for(db, inv["user_id"])
     return {
         "ok": True,
-        "invoice": invoices_api.public_view(inv, _business_name_for(db, inv["user_id"])),
+        "invoice": invoices_api.public_view(inv, name, logo),
         "networks": payments.configured_networks(),
     }
 
@@ -3484,6 +3527,33 @@ async def run_payroll(req: PayrollRunRequest, user_id: str = Depends(require_use
         return {"ok": True, "run": payroll_api.run_payroll(db, user_id, req.period, req.pay_date)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ── Business identity lookup (Setup Wizard "is this you?") ───────────────────
+# READ-ONLY and write-free: this suggests, the owner decides, and the client
+# PATCHes their own profile only after they tap "Yes, that's my business".
+# Throttled hard because every miss costs a Places call: the wizard debounces
+# to a pause in typing, and identity.py caches identical queries in-process.
+@app.get("/identity/lookup")
+async def identity_lookup(
+    q: str = Query(..., min_length=2, max_length=120),
+    country: str = Query("ZM", max_length=2),
+    phone: Optional[str] = Query(None, max_length=32),
+    user_id: str = Depends(rate_limit.limiter("identity_lookup", 15, 60)),
+):
+    """Find the caller's business online so setup can fill itself.
+
+    `configured` is reported separately from an empty `candidates` list so the
+    wizard can tell "we looked and found nothing" (→ offer to get them listed)
+    apart from "this deployment has no PLACES_API_KEY" (→ say nothing at all).
+    """
+    if not identity_api.available():
+        return {"ok": True, "configured": False, "candidates": []}
+    return {
+        "ok": True,
+        "configured": True,
+        "candidates": identity_api.search(q, country, phone),
+    }
 
 
 # ── Hospitality (short-let PMS) — Phase 1: properties & units ─────────────────

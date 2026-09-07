@@ -102,18 +102,24 @@ def build_pay_url(base_url: str, token: str) -> str:
     return f"{(base_url or '').rstrip('/')}/pay/{token}"
 
 
-def public_view(inv: dict, business_name: str | None = None) -> dict:
+def public_view(inv: dict, business_name: str | None = None,
+                business_logo_url: str | None = None) -> dict:
     """The ONLY invoice shape an anonymous payer may see.
 
     A whitelist, never a blacklist: anyone holding the token gets exactly these
     fields. `notes` is deliberately absent — the owner writes those for
     themselves ("chase this one, they always pay late"), not for the customer.
     So are user_id, business_id, party_id, the spine event ids and pay_token.
+
+    `business_logo_url` is on the whitelist deliberately: the customer is being
+    asked for money by a stranger's link, and seeing the mark they know is the
+    cheapest trust the page can buy. It is a public image URL, not tenant data.
     """
     return {
         "number": inv.get("number"),
         "customer_name": inv.get("customer_name"),
         "business_name": business_name,
+        "business_logo_url": business_logo_url or None,
         "currency": inv.get("currency") or "ZMW",
         "lines": [
             {

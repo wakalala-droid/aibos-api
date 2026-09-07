@@ -1,0 +1,86 @@
+# AI-BOS API on Render's free tier.
+#
+# WHY RENDER AND NOT RAILWAY
+#
+# Railway no longer has a free tier. It gives a small one-off trial credit and
+# then bills, which is how the API came to be switched off. Render still has a
+# genuinely free web service and does not ask for a card to use it.
+#
+# WHAT FREE COSTS YOU, HONESTLY
+#
+# A free Render service SLEEPS after 15 minutes with no traffic, and the next
+# request has to wait for it to boot. With pandas, numpy and reportlab to load,
+# expect roughly 40 to 60 seconds on that first request. Every request after it
+# is normal speed until it goes quiet again for 15 minutes.
+#
+# For a business tool that people open a few times a day, that first-hit wait is
+# the thing they will complain about. Two ways to deal with it:
+#
+#   - Leave it. Free, and the app is honest about being slow to wake.
+#   - Ping /health every 10 minutes from an uptime checker so it never sleeps.
+#     Render's free allowance is 750 instance-hours a month and a month is about
+#     730 hours, so ONE service pinged around the clock still fits inside free.
+#     A second always-on service would not.
+#
+# Render reads this file when you click "New +" -> "Blueprint" and point it at
+# this repository.
+
+services:
+  - type: web
+    name: aibos-api
+    runtime: python
+    plan: free
+    region: frankfurt          # nearest of Render's regions to Lusaka
+    branch: main
+    healthCheckPath: /health
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      # Pinned to match runtime.txt. Render defaults to a newer Python than
+      # some of these wheels have builds for.
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+      # ── Without these three, the app runs but does nothing useful ────────
+      # sync: false means "ask me for it in the dashboard, do not store it
+      # here". None of these belong in a file in a public repository.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY          # the service_role key, NOT the anon key
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # ── Without this the browser blocks every call from the site ─────────
+      # Comma separated, no trailing slash, e.g.
+      #   https://aibos.vercel.app,https://www.your-domain.com
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      # ── Strongly recommended ────────────────────────────────────────────
+      # Lets the API verify a login locally instead of calling Supabase on
+      # every request. Leave it unset and auth still works, just slower.
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      # The public address of the front end, used in links the API generates.
+      - key: PUBLIC_APP_URL
+        sync: false
+      # Must match CRON_SECRET on Vercel or the nightly brief job is refused.
+      - key: CRON_SECRET
+        sync: false
+
+      # ── Everything below is per-feature. Leave unset and that feature is
+      #    simply off; nothing else breaks. ─────────────────────────────────
+      # Mobile money. PAYMENTS_SIMULATION=1 lets checkout be exercised end to
+      # end without real credentials, which is the sane way to start.
+      - key: PAYMENTS_SIMULATION
+        value: "1"
+      - key: PAYMENTS_CALLBACK_SECRET
+        sync: false
+      # Email (Resend), WhatsApp and Google Places are all optional:
+      #   RESEND_API_KEY, BRIEF_FROM_EMAIL
+      #   WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_VERIFY_TOKEN,
+      #   WHATSAPP_APP_SECRET, WHATSAPP_TEMPLATE
+      #   PLACES_API_KEY
+      # Add them in the dashboard when you have the keys.
