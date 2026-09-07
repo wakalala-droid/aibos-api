@@ -71,6 +71,12 @@ jobs:
       - name: Entitlements tests
         run: python test_entitlements.py
 
+      - name: Route scoping tests
+        # Asserts hospitality follows the business and payroll stays with the
+        # owner. These routes resolved their data from the CALLER's own id,
+        # which is identical to the business until somebody is invited.
+        run: python test_route_scoping.py
+
       - name: Compliance calendar tests
         run: python test_compliance.py
 

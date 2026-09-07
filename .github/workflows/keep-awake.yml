@@ -1,0 +1,68 @@
+# Keep the API awake.
+#
+# THE PROBLEM. Render's free plan stops the service after 15 minutes with no
+# traffic. The next person to open AI-BOS then waits while it boots, and with
+# pandas, numpy and reportlab to load that is roughly 40 to 60 seconds of a
+# blank screen. For an owner checking their takings on a phone that reads as
+# broken, not as free.
+#
+# THE FIX. Knock on the door often enough that it never sleeps. Render's free
+# allowance is 750 instance hours a month against a month of about 730 hours,
+# so ONE service kept awake around the clock still fits inside free. A second
+# one would not.
+#
+# WHY IT PINGS THROUGH THE WEBSITE. The address is https://aibos.vercel.app,
+# which never changes, instead of the Render address, which is a value someone
+# would have to keep in step here. /api/proxy/health passes straight through to
+# the API, so the API is what wakes up. Set the repository variable HEALTH_URL
+# if you would rather hit Render directly.
+#
+# WHY EACH RUN PINGS TWICE. GitHub does not promise to run a schedule on time
+# and will delay one under load. A single ping every 10 minutes leaves only 5
+# minutes of slack against the 15 minute sleep. Two pings 5 minutes apart make
+# the real gap about 5 minutes, so a late run still lands in time.
+#
+# ONE THING TO KNOW. GitHub switches off scheduled workflows in a repository
+# that has had no commits for 60 days. It emails first. If the API starts
+# sleeping again months from now, look here before looking anywhere else.
+
+name: Keep awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# A late run must not be cancelled by the next one on its way in.
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ping, wait five minutes, ping again
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://aibos.vercel.app/api/proxy/health' }}
+        run: |
+          ping() {
+            # --max-time 90 because a cold start really does take that long.
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 90 "$HEALTH_URL" || echo 000)
+            echo "$(date -u '+%H:%M:%S') $HEALTH_URL -> $code"
+            cat /tmp/health.json 2>/dev/null | head -c 400; echo
+            [ "$code" = "200" ]
+          }
+
+          first=0; ping || first=1
+          sleep 300
+          second=0; ping || second=1
+
+          # One failed ping is a cold start that timed out, which is exactly the
+          # thing this job exists to prevent happening to a person. Two in a row
+          # means the API is actually down, and that is worth a red tick.
+          if [ "$first" = "1" ] && [ "$second" = "1" ]; then
+            echo "::error::The API did not answer either ping. Check Render."
+            exit 1
+          fi
