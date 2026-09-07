@@ -91,6 +91,31 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+
+# ─── CORS for the public booking surface ─────────────────────────────────────
+# /public/stay/* is deliberately open to any origin. It carries no credentials,
+# it is scoped to a token the owner chose to hand out, and the whole point of it
+# is to be called from a property's own website — which lives on a different
+# domain that nobody would remember to add to an allowlist.
+#
+# Making it depend on ALLOWED_ORIGINS would mean the site goes live, looks
+# perfect, and every date check silently fails in the browser with a CORS error
+# the owner will never see. That is the same shape of failure as the wrong
+# Supabase key: a configuration step nobody knows they missed.
+@app.middleware("http")
+async def _public_cors(request: Request, call_next):
+    is_public = request.url.path.startswith("/public/")
+    if is_public and request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
+    if is_public:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Max-Age"] = "600"
+    return response
+
 # ─── In-memory cabinet (file storage across sessions) ────────────────────────
 # Keyed by cabinet_id → {user_id, name, file_type, sheets, active_sheet, df_json,
 # analysis}. Every entry is stamped with the owning user_id (from the verified
@@ -1890,7 +1915,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 26
+EXPECTS_MIGRATION = 27
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -4066,6 +4091,105 @@ class SimulateRequest(BaseModel):
     count: Optional[int] = None
     monthly_salary: Optional[float] = None
     months: Optional[int] = None
+
+
+#  ── The property's own website (public, token-scoped) ────────────────────────
+# The token IS the capability, exactly as it is for the public iCal feed above.
+# Everything under /public/stay/ is unauthenticated on purpose: dunslimapartments.com
+# has no Supabase session and never will. Nothing here can read or write outside
+# the one property its token belongs to, and nothing here can post revenue.
+
+
+@app.post("/hospitality/properties/{property_id}/site-token")
+async def hospitality_mint_site_token(property_id: str,
+                                      ctx: membership.Context = Depends(membership.require_owner)):
+    """Mint or rotate the token the property's website uses. Owner only: it is a
+    key to a public door, and rotating it cuts off whoever holds the old one."""
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        prop = hospitality_api.mint_site_token(db, ctx.tenant, property_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, "property": prop}
+
+
+@app.delete("/hospitality/properties/{property_id}/site-token")
+async def hospitality_clear_site_token(property_id: str,
+                                       ctx: membership.Context = Depends(membership.require_owner)):
+    """Take the public site offline."""
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        prop = hospitality_api.clear_site_token(db, ctx.tenant, property_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, "property": prop}
+
+
+@app.get("/public/stay/{site_token}/units")
+async def public_stay_units(site_token: str):
+    """The rooms this site may show, with their rates. No ids, no guest data."""
+    db = _require_db()
+    try:
+        return {"ok": True, **hospitality_api.public_units(db, site_token)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/public/stay/{site_token}/availability")
+async def public_stay_availability(site_token: str,
+                                   unit_slug: str = Query(...),
+                                   from_: str = Query(..., alias="from"),
+                                   to: str = Query(...)):
+    """Are these dates free? Same half-open rule as the write-time guard."""
+    db = _require_db()
+    try:
+        return {"ok": True, **hospitality_api.public_availability(db, site_token, unit_slug, from_, to)}
+    except ValueError as e:
+        # "Unknown site" is a 404; a bad date range is the caller's mistake.
+        code = 404 if str(e) in ("Unknown site.", "That residence does not exist.") else 400
+        raise HTTPException(status_code=code, detail=str(e))
+
+
+@app.post("/public/stay/{site_token}/booking-request")
+async def public_stay_booking_request(site_token: str, request: Request,
+                                      body: Dict[str, Any] = Body(...)):
+    """Take a booking request from the property's website.
+
+    It lands as `pending`, which already blocks the dates in the double-booking
+    guard, so the request holds the room while the owner looks at it. It is NOT
+    confirmed and posts NO Sale: confirming in the dashboard is what books
+    revenue, and that has to stay a decision a person makes.
+    """
+    db = _require_db()
+
+    # Per-IP, because there is no user to count against. A real guest sends one
+    # request and thinks about it; this only ever stops a script.
+    client_ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                 or (request.client.host if request.client else "unknown"))
+    try:
+        allowed, retry = rate_limit.check(f"ip:{client_ip}", "public_booking", 10, 3600)
+    except Exception:  # noqa: BLE001 — never block a real guest on a limiter bug
+        allowed, retry = True, 0
+    if not allowed:
+        raise HTTPException(status_code=429,
+                            detail=f"Too many requests. Please wait about {retry}s and try again.",
+                            headers={"Retry-After": str(retry)})
+
+    # The site's honeypot field. A person never fills it in; a bot fills in
+    # everything. Answer exactly as if it worked, and write nothing — telling a
+    # bot it was caught only teaches it to stop filling the field in.
+    if str(body.get("company_website") or "").strip():
+        log.info("[hospitality] public booking request rejected as automated")
+        return {"ok": True, "reference": str(body.get("reference") or "")[:40],
+                "status": "pending"}
+
+    try:
+        return {"ok": True, **hospitality_api.public_booking_request(db, site_token, body)}
+    except ValueError as e:
+        code = 404 if str(e) in ("Unknown site.", "That residence does not exist.") else 400
+        raise HTTPException(status_code=code, detail=str(e))
 
 
 @app.post("/simulate")

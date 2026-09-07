@@ -71,6 +71,12 @@ jobs:
       - name: Entitlements tests
         run: python test_entitlements.py
 
+      - name: Public booking-surface tests
+        # /public/stay/* is unauthenticated by design. These hold the boundary:
+        # a token never reaches another owner's property, a request lands as
+        # pending, and nothing public can post revenue.
+        run: python test_public_stay.py
+
       - name: Route scoping tests
         # Asserts hospitality follows the business and payroll stays with the
         # owner. These routes resolved their data from the CALLER's own id,

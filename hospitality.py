@@ -37,6 +37,10 @@ PROPERTY_EDITABLE = (
 UNIT_EDITABLE = (
     "unit_name", "bedrooms", "bathrooms", "max_guests", "amenities",
     "base_nightly_rate", "currency", "photos",
+    # The handle the property's own website uses in a URL (migration 0027).
+    # Separate from unit_name because a slug lives in links people have already
+    # shared: renaming a unit must not break the public site.
+    "public_slug",
 )
 
 GUEST_STATUSES = ()  # guests have no status enum
@@ -160,6 +164,14 @@ def _clean_unit(data: dict, partial: bool = False) -> dict:
 
     if "currency" in out and out["currency"] is not None:
         out["currency"] = (str(out["currency"]).strip() or "ZMW").upper()
+
+    # Normalise the website handle here as well as in set_unit_slug, so the
+    # generic patch route cannot put a space or a slash into a URL.
+    if "public_slug" in out:
+        raw = out["public_slug"]
+        out["public_slug"] = _slugify(raw) or None
+        if raw and not out["public_slug"]:
+            raise ValueError("A web address needs letters or numbers in it.")
 
     return out
 
@@ -1140,3 +1152,246 @@ def sync_all_channels(db) -> dict:
         else:
             errors += 1
     return {"channels": len(rows), "synced": synced, "errors": errors}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC BOOKING SURFACE — a property's own website, with no login
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Every route above needs a Supabase session. A public website does not have one
+# and never will, which is why dunslimapartments.com could show its rooms and
+# then had nowhere to send a booking.
+#
+# The pattern is the one the public iCal feed already uses: an unguessable token
+# IS the capability. The owner mints it, pastes it into the site's environment,
+# and revokes it by rotating. Nothing here reads or writes outside the one
+# property that token belongs to.
+#
+# Three things a booking site actually needs, and nothing else:
+#   • the units, so it can show rooms and rates
+#   • whether some dates are free
+#   • somewhere to send a request
+#
+# A request lands as `pending`, which is already a blocking status in the
+# double-booking guard, so it holds the dates on its own. Nobody is told their
+# stay is confirmed: the owner confirms in the dashboard, and THAT is what posts
+# the Sale through the existing bridge. A stranger on the internet must never be
+# able to write revenue into someone's books.
+
+
+def _slugify(value: str) -> str:
+    """A URL handle from a unit name, used as the fallback when none is set."""
+    out = "".join(c.lower() if c.isalnum() else "-" for c in str(value or ""))
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out.strip("-")[:60]
+
+
+def mint_site_token(db, user_id: str, property_id: str) -> dict:
+    """Give a property a public site token, or replace the one it has.
+
+    Rotating is the revoke: the old token stops resolving the moment this
+    returns, so a site whose token has leaked is cut off in one click.
+    """
+    get_property(db, user_id, property_id)          # ownership → clean 404
+    token = _gen_export_token()
+    (db.table("properties").update({"public_site_token": token})
+     .eq("id", property_id).eq("user_id", user_id).execute())
+    return get_property(db, user_id, property_id)
+
+
+def clear_site_token(db, user_id: str, property_id: str) -> dict:
+    """Take the public site offline entirely."""
+    get_property(db, user_id, property_id)
+    (db.table("properties").update({"public_site_token": None})
+     .eq("id", property_id).eq("user_id", user_id).execute())
+    return get_property(db, user_id, property_id)
+
+
+def set_unit_slug(db, user_id: str, unit_id: str, slug: str) -> dict:
+    """The handle the website uses for this unit in a URL.
+
+    Kept apart from unit_name on purpose: a slug appears in links people have
+    already shared, so renaming a unit in the dashboard must not silently break
+    the public site.
+    """
+    clean = _slugify(slug)
+    if slug and not clean:
+        raise ValueError("A web address needs letters or numbers in it.")
+    (db.table("units").update({"public_slug": clean or None})
+     .eq("id", unit_id).eq("user_id", user_id).execute())
+    return get_unit(db, user_id, unit_id)
+
+
+def _site_for_token(db, token: str) -> dict:
+    """Resolve a site token to its property. Raises ValueError when unknown."""
+    if not token or len(str(token)) < 16:
+        raise ValueError("Unknown site.")
+    res = (db.table("properties").select("id,user_id,name,status")
+           .eq("public_site_token", str(token)).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise ValueError("Unknown site.")
+    prop = rows[0]
+    if prop.get("status") == "inactive":
+        raise ValueError("This property is not taking bookings.")
+    return prop
+
+
+def _public_unit(row: dict) -> dict:
+    """What a website may see: room facts and the rate. No ids, no guests,
+    nothing internal."""
+    return {
+        "slug": row.get("public_slug") or _slugify(row.get("unit_name")),
+        "name": row.get("unit_name"),
+        "bedrooms": row.get("bedrooms"),
+        "bathrooms": row.get("bathrooms"),
+        "max_guests": row.get("max_guests"),
+        "amenities": row.get("amenities") or [],
+        "photos": row.get("photos") or [],
+        "nightly_rate": _num(row.get("base_nightly_rate"), 0.0),
+        "currency": row.get("currency") or "ZMW",
+    }
+
+
+def public_units(db, token: str) -> dict:
+    prop = _site_for_token(db, token)
+    res = (db.table("units").select("*")
+           .eq("user_id", prop["user_id"]).eq("property_id", prop["id"])
+           .order("unit_name").execute())
+    rows = getattr(res, "data", None) or []
+    return {"property": prop.get("name"), "units": [_public_unit(r) for r in rows]}
+
+
+def _unit_by_slug(db, prop: dict, slug: str) -> dict:
+    """Find a unit by its public slug, falling back to one derived from the name
+    so a property works before anybody has set slugs by hand."""
+    slug = str(slug or "").strip().lower()
+    if not slug:
+        raise ValueError("Which residence?")
+    res = (db.table("units").select("*")
+           .eq("user_id", prop["user_id"]).eq("property_id", prop["id"]).execute())
+    rows = getattr(res, "data", None) or []
+    for r in rows:
+        if str(r.get("public_slug") or "").strip().lower() == slug:
+            return r
+    for r in rows:
+        if _slugify(r.get("unit_name")) == slug:
+            return r
+    raise ValueError("That residence does not exist.")
+
+
+def public_availability(db, token: str, unit_slug: str, frm: str, to: str) -> dict:
+    """Are these dates free?
+
+    Half-open [check_in, check_out), so a departure and an arrival on the same
+    day do not clash. It is the same rule the write-time guard uses: two
+    different answers to one question would be worse than either answer.
+    """
+    prop = _site_for_token(db, token)
+    unit = _unit_by_slug(db, prop, unit_slug)
+
+    check_in = _parse_date(frm, "from")
+    check_out = _parse_date(to, "to")
+    if check_out <= check_in:
+        raise ValueError("Departure must be after arrival.")
+
+    res = (db.table("bookings")
+           .select("id")
+           .eq("user_id", prop["user_id"]).eq("unit_id", unit["id"])
+           .in_("status", list(BLOCKING_STATUSES))
+           .lt("check_in", check_out.isoformat())
+           .gt("check_out", check_in.isoformat())
+           .limit(1).execute())
+    taken = bool(getattr(res, "data", None))
+    return {
+        "available": not taken,
+        "unit": _public_unit(unit),
+        "nights": (check_out - check_in).days,
+        "reason": "Those dates are already taken." if taken else "",
+    }
+
+
+# Length caps on everything a stranger can type. Long enough for a real answer,
+# short enough that nobody can post a novel into the owner's dashboard.
+_PUBLIC_LIMITS = {
+    "firstName": 80, "lastName": 80, "email": 160, "phone": 40,
+    "organisation": 120, "purpose": 40, "arrivalTime": 40,
+    "notes": 1000, "reference": 40, "payment": 40,
+}
+
+
+def _capped(data: dict, key: str) -> str:
+    return str(data.get(key) or "").strip()[:_PUBLIC_LIMITS.get(key, 200)]
+
+
+def public_booking_request(db, token: str, data: dict) -> dict:
+    """Take a booking request from a website. Creates a `pending` booking."""
+    prop = _site_for_token(db, token)
+    owner = prop["user_id"]
+    unit = _unit_by_slug(db, prop, data.get("slug") or data.get("unit_slug"))
+
+    check_in = _parse_date(data.get("from"), "from")
+    check_out = _parse_date(data.get("to"), "to")
+    if check_out <= check_in:
+        raise ValueError("Departure must be after arrival.")
+    if (check_out - check_in).days > 365:
+        raise ValueError("That stay is longer than a year.")
+
+    first, last = _capped(data, "firstName"), _capped(data, "lastName")
+    full_name = " ".join(p for p in (first, last) if p) or "Website guest"
+    email = _capped(data, "email").lower()
+    if "@" not in email:
+        raise ValueError("A valid email address is required.")
+
+    guests = _int(data.get("guests"), 1) or 1
+    max_guests = _int(unit.get("max_guests"), 0) or 0
+    if guests < 1:
+        raise ValueError("At least one guest.")
+    if max_guests and guests > max_guests:
+        raise ValueError(f"{unit.get('unit_name')} sleeps {max_guests}.")
+
+    # Reuse the guest record when this person has stayed before, so the CRM does
+    # not grow a duplicate for every request from the same address.
+    guest_id = None
+    try:
+        found = (db.table("guests").select("id")
+                 .eq("user_id", owner).eq("email", email).limit(1).execute())
+        rows = getattr(found, "data", None) or []
+        if rows:
+            guest_id = rows[0]["id"]
+        else:
+            guest_id = create_guest(db, owner, {
+                "full_name": full_name, "email": email,
+                "phone": _capped(data, "phone"),
+                "notes": "Added from the website booking form.",
+            }).get("id")
+    except Exception as e:  # noqa: BLE001 — a request is worth more than a CRM row
+        log.warning("[hospitality] public request: guest record failed: %s", e)
+
+    reference = _capped(data, "reference")
+    lines = ["Website booking request." + (f" Reference {reference}." if reference else ""),
+             f"Guest: {full_name} / {email} / {_capped(data, 'phone') or 'no phone'}"]
+    for label, key in (("Organisation", "organisation"), ("Purpose", "purpose"),
+                       ("Arrival", "arrivalTime"), ("Payment", "payment")):
+        value = _capped(data, key)
+        if value:
+            lines.append(f"{label}: {value}")
+    notes = _capped(data, "notes")
+    if notes:
+        lines.append(f"Notes: {notes}")
+
+    booking = create_booking(db, owner, {
+        "unit_id": unit["id"],
+        "guest_id": guest_id,
+        "check_in": check_in.isoformat(),
+        "check_out": check_out.isoformat(),
+        "guests_count": guests,
+        # The total the site quoted, recorded so the owner sees what the guest
+        # was shown. It posts nothing while the booking is pending.
+        "total_amount": max(_num(data.get("totalZmw"), 0.0), 0.0),
+        "currency": unit.get("currency") or "ZMW",
+        "status": "pending",
+        "source_notes": "\n".join(lines),
+    })
+    return {"reference": reference, "booking_id": booking.get("id"), "status": "pending"}
