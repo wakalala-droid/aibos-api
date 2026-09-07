@@ -76,6 +76,16 @@ services:
       # Must match CRON_SECRET on Vercel or the nightly brief job is refused.
       - key: CRON_SECRET
         sync: false
+      # Hospitality only, but not optional once that module is used: guest ID
+      # document numbers are sealed with this BEFORE they reach the database,
+      # because Supabase's at-rest encryption does not protect against a leaked
+      # service-role key and this whole API runs on that key. It fails CLOSED —
+      # with no key set, capturing a guest ID is refused rather than written in
+      # the clear. Generate once:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      # Changing it later makes every already-sealed value unreadable.
+      - key: FIELD_ENCRYPTION_KEY
+        sync: false
 
       # ── Sized for a 512MB box ───────────────────────────────────────────
       # The analysis cabinet and the payments store are both plain dictionaries
