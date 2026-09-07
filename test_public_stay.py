@@ -288,6 +288,47 @@ def test_slugs_are_normalised_not_trusted():
     assert hospitality._slugify("!!!") == ""
 
 
+def test_a_missing_migration_is_named_not_a_500():
+    """Before the migration is run, the column simply is not there. That came
+    out as a bare 500 that read like a broken endpoint, when the fix is one
+    paste into the SQL editor."""
+
+    class _Missing(_DB):
+        def table(self, name):
+            t = _T(self, name)
+            if name == "properties":
+                def boom(*_a, **_k):
+                    raise Exception(
+                        'column properties.public_site_token does not exist (42703)')
+                t.select = boom
+            return t
+
+    try:
+        hospitality.public_units(_Missing({"properties": [], "units": []}), TOKEN)
+    except hospitality.SetupRequired as e:
+        assert "0027" in str(e)
+    else:
+        raise AssertionError("a missing column was not reported as setup")
+
+
+def test_a_real_failure_is_not_disguised_as_setup():
+    class _Broken(_DB):
+        def table(self, name):
+            t = _T(self, name)
+            if name == "properties":
+                def boom(*_a, **_k):
+                    raise Exception("connection reset by peer")
+                t.select = boom
+            return t
+
+    try:
+        hospitality.public_units(_Broken({"properties": [], "units": []}), TOKEN)
+    except hospitality.SetupRequired:
+        raise AssertionError("an outage was reported as a missing migration")
+    except Exception as e:
+        assert "connection reset" in str(e)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -4109,6 +4109,8 @@ async def hospitality_mint_site_token(property_id: str,
     db = _require_db()
     try:
         prop = hospitality_api.mint_site_token(db, ctx.tenant, property_id)
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"ok": True, "property": prop}
@@ -4122,6 +4124,8 @@ async def hospitality_clear_site_token(property_id: str,
     db = _require_db()
     try:
         prop = hospitality_api.clear_site_token(db, ctx.tenant, property_id)
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"ok": True, "property": prop}
@@ -4133,6 +4137,8 @@ async def public_stay_units(site_token: str):
     db = _require_db()
     try:
         return {"ok": True, **hospitality_api.public_units(db, site_token)}
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -4146,6 +4152,8 @@ async def public_stay_availability(site_token: str,
     db = _require_db()
     try:
         return {"ok": True, **hospitality_api.public_availability(db, site_token, unit_slug, from_, to)}
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         # "Unknown site" is a 404; a bad date range is the caller's mistake.
         code = 404 if str(e) in ("Unknown site.", "That residence does not exist.") else 400
@@ -4187,6 +4195,8 @@ async def public_stay_booking_request(site_token: str, request: Request,
 
     try:
         return {"ok": True, **hospitality_api.public_booking_request(db, site_token, body)}
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         code = 404 if str(e) in ("Unknown site.", "That residence does not exist.") else 400
         raise HTTPException(status_code=code, detail=str(e))

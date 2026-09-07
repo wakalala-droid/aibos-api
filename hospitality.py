@@ -55,6 +55,15 @@ PAYMENT_STATUSES = ("unpaid", "partial", "paid", "refunded")
 # Statuses that physically occupy the unit and therefore block the calendar. A
 # cancelled or no-show booking frees its dates for someone else.
 BLOCKING_STATUSES = ("confirmed", "pending", "completed")
+
+
+class SetupRequired(Exception):
+    """A migration this feature needs has not been run on this database.
+
+    Distinct from ValueError, which means the caller asked for something that
+    does not exist. This means WE are not finished, and the caller should be
+    told that rather than shown a 500 or told their token is wrong.
+    """
 # Statuses that count a real stay for the guest's repeat/VIP history.
 STAY_STATUSES = ("confirmed", "completed")
 BOOKING_EDITABLE = (
@@ -1187,6 +1196,26 @@ def _slugify(value: str) -> str:
     return out.strip("-")[:60]
 
 
+SETUP_NEEDED = (
+    "The public website surface is not set up on this database yet. "
+    "Run migration 0027_hospitality_public_site.sql in Supabase."
+)
+
+
+def _is_missing_column(exc: Exception) -> bool:
+    """Does this failure mean the column simply is not there?
+
+    PostgREST answers a query naming an unknown column with 42703 and a message
+    saying so. Before this, that came out of the API as a bare 500 and read like
+    a broken endpoint. It is not: it is a migration nobody has run, and saying
+    which one turns a morning of looking into a paste.
+    """
+    text = str(exc).lower()
+    return ("42703" in text
+            or ("column" in text and ("does not exist" in text or "not exist" in text))
+            or "public_site_token" in text)
+
+
 def mint_site_token(db, user_id: str, property_id: str) -> dict:
     """Give a property a public site token, or replace the one it has.
 
@@ -1195,16 +1224,26 @@ def mint_site_token(db, user_id: str, property_id: str) -> dict:
     """
     get_property(db, user_id, property_id)          # ownership → clean 404
     token = _gen_export_token()
-    (db.table("properties").update({"public_site_token": token})
-     .eq("id", property_id).eq("user_id", user_id).execute())
+    try:
+        (db.table("properties").update({"public_site_token": token})
+         .eq("id", property_id).eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_column(e):
+            raise SetupRequired(SETUP_NEEDED) from e
+        raise
     return get_property(db, user_id, property_id)
 
 
 def clear_site_token(db, user_id: str, property_id: str) -> dict:
     """Take the public site offline entirely."""
     get_property(db, user_id, property_id)
-    (db.table("properties").update({"public_site_token": None})
-     .eq("id", property_id).eq("user_id", user_id).execute())
+    try:
+        (db.table("properties").update({"public_site_token": None})
+         .eq("id", property_id).eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_column(e):
+            raise SetupRequired(SETUP_NEEDED) from e
+        raise
     return get_property(db, user_id, property_id)
 
 
@@ -1227,8 +1266,13 @@ def _site_for_token(db, token: str) -> dict:
     """Resolve a site token to its property. Raises ValueError when unknown."""
     if not token or len(str(token)) < 16:
         raise ValueError("Unknown site.")
-    res = (db.table("properties").select("id,user_id,name,status")
-           .eq("public_site_token", str(token)).limit(1).execute())
+    try:
+        res = (db.table("properties").select("id,user_id,name,status")
+               .eq("public_site_token", str(token)).limit(1).execute())
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_column(e):
+            raise SetupRequired(SETUP_NEEDED) from e
+        raise
     rows = getattr(res, "data", None) or []
     if not rows:
         raise ValueError("Unknown site.")
