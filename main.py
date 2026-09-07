@@ -30,7 +30,7 @@ import payments
 
 # ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
 # Isolated modules; the existing file-analysis endpoints above are untouched.
-from db import get_db, supabase_enabled
+from db import get_db, supabase_enabled, db_health
 from auth import require_user
 import entitlements
 import nervous_system as nervous
@@ -1909,6 +1909,7 @@ async def health():
     proves the NEW image is actually live (Railway pins the last good image
     on a crash, which used to look green while serving old code)."""
     ai_ready = llm.configured()
+    dbh = db_health()
     return {
         "status": "ok",
         "ai_configured": ai_ready,
@@ -1916,11 +1917,43 @@ async def health():
         "ai_model": llm.chat_model() if ai_ready else None,
         "cabinet_size": len(CABINET),
         "supabase_configured": supabase_enabled(),   # Evolution spine persistence
+        # Whether the key in SUPABASE_SERVICE_KEY can actually SEE the database.
+        # supabase_configured only proves the variables are non-empty; the anon
+        # key put there by mistake also passes that check and then silently
+        # returns nothing, which reads downstream as "this customer is on Free".
+        "db_readable": dbh["readable"],
+        "db_service_role": dbh["service_role"],
+        "db_note": dbh["note"],
         "spine": "events+twin" if supabase_enabled() else "disabled",
         "version": "3.2.0",
         "build_sha": _build_sha(),
         "host": _host_name(),
         "expects_migration": EXPECTS_MIGRATION,
+    }
+
+
+@app.get("/me/entitlements")
+async def my_entitlements(user_id: str = Depends(require_user)):
+    """What the SERVER believes this account may use — the authoritative answer.
+
+    The browser keeps its own copy of the plan so the interface can gate
+    instantly, and that copy is a cache: it survives a logout, a database
+    rebuild and a failed refresh. When the two disagree the owner sees a paid
+    screen and the API says "upgrade", with no way to tell which half is wrong.
+
+    This endpoint is the tiebreaker, and it is deliberately blunt about how it
+    knows: `reason` says whether the plan was actually read, defaulted, or could
+    not be established at all.
+    """
+    detail = entitlements.tier_detail(user_id)
+    tier = detail["tier"]
+    return {
+        "ok": True,
+        "tier": tier,
+        "reason": detail.get("reason", "ok"),
+        "plan_readable": detail.get("reason") != "unreadable",
+        "features": entitlements.features_for(tier),
+        "note": detail.get("note", ""),
     }
 
 

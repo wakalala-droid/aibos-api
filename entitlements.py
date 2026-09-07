@@ -86,37 +86,89 @@ def invalidate(user_id: str) -> None:
     _CACHE.pop(user_id, None)
 
 
-def user_tier(user_id: str) -> str:
-    """Return the caller's tier ('free'|'pro'|'growth').
+def tier_detail(user_id: str) -> dict:
+    """The caller's tier AND how we know it — the answer /me/entitlements gives.
 
-    Reads profiles.tier via the service-role client. On a definitive answer we
-    cache it. On an INFRASTRUCTURE error (Supabase unreachable) we fail OPEN to
-    the last known tier, or 'free' if none — a brief outage must never lock out a
-    paying customer, and the auth layer has already proven the caller's identity.
+    `reason` is the whole point. "free" is the same word whether the owner is
+    genuinely on the Free plan, has no profile row yet, or the database could not
+    be read at all, and those three need very different responses. Collapsing
+    them is what let a paying customer be told to upgrade to the plan they had
+    already bought, with nothing anywhere saying why.
+
+      ok       — a row was read; `tier` is what it says.
+      provisioned — no row existed, so one was created on Free.
+      unreadable  — the row could not be read (no database, or a key without
+                    rights). We fail OPEN to the last tier we saw and never
+                    cache the guess.
     """
     if not user_id:
-        return "free"
+        return {"tier": "free", "reason": "ok", "row": False}
 
     hit = _CACHE.get(user_id)
     if hit and time.time() < hit[1]:
-        return hit[0]
+        return {"tier": hit[0], "reason": "ok", "row": True, "cached": True}
 
-    tier = "free"
     db = get_db()
-    if db is not None:
-        try:
-            res = db.table("profiles").select("tier").eq("id", user_id).limit(1).execute()
-            rows = getattr(res, "data", None) or []
-            value = rows[0].get("tier") if rows else None
-            tier = value if value in _VALID_TIERS else "free"
-        except Exception as e:  # noqa: BLE001 — infra error → fail open
-            log.warning("[entitlements] tier lookup failed for %s: %s", user_id, e)
-            return hit[0] if hit else "free"   # don't cache a guessed value
+    if db is None:
+        log.warning("[entitlements] no database — cannot establish tier for %s", user_id)
+        return {"tier": hit[0] if hit else "free", "reason": "unreadable", "row": False,
+                "note": "Supabase is not configured on the API, so no plan can be read."}
 
+    try:
+        res = db.table("profiles").select("tier").eq("id", user_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — infra error → fail open, don't cache
+        log.warning("[entitlements] tier lookup failed for %s: %s", user_id, e)
+        return {"tier": hit[0] if hit else "free", "reason": "unreadable", "row": False,
+                "note": f"The database refused the read: {e}"}
+
+    if not rows:
+        # The caller's token was verified against THIS Supabase project, so the
+        # account exists; only the profile row is missing. Create it rather than
+        # answering "free" forever to a row that will never appear on its own.
+        #
+        # If this insert is also refused, the key cannot write either — that is
+        # the anon-key misconfiguration, not a new customer, and saying "Free"
+        # would be a guess dressed as a fact.
+        try:
+            db.table("profiles").insert({"id": user_id}).execute()
+            log.info("[entitlements] provisioned a missing profiles row for %s", user_id)
+            _cache_put(user_id, "free")
+            return {"tier": "free", "reason": "provisioned", "row": True}
+        except Exception as e:  # noqa: BLE001
+            log.error("[entitlements] no profile row for %s and it could not be "
+                      "created: %s — treating the plan as unknown, not Free", user_id, e)
+            return {"tier": hit[0] if hit else "free", "reason": "unreadable", "row": False,
+                    "note": "No profile row could be read or created. If this is a "
+                            "live account, SUPABASE_SERVICE_KEY is probably the anon "
+                            "key rather than the service_role key — see /health."}
+
+    value = rows[0].get("tier")
+    tier = value if value in _VALID_TIERS else "free"
+    if value and value not in _VALID_TIERS:
+        log.warning("[entitlements] profiles.tier for %s is %r, which is not a plan "
+                    "this build knows about — treating as free", user_id, value)
+    _cache_put(user_id, tier)
+    return {"tier": tier, "reason": "ok", "row": True}
+
+
+def _cache_put(user_id: str, tier: str) -> None:
     if len(_CACHE) >= _CACHE_MAX:
         _CACHE.clear()
     _CACHE[user_id] = (tier, time.time() + _TTL)
-    return tier
+
+
+def user_tier(user_id: str) -> str:
+    """Return the caller's tier ('free'|'pro'|'proplus'|'growth').
+
+    Reads profiles.tier via the service-role client. On an INFRASTRUCTURE error
+    (Supabase unreachable, or a key that cannot read) we fail OPEN to the last
+    known tier, or 'free' if none — a brief outage must never lock out a paying
+    customer, and the auth layer has already proven the caller's identity.
+
+    Callers that need to explain themselves to a human should use tier_detail().
+    """
+    return tier_detail(user_id)["tier"]
 
 
 def can_access(tier: str, feature: str) -> bool:
@@ -214,9 +266,26 @@ def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY,
         return False, 0
 
 
+def _sentence(label: str) -> str:
+    """Capitalise the first letter and leave the rest alone.
+
+    str.capitalize() lower-cases everything after the first character, which
+    turned "Customer intelligence (Engine 2)" into "(engine 2)" and
+    "the Hospitality property-management module" into "hospitality". Product
+    names are not decoration; a message that mangles them reads like a bug even
+    when the gate behind it is right."""
+    return label[:1].upper() + label[1:] if label else label
+
+
+def features_for(tier: str) -> list[str]:
+    """Everything `tier` actually unlocks today, unbuilt flags excluded."""
+    return sorted(f for f in _ACCESS.get(tier, set()) if f not in _UNBUILT)
+
+
 def require_feature(user_id: str, feature: str) -> str:
     """Raise 402 unless the caller's tier unlocks `feature`. Returns the tier."""
-    tier = user_tier(user_id)
+    detail = tier_detail(user_id)
+    tier = detail["tier"]
     # An unbuilt feature is not an upsell. Telling a Growth customer to
     # "upgrade to Growth" for something nobody has written is the same class of
     # lie as telling a Free owner their spent taster "is a Pro feature".
@@ -230,10 +299,22 @@ def require_feature(user_id: str, feature: str) -> str:
     if not can_access(tier, feature):
         need = _required_tier(feature)
         need_label = _TIER_LABEL.get(need, need.capitalize())
-        label = _FEATURE_LABEL.get(feature, feature)
+        label = _sentence(_FEATURE_LABEL.get(feature, feature))
+
+        # Do not sell an upgrade we are not sure they need. When the plan could
+        # not be read, "upgrade to Pro" is a guess aimed at someone who may
+        # already have paid — say what actually happened instead.
+        if detail.get("reason") == "unreadable":
+            raise HTTPException(
+                status_code=503,
+                detail=f"{label} is locked because your plan could not be read "
+                       "just now, not because of what you pay. This is a fault on "
+                       "our side — try again in a moment.",
+            )
+
         raise HTTPException(
             status_code=402,
-            detail=f"{label.capitalize()} is a {need_label} feature. "
+            detail=f"{label} is a {need_label} feature. "
                    f"Upgrade to {need_label} to unlock it.",
         )
     return tier
