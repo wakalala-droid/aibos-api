@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from groq import Groq
+import llm
 
 logger = logging.getLogger(__name__)
 
@@ -503,7 +503,7 @@ def get_customer_intelligence(
     sym: str = "K",
 ) -> str:
     """
-    Call Groq (llama-3.3-70b-versatile) to generate a 3-point customer
+    Ask the configured AI provider for a 3-point customer
     intelligence brief.
 
     Returns the raw string brief (or a fallback on error).
@@ -543,9 +543,17 @@ INSTRUCTIONS:
 
 Respond with exactly 3 numbered insights only. No preamble or conclusion."""
 
-        client = Groq()
+        # Provider and model come from llm.py rather than being named here.
+        # llm.py's docstring used to say the engines were deliberately not
+        # wired to it, on core-immutability grounds. That reading does not
+        # survive the provider dying: SAFEGUARD 0.3 forbids AI-PROPOSED
+        # functions from modifying a core engine, and says nothing about which
+        # vendor answers the phone. Left alone, these two blocks would keep
+        # calling a Groq model that no longer responds and silently serve the
+        # deterministic fallback below forever. No calculation is touched.
+        client = llm.client()
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=llm.chat_model(),
             max_tokens=1000,
             timeout=30,
             messages=[{"role": "user", "content": prompt}],
@@ -553,7 +561,7 @@ Respond with exactly 3 numbered insights only. No preamble or conclusion."""
         return response.choices[0].message.content.strip()
 
     except Exception as exc:
-        logger.warning("Groq customer intelligence call failed: %s", exc)
+        logger.warning("customer intelligence call failed: %s", exc)
         # Deterministic fallback
         champions = int((rfm["segment"] == "Champion").sum()) if not rfm.empty else 0
         at_risk = int((rfm["segment"] == "At Risk").sum()) if not rfm.empty else 0

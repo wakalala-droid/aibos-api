@@ -156,10 +156,14 @@ def test_one_question_costs_one_taster_across_the_streaming_fallback():
     assert len(charged) == 1, f"one question charged {len(charged)} taster questions"
 
 
-def test_a_missing_groq_key_does_not_burn_a_free_question():
+def test_a_missing_ai_key_does_not_burn_a_free_question():
     # The key check used to sit AFTER the taster was consumed, so a server with
-    # no key charged the owner a question and then 500'd — and the client's
+    # no key charged the owner a question and then errored — and the client's
     # fallback charged a second. Never bill for an answer that cannot be given.
+    #
+    # "no key" now means no key for ANY provider. Clearing only GROQ_API_KEY
+    # stopped being enough the moment Gemini was added: with a Gemini key in
+    # the environment this test would sail past the check it exists to guard.
     charged = []
 
     def taster(db, user_id, limit=entitlements.CHAT_TASTER_PER_DAY, qid=None):
@@ -171,16 +175,19 @@ def test_a_missing_groq_key_does_not_burn_a_free_question():
             main._prepare_chat(main.ChatRequest(message="hi", qid="q-2"), "u1")
         except HTTPException as e:
             return e
-        raise AssertionError("expected a 500 for the missing key")
+        raise AssertionError("expected an error for the missing key")
 
-    key = os.environ.pop("GROQ_API_KEY", None)
+    names = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY")
+    saved = {n: os.environ.pop(n, None) for n in names}
     try:
         exc = _with_patched(
             lambda *_a, **_k: (_ for _ in ()).throw(_gate_exc()), taster, go)
     finally:
-        if key is not None:
-            os.environ["GROQ_API_KEY"] = key
-    assert exc.status_code == 500
+        for n, v in saved.items():
+            if v is not None:
+                os.environ[n] = v
+    # 503, not 500: the server is fine, a dependency it needs is not set up.
+    assert exc.status_code == 503
     assert charged == [], "a taster question was spent on an unservable request"
 
 

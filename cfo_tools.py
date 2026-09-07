@@ -14,7 +14,7 @@ Discipline:
     propose→confirm surfaces (SAFEGUARD §0.4).
   • Results are deliberately compact (caps everywhere) — tool output is token
     budget, and an owner's question rarely needs more than the top slice.
-  • run_agent_loop() is dependency-injected (any client with the Groq/OpenAI
+  • run_agent_loop() is dependency-injected (any client with the OpenAI
     chat.completions.create shape) so the loop is offline-testable.
 """
 
@@ -35,7 +35,7 @@ MAX_TOOL_ROUNDS = 4
 _EVENT_SCAN_CAP = 2000
 
 
-# ── Tool schemas (OpenAI/Groq function-calling format) ────────────────────────
+# ── Tool schemas (OpenAI function-calling format) ─────────────────────────────
 
 TOOLS = [
     {"type": "function", "function": {

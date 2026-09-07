@@ -1,6 +1,6 @@
 """
 AIBOS Backend — FastAPI
-Fixes: column detection, multi-sheet Excel, Groq chat, cabinet, data studio
+Fixes: column detection, multi-sheet Excel, AI chat, cabinet, data studio
 """
 
 import os
@@ -19,7 +19,6 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Bo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
-from groq import Groq
 
 # ─── Engine imports ──────────────────────────────────────────────────────────
 from engine import run_engine1
@@ -521,7 +520,7 @@ def _build_ai_context(
     sheet_name: Optional[str] = None,
 ) -> str:
     """
-    Build rich context string injected into Groq system prompt.
+    Build rich context string injected into the AI system prompt.
     monthly_rows: the normalised [{month, revenue, costs, profit, margin}] list
     analysis:     the raw engine output dict (forecast, anomalies, breakeven, etc.)
     df:           original DataFrame for column-level summary
@@ -1172,9 +1171,8 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
 
     # ── AI formula mode ───────────────────────────────────────────────────────
     if req.ai_mode or formula.upper().startswith("AI:"):
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+        if not llm.configured():
+            raise HTTPException(status_code=503, detail=llm.not_configured_message())
 
         clean_formula = formula[3:].strip() if formula.upper().startswith("AI:") else formula
         context_str = "\n".join(
@@ -1189,7 +1187,7 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
         )
 
         try:
-            client = Groq(api_key=api_key)
+            client = llm.client()
             resp = llm.chat_create(
                 client,
                 messages=[{"role": "user", "content": prompt}],
@@ -1587,7 +1585,7 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     """
     Shared setup for /chat and /chat/stream (audit #21): the paid gate + free
     taster, the system prompt (context, currency, anti-fabrication), the tool
-    prompt, the message list and the Groq client. ONE place so the streaming
+    prompt, the message list and the AI client. ONE place so the streaming
     and non-streaming paths can never drift apart.
 
     Returns {taster_note, system_prompt, tool_system, chat_messages, client,
@@ -1596,13 +1594,8 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     # Checked BEFORE the taster is charged: without a key nothing can be
     # answered, and burning one of a Free owner's three daily questions on a
     # request the server was never going to serve is theft of the allowance.
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured on the server. "
-                   "Add it to Railway environment variables.",
-        )
+    if not llm.configured():
+        raise HTTPException(status_code=503, detail=llm.not_configured_message())
 
     taster_note = None
     # AI CFO chat is a paid capability — but Free gets a daily taster
@@ -1714,7 +1707,7 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
         "system_prompt": "\n\n".join(system_parts),
         "tool_system": tool_system,
         "chat_messages": chat_messages,
-        "client": Groq(api_key=api_key),
+        "client": llm.client(),
         "injected": injected,
         "db": get_db(),
     }
@@ -1780,7 +1773,8 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limite
 
 @app.post("/chat")
 async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
-    """AI CFO Chat powered by Groq llama-3.3-70b-versatile.
+    """AI CFO Chat. The model comes from llm.chat_model(), so which provider
+    and which model answers is configuration, not code.
 
     Returns BOTH "reply" (live frontend reads this) and "response" (legacy).
 
@@ -1914,10 +1908,12 @@ async def health():
     highest migration the code expects, so a green /health after a deploy
     proves the NEW image is actually live (Railway pins the last good image
     on a crash, which used to look green while serving old code)."""
-    groq_key = bool(os.environ.get("GROQ_API_KEY"))
+    ai_ready = llm.configured()
     return {
         "status": "ok",
-        "groq_configured": groq_key,
+        "ai_configured": ai_ready,
+        "ai_provider": llm.provider() or "none",
+        "ai_model": llm.chat_model() if ai_ready else None,
         "cabinet_size": len(CABINET),
         "supabase_configured": supabase_enabled(),   # Evolution spine persistence
         "spine": "events+twin" if supabase_enabled() else "disabled",
@@ -2175,11 +2171,10 @@ async def classify_activity(req: ClassifyRequest,
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Describe what happened, e.g. 'I sold 15 drinks for K150'.")
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
+    if not llm.configured():
+        raise HTTPException(status_code=503, detail=llm.not_configured_message())
     try:
-        client = Groq(api_key=api_key)
+        client = llm.client()
         completion = llm.chat_create(
             client,
             messages=nervous.classify_prompt(text, req.currency),
@@ -2891,8 +2886,7 @@ async def whatsapp_webhook(request: Request):
     db = get_db()
     if db is None:
         return {"ok": True, "skipped": "no database configured"}
-    api_key = os.environ.get("GROQ_API_KEY")
-    client = Groq(api_key=api_key) if api_key else None
+    client = llm.client()
     return {"ok": True, **whatsapp_bot.process_webhook(db, payload, client)}
 
 
@@ -2974,21 +2968,18 @@ MAX_VOICE_BYTES = 6 * 1024 * 1024
 @app.post("/transcribe")
 async def transcribe_voice(file: UploadFile = File(...),
                            user_id: str = Depends(rate_limit.limiter("transcribe", 30, 60))):
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="Voice transcription isn't configured on the server.")
+    if not llm.configured():
+        raise HTTPException(status_code=503, detail=llm.not_configured_message())
     content = await file.read()
     if len(content) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413, detail="Voice note too long — keep it under a minute or two.")
     if not content:
         raise HTTPException(status_code=400, detail="Empty audio.")
     try:
-        client = Groq(api_key=api_key)
-        result = client.audio.transcriptions.create(
-            file=(file.filename or "note.webm", content),
-            model=llm.whisper_model(),
-        )
-        text = (getattr(result, "text", None) or "").strip()
+        # Groq has a Whisper endpoint; Gemini's OpenAI-compatible layer has no
+        # /audio/transcriptions at all and takes the audio inside a chat
+        # message instead. llm.transcribe hides which one is behind this.
+        text = llm.transcribe(llm.client(), file.filename or "note.webm", content)
     except Exception as exc:  # noqa: BLE001
         logger.error("transcribe error: %s", exc)
         raise HTTPException(status_code=502, detail="Could not transcribe that — try again or type it.")

@@ -8,12 +8,14 @@ parser, so the front-end review/confirm flow is identical (confirm-before-save,
 SAFEGUARD §0.4).
 
 Ready-for-keys / graceful, like payments.py: the vision model id is configurable
-(`GROQ_VISION_MODEL`) so model churn never needs a code change, and any failure
+(`LLM_VISION_MODEL`) so model churn never needs a code change, and any failure
 returns a clear error instead of crashing. The image never leaves this call —
-it is base64-inlined to Groq and not persisted here.
+it is base64-inlined to whichever provider llm.py selects, and not persisted here.
 """
 
 import os
+
+import llm
 import json
 import base64
 import logging
@@ -23,7 +25,8 @@ from ingestion import register_parser, _parse_date  # reuse the date parser
 log = logging.getLogger("aibos.ocr")
 
 # Groq's multimodal model. Override via env if Groq renames/retires it.
-VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# The model id now lives in llm.py, which knows which provider is configured.
+# Override with LLM_VISION_MODEL (GROQ_VISION_MODEL is still honoured).
 
 PROMPT = (
     "You are reading a photographed receipt or invoice for a Zambian SME. "
@@ -96,16 +99,14 @@ def parse_vision_json(raw: str, currency: str = "ZMW") -> dict:
 
 def parse_receipt_image(image_bytes: bytes, mime: str = "image/jpeg", currency: str = "ZMW") -> dict:
     """Vision-OCR a receipt image → proposed Purchase event. Raises on infra failure."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured on the server.")
+    if not llm.configured():
+        raise RuntimeError(llm.not_configured_message())
     if not image_bytes:
         raise ValueError("Empty image.")
-    from groq import Groq
     data_url = f"data:{mime or 'image/jpeg'};base64,{base64.b64encode(image_bytes).decode()}"
-    client = Groq(api_key=api_key)
+    client = llm.client()
     completion = client.chat.completions.create(
-        model=VISION_MODEL,
+        model=llm.vision_model(),
         messages=[{
             "role": "user",
             "content": [

@@ -49,7 +49,14 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY          # the service_role key, NOT the anon key
         sync: false
-      - key: GROQ_API_KEY
+      # THE AI KEY. Gemini is the one to set: Groq stopped working, and a free
+      # Gemini key from aistudio.google.com needs no card.
+      #
+      # llm.py picks the provider from whichever key is present and Gemini wins
+      # if both are, so an old GROQ_API_KEY can stay set without fighting it.
+      # Google publish an OpenAI-compatible endpoint, which is why swapping
+      # provider did not mean rewriting every prompt.
+      - key: GEMINI_API_KEY
         sync: false
 
       # ── Without this the browser blocks every call from the site ─────────
@@ -97,6 +104,14 @@ services:
         value: "1"
       - key: PAYMENTS_CALLBACK_SECRET
         sync: false
+      # Model ids, if a provider ever retires one. Defaults live in llm.py and
+      # are the current Gemini Flash line; a retirement is a variable change
+      # here, not a deploy:
+      #   LLM_MODEL, LLM_FALLBACK_MODEL, LLM_VISION_MODEL, LLM_TRANSCRIBE_MODEL
+      # Check https://ai.google.dev/gemini-api/docs/models before setting one.
+      #
+      # GROQ_API_KEY is still read if you ever want to switch back.
+      #
       # Email (Resend), WhatsApp and Google Places are all optional:
       #   RESEND_API_KEY, BRIEF_FROM_EMAIL
       #   WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_VERIFY_TOKEN,

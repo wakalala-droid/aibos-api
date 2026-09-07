@@ -15,6 +15,10 @@ pandas==2.2.2
 openpyxl==3.1.2
 xlrd==2.0.1
 groq==0.8.0
+# Google's Gemini publishes an OpenAI-compatible endpoint, so the same SDK
+# talks to it and every existing chat.completions call carries over unchanged.
+# See llm.py. groq stays so an existing GROQ_API_KEY keeps working.
+openai==1.99.9
 supabase==2.4.6
 httpx==0.27.0
 

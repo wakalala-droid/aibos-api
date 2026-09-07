@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from groq import Groq
+import llm
 
 logger = logging.getLogger(__name__)
 
@@ -764,7 +764,7 @@ def detect_menu_gaps(pos_data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 10. get_ops_intelligence  (Groq)
+# 10. get_ops_intelligence  (AI)
 # ---------------------------------------------------------------------------
 
 
@@ -774,7 +774,7 @@ def get_ops_intelligence(
     sym: str = "K",
 ) -> str:
     """
-    Call Groq (llama-3.3-70b-versatile) for a 3-point operational brief.
+    Ask the configured AI provider for a 3-point operational brief.
 
     Returns the raw string brief (or a deterministic fallback on error).
     """
@@ -824,9 +824,17 @@ INSTRUCTIONS:
 
 Respond with exactly 3 numbered insights only. No preamble."""
 
-        client = Groq()
+        # Provider and model come from llm.py rather than being named here.
+        # llm.py's docstring used to say the engines were deliberately not
+        # wired to it, on core-immutability grounds. That reading does not
+        # survive the provider dying: SAFEGUARD 0.3 forbids AI-PROPOSED
+        # functions from modifying a core engine, and says nothing about which
+        # vendor answers the phone. Left alone, these two blocks would keep
+        # calling a Groq model that no longer responds and silently serve the
+        # deterministic fallback below forever. No calculation is touched.
+        client = llm.client()
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=llm.chat_model(),
             max_tokens=1000,
             timeout=30,
             messages=[{"role": "user", "content": prompt}],
@@ -834,7 +842,7 @@ Respond with exactly 3 numbered insights only. No preamble."""
         return response.choices[0].message.content.strip()
 
     except Exception as exc:
-        logger.warning("Groq ops intelligence call failed: %s", exc)
+        logger.warning("ops intelligence call failed: %s", exc)
         gt = pos_data["grand_totals"]
         return (
             f"1. Net revenue of {sym}{gt['net_revenue']:,.0f} over the period — identify your peak hours to maximise throughput during high-demand windows.\n"

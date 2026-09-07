@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import ast
 import os
+
+import llm
 import json
 import logging
 import uuid
@@ -277,15 +279,13 @@ def _rule_proposals(df, manifest, token_map, arrays) -> List[Dict[str, Any]]:
     return out
 
 
-# ── Optional LLM proposer (Groq) — output is UNTRUSTED, re-validated here ──────
+# ── Optional LLM proposer — output is UNTRUSTED, re-validated here ────────────
 
 def _llm_proposals(df, manifest, token_map, arrays, max_props=3) -> List[Dict[str, Any]]:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key or not token_map:
+    if not llm.configured() or not token_map:
         return []
     try:
-        from groq import Groq
-        client = Groq(api_key=api_key)
+        client = llm.client()
         cols_desc = "\n".join(f"  {t} = \"{token_map[t]}\"" for t in token_map)
         prompt = (
             "You are a careful financial-data analyst for AIBOS. Propose up to "
@@ -330,15 +330,13 @@ def _llm_proposals(df, manifest, token_map, arrays, max_props=3) -> List[Dict[st
 
 
 def _llm_critic(name, purpose, formula, inputs, preview) -> Dict[str, Any]:
-    """Independent second-opinion review (Groq). Judges mathematical + real-world
+    """Independent second-opinion review. Judges mathematical + real-world
     soundness. Fails OPEN on infra error (deterministic gate still applies) but
     records `checked=False` so the owner sees it wasn't double-reviewed."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
+    if not llm.configured():
         return {"checked": False, "sound": True, "score": None, "notes": "AI critic unavailable (no key)"}
     try:
-        from groq import Groq
-        client = Groq(api_key=api_key)
+        client = llm.client()
         prompt = (
             "You are a rigorous quantitative reviewer for an SME finance product. "
             "Judge whether this proposed metric is mathematically sound AND real-world "

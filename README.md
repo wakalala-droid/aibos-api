@@ -48,8 +48,29 @@ genuinely free web service and does not ask for a card.
 |---|---|
 | `SUPABASE_URL` | Supabase → Project Settings → API → Project URL |
 | `SUPABASE_SERVICE_KEY` | same page → **`service_role`** key, *not* the anon key |
-| `GROQ_API_KEY` | console.groq.com, free |
+| `GEMINI_API_KEY` | aistudio.google.com, free, no card |
 | `ALLOWED_ORIGINS` | your Vercel address, comma separated, **no trailing slash** |
+
+### Which AI answers
+
+Groq stopped working, so the API now talks to **Google's Gemini**, and the swap
+was cheap for one reason: Google publish an OpenAI-compatible endpoint, so every
+existing prompt and `chat.completions` call carried over untouched.
+
+`llm.py` is the only file that knows which provider is in play. It picks Gemini
+if `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) is set, Groq if only `GROQ_API_KEY` is,
+and Gemini wins when both are — so an old key can stay put without fighting it.
+
+**One thing does not carry over: audio.** Gemini's compatibility layer has no
+`/audio/transcriptions`, so voice notes go in as `input_audio` inside an ordinary
+chat message instead. `llm.transcribe()` hides the difference; the endpoint calls
+one function either way.
+
+Model ids come from env, because a provider retiring one should be a variable
+change and not a deploy — Google have already shut down `gemini-2.0-flash`.
+Defaults are the current Flash line; check
+<https://ai.google.dev/gemini-api/docs/models> before overriding with
+`LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_VISION_MODEL` or `LLM_TRANSCRIBE_MODEL`.
 
 `SUPABASE_SERVICE_KEY` once held the anon key by mistake and every write silently
 failed the database's security rules — the API looked healthy and saved nothing.
@@ -102,12 +123,17 @@ curl https://your-service.onrender.com/health
 {
   "status": "ok",
   "supabase_configured": true,
+  "ai_configured": true,
+  "ai_provider": "gemini",
+  "ai_model": "gemini-3.8-flash",
   "host": "render",
   "build_sha": "a74fe56",
   "expects_migration": 26
 }
 ```
 
+- `ai_provider: "none"` → no AI key is set, so chat, receipt scanning and voice
+  are off. Everything else still works.
 - `supabase_configured: false` → the API cannot see the database. `SUPABASE_URL`
   or `SUPABASE_SERVICE_KEY` is wrong or missing.
 - `build_sha` is the commit actually serving. Compare it against what you pushed:
