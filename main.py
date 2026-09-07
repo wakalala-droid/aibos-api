@@ -665,7 +665,7 @@ async def upload_file(
                     raise ValueError("POS parse produced no sales data")
                 # Operations intelligence (Engine 3) is a paid capability with no
                 # free preview — enforce the tier before returning any of it.
-                entitlements.require_feature(user_id, "engine3")
+                entitlements.require_feature_for_caller(user_id, "engine3")
                 cab_id = cabinet_id or str(uuid.uuid4())
                 _cabinet_put(cab_id, {
                     "name": filename,
@@ -729,7 +729,7 @@ async def upload_file(
         if is_engine2_data(df):
             # Customer intelligence (Engine 2) is a paid capability with no free
             # preview — enforce the tier before running/returning any of it.
-            entitlements.require_feature(user_id, "engine2")
+            entitlements.require_feature_for_caller(user_id, "engine2")
             sym_in = "K"
             e2_result = run_engine2(df, sym_in)
             cab_id = cabinet_id or str(uuid.uuid4())
@@ -1602,9 +1602,13 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     # (audit #24): 3 questions/day, counted server-side. Exhausted or
     # uncountable → the original paid gate stands.
     try:
-        entitlements.require_feature(user_id, "ai_chat")
+        entitlements.require_feature_for_caller(user_id, "ai_chat")
     except HTTPException as gate:
-        allowed, used = entitlements.chat_taster(get_db(), user_id, qid=req.qid)
+        # Counted against the BUSINESS, not the person: three free questions a
+        # day is an allowance for the account, and inviting staff must not
+        # multiply it.
+        allowed, used = entitlements.chat_taster(
+            get_db(), entitlements.paying_account(user_id), qid=req.qid)
         if not allowed:
             # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
             # feature" reads as a lie to someone who just asked three questions,
@@ -3368,7 +3372,7 @@ async def create_schedule_item(body: Dict[str, Any] = Body(...), ctx: membership
 async def patch_schedule_item(item_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
     db = _require_db()
     if schedule_api.wants_paid_features(body):
-        entitlements.require_feature(user_id, "schedule")
+        entitlements.require_feature_for_caller(user_id, "schedule")
     try:
         return {"ok": True, "item": schedule_api.update_item(db, user_id, item_id, body)}
     except ValueError as e:
@@ -3460,7 +3464,7 @@ async def payroll_compliance_text(run_id: str, business_name: Optional[str] = Qu
                                   user_id: str = Depends(require_user)):
     """A shareable monthly statutory summary — PAYE/NAPSA/NHIMA owed for the
     period (audit #66). Owner sends/keeps it; nothing is auto-filed."""
-    entitlements.require_feature(user_id, "payroll")
+    entitlements.require_feature_for_caller(user_id, "payroll")
     db = _require_db()
     try:
         run = payroll_api.get_run(db, user_id, run_id)
@@ -3475,7 +3479,7 @@ async def payslip_pdf(run_id: str, employee_id: str = Query(...),
                       user_id: str = Depends(require_user)):
     """Printable payslip PDF (audit #26). Falls back to .txt if the PDF lib
     isn't available in this environment."""
-    entitlements.require_feature(user_id, "payroll")
+    entitlements.require_feature_for_caller(user_id, "payroll")
     db = _require_db()
     try:
         run = payroll_api.get_run(db, user_id, run_id)
@@ -3498,7 +3502,7 @@ async def payslip_pdf(run_id: str, employee_id: str = Query(...),
 async def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
                          user_id: str = Depends(require_user)):
     """Printable statutory compliance pack PDF (audit #66)."""
-    entitlements.require_feature(user_id, "payroll")
+    entitlements.require_feature_for_caller(user_id, "payroll")
     db = _require_db()
     try:
         run = payroll_api.get_run(db, user_id, run_id)
@@ -3519,7 +3523,7 @@ async def payslip_share_text(run_id: str, employee_id: str = Query(...),
                              user_id: str = Depends(require_user)):
     """WhatsApp-ready payslip for one employee (audit #26) — the owner sends
     it from their own phone, like invoice and debtor sharing."""
-    entitlements.require_feature(user_id, "payroll")
+    entitlements.require_feature_for_caller(user_id, "payroll")
     db = _require_db()
     try:
         run = payroll_api.get_run(db, user_id, run_id)
@@ -3547,7 +3551,7 @@ async def run_payroll(req: PayrollRunRequest, user_id: str = Depends(require_use
     try:
         if req.preview:
             return {"ok": True, "preview": payroll_api.preview_run(db, user_id, req.period, req.pay_date)}
-        entitlements.require_feature(user_id, "payroll")
+        entitlements.require_feature_for_caller(user_id, "payroll")
         return {"ok": True, "run": payroll_api.run_payroll(db, user_id, req.period, req.pay_date)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -3585,7 +3589,7 @@ async def identity_lookup(
 # WHOLE module is gated on the "hospitality" capability — a Free finance user
 # does not get a free PMS. One guard, applied on every route below.
 def _require_hospitality(user_id: str):
-    entitlements.require_feature(user_id, "hospitality")
+    entitlements.require_feature_for_caller(user_id, "hospitality")
 
 
 @app.get("/hospitality/properties")

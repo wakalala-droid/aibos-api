@@ -196,6 +196,45 @@ def test_features_for_hides_unbuilt_flags():
     assert entitlements.features_for("free") == []
 
 
+def test_staff_inherit_the_owners_plan():
+    """An invited member of staff signs in on their own Free account. The plan
+    belongs to the business they work in, so the gate must ask about the owner —
+    otherwise staff are told to upgrade a business they do not own."""
+    import sys, types
+
+    owner, staff = "owner-1", "staff-9"
+    fake = types.ModuleType("membership")
+
+    class _Ctx:
+        def __init__(self, tenant): self.tenant = tenant
+
+    fake.resolve_context = lambda uid: _Ctx(owner if uid == staff else uid)
+    sys.modules["membership"] = fake
+    try:
+        _with_db(_Profiles([{"id": owner, "tier": "growth"}, {"id": staff, "tier": "free"}]))
+        assert entitlements.paying_account(staff) == owner
+        assert entitlements.require_feature_for_caller(staff, "hospitality") == "growth"
+        # The owner working alone is unchanged.
+        assert entitlements.require_feature_for_caller(owner, "hospitality") == "growth"
+    finally:
+        sys.modules.pop("membership", None)
+
+
+def test_paying_account_falls_back_to_the_caller():
+    import sys, types
+    fake = types.ModuleType("membership")
+
+    def _boom(_uid):
+        raise Exception("business_members does not exist yet")
+
+    fake.resolve_context = _boom
+    sys.modules["membership"] = fake
+    try:
+        assert entitlements.paying_account("solo") == "solo"
+    finally:
+        sys.modules.pop("membership", None)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

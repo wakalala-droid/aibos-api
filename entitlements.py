@@ -141,7 +141,7 @@ def tier_detail(user_id: str) -> dict:
             return {"tier": hit[0] if hit else "free", "reason": "unreadable", "row": False,
                     "note": "No profile row could be read or created. If this is a "
                             "live account, SUPABASE_SERVICE_KEY is probably the anon "
-                            "key rather than the service_role key — see /health."}
+                            "key rather than the service_role key. See /health."}
 
     value = rows[0].get("tier")
     tier = value if value in _VALID_TIERS else "free"
@@ -266,6 +266,37 @@ def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY,
         return False, 0
 
 
+def paying_account(user_id: str) -> str:
+    """The account whose PLAN applies to this caller.
+
+    A plan belongs to a business, not to a person. When an owner on Pro invites
+    a member of staff, that member signs in on their own Free account — and
+    every gate that asked about the CALLER told them to upgrade a business they
+    do not own and cannot pay for. The owner had already paid for exactly the
+    thing their staff were being blocked from.
+
+    Most gates already asked about the tenant. Some asked about the caller, and
+    the difference is invisible until somebody is invited. Resolved here so
+    there is one answer.
+
+    Falls back to the caller's own id when membership cannot be resolved, which
+    is also the right answer for the ordinary case of an owner working alone.
+    """
+    if not user_id:
+        return user_id
+    try:
+        import membership  # local import: membership imports db, not this module
+        return membership.resolve_context(user_id).tenant or user_id
+    except Exception as e:  # noqa: BLE001 — pre-0022 / infra → owner-of-self
+        log.info("[entitlements] could not resolve the paying account for %s: %s", user_id, e)
+        return user_id
+
+
+def require_feature_for_caller(user_id: str, feature: str) -> str:
+    """Gate on the plan of the business this caller works in, not their own."""
+    return require_feature(paying_account(user_id), feature)
+
+
 def _sentence(label: str) -> str:
     """Capitalise the first letter and leave the rest alone.
 
@@ -309,7 +340,7 @@ def require_feature(user_id: str, feature: str) -> str:
                 status_code=503,
                 detail=f"{label} is locked because your plan could not be read "
                        "just now, not because of what you pay. This is a fault on "
-                       "our side — try again in a moment.",
+                       "our side, not a change to your plan. Try again in a moment.",
             )
 
         raise HTTPException(

@@ -127,8 +127,8 @@ def db_health(force: bool = False) -> dict:
         out["note"] = "ok"
     except Exception as e:  # noqa: BLE001
         out["note"] = (
-            "SUPABASE_SERVICE_KEY is set but it is NOT the service_role key — "
-            "listing users was refused (" + str(e)[:120] + "). Every read will "
+            "SUPABASE_SERVICE_KEY is set but it is NOT the service_role key. "
+            "Listing users was refused (" + str(e)[:120] + "). Every read will "
             "come back empty and every write will be dropped without an error, "
             "which shows up as paying customers being told to upgrade. Copy the "
             "service_role key from Supabase -> Project Settings -> API."
