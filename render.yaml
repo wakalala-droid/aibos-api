@@ -70,6 +70,25 @@ services:
       - key: CRON_SECRET
         sync: false
 
+      # ── Sized for a 512MB box ───────────────────────────────────────────
+      # The analysis cabinet and the payments store are both plain dictionaries
+      # in this process's memory, so they are capped or a few large uploads
+      # would evict everyone. The defaults in main.py (500 and 5000) were set
+      # when this ran on Railway with more room. Render's free instance has
+      # 512MB, of which Python plus pandas, numpy and reportlab take a good
+      # 150-250MB before a single row is read.
+      #
+      # These are retention limits, not capability limits: the oldest entry is
+      # evicted, so a user's own recent work is still there.
+      - key: MAX_CABINET_ENTRIES
+        value: "150"
+      - key: MAX_PAYMENTS
+        value: "1000"
+      # MAX_UPLOAD_BYTES is deliberately left at its 15MB default rather than
+      # quietly shrinking what people can upload. If the service starts
+      # restarting under memory pressure, this is the first knob to turn: a
+      # spreadsheet costs several times its file size once parsed.
+
       # ── Everything below is per-feature. Leave unset and that feature is
       #    simply off; nothing else breaks. ─────────────────────────────────
       # Mobile money. PAYMENTS_SIMULATION=1 lets checkout be exercised end to
