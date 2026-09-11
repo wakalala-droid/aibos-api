@@ -284,3 +284,154 @@ def dispatch_briefs(db) -> dict:
     }
     log.info("[notify] dispatch: %s", summary)
     return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EVENT ALERTS — told the moment it happens, not in tomorrow's brief
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Everything above this line is the daily Morning Brief: one sweep, once a day,
+# composed from the twin. A booking request is the opposite kind of news. It has
+# a person waiting at the other end of it, and a brief that arrives at 04:30
+# tomorrow is not an answer.
+#
+# THREE DELIVERIES, IN ORDER OF HOW RELIABLE THEY ARE.
+#   1. A row in the owner's own database. This one cannot be unconfigured, so it
+#      is the one the promise rests on.
+#   2. Email, if a Resend key is set.
+#   3. WhatsApp, if the Meta credentials are set.
+#
+# Both 2 and 3 are unset on this deployment today, which is exactly why the
+# order matters: an email-only alert would have shipped as a silent no-op.
+#
+# NONE OF IT MAY EVER COST THE BOOKING. Every send is wrapped, every failure is
+# logged and swallowed, and the caller is a best-effort side effect in the same
+# shape as the spine bridge in hospitality.py.
+
+
+def record_notification(db, user_id: str, kind: str, title: str,
+                        body: str = "", link: str = "", meta: dict | None = None) -> bool:
+    """Put it in the app, where it stays until the owner deals with it.
+
+    Deduped on (user_id, kind, meta->>booking_id) by a unique index, so a
+    retried request does not become a second bell. A duplicate is success, not
+    an error: the owner has already been told.
+    """
+    if db is None or not user_id:
+        return False
+    try:
+        db.table("notifications").insert({
+            "user_id": user_id, "kind": kind, "title": title,
+            "body": body or None, "link": link or None, "meta": meta or {},
+        }).execute()
+        return True
+    except Exception as e:  # noqa: BLE001
+        text = str(e).lower()
+        if "duplicate" in text or "23505" in text:
+            return True                      # already told them; nothing wrong
+        log.warning("[notify] could not record %s for %s: %s", kind, user_id, e)
+        return False
+
+
+def _owner_contacts(db, user_id: str) -> dict:
+    """Where to reach this owner.
+
+    Deliberately NOT gated on brief_email_enabled. That flag defaults to false,
+    so reusing it would have opted almost every owner out of hearing about their
+    own bookings by default. A brief is a convenience an owner chooses; a guest
+    waiting for an answer is not.
+    """
+    out = {"email": None, "whatsapp": None, "name": None}
+    if db is None or not user_id:
+        return out
+    try:
+        res = (db.table("profiles")
+               .select("email,contact_email,whatsapp_number,whatsapp,phone,business_name")
+               .eq("id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return out
+        p = rows[0]
+        # contact_email first: an owner who typed a business address into the
+        # profile meant that to be the one people reach them on. It was
+        # collected and shown in the UI and never used by anything.
+        out["email"] = (p.get("contact_email") or p.get("email") or "").strip() or None
+        out["whatsapp"] = (p.get("whatsapp_number") or p.get("whatsapp")
+                           or p.get("phone") or "").strip() or None
+        out["name"] = (p.get("business_name") or "").strip() or None
+    except Exception as e:  # noqa: BLE001
+        log.warning("[notify] contact lookup failed for %s: %s", user_id, e)
+    return out
+
+
+def booking_received(db, user_id: str, result: dict) -> dict:
+    """A booking request just arrived from a property's own website.
+
+    `result` is what hospitality.public_booking_request returned, including the
+    full booking row under "booking".
+    """
+    if not user_id:
+        return {"recorded": False, "email": False, "whatsapp": False}
+
+    b = (result or {}).get("booking") or {}
+    guest = b.get("guest_name") or "A guest"
+    unit = result.get("unit") or "a unit"
+    nights_from = result.get("check_in") or b.get("check_in") or ""
+    nights_to = result.get("check_out") or b.get("check_out") or ""
+    ref = result.get("reference") or b.get("reference") or ""
+    sym = _sym(b.get("currency") or "ZMW")
+    amount = b.get("quoted_total") or b.get("total_amount") or 0
+
+    title = f"{guest} wants {unit}"
+    lines = [
+        f"{guest} has asked to stay in {unit} from {nights_from} to {nights_to}.",
+        f"{b.get('guests_count') or 1} guest(s). {_money(float(amount or 0), sym)}.",
+    ]
+    if b.get("guest_phone"):
+        lines.append(f"Phone: {b['guest_phone']}")
+    if b.get("guest_email"):
+        lines.append(f"Email: {b['guest_email']}")
+    if b.get("organisation"):
+        lines.append(f"Company: {b['organisation']}")
+    if b.get("arrival_time"):
+        lines.append(f"Arriving around {b['arrival_time']}.")
+    if b.get("payment_method"):
+        lines.append(f"Intends to pay by {str(b['payment_method']).replace('_', ' ')}.")
+    if b.get("guest_notes"):
+        lines.append(f"They wrote: {b['guest_notes']}")
+    if ref:
+        lines.append(f"Reference {ref}.")
+    lines.append("")
+    lines.append("The dates are held while it waits for you. Open AI-BOS to "
+                 "confirm or decline it.")
+    body = "\n".join(lines)
+
+    out = {}
+    # 1. The delivery that cannot be unconfigured.
+    out["recorded"] = record_notification(
+        db, user_id, "booking_request", title, body,
+        link="/dashboard/hospitality/bookings",
+        meta={"booking_id": result.get("booking_id"), "reference": ref,
+              "unit": unit, "guest": guest},
+    )
+
+    contacts = _owner_contacts(db, user_id)
+
+    # 2 and 3. Extra reach, never the thing the promise rests on.
+    out["email"] = False
+    if contacts["email"] and email_enabled():
+        try:
+            out["email"] = send_email(contacts["email"], f"New booking request: {title}", body)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[notify] booking email failed: %s", e)
+
+    out["whatsapp"] = False
+    if contacts["whatsapp"] and whatsapp_enabled():
+        try:
+            out["whatsapp"] = send_whatsapp(contacts["whatsapp"], body)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[notify] booking whatsapp failed: %s", e)
+
+    log.info("[notify] booking alert for %s: recorded=%s email=%s whatsapp=%s",
+             user_id, out["recorded"], out["email"], out["whatsapp"])
+    return out

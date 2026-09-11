@@ -70,6 +70,16 @@ import identity as identity_api
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aibos")
 
+# `log` is the name eight call sites in this file already use, and it was never
+# defined. Every one of them was a NameError waiting for its branch to run, and
+# the worst sits on the money path: _grant_tier writes the tier, then calls
+# log.info, which raises, and the except clause calls log.error, which raises
+# again and propagates out of a function documented as best-effort. The customer
+# had paid, the upgrade HAD been written, and the caller saw a failure.
+#
+# One alias fixes all of them and keeps both spellings working.
+log = logger
+
 app = FastAPI(title="AIBOS API", version="3.0.0")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
@@ -1915,7 +1925,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 28
+EXPECTS_MIGRATION = 30
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -3877,11 +3887,27 @@ async def hospitality_guest_bookings(guest_id: str, ctx: membership.Context = De
 async def hospitality_list_bookings(
     unit_id: Optional[str] = Query(None), status: Optional[str] = Query(None),
     from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
+    statuses: Optional[str] = Query(None, description="comma-separated, e.g. pending,confirmed"),
+    source: Optional[str] = Query(None), search: Optional[str] = Query(None),
+    order: str = Query("check_in"), limit: Optional[int] = Query(None),
     ctx: membership.Context = Depends(membership.require_context),
 ):
+    """Bookings, each carrying the guest it belongs to.
+
+    Every booking used to come back with a bare guest_id, so the calendar drew
+    each stay as an anonymous coloured cell and the owner could not see who a
+    request was from without leaving the page.
+    """
     _require_hospitality(ctx.tenant)
     db = _require_db()
-    return {"ok": True, "bookings": hospitality_api.list_bookings(db, ctx.tenant, unit_id, status, from_, to)}
+    try:
+        return {"ok": True, "bookings": hospitality_api.list_bookings(
+            db, ctx.tenant, unit_id, status, from_, to,
+            statuses=[x.strip() for x in statuses.split(",") if x.strip()] if statuses else None,
+            source=source, search=search, order=order, limit=limit,
+        )}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/hospitality/bookings")
@@ -3890,6 +3916,12 @@ async def hospitality_create_booking(body: Dict[str, Any] = Body(...), ctx: memb
     db = _require_db()
     try:
         return {"ok": True, "booking": hospitality_api.create_booking(db, ctx.tenant, body)}
+    except hospitality_api.DatesUnavailable as e:
+        # 409, not 400. The request was well formed; somebody else got there
+        # first. A client cannot tell those apart from a shared status code, and
+        # a website that cannot tell them apart tells the guest their booking
+        # was not received.
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3924,6 +3956,37 @@ async def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body
     db = _require_db()
     try:
         return {"ok": True, "booking": hospitality_api.update_booking(db, ctx.tenant, booking_id, body)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/hospitality/bookings/{booking_id}/confirm")
+async def hospitality_confirm_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    """Accept a request. This is what puts the stay in the books.
+
+    The dashboard could cancel a booking and could not accept one, so a request
+    arriving from the property's own website had nowhere to go.
+    """
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.confirm_booking(db, ctx.tenant, booking_id)}
+    except hospitality_api.DatesUnavailable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/hospitality/bookings/{booking_id}/decline")
+async def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Body(default={}),
+                                      ctx: membership.Context = Depends(membership.require_write)):
+    """Turn down a request that was never agreed to. Frees the dates, records a
+    reason, and touches nothing in the books because nothing was ever posted."""
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        return {"ok": True, "booking": hospitality_api.decline_booking(
+            db, ctx.tenant, booking_id, (body or {}).get("reason"))}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -4194,12 +4257,71 @@ async def public_stay_booking_request(site_token: str, request: Request,
                 "status": "pending"}
 
     try:
-        return {"ok": True, **hospitality_api.public_booking_request(db, site_token, body)}
+        result = hospitality_api.public_booking_request(db, site_token, body)
+    except hospitality_api.DatesUnavailable as e:
+        # The PUBLIC message, never str(e): the full one names the arrival and
+        # departure of the guest who already holds the room, and this endpoint
+        # answers anyone on the internet.
+        raise HTTPException(status_code=409, detail=e.public_message)
     except hospitality_api.SetupRequired as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         code = 404 if str(e) in ("Unknown site.", "That residence does not exist.") else 400
         raise HTTPException(status_code=code, detail=str(e))
+
+    # Tell the owner, without delay. Best-effort in the same shape as the spine
+    # bridge: a dead mail provider must never cost somebody the booking that
+    # just came in.
+    try:
+        notify.booking_received(db, result.get("owner_id"), result)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[hospitality] booking alert failed: %s", e)
+
+    # owner_id and the full booking row are ours, not the internet's.
+    public = {k: v for k, v in result.items() if k not in ("owner_id", "booking")}
+    return {"ok": True, **public}
+
+
+# ── Notifications ───────────────────────────────────────────────────────────
+# The durable half of "tell me whenever a booking is made". A row here does not
+# depend on a mail key being set, which is why the promise rests on it.
+
+@app.get("/notifications")
+async def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),
+                             ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    try:
+        q = (db.table("notifications").select("*")
+             .eq("user_id", ctx.tenant).order("created_at", desc=True)
+             .limit(max(1, min(int(limit), 200))))
+        if unread_only:
+            q = q.is_("read_at", "null")
+        res = q.execute()
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — a bell that errors is worse than a quiet one
+        log.warning("[notify] feed read failed for %s: %s", ctx.tenant, e)
+        return {"ok": True, "notifications": [], "unread": 0, "note": str(e)[:200]}
+    return {"ok": True, "notifications": rows,
+            "unread": sum(1 for r in rows if not r.get("read_at"))}
+
+
+@app.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str,
+                                 ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    from datetime import datetime, timezone
+    (db.table("notifications").update({"read_at": datetime.now(timezone.utc).isoformat()})
+     .eq("id", notification_id).eq("user_id", ctx.tenant).execute())
+    return {"ok": True}
+
+
+@app.post("/notifications/read-all")
+async def mark_all_notifications_read(ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    from datetime import datetime, timezone
+    (db.table("notifications").update({"read_at": datetime.now(timezone.utc).isoformat()})
+     .eq("user_id", ctx.tenant).is_("read_at", "null").execute())
+    return {"ok": True}
 
 
 @app.post("/simulate")

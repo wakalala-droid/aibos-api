@@ -71,6 +71,13 @@ jobs:
       - name: Entitlements tests
         run: python test_entitlements.py
 
+      - name: Booking-engine tests
+        # The owner's half: confirming, declining, the clash exception and the
+        # guest join. Also asserts BOOKING_STATUSES matches the CHECK constraint
+        # in the aibos repo's migration 0029 — a status Python accepts and
+        # Postgres rejects loses a real booking when somebody presses the button.
+        run: python test_booking_engine.py
+
       - name: Public booking-surface tests
         # /public/stay/* is unauthenticated by design. These hold the boundary:
         # a token never reaches another owner's property, a request lands as

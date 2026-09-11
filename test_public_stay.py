@@ -218,13 +218,40 @@ def test_a_request_is_pending_and_posts_no_revenue():
     assert posted == []                           # nothing reached the books
 
 
-def test_the_request_details_reach_the_owner():
+def test_the_request_details_reach_the_owner_as_columns():
+    """Everything the guest typed used to be joined into one English sentence in
+    source_notes that nothing in the product ever read back. The owner could see
+    that somebody wanted a room and almost nothing else."""
     db = _db()
     hospitality.public_booking_request(db, TOKEN, _request())
-    notes = db.rows["bookings"][0]["source_notes"]
-    for expected in ("Website booking request", "DA-2611-ABC123", "Grace Phiri",
-                     "grace@example.com", "Purpose: leisure", "Notes: Late arrival"):
-        assert expected in notes, expected
+    b = db.rows["bookings"][0]
+
+    assert b["reference"] == "DA-2611-ABC123"
+    assert b["source"] == "website"
+    assert b["guest_name"] == "Grace Phiri"
+    assert b["guest_email"] == "grace@example.com"
+    assert b["guest_phone"] == "0977000000"
+    assert b["purpose"] == "leisure"
+    assert b["arrival_time"] == "18:00"
+    assert b["payment_method"] == "mobile_money"      # normalised from "mobile-money"
+    assert b["guest_notes"] == "Late arrival"
+    assert b["quoted_total"] == 6000
+
+    # source_notes is provenance again, not a dumping ground for the guest.
+    assert "website" in b["source_notes"].lower()
+    assert "Late arrival" not in b["source_notes"]
+
+
+def test_a_returning_guest_has_their_record_kept_current():
+    """Matching on email used to skip the write entirely, so a returning guest
+    with a newly given phone number had it thrown away."""
+    db = _db()
+    db.rows["guests"].append({"id": "g-known", "user_id": OWNER,
+                              "email": "grace@example.com", "full_name": "Grace Phiri",
+                              "phone": ""})
+    hospitality.public_booking_request(db, TOKEN, _request())
+    assert len(db.rows["guests"]) == 1                # still no duplicate
+    assert db.rows["guests"][0]["phone"] == "0977000000"
 
 
 def test_a_returning_guest_is_not_duplicated():
@@ -277,9 +304,9 @@ def test_long_input_is_capped():
     db = _db()
     hospitality.public_booking_request(db, TOKEN, _request(notes="x" * 5000,
                                                            organisation="y" * 500))
-    notes = db.rows["bookings"][0]["source_notes"]
-    assert "x" * 1000 in notes and "x" * 1001 not in notes
-    assert "y" * 120 in notes and "y" * 121 not in notes
+    b = db.rows["bookings"][0]
+    assert b["guest_notes"] == "x" * 1000
+    assert b["organisation"] == "y" * 120
 
 
 def test_slugs_are_normalised_not_trusted():

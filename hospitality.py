@@ -50,11 +50,42 @@ GUEST_EDITABLE = (
     "notes", "vip_flag",
 )
 
-BOOKING_STATUSES = ("confirmed", "pending", "cancelled", "completed", "no_show")
+# Keep in lock-step with bookings_status_chk (migration 0029). test_booking_engine
+# asserts the two match: a status Python accepts and Postgres rejects loses a real
+# booking at the moment somebody presses the button.
+BOOKING_STATUSES = ("confirmed", "pending", "cancelled", "completed", "no_show",
+                    # Declined is not cancelled. Cancelled is a stay that was
+                    # agreed and then called off; declined was never agreed to.
+                    # Different conversation with the guest, different line in a
+                    # report, and only one of them is ever a refund.
+                    "declined")
 PAYMENT_STATUSES = ("unpaid", "partial", "paid", "refunded")
 # Statuses that physically occupy the unit and therefore block the calendar. A
 # cancelled or no-show booking frees its dates for someone else.
 BLOCKING_STATUSES = ("confirmed", "pending", "completed")
+
+
+class DatesUnavailable(ValueError):
+    """Those dates are already taken on that unit.
+
+    A subclass of ValueError so every existing `except ValueError` site keeps
+    behaving, and its own type so the routes can answer 409 before the generic
+    handler flattens it to 400. That difference is the whole bug an owner
+    reported: a sold-out room and a malformed date were the same 400, so the
+    website could not tell "somebody else got there first" from "the form is
+    broken", and told the guest their booking had not been received.
+
+    `public_message` is what a stranger may read. `args[0]` carries the dates of
+    the clashing stay for the dashboard, and MUST NOT be returned on the public
+    endpoint: those are another guest's arrival and departure.
+    """
+
+    def __init__(self, message: str, public_message: str,
+                 check_in: str | None = None, check_out: str | None = None):
+        super().__init__(message)
+        self.public_message = public_message
+        self.check_in = check_in
+        self.check_out = check_out
 
 
 class SetupRequired(Exception):
@@ -70,7 +101,25 @@ BOOKING_EDITABLE = (
     "unit_id", "guest_id", "channel_id", "check_in", "check_out", "guests_count",
     "status", "total_amount", "currency", "deposit_amount", "payment_status",
     "source_notes",
+    # What the guest actually told us (migration 0029). All of this used to be
+    # joined into one English sentence in source_notes that nothing read back,
+    # so an owner could see that somebody wanted a room and almost nothing else.
+    "reference", "source", "guest_name", "guest_email", "guest_phone",
+    "organisation", "purpose", "arrival_time", "payment_method", "guest_notes",
+    "quoted_total",
+    # When the answer was given, and why.
+    "confirmed_at", "declined_at", "cancelled_at", "decline_reason",
 )
+
+BOOKING_SOURCES = ("direct", "website", "ota", "phone", "walk_in")
+
+# Free-text fields off a website form. Trimmed and capped, never rejected: a
+# marketing page adding a dropdown option must not cost somebody a real booking.
+_BOOKING_TEXT_CAPS = {
+    "reference": 40, "guest_name": 160, "guest_email": 160, "guest_phone": 40,
+    "organisation": 120, "purpose": 40, "arrival_time": 40, "payment_method": 40,
+    "guest_notes": 2000, "decline_reason": 500, "source_notes": 4000,
+}
 
 EXPENSE_CATEGORIES = (
     "utilities", "staff", "security", "cleaning_supplies", "maintenance",
@@ -311,6 +360,12 @@ def _void_event(db, user_id: str, event_id: str | None, reason: str) -> None:
         log.error("[hospitality] spine void failed event=%s: %s", event_id, exc)
 
 
+def _now_iso() -> str:
+    """Now, in UTC, as the database writes it."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _parse_date(v, field: str) -> date:
     try:
         return date.fromisoformat(str(v))
@@ -488,9 +543,24 @@ def _clean_booking(data: dict, partial: bool = False) -> dict:
     if "currency" in out and out["currency"] is not None:
         out["currency"] = (str(out["currency"]).strip() or "ZMW").upper()
 
-    for tkey in ("source_notes",):
+    if "source" in out and out["source"] is not None:
+        src = str(out["source"]).strip().lower().replace("-", "_")
+        if src not in BOOKING_SOURCES:
+            raise ValueError(f"source must be one of {', '.join(BOOKING_SOURCES)}.")
+        out["source"] = src
+
+    if "quoted_total" in out and out["quoted_total"] is not None:
+        val = _num(out["quoted_total"], None)
+        if val is None or val < 0:
+            raise ValueError("quoted_total must be a positive number.")
+        out["quoted_total"] = val
+
+    if "guest_email" in out and out["guest_email"]:
+        out["guest_email"] = str(out["guest_email"]).strip().lower()
+
+    for tkey, cap in _BOOKING_TEXT_CAPS.items():
         if tkey in out and out[tkey] is not None:
-            out[tkey] = str(out[tkey]).strip() or None
+            out[tkey] = str(out[tkey]).strip()[:cap] or None
 
     return out
 
@@ -512,38 +582,122 @@ def _assert_free(db, user_id: str, unit_id: str, check_in: str, check_out: str,
     res = q.limit(1).execute()
     if getattr(res, "data", None):
         clash = res.data[0]
-        raise ValueError(
+        raise DatesUnavailable(
+            # For the owner, who is entitled to know what it clashed with.
             f"Those dates clash with an existing booking on this unit "
-            f"({clash['check_in']} → {clash['check_out']}). Pick different dates."
+            f"({clash['check_in']} → {clash['check_out']}). Pick different dates.",
+            # For anyone else. The old message went out verbatim on the
+            # unauthenticated website endpoint, which told a stranger exactly
+            # when another guest arrives and leaves.
+            public_message="Those dates have just been taken. Please choose different dates.",
+            check_in=clash.get("check_in"),
+            check_out=clash.get("check_out"),
         )
 
 
 def _sale_payload(unit_id: str, booking: dict, amount: float, currency: str) -> dict:
+    """The Sale event a confirmed booking posts to the spine.
+
+    booking_id and guest_id are carried so revenue in the books can be traced
+    back to the stay and the person who took it. Without them the money arrives
+    in the P&L as an anonymous accommodation line, and "what did this corporate
+    account spend with us" has no answer even though every fact needed to
+    answer it exists one table away.
+    """
     return {
         "amount": amount,
         "currency": currency,
         "category": "accommodation",
         "unit_id": unit_id,
+        "booking_id": booking.get("id"),
+        "guest_id": booking.get("guest_id"),
+        "reference": booking.get("reference"),
+        "booking_source": booking.get("source") or "direct",
         "check_in": booking.get("check_in"),
         "check_out": booking.get("check_out"),
         "source": "hospitality_booking",
     }
 
 
+def attach_guests(db, user_id: str, bookings: list) -> list:
+    """Put each booking's guest record on the booking.
+
+    Done in Python with one extra query rather than a PostgREST embed, because
+    the embed depends on a foreign-key relationship being detected at the API
+    layer and fails as an empty column rather than an error when it is not.
+    One `in_` over the ids is boring, obvious and testable.
+
+    Every screen that shows a stay needs the person: the calendar rendered every
+    booking as an anonymous coloured cell because guest_id was written on create
+    and never read back.
+    """
+    ids = {b.get("guest_id") for b in bookings if b.get("guest_id")}
+    by_id = {}
+    if ids:
+        try:
+            res = (db.table("guests").select("*")
+                   .eq("user_id", user_id).in_("id", list(ids)).execute())
+            for row in (getattr(res, "data", None) or []):
+                by_id[row["id"]] = _guest_for_read(row)
+        except Exception as e:  # noqa: BLE001 — a nameless booking beats no booking
+            log.warning("[hospitality] could not attach guests: %s", e)
+
+    for b in bookings:
+        b["guest"] = by_id.get(b.get("guest_id"))
+    return bookings
+
+
 def list_bookings(db, user_id: str, unit_id: str | None = None, status: str | None = None,
-                  frm: str | None = None, to: str | None = None) -> list:
+                  frm: str | None = None, to: str | None = None,
+                  statuses: list | None = None, source: str | None = None,
+                  search: str | None = None, order: str = "check_in",
+                  limit: int | None = None, with_guest: bool = True) -> list:
+    """Bookings for this account, newest filters last so old callers are unchanged.
+
+    `statuses` takes a set where `status` takes one, because the question an
+    owner actually asks is "what is confirmed OR pending", which is the same set
+    the calendar treats as occupying a unit.
+    """
     q = db.table("bookings").select("*").eq("user_id", user_id)
     if unit_id:
         q = q.eq("unit_id", unit_id)
     if status:
         q = q.eq("status", status)
+    if statuses:
+        wanted = [x for x in statuses if x in BOOKING_STATUSES]
+        if not wanted:
+            raise ValueError(f"statuses must be from {', '.join(BOOKING_STATUSES)}.")
+        q = q.in_("status", wanted)
+    if source:
+        q = q.eq("source", str(source).strip().lower().replace("-", "_"))
     # Window overlap: a stay is in [frm,to) if it starts before `to` and ends after `frm`.
     if to:
         q = q.lt("check_in", to)
     if frm:
         q = q.gt("check_out", frm)
-    res = q.order("check_in").execute()
-    return getattr(res, "data", None) or []
+    if order in ("check_in", "check_out", "created_at"):
+        q = q.order(order)
+    if limit:
+        q = q.limit(int(limit))
+    res = q.execute()
+    rows = getattr(res, "data", None) or []
+
+    # Searched here rather than in the query: the terms an owner types are a
+    # guest name, a reference or a phone number, and those live across two
+    # tables. Filtering after the join keeps one code path for all of them.
+    if with_guest:
+        rows = attach_guests(db, user_id, rows)
+    if search:
+        needle = str(search).strip().lower()
+        def hit(b):
+            g = b.get("guest") or {}
+            return any(needle in str(v or "").lower() for v in (
+                b.get("reference"), b.get("guest_name"), b.get("guest_email"),
+                b.get("guest_phone"), b.get("organisation"),
+                g.get("full_name"), g.get("email"), g.get("phone"),
+            ))
+        rows = [b for b in rows if hit(b)]
+    return rows
 
 
 def get_booking(db, user_id: str, booking_id: str) -> dict:
@@ -618,7 +772,7 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
 
     # Keep the books honest as status crosses the confirmed boundary.
     was_live = current.get("linked_event_id")
-    if new_status in ("cancelled", "no_show") and was_live:
+    if new_status in ("cancelled", "no_show", "declined") and was_live:
         _void_event(db, user_id, was_live, reason=f"Booking {new_status}")
         (db.table("bookings").update({"linked_event_id": None})
          .eq("id", booking_id).eq("user_id", user_id).execute())
@@ -638,10 +792,53 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     return saved
 
 
+def confirm_booking(db, user_id: str, booking_id: str) -> dict:
+    """Say yes to a request. This is what puts the money in the books.
+
+    update_booking already posts the Sale when a booking crosses into
+    confirmed, so this only has to name the decision and stamp when it was
+    made. It exists as its own function because "confirm" is the single most
+    important verb in the module and it had no name: the dashboard could cancel
+    a booking and could not accept one.
+    """
+    current = get_booking(db, user_id, booking_id)
+    if current.get("status") == "confirmed":
+        return current
+    if current.get("status") in ("cancelled", "declined", "no_show"):
+        raise ValueError("That booking was already turned down. Make a new one instead.")
+    return update_booking(db, user_id, booking_id, {
+        "status": "confirmed",
+        "confirmed_at": _now_iso(),
+    })
+
+
+def decline_booking(db, user_id: str, booking_id: str, reason: str | None = None) -> dict:
+    """Say no to a request that was never agreed to.
+
+    Separate from cancel_booking on purpose: this frees the dates and records a
+    reason, and it never touches the books, because a declined request never
+    put anything in them.
+    """
+    current = get_booking(db, user_id, booking_id)
+    if current.get("status") == "confirmed":
+        raise ValueError("That stay is already confirmed. Cancel it instead of declining it.")
+    return update_booking(db, user_id, booking_id, {
+        "status": "declined",
+        "declined_at": _now_iso(),
+        "decline_reason": (str(reason).strip()[:500] or None) if reason else None,
+    })
+
+
 def cancel_booking(db, user_id: str, booking_id: str) -> dict:
-    """Convenience over update_booking — flips status to cancelled and unwinds the
-    linked Sale so cancelled revenue leaves the P&L."""
-    return update_booking(db, user_id, booking_id, {"status": "cancelled"})
+    """Call off a stay that was agreed. Frees the dates and unwinds the linked
+    Sale so cancelled revenue leaves the P&L.
+
+    Distinct from decline_booking, which turns down a request that was never
+    agreed to in the first place."""
+    return update_booking(db, user_id, booking_id, {
+        "status": "cancelled",
+        "cancelled_at": _now_iso(),
+    })
 
 
 def availability(db, user_id: str, unit_id: str, frm: str | None = None,
@@ -1365,6 +1562,12 @@ _PUBLIC_LIMITS = {
 }
 
 
+def _norm_choice(value: str) -> str:
+    """Lower-case, underscore-joined. Never rejects: a website adding a new
+    dropdown option must not cost somebody a real booking."""
+    return "_".join(str(value or "").strip().lower().replace("-", " ").split())
+
+
 def _capped(data: dict, key: str) -> str:
     return str(data.get(key) or "").strip()[:_PUBLIC_LIMITS.get(key, 200)]
 
@@ -1395,35 +1598,38 @@ def public_booking_request(db, token: str, data: dict) -> dict:
     if max_guests and guests > max_guests:
         raise ValueError(f"{unit.get('unit_name')} sleeps {max_guests}.")
 
+    phone = _capped(data, "phone")
+
     # Reuse the guest record when this person has stayed before, so the CRM does
-    # not grow a duplicate for every request from the same address.
+    # not grow a duplicate for every request from the same address — and keep it
+    # CURRENT. Matching on email used to skip the write entirely, so a returning
+    # guest with a new phone number or a newly given company had that detail
+    # thrown away silently, which is the opposite of what a CRM is for.
     guest_id = None
     try:
-        found = (db.table("guests").select("id")
+        found = (db.table("guests").select("id,full_name,phone")
                  .eq("user_id", owner).eq("email", email).limit(1).execute())
         rows = getattr(found, "data", None) or []
         if rows:
             guest_id = rows[0]["id"]
+            fresh = {}
+            if phone and not str(rows[0].get("phone") or "").strip():
+                fresh["phone"] = phone
+            if full_name and full_name != "Website guest" and not str(rows[0].get("full_name") or "").strip():
+                fresh["full_name"] = full_name
+            if fresh:
+                (db.table("guests").update(fresh)
+                 .eq("id", guest_id).eq("user_id", owner).execute())
         else:
             guest_id = create_guest(db, owner, {
-                "full_name": full_name, "email": email,
-                "phone": _capped(data, "phone"),
+                "full_name": full_name, "email": email, "phone": phone,
                 "notes": "Added from the website booking form.",
             }).get("id")
     except Exception as e:  # noqa: BLE001 — a request is worth more than a CRM row
         log.warning("[hospitality] public request: guest record failed: %s", e)
 
     reference = _capped(data, "reference")
-    lines = ["Website booking request." + (f" Reference {reference}." if reference else ""),
-             f"Guest: {full_name} / {email} / {_capped(data, 'phone') or 'no phone'}"]
-    for label, key in (("Organisation", "organisation"), ("Purpose", "purpose"),
-                       ("Arrival", "arrivalTime"), ("Payment", "payment")):
-        value = _capped(data, key)
-        if value:
-            lines.append(f"{label}: {value}")
-    notes = _capped(data, "notes")
-    if notes:
-        lines.append(f"Notes: {notes}")
+    quoted = max(_num(data.get("totalZmw"), 0.0), 0.0)
 
     booking = create_booking(db, owner, {
         "unit_id": unit["id"],
@@ -1431,11 +1637,40 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         "check_in": check_in.isoformat(),
         "check_out": check_out.isoformat(),
         "guests_count": guests,
-        # The total the site quoted, recorded so the owner sees what the guest
-        # was shown. It posts nothing while the booking is pending.
-        "total_amount": max(_num(data.get("totalZmw"), 0.0), 0.0),
+        # The total the site quoted. Recorded in BOTH places on purpose:
+        # total_amount is what will be charged and an owner may adjust it,
+        # quoted_total is what the guest was shown and must not move.
+        "total_amount": quoted,
+        "quoted_total": quoted,
         "currency": unit.get("currency") or "ZMW",
         "status": "pending",
-        "source_notes": "\n".join(lines),
+        # Every one of these used to be a clause in an English sentence written
+        # to source_notes, which nothing in the product ever read back.
+        "source": "website",
+        "reference": reference,
+        "guest_name": full_name,
+        "guest_email": email,
+        "guest_phone": phone,
+        "organisation": _capped(data, "organisation"),
+        "purpose": _norm_choice(_capped(data, "purpose")),
+        "arrival_time": _capped(data, "arrivalTime"),
+        "payment_method": _norm_choice(_capped(data, "payment")),
+        "guest_notes": _capped(data, "notes"),
+        # source_notes goes back to being what its name says: where this came
+        # from. The guest's own words live in guest_notes now, so a plain
+        # "show the notes" screen no longer mixes two unrelated things.
+        "source_notes": "Booking request from the property website.",
     })
-    return {"reference": reference, "booking_id": booking.get("id"), "status": "pending"}
+    return {
+        # Stripped off by the route before it answers the website: the owner's
+        # id and the full row are ours, not the internet's. They are here so the
+        # alert knows who to tell and what to say.
+        "owner_id": owner,
+        "booking": booking,
+        "reference": reference,
+        "booking_id": booking.get("id"),
+        "status": "pending",
+        "unit": unit.get("unit_name"),
+        "check_in": check_in.isoformat(),
+        "check_out": check_out.isoformat(),
+    }
