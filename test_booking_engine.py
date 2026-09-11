@@ -190,6 +190,21 @@ def test_python_and_postgres_agree_on_the_status_list():
         f"SQL has {sorted(in_sql)}, Python has {sorted(hospitality.BOOKING_STATUSES)}")
 
 
+def test_the_browser_knows_the_same_status_list():
+    """The third copy, and the one that actually got missed.
+
+    'declined' was added to Python and to the CHECK constraint and NOT to the
+    TypeScript union, so the dashboard could receive a status its own types said
+    was impossible. A reviewer caught it; this catches the next one.
+    """
+    ts = open(r"../aibos/lib/hospitality.ts", encoding="utf-8").read()
+    m = re.search(r"export type BookingStatus\s*=(.*?);", ts, re.S)
+    assert m, "could not find the BookingStatus union in lib/hospitality.ts"
+    in_ts = set(re.findall(r"'([a-z_]+)'", m.group(1)))
+    assert in_ts == set(hospitality.BOOKING_STATUSES), (
+        f"TypeScript has {sorted(in_ts)}, Python has {sorted(hospitality.BOOKING_STATUSES)}")
+
+
 # ── The clash is its own thing, and it does not leak ────────────────────────
 
 def test_a_clash_raises_its_own_exception():
