@@ -308,14 +308,67 @@ def test_declining_frees_the_dates_and_books_nothing():
     assert free["status"] == "pending"
 
 
-def test_a_confirmed_stay_is_cancelled_not_declined():
-    db = _db([_booking(id="b1", status="confirmed", linked_event_id="evt-1")])
+def test_only_a_waiting_request_can_be_turned_down():
+    """The guard named 'confirmed' alone, which let a COMPLETED stay be
+    declined: the guest had been and gone, and declining voided the Sale,
+    quietly taking real earned money back out of the P&L."""
+    for status in ("confirmed", "completed", "cancelled", "no_show"):
+        db = _db([_booking(id="b1", status=status, linked_event_id="evt-1")])
+        posted, voided, originals = _spy_events(db)
+        try:
+            hospitality.decline_booking(db, OWNER, "b1")
+        except ValueError as e:
+            assert "still waiting" in str(e), status
+        else:
+            raise AssertionError(f"a {status} booking was declined")
+        finally:
+            _restore(originals)
+        assert voided == [], f"declining a {status} booking touched the books"
+
+
+def test_confirming_re_checks_the_nights():
+    """pending already blocks, so update_booking's footprint test is false on a
+    confirm and the guard is skipped. An iCal import bypasses the guard on
+    purpose, so an OTA stay CAN land on a waiting request's nights."""
+    db = _db([
+        _booking(id="b1", status="pending"),
+        # What Booking.com sold while the request sat in the queue.
+        _booking(id="b2", status="confirmed", guest_id=None,
+                 check_in="2026-11-02", check_out="2026-11-03"),
+    ])
     try:
-        hospitality.decline_booking(db, OWNER, "b1")
-    except ValueError as e:
-        assert "Cancel it instead" in str(e)
+        hospitality.confirm_booking(db, OWNER, "b1")
+    except hospitality.DatesUnavailable as e:
+        assert "clash" in str(e).lower()
     else:
-        raise AssertionError("a confirmed stay was declined")
+        raise AssertionError("two parties were put in one apartment")
+
+
+def test_a_stay_counts_when_it_is_agreed_not_when_it_is_asked_for():
+    """_bump_guest_stay only ever ran in create_booking, so it never fired for
+    the flow this engine exists for: request arrives pending, owner confirms
+    later. Every returning guest read as a first-timer for ever."""
+    db = _db([_booking(id="b1", status="pending")])
+    assert db.rows["guests"][0]["stay_count"] == 2
+    posted, _v, originals = _spy_events(db)
+    try:
+        hospitality.confirm_booking(db, OWNER, "b1")
+    finally:
+        _restore(originals)
+    assert db.rows["guests"][0]["stay_count"] == 3
+    assert db.rows["guests"][0]["is_repeat_guest"] is True
+
+
+def test_calling_off_an_agreed_stay_uncounts_it():
+    """stay_count only ever went up, so a property could hand a VIP badge to
+    somebody who booked twice and came none."""
+    db = _db([_booking(id="b1", status="confirmed", linked_event_id="evt-1")])
+    posted, _v, originals = _spy_events(db)
+    try:
+        hospitality.cancel_booking(db, OWNER, "b1")
+    finally:
+        _restore(originals)
+    assert db.rows["guests"][0]["stay_count"] == 1
 
 
 def test_cancelling_a_confirmed_stay_takes_the_money_back_out():

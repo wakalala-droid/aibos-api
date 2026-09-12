@@ -34,8 +34,24 @@ def check(identity: str, bucket: str, limit: int, window_s: int, now: float | No
         start, count = now, 0
     if count >= limit:
         return False, max(1, int(window_s - (now - start)))
-    if len(_HITS) >= _MAX_KEYS:            # crude cap; windows are short-lived
-        _HITS.clear()
+    if len(_HITS) >= _MAX_KEYS:
+        # Drop the windows that have already elapsed, NOT everything.
+        #
+        # This used to clear the whole table, which meant anyone who could add
+        # keys cheaply could wipe every other user's throttle as a side effect:
+        # fill 20,000 slots, and every live limit in the process resets to zero.
+        # The public booking endpoint made that reachable by an anonymous caller.
+        # Expired windows are free to drop because they were about to reset
+        # anyway; live ones are exactly what must survive.
+        for k, (s0, _c) in list(_HITS.items()):
+            if now - s0 >= window_s:
+                _HITS.pop(k, None)
+        if len(_HITS) >= _MAX_KEYS:
+            # Still full of live windows: drop the oldest tenth so the table
+            # stays bounded, rather than punishing everyone.
+            oldest = sorted(_HITS.items(), key=lambda kv: kv[1][0])[: _MAX_KEYS // 10]
+            for k, _v in oldest:
+                _HITS.pop(k, None)
     _HITS[key] = (start, count + 1)
     return True, 0
 

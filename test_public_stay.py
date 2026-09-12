@@ -242,16 +242,25 @@ def test_the_request_details_reach_the_owner_as_columns():
     assert "Late arrival" not in b["source_notes"]
 
 
-def test_a_returning_guest_has_their_record_kept_current():
-    """Matching on email used to skip the write entirely, so a returning guest
-    with a newly given phone number had it thrown away."""
+def test_a_returning_guest_is_linked_but_never_written_to():
+    """A stranger who knows a past guest's email must not be able to edit that
+    guest's record from an anonymous form.
+
+    The booking carries its own guest_name, guest_email and guest_phone, so the
+    owner sees what was typed THIS time next to what they already had and
+    decides which is true. Nothing an unauthenticated caller sends reaches the
+    CRM row."""
     db = _db()
     db.rows["guests"].append({"id": "g-known", "user_id": OWNER,
-                              "email": "grace@example.com", "full_name": "Grace Phiri",
-                              "phone": ""})
-    hospitality.public_booking_request(db, TOKEN, _request())
-    assert len(db.rows["guests"]) == 1                # still no duplicate
-    assert db.rows["guests"][0]["phone"] == "0977000000"
+                              "email": "grace@example.com",
+                              "full_name": "Grace Phiri", "phone": ""})
+    hospitality.public_booking_request(db, TOKEN, _request(phone="0999INTRUDER"))
+
+    assert len(db.rows["guests"]) == 1                 # linked, no duplicate
+    assert db.rows["guests"][0]["phone"] == ""         # and not written to
+    # The submitted detail is on the booking, where the owner can weigh it.
+    assert db.rows["bookings"][0]["guest_phone"] == "0999INTRUDER"
+    assert db.rows["bookings"][0]["guest_id"] == "g-known"
 
 
 def test_a_returning_guest_is_not_duplicated():

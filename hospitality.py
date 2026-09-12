@@ -501,6 +501,28 @@ def _bump_guest_stay(db, user_id: str, guest_id: str | None) -> None:
 
 # ── Booking engine (tenant-scoped) — the P0 core loop ────────────────────────
 
+def _drop_guest_stay(db, user_id: str, guest_id: str | None) -> None:
+    """Undo a counted stay when one is cancelled, declined or marked no-show.
+
+    stay_count only ever went up, so cancelling an agreed stay left the guest
+    permanently credited with a visit that never happened, and a property could
+    hand a VIP badge to somebody who booked twice and came none."""
+    if not guest_id:
+        return
+    try:
+        res = (db.table("guests").select("stay_count")
+               .eq("id", guest_id).eq("user_id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return
+        count = max(0, _int(rows[0].get("stay_count"), 0) - 1)
+        (db.table("guests")
+         .update({"stay_count": count, "is_repeat_guest": count > 1})
+         .eq("id", guest_id).eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001 — a history count is not worth a 500
+        log.warning("[hospitality] could not lower stay count for %s: %s", guest_id, e)
+
+
 def _clean_booking(data: dict, partial: bool = False) -> dict:
     """
     Whitelist + normalise a booking insert/patch. Validates the date window,
@@ -770,6 +792,20 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     rows = getattr(res, "data", None) or []
     saved = rows[0] if rows else {**current, **clean}
 
+    # Keep the guest's history honest as the status crosses the stay boundary.
+    #
+    # _bump_guest_stay only ever ran in create_booking, so it fired for a stay
+    # typed straight in as confirmed and NEVER for the flow this engine exists
+    # for: a website request arrives pending, the owner confirms it later, and
+    # the guest's stay_count stayed at zero. Every returning guest read as a
+    # first-timer, so is_repeat_guest and the VIP badges were permanently false.
+    was_stay = current["status"] in STAY_STATUSES
+    now_stay = new_status in STAY_STATUSES
+    if now_stay and not was_stay:
+        _bump_guest_stay(db, user_id, saved.get("guest_id"))
+    elif was_stay and not now_stay:
+        _drop_guest_stay(db, user_id, saved.get("guest_id"))
+
     # Keep the books honest as status crosses the confirmed boundary.
     was_live = current.get("linked_event_id")
     if new_status in ("cancelled", "no_show", "declined") and was_live:
@@ -806,6 +842,19 @@ def confirm_booking(db, user_id: str, booking_id: str) -> dict:
         return current
     if current.get("status") in ("cancelled", "declined", "no_show"):
         raise ValueError("That booking was already turned down. Make a new one instead.")
+
+    # Check the nights are STILL free, excluding this booking's own hold.
+    #
+    # update_booking will not do it for us: pending already blocks, so its
+    # "did the footprint move" test is false here and the guard is skipped. That
+    # is sound only while nothing else can take the nights, and something can.
+    # An iCal import deliberately bypasses the write-time guard, because an OTA
+    # block is ground truth about a stay that has already been sold. So a
+    # request sitting in the queue can have its nights taken by Booking.com, and
+    # confirming it would put two parties in one apartment.
+    _assert_free(db, user_id, current["unit_id"], current["check_in"],
+                 current["check_out"], exclude_booking_id=booking_id)
+
     return update_booking(db, user_id, booking_id, {
         "status": "confirmed",
         "confirmed_at": _now_iso(),
@@ -820,8 +869,15 @@ def decline_booking(db, user_id: str, booking_id: str, reason: str | None = None
     put anything in them.
     """
     current = get_booking(db, user_id, booking_id)
-    if current.get("status") == "confirmed":
-        raise ValueError("That stay is already confirmed. Cancel it instead of declining it.")
+    # Only a request can be declined. The old guard named 'confirmed' alone,
+    # which let a COMPLETED stay be turned down: the guest had already been and
+    # gone, and declining voided the Sale, quietly removing real money that had
+    # been earned from the P&L.
+    if current.get("status") != "pending":
+        raise ValueError(
+            "Only a request that is still waiting can be turned down. "
+            f"That booking is {current.get('status')}."
+        )
     return update_booking(db, user_id, booking_id, {
         "status": "declined",
         "declined_at": _now_iso(),
@@ -1611,15 +1667,16 @@ def public_booking_request(db, token: str, data: dict) -> dict:
                  .eq("user_id", owner).eq("email", email).limit(1).execute())
         rows = getattr(found, "data", None) or []
         if rows:
+            # Linked, but NOT written to.
+            #
+            # Filling in blanks here looked like keeping the CRM current, and it
+            # meant anyone who knows a past guest's email address could put a
+            # phone number onto that guest's record from an anonymous form. The
+            # booking carries its own guest_name, guest_email and guest_phone
+            # exactly so the snapshot does not need to touch the profile: the
+            # owner can see what was typed this time, next to what they already
+            # had, and decide which is true.
             guest_id = rows[0]["id"]
-            fresh = {}
-            if phone and not str(rows[0].get("phone") or "").strip():
-                fresh["phone"] = phone
-            if full_name and full_name != "Website guest" and not str(rows[0].get("full_name") or "").strip():
-                fresh["full_name"] = full_name
-            if fresh:
-                (db.table("guests").update(fresh)
-                 .eq("id", guest_id).eq("user_id", owner).execute())
         else:
             guest_id = create_guest(db, owner, {
                 "full_name": full_name, "email": email, "phone": phone,

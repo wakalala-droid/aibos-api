@@ -3956,6 +3956,10 @@ async def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body
     db = _require_db()
     try:
         return {"ok": True, "booking": hospitality_api.update_booking(db, ctx.tenant, booking_id, body)}
+    except hospitality_api.DatesUnavailable as e:
+        # The edit path was the one booking route left flattening a clash to
+        # 400, so moving a stay onto occupied nights read as malformed input.
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -4237,8 +4241,17 @@ async def public_stay_booking_request(site_token: str, request: Request,
 
     # Per-IP, because there is no user to count against. A real guest sends one
     # request and thinks about it; this only ever stops a script.
-    client_ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-                 or (request.client.host if request.client else "unknown"))
+    # The RIGHTMOST entry, not the leftmost.
+    #
+    # X-Forwarded-For is a list the caller can start: anyone may send
+    # "X-Forwarded-For: 1.2.3.4" and the proxy appends the real address after
+    # it. Reading the leftmost entry therefore reads a value the attacker chose,
+    # so rotating it walked straight through a per-IP throttle AND filled the
+    # limiter's key table with junk. The rightmost hop is the one our own proxy
+    # wrote, which is the closest thing to the truth we have.
+    _forwarded = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    client_ip = (_forwarded[-1] if _forwarded
+                 else (request.client.host if request.client else "unknown"))
     try:
         allowed, retry = rate_limit.check(f"ip:{client_ip}", "public_booking", 10, 3600)
     except Exception:  # noqa: BLE001 — never block a real guest on a limiter bug
