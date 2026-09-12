@@ -616,3 +616,69 @@ def test_the_website_is_told_the_same_thing_the_guard_enforces():
     out = hospitality.public_availability(db, "tok" * 8, "mandela",
                                           "2026-11-01", "2026-11-04")
     assert out["available"] is True
+
+
+# ── One fact, four readers ─────────────────────────────────────────────────
+#
+# The lapse was enforced in the write guard and read back nowhere else, so every
+# other surface went on treating a request that had stopped holding anything as
+# occupied. The website sold the night; the owner's calendar, the KPI row and
+# Booking.com all said it was taken.
+
+def test_the_calendar_stops_showing_a_hold_that_stopped_holding():
+    db = _db([_booking(id="b1", status="pending", source="website",
+                       created_at=_hours_ago(30))])
+    out = hospitality.availability(db, OWNER, "u1", "2026-11-01", "2026-11-30")
+    assert out["blocks"] == [], "the owner was shown a night the website would sell"
+
+
+def test_a_real_stay_behind_a_lapsed_hold_still_shows_on_the_calendar():
+    """Dropping the lapsed one must not drop the one sitting behind it."""
+    db = _db([
+        _booking(id="b1", status="pending", source="website", created_at=_hours_ago(99)),
+        _booking(id="b2", status="confirmed", source="direct", created_at=_hours_ago(99)),
+    ])
+    out = hospitality.availability(db, OWNER, "u1", "2026-11-01", "2026-11-30")
+    assert [b["booking_id"] for b in out["blocks"]] == ["b2"]
+
+
+def test_a_fresh_request_still_shows_on_the_calendar():
+    db = _db([_booking(id="b1", status="pending", source="website",
+                       created_at=_hours_ago(2))])
+    out = hospitality.availability(db, OWNER, "u1", "2026-11-01", "2026-11-30")
+    assert [b["booking_id"] for b in out["blocks"]] == ["b1"]
+
+
+def test_only_a_website_request_lapses_off_the_calendar():
+    for source in ("ota", "direct", "phone", "walk_in"):
+        db = _db([_booking(id="b1", status="pending", source=source,
+                           created_at=_hours_ago(500))])
+        out = hospitality.availability(db, OWNER, "u1", "2026-11-01", "2026-11-30")
+        assert len(out["blocks"]) == 1, f"a {source} booking fell off the calendar"
+
+
+def test_the_channels_are_not_told_a_lapsed_hold_is_sold():
+    """If we will not hold the nights for the person who asked, we must not tell
+    Booking.com they are gone. Exported as "Reserved" it closed the night on
+    every channel for ever."""
+    db = _db([
+        _booking(id="b1", status="pending", source="website", created_at=_hours_ago(30)),
+        _booking(id="b2", status="confirmed", source="direct", check_in="2026-12-01",
+                 check_out="2026-12-03"),
+    ])
+    uids = [b["uid"] for b in hospitality._blocks_for_unit(db, OWNER, "u1")]
+    assert uids == [f"b2@{hospitality._ICAL_UID_DOMAIN}"]
+
+
+def test_every_booking_says_whether_it_is_still_holding_its_nights():
+    """So no screen has to re-derive it from a status and get it wrong."""
+    db = _db([
+        _booking(id="b1", status="pending", source="website", created_at=_hours_ago(30)),
+        _booking(id="b2", status="pending", source="website", created_at=_hours_ago(1),
+                 check_in="2026-12-01", check_out="2026-12-03"),
+        _booking(id="b3", status="cancelled", source="direct", check_in="2027-01-01",
+                 check_out="2027-01-02"),
+    ])
+    holding = {b["id"]: b["holding"] for b in hospitality.list_bookings(db, OWNER)}
+    assert holding == {"b1": False, "b2": True, "b3": False}
+    assert hospitality.get_booking(db, OWNER, "b1")["holding"] is False

@@ -640,6 +640,24 @@ def _hold_lapsed(booking: dict, now: datetime | None = None) -> bool:
     return (now - made).total_seconds() > _hold_hours() * 3600
 
 
+def _with_hold_flag(rows: list) -> list:
+    """Stamp each booking with whether it is still holding its nights.
+
+    The lapse was enforced in the write guard and read back nowhere else, so
+    three other surfaces went on treating a request that had stopped holding
+    anything as occupied: the owner's calendar, the KPI row above it, and the
+    feed served to Booking.com and Airbnb. The nights were free on the website
+    and sold-out everywhere the owner looked.
+
+    `holding` is the server's answer to "does this stand in the way of a paying
+    guest", so no screen has to re-derive it from a status and get it wrong.
+    """
+    for b in rows:
+        b["holding"] = (b.get("status") in BLOCKING_STATUSES
+                        and not _hold_lapsed(b))
+    return rows
+
+
 def _blocking_overlaps(db, user_id: str, unit_id: str, check_in: str, check_out: str,
                        exclude_booking_id: str | None = None) -> list:
     """Bookings that genuinely stand in the way of these nights.
@@ -787,7 +805,7 @@ def list_bookings(db, user_id: str, unit_id: str | None = None, status: str | No
                 g.get("full_name"), g.get("email"), g.get("phone"),
             ))
         rows = [b for b in rows if hit(b)]
-    return rows
+    return _with_hold_flag(rows)
 
 
 def get_booking(db, user_id: str, booking_id: str) -> dict:
@@ -796,7 +814,7 @@ def get_booking(db, user_id: str, booking_id: str) -> dict:
     rows = getattr(res, "data", None) or []
     if not rows:
         raise ValueError("Booking not found.")
-    return rows[0]
+    return _with_hold_flag(rows)[0]
 
 
 # Columns migration 0029 adds. Everything here is DETAIL about a request: losing
@@ -1022,7 +1040,8 @@ def availability(db, user_id: str, unit_id: str, frm: str | None = None,
     """
     get_unit(db, user_id, unit_id)  # ownership / 404
     q = (db.table("bookings")
-         .select("id,check_in,check_out,status,channel_id,guest_id")
+         # source and created_at are here for the lapse test, not for display.
+         .select("id,check_in,check_out,status,channel_id,guest_id,source,created_at")
          .eq("user_id", user_id).eq("unit_id", unit_id)
          .in_("status", list(BLOCKING_STATUSES)))
     if to:
@@ -1033,7 +1052,10 @@ def availability(db, user_id: str, unit_id: str, frm: str | None = None,
     blocks = [
         {"booking_id": r["id"], "check_in": r["check_in"], "check_out": r["check_out"],
          "status": r["status"], "channel_id": r.get("channel_id"), "guest_id": r.get("guest_id")}
-        for r in (getattr(res, "data", None) or [])
+        # A lapsed website hold is not in the way any more. Leaving it in here
+        # painted a night as taken that the booking endpoint would happily sell,
+        # so the owner turned away a walk-in for a room that was free.
+        for r in (getattr(res, "data", None) or []) if not _hold_lapsed(r)
     ]
     return {"unit_id": unit_id, "from": frm, "to": to, "blocks": blocks}
 
@@ -1374,11 +1396,17 @@ def rotate_export_token(db, user_id: str, channel_id: str) -> dict:
 def _blocks_for_unit(db, user_id: str, unit_id: str) -> list[dict]:
     """Every occupying booking on a unit, as export blocks. UID = the AIBOS booking
     id so an OTA re-import is recognised as ours (skipped) rather than duplicated."""
-    res = (db.table("bookings").select("id,check_in,check_out,status")
+    res = (db.table("bookings")
+           .select("id,check_in,check_out,status,source,created_at")
            .eq("user_id", user_id).eq("unit_id", unit_id)
            .in_("status", list(BLOCKING_STATUSES)).order("check_in").execute())
     out = []
     for r in (getattr(res, "data", None) or []):
+        # If we will not hold these nights for the person who asked, we must not
+        # tell Booking.com they are sold. A lapsed hold exported as "Reserved"
+        # closed the night on every channel for ever.
+        if _hold_lapsed(r):
+            continue
         out.append({
             "uid": f"{r['id']}@{_ICAL_UID_DOMAIN}",
             "check_in": r["check_in"], "check_out": r["check_out"],
