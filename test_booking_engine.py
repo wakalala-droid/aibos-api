@@ -533,3 +533,86 @@ def test_a_real_database_error_is_not_swallowed():
         assert "connection reset" in str(e)
     else:
         raise AssertionError("an outage was quietly retried as a migration gap")
+
+
+# ── A stranger cannot hold the calendar for ever ───────────────────────────
+
+def _hours_ago(n):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=n)).isoformat()
+
+
+def test_an_unanswered_website_request_stops_blocking_after_a_day():
+    """pending blocks, which is right while somebody waits for an answer. The
+    public endpoint is open to the internet, so that same rule let anyone hold a
+    property's whole calendar by sending requests and never coming back."""
+    db = _db([_booking(id="b1", status="pending", source="website",
+                       created_at=_hours_ago(30))])
+    # The nights are free again for a real guest.
+    made = hospitality.create_booking(db, OWNER, _booking(guest_id=None))
+    assert made["status"] == "pending"
+
+
+def test_a_fresh_request_still_holds_its_nights():
+    db = _db([_booking(id="b1", status="pending", source="website",
+                       created_at=_hours_ago(2))])
+    try:
+        hospitality.create_booking(db, OWNER, _booking(guest_id=None))
+    except hospitality.DatesUnavailable:
+        pass
+    else:
+        raise AssertionError("a request made two hours ago lost its nights")
+
+
+def test_only_a_website_request_ever_lapses():
+    """An OTA block is ground truth about a stay already sold, and anything the
+    owner typed in is a decision they made. Neither is a stranger's claim."""
+    for source in ("ota", "direct", "phone", "walk_in"):
+        db = _db([_booking(id="b1", status="pending", source=source,
+                           created_at=_hours_ago(500))])
+        try:
+            hospitality.create_booking(db, OWNER, _booking(guest_id=None))
+        except hospitality.DatesUnavailable:
+            pass
+        else:
+            raise AssertionError(f"a {source} booking lapsed and should not have")
+
+
+def test_a_confirmed_stay_never_lapses():
+    db = _db([_booking(id="b1", status="confirmed", source="website",
+                       created_at=_hours_ago(9000))])
+    try:
+        hospitality.create_booking(db, OWNER, _booking(guest_id=None))
+    except hospitality.DatesUnavailable:
+        pass
+    else:
+        raise AssertionError("a confirmed stay lapsed")
+
+
+def test_a_lapsed_hold_does_not_hide_a_real_booking_behind_it():
+    """The guard used to read one row. If a lapsed hold came back first, a real
+    confirmed stay sitting on the same nights would have been invisible."""
+    db = _db([
+        _booking(id="b1", status="pending", source="website", created_at=_hours_ago(99)),
+        _booking(id="b2", status="confirmed", source="direct", created_at=_hours_ago(99)),
+    ])
+    try:
+        hospitality.create_booking(db, OWNER, _booking(guest_id=None))
+    except hospitality.DatesUnavailable as e:
+        assert e.check_in == "2026-11-01"
+    else:
+        raise AssertionError("a confirmed stay was double-booked behind a lapsed hold")
+
+
+def test_the_website_is_told_the_same_thing_the_guard_enforces():
+    """If availability says free and the booking endpoint then refuses, the
+    guest is called a liar by the system that just invited them."""
+    db = _db([_booking(id="b1", status="pending", source="website",
+                       created_at=_hours_ago(30))])
+    db.rows["properties"] = [{"id": "p1", "user_id": OWNER, "name": "Dunslim",
+                              "status": "active", "public_site_token": "tok" * 8}]
+    db.rows["units"][0]["property_id"] = "p1"
+    db.rows["units"][0]["public_slug"] = "mandela"
+    out = hospitality.public_availability(db, "tok" * 8, "mandela",
+                                          "2026-11-01", "2026-11-04")
+    assert out["available"] is True

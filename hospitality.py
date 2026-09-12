@@ -64,6 +64,34 @@ PAYMENT_STATUSES = ("unpaid", "partial", "paid", "refunded")
 # cancelled or no-show booking frees its dates for someone else.
 BLOCKING_STATUSES = ("confirmed", "pending", "completed")
 
+# How long an UNANSWERED request from a property's own website keeps its nights.
+#
+# A pending booking blocks the calendar, which is right: somebody is waiting for
+# an answer and the nights must not be sold twice while they wait. But the
+# public endpoint is open to the internet, so that same rule let anyone hold a
+# property's entire calendar by sending requests and never coming back. The
+# per-IP throttle caps the rate, not the damage: the holds it does allow last
+# for ever, so they accumulate.
+#
+# A lapse fixes it without a scheduler and without ever discarding a real
+# request. The booking stays in the owner's queue to be answered; it simply
+# stops standing in the way of a paying guest after the owner has had a fair
+# chance to answer it.
+#
+# Only WEBSITE requests lapse. An OTA block is ground truth about a stay that is
+# already sold, and anything the owner typed in themselves is a decision they
+# made. Neither is a stranger's claim on a room.
+def _hold_hours() -> int:
+    """Read at call time, not import time, so it can be tuned without a deploy."""
+    import os
+    try:
+        return max(1, int(os.environ.get("PENDING_HOLD_HOURS") or 24))
+    except (TypeError, ValueError):
+        return 24
+
+
+PENDING_HOLD_HOURS = _hold_hours()
+
 
 class DatesUnavailable(ValueError):
     """Those dates are already taken on that unit.
@@ -587,6 +615,51 @@ def _clean_booking(data: dict, partial: bool = False) -> dict:
     return out
 
 
+def _hold_lapsed(booking: dict, now: datetime | None = None) -> bool:
+    """Has an unanswered website request held its nights for long enough?
+
+    Anything that is not a waiting website request answers False: an OTA block
+    and an owner's own booking both hold their nights until somebody changes
+    them.
+    """
+    if booking.get("status") != "pending" or booking.get("source") != "website":
+        return False
+    stamp = booking.get("created_at")
+    if not stamp:
+        # Pre-0029 rows have no source and never reach here; a row with no
+        # timestamp at all keeps its hold, because guessing would free a real
+        # guest's nights.
+        return False
+    try:
+        made = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - made).total_seconds() > _hold_hours() * 3600
+
+
+def _blocking_overlaps(db, user_id: str, unit_id: str, check_in: str, check_out: str,
+                       exclude_booking_id: str | None = None) -> list:
+    """Bookings that genuinely stand in the way of these nights.
+
+    Half-open overlap, so a same-day changeover does not clash, and lapsed
+    website holds are dropped. ONE function so the write guard and every
+    availability read can never disagree about whether a night is free, which
+    would show a guest a date the booking endpoint then refuses.
+    """
+    q = (db.table("bookings").select("id,check_in,check_out,status,source,created_at")
+         .eq("user_id", user_id).eq("unit_id", unit_id)
+         .in_("status", list(BLOCKING_STATUSES))
+         .lt("check_in", check_out).gt("check_out", check_in))
+    if exclude_booking_id:
+        q = q.neq("id", exclude_booking_id)
+    # Not .limit(1): a lapsed hold must not hide a real booking behind it.
+    rows = getattr(q.limit(200).execute(), "data", None) or []
+    return [b for b in rows if not _hold_lapsed(b)]
+
+
 def _assert_free(db, user_id: str, unit_id: str, check_in: str, check_out: str,
                  exclude_booking_id: str | None = None) -> None:
     """
@@ -595,15 +668,10 @@ def _assert_free(db, user_id: str, unit_id: str, check_in: str, check_out: str,
     half-open interval test, so a same-day checkout/checkin does NOT collide.
     Only blocking statuses count; a cancelled/no-show booking frees its dates.
     """
-    q = (db.table("bookings").select("id,check_in,check_out,status")
-         .eq("user_id", user_id).eq("unit_id", unit_id)
-         .in_("status", list(BLOCKING_STATUSES))
-         .lt("check_in", check_out).gt("check_out", check_in))
-    if exclude_booking_id:
-        q = q.neq("id", exclude_booking_id)
-    res = q.limit(1).execute()
-    if getattr(res, "data", None):
-        clash = res.data[0]
+    blocking = _blocking_overlaps(db, user_id, unit_id, check_in, check_out,
+                                  exclude_booking_id)
+    if blocking:
+        clash = blocking[0]
         raise DatesUnavailable(
             # For the owner, who is entitled to know what it clashed with.
             f"Those dates clash with an existing booking on this unit "
@@ -1641,14 +1709,10 @@ def public_availability(db, token: str, unit_slug: str, frm: str, to: str) -> di
     if check_out <= check_in:
         raise ValueError("Departure must be after arrival.")
 
-    res = (db.table("bookings")
-           .select("id")
-           .eq("user_id", prop["user_id"]).eq("unit_id", unit["id"])
-           .in_("status", list(BLOCKING_STATUSES))
-           .lt("check_in", check_out.isoformat())
-           .gt("check_out", check_in.isoformat())
-           .limit(1).execute())
-    taken = bool(getattr(res, "data", None))
+    # The same rule the write guard uses, so a night this says is free is a
+    # night the booking endpoint will actually accept.
+    taken = bool(_blocking_overlaps(db, prop["user_id"], unit["id"],
+                                    check_in.isoformat(), check_out.isoformat()))
     return {
         "available": not taken,
         "unit": _public_unit(unit),

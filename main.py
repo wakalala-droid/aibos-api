@@ -31,7 +31,7 @@ import payments
 
 # ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
 # Isolated modules; the existing file-analysis endpoints above are untouched.
-from db import get_db, supabase_enabled, db_health
+from db import get_db, supabase_enabled, db_health, schema_health
 from auth import require_user
 import entitlements
 import nervous_system as nervous
@@ -1970,6 +1970,7 @@ async def health():
     on a crash, which used to look green while serving old code)."""
     ai_ready = llm.configured()
     dbh = db_health()
+    _schema = schema_health()
     return {
         "status": "ok",
         "ai_configured": ai_ready,
@@ -1989,6 +1990,12 @@ async def health():
         "build_sha": _build_sha(),
         "host": _host_name(),
         "expects_migration": EXPECTS_MIGRATION,
+        # What the DATABASE actually has, not just what the code wants. Without
+        # this, "have the migrations been run" was a question only a person
+        # could answer.
+        "migrations_applied": _schema["applied"],
+        "migrations_missing": _schema["missing"],
+        "schema_note": _schema["note"],
     }
 
 

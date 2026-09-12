@@ -136,3 +136,63 @@ def db_health(force: bool = False) -> dict:
 
     _health_cache = (out, _time.time() + _HEALTH_TTL)
     return out
+
+
+# ── Is the schema the code expects actually there? ───────────────────────────
+#
+# /health reported `expects_migration`, which is what the CODE wants, and never
+# what the DATABASE has. So "have the migrations been run" was a question only a
+# person could answer, and the honest answer from here was a shrug. Code ships
+# when it is pushed and a migration waits for somebody to paste it, so that gap
+# is a real and recurring state, not a hypothetical.
+#
+# Each probe asks PostgREST for one column and reads nothing: the column either
+# resolves or it answers PGRST204. Cheap, and it cannot be wrong.
+
+_SCHEMA_PROBES = (
+    # (migration, table, column that migration added)
+    (27, "properties", "public_site_token"),
+    (28, "profiles", "welcome_seen_tier"),
+    (29, "bookings", "reference"),
+    (30, "notifications", "id"),
+)
+
+_schema_cache: tuple[dict, float] | None = None
+
+
+def schema_health(force: bool = False) -> dict:
+    """Which expected migrations are actually applied. Never raises."""
+    global _schema_cache
+    import time as _time
+
+    if _schema_cache and not force and _time.time() < _schema_cache[1]:
+        return _schema_cache[0]
+
+    out = {"checked": False, "applied": [], "missing": [], "note": ""}
+    db = get_db()
+    if db is None:
+        out["note"] = "No database to check."
+        _schema_cache = (out, _time.time() + _HEALTH_TTL)
+        return out
+
+    for number, table, column in _SCHEMA_PROBES:
+        try:
+            db.table(table).select(column).limit(1).execute()
+            out["applied"].append(number)
+        except Exception as e:  # noqa: BLE001
+            text = str(e)
+            if "PGRST204" in text or "schema cache" in text or "does not exist" in text:
+                out["missing"].append(number)
+            else:
+                # A real fault, not a missing column. Say so rather than
+                # reporting a migration as un-run because the network blipped.
+                out["note"] = f"Could not check migration {number}: {text[:120]}"
+    out["checked"] = True
+    if out["missing"] and not out["note"]:
+        out["note"] = ("Run these in the Supabase SQL editor: "
+                       + ", ".join(f"{n:04d}_*.sql" for n in out["missing"]))
+    elif not out["missing"] and not out["note"]:
+        out["note"] = "ok"
+
+    _schema_cache = (out, _time.time() + _HEALTH_TTL)
+    return out
