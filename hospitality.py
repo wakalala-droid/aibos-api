@@ -731,6 +731,54 @@ def get_booking(db, user_id: str, booking_id: str) -> dict:
     return rows[0]
 
 
+# Columns migration 0029 adds. Everything here is DETAIL about a request: losing
+# it costs the owner context, and refusing the write costs them the booking.
+_M0029_COLUMNS = (
+    "reference", "source", "guest_name", "guest_email", "guest_phone",
+    "organisation", "purpose", "arrival_time", "payment_method", "guest_notes",
+    "quoted_total", "confirmed_at", "declined_at", "cancelled_at", "decline_reason",
+)
+
+
+def _insert_booking(db, row: dict):
+    """Write the booking, and write it even if migration 0029 has not been run.
+
+    Code deploys the moment it is pushed; a migration waits for a person to
+    paste it into the SQL editor. In that window every one of the columns below
+    is unknown to the database, PostgREST answers PGRST204, and a guest on the
+    website gets an error for a room that was free.
+
+    A booking is money and a person waiting. So a schema-cache miss drops the
+    new columns and writes the booking anyway: the stay, the dates, the guest
+    link and the amount all survive, and the detail is kept in source_notes so
+    nothing the guest typed is actually lost. It shouts in the log, because this
+    is a state somebody needs to fix, not a mode to live in.
+    """
+    try:
+        return db.table("bookings").insert(row).execute()
+    except Exception as e:  # noqa: BLE001
+        text = str(e)
+        if not ("PGRST204" in text or "schema cache" in text
+                or ("column" in text.lower() and "not" in text.lower())):
+            raise
+        missing = [k for k in _M0029_COLUMNS if k in row]
+        if not missing:
+            raise
+        log.error(
+            "[hospitality] the bookings table is missing %s, so migration 0029 has "
+            "not been run. Writing the booking WITHOUT those columns and keeping "
+            "the detail in source_notes. Run 0029_booking_engine.sql. (%s)",
+            ", ".join(missing), text[:200],
+        )
+        kept = {k: v for k, v in row.items() if k not in _M0029_COLUMNS}
+        carried = "; ".join(f"{k}: {row[k]}" for k in missing if row.get(k))
+        if carried:
+            kept["source_notes"] = ((kept.get("source_notes") or "") +
+                                    chr(10) + "[pending migration 0029] " +
+                                    carried).strip()
+        return db.table("bookings").insert(kept).execute()
+
+
 def create_booking(db, user_id: str, data: dict) -> dict:
     unit_id = data.get("unit_id")
     if not unit_id:
@@ -748,7 +796,7 @@ def create_booking(db, user_id: str, data: dict) -> dict:
         _assert_free(db, user_id, unit_id, clean["check_in"], clean["check_out"])
 
     row = {"user_id": user_id, **clean}
-    res = db.table("bookings").insert(row).execute()
+    res = _insert_booking(db, row)
     saved = (getattr(res, "data", None) or [row])[0]
 
     # Record bridge: a confirmed booking with revenue posts a Sale and links back.

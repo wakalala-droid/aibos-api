@@ -474,3 +474,62 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} booking-engine tests passed ===")
+
+
+# ── A booking is never lost to an unrun migration ──────────────────────────
+
+def test_a_booking_survives_the_window_before_migration_0029():
+    """Code deploys when it is pushed; a migration waits for a person. In that
+    window PostgREST answers PGRST204 for every new column and a guest on the
+    website gets an error for a room that was free."""
+    attempts = []
+
+    class _Unmigrated(_DB):
+        def table(self, name):
+            t = _T(self, name)
+            if name == "bookings":
+                real_insert = t.insert
+
+                def insert(row):
+                    attempts.append(dict(row))
+                    if any(k in row for k in hospitality._M0029_COLUMNS):
+                        raise Exception(
+                            "{'code': 'PGRST204', 'message': \"Could not find the "
+                            "'reference' column of 'bookings' in the schema cache\"}")
+                    return real_insert(row)
+                t.insert = insert
+            return t
+
+    db = _Unmigrated({"units": _db().rows["units"], "guests": _db().rows["guests"],
+                      "bookings": [], "business_events": []})
+    out = hospitality.create_booking(db, OWNER, _booking(guest_notes="Late arrival"))
+
+    assert len(attempts) == 2                      # tried full, then retried
+    saved = db.rows["bookings"][0]
+    # The stay itself is intact: that is the part that is money.
+    assert saved["check_in"] == "2026-11-01" and saved["guest_id"] == "g1"
+    assert saved["total_amount"] == 6000
+    # And nothing the guest typed was thrown away.
+    assert "DA-2611-ABC123" in saved["source_notes"]
+    assert "Late arrival" in saved["source_notes"]
+    assert out["id"]
+
+
+def test_a_real_database_error_is_not_swallowed():
+    class _Broken(_DB):
+        def table(self, name):
+            t = _T(self, name)
+            if name == "bookings":
+                def insert(_row):
+                    raise Exception("connection reset by peer")
+                t.insert = insert
+            return t
+
+    db = _Broken({"units": _db().rows["units"], "guests": _db().rows["guests"],
+                  "bookings": [], "business_events": []})
+    try:
+        hospitality.create_booking(db, OWNER, _booking())
+    except Exception as e:
+        assert "connection reset" in str(e)
+    else:
+        raise AssertionError("an outage was quietly retried as a migration gap")
