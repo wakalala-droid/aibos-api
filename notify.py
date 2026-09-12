@@ -364,6 +364,47 @@ def _owner_contacts(db, user_id: str) -> dict:
     return out
 
 
+def reach(db, user_id: str) -> dict:
+    """How a booking alert would ACTUALLY reach this owner, right now.
+
+    Setting RESEND_API_KEY is only half of it: the address comes from the
+    owner's own profile, and a profile row created by entitlements.py starts
+    with no email on it at all. Both halves fail the same silent way — the
+    booking is recorded, the send is skipped, and nothing anywhere says why.
+    One authenticated call answers it instead of a person guessing.
+    """
+    c = _owner_contacts(db, user_id)
+    email_live, wa_live = email_enabled(), whatsapp_enabled()
+
+    def _why(address, live, key, channel):
+        if not address and not live:
+            return (f"No {channel} address on your profile, and the API has no "
+                    f"{key} set. Both are needed.")
+        if not address:
+            return (f"There is no {channel} address on your profile, so there is "
+                    f"nowhere to send it. Add one in Settings.")
+        if not live:
+            return f"{key} is not set on the API, so nothing is sent."
+        return ""
+
+    return {
+        # The one delivery that cannot be unconfigured.
+        "in_app": True,
+        "email": {
+            "address": c["email"],
+            "channel_live": email_live,
+            "will_arrive": bool(c["email"] and email_live),
+            "why_not": _why(c["email"], email_live, "RESEND_API_KEY", "email"),
+        },
+        "whatsapp": {
+            "address": c["whatsapp"],
+            "channel_live": wa_live,
+            "will_arrive": bool(c["whatsapp"] and wa_live),
+            "why_not": _why(c["whatsapp"], wa_live, "WHATSAPP_TOKEN", "WhatsApp"),
+        },
+    }
+
+
 def booking_received(db, user_id: str, result: dict) -> dict:
     """A booking request just arrived from a property's own website.
 

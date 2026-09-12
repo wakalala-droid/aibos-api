@@ -2339,6 +2339,19 @@ async def notify_config():
     return {"email": notify.email_enabled(), "whatsapp": notify.whatsapp_enabled()}
 
 
+@app.get("/notify/reach")
+async def notify_reach(ctx: membership.Context = Depends(membership.require_context)):
+    """Would a booking alert actually reach you?
+
+    /health/setup answers whether the KEY is set. This answers the other half:
+    whether there is an address on the profile to send to. A key set against a
+    profile with no email address is indistinguishable, from the outside, from
+    no key at all — both record the booking and send nothing.
+    """
+    db = _require_db()
+    return {"ok": True, **notify.reach(db, ctx.tenant)}
+
+
 @app.post("/notify/dispatch-briefs")
 async def notify_dispatch(x_cron_secret: Optional[str] = Header(default=None)):
     """
