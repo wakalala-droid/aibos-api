@@ -1999,6 +1999,58 @@ async def health():
     }
 
 
+@app.get("/health/setup")
+async def health_setup():
+    """What is switched on, what is not, and what each missing key costs.
+
+    Every optional capability here fails SILENTLY when its key is absent: the
+    feature simply does nothing and says nothing. That is the right behaviour at
+    runtime and a terrible way to find out, so this is the one place that says
+    plainly which doors are shut.
+
+    Booleans and explanations only. No key is ever read back out.
+    """
+    import os
+
+    def on(*names):
+        return all(bool(os.environ.get(n)) for n in names)
+
+    features = [
+        {"key": "database", "live": db_health()["service_role"],
+         "needs": ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"],
+         "without_it": "Nothing is stored or read. This is the one that must be on."},
+        {"key": "ai_chat", "live": llm.configured(),
+         "needs": ["GEMINI_API_KEY"],
+         "without_it": "The AI CFO chat cannot answer at all."},
+        {"key": "booking_email_alerts", "live": on("RESEND_API_KEY"),
+         "needs": ["RESEND_API_KEY", "BRIEF_FROM_EMAIL"],
+         "without_it": "A booking request reaches the owner in the app only. "
+                       "Nothing is emailed, so a closed laptop learns nothing."},
+        {"key": "booking_whatsapp_alerts", "live": on("WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID"),
+         "needs": ["WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "WHATSAPP_TEMPLATE"],
+         "without_it": "No WhatsApp on a new booking, which is the channel a "
+                       "Zambian owner actually watches."},
+        {"key": "guest_id_documents", "live": on("FIELD_ENCRYPTION_KEY"),
+         "needs": ["FIELD_ENCRYPTION_KEY"],
+         "without_it": "Capturing a guest's passport or NRC number is REFUSED "
+                       "rather than stored in the clear. Fails closed on purpose."},
+        {"key": "channel_sync_cron", "live": on("CRON_SECRET"),
+         "needs": ["CRON_SECRET"],
+         "without_it": "The nightly iCal sync with Booking.com and Airbnb cannot "
+                       "be triggered, so OTA calendars drift."},
+        {"key": "card_and_mobile_money", "live": any(payments.configured_networks().values()),
+         "needs": ["MTN_MOMO_SUBSCRIPTION_KEY", "AIRTEL_CLIENT_ID"],
+         "without_it": "Checkout runs in simulation. No real money moves."},
+        {"key": "faster_auth", "live": on("SUPABASE_JWT_SECRET"),
+         "needs": ["SUPABASE_JWT_SECRET"],
+         "without_it": "Every request verifies the login against Supabase over "
+                       "the network instead of locally. It works, just slower."},
+    ]
+    missing = [f["key"] for f in features if not f["live"]]
+    return {"ok": True, "features": features, "missing": missing,
+            "all_live": not missing}
+
+
 @app.get("/health/ai")
 async def health_ai(user_id: str = Depends(require_user)):
     """Which calls to the AI provider actually work.
