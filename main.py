@@ -91,7 +91,7 @@ app = FastAPI(title="AIBOS API", version="3.0.0")
 _origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not _origins:
     # Safe defaults: local dev only. Set ALLOWED_ORIGINS in prod (Railway) to the
-    # real web origin(s), comma-separated, e.g. "https://app.aibos.africa".
+    # real web origin(s), comma-separated, e.g. "https://ai-bos.website".
     _origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -2171,7 +2171,7 @@ CALLBACK_SECRET = os.environ.get("PAYMENTS_CALLBACK_SECRET")
 # Where the customer-facing app lives — used to build invoice payment links.
 # Set this on Railway if the frontend ever moves off the Vercel domain, or every
 # link AIBOS hands a paying customer points at the wrong host.
-PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://aibos.vercel.app")
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://ai-bos.website")
 
 
 def _grant_tier(user_id: Optional[str], plan: str) -> None:

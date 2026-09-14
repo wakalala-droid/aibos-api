@@ -61,7 +61,7 @@ services:
 
       # ── Without this the browser blocks every call from the site ─────────
       # Comma separated, no trailing slash, e.g.
-      #   https://aibos.vercel.app,https://www.your-domain.com
+      #   https://ai-bos.website,https://www.ai-bos.website,https://aibos.vercel.app
       - key: ALLOWED_ORIGINS
         sync: false
 

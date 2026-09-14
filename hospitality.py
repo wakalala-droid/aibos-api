@@ -165,6 +165,11 @@ CHANNEL_EDITABLE = (
 )
 # UID suffix on every VEVENT we export, so a feed we publish and an OTA re-imports
 # is recognised as our own on the way back in and never double-counted.
+#
+# NOT the website address, and it must never change to match it. Booking.com and
+# Airbnb already hold feeds stamped @aibos.app. Change this and every stay we
+# exported comes back looking foreign: imported as a second block on the same
+# nights, and exported again, round and round.
 _ICAL_UID_DOMAIN = "aibos.app"
 
 
