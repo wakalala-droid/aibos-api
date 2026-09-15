@@ -90,6 +90,17 @@ jobs:
         # which is identical to the business until somebody is invited.
         run: python test_route_scoping.py
 
+      - name: Guest email tests
+        # The guest must never hear from AI-BOS: every email is read as a guest
+        # would and searched for the platform's name. Also holds off-by-default,
+        # never the same email twice, and never the owner's private reason.
+        run: python test_guest_mail.py
+
+      - name: Alert reach tests
+        # A mail key with no address on the profile sends nothing and says
+        # nothing. /notify/reach is what says so.
+        run: python test_notify_reach.py
+
       - name: Compliance calendar tests
         run: python test_compliance.py
 

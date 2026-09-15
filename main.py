@@ -63,6 +63,7 @@ import pdfdoc
 import schedule_items as schedule_api
 import payroll as payroll_api
 import hospitality as hospitality_api
+import guest_mail
 import notify
 import ocr
 import identity as identity_api
@@ -1925,7 +1926,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 30
+EXPECTS_MIGRATION = 31
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -3827,8 +3828,39 @@ async def hospitality_patch_property(property_id: str, body: Dict[str, Any] = Bo
     db = _require_db()
     try:
         return {"ok": True, "property": hospitality_api.update_property(db, ctx.tenant, property_id, body)}
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hospitality/properties/{property_id}/guest-emails")
+async def hospitality_guest_email_status(property_id: str,
+                                         ctx: membership.Context = Depends(membership.require_context)):
+    """How this property writes to its guests, and who the guest will see it from."""
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        prop = hospitality_api.get_property(db, ctx.tenant, property_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, **guest_mail.status(prop)}
+
+
+@app.post("/hospitality/properties/{property_id}/guest-emails/samples")
+async def hospitality_guest_email_samples(property_id: str,
+                                          ctx: membership.Context = Depends(membership.require_write)):
+    """All three guest emails, filled with example details, to the person asking.
+
+    So the owner reads exactly what a guest will get before switching it on,
+    and learns from their own inbox whether their domain is verified.
+    """
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        return guest_mail.send_samples(db, ctx.tenant, ctx.actor, property_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.delete("/hospitality/properties/{property_id}")
@@ -4046,11 +4078,17 @@ async def hospitality_confirm_booking(booking_id: str, ctx: membership.Context =
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
-        return {"ok": True, "booking": hospitality_api.confirm_booking(db, ctx.tenant, booking_id)}
+        before = hospitality_api.get_booking(db, ctx.tenant, booking_id)
+        booking = hospitality_api.confirm_booking(db, ctx.tenant, booking_id)
     except hospitality_api.DatesUnavailable as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Only on the press that actually changed it. Confirming twice is harmless
+    # to the calendar and must be harmless to the guest's inbox too.
+    guest_email = (guest_mail.deliver(db, ctx.tenant, booking, "confirmed")
+                   if before.get("status") != "confirmed" else None)
+    return {"ok": True, "booking": booking, "guest_email": guest_email}
 
 
 @app.post("/hospitality/bookings/{booking_id}/decline")
@@ -4061,10 +4099,14 @@ async def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Bo
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
-        return {"ok": True, "booking": hospitality_api.decline_booking(
-            db, ctx.tenant, booking_id, (body or {}).get("reason"))}
+        booking = hospitality_api.decline_booking(
+            db, ctx.tenant, booking_id, (body or {}).get("reason"))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # decline_booking only accepts a waiting request, so reaching here IS the
+    # change. The owner's reason is never sent: it is their private note.
+    guest_email = guest_mail.deliver(db, ctx.tenant, booking, "declined")
+    return {"ok": True, "booking": booking, "guest_email": guest_email}
 
 
 @app.post("/hospitality/bookings/{booking_id}/cancel")
@@ -4362,9 +4404,13 @@ async def public_stay_booking_request(site_token: str, request: Request,
     except Exception as e:  # noqa: BLE001
         log.warning("[hospitality] booking alert failed: %s", e)
 
+    # And tell the guest, in the property's name. deliver() never raises, and
+    # only a yes/no goes back to the website: the note can name the owner's setup.
+    guest = guest_mail.deliver(db, result.get("owner_id"), result.get("booking") or {}, "received")
+
     # owner_id and the full booking row are ours, not the internet's.
     public = {k: v for k, v in result.items() if k not in ("owner_id", "booking")}
-    return {"ok": True, **public}
+    return {"ok": True, **public, "guest_emailed": bool(guest.get("sent"))}
 
 
 # ── Notifications ───────────────────────────────────────────────────────────

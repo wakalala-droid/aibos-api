@@ -82,3 +82,48 @@ def test_the_business_address_wins_over_the_login_one(monkeypatch):
     db = _DB([{"id": OWNER, "email": "personal@gmail.com",
                "contact_email": "book@dunslim.com"}])
     assert notify.reach(db, OWNER)["email"]["address"] == "book@dunslim.com"
+
+
+class _MonkeyPatch:
+    """Just enough of pytest's monkeypatch for CI's plain `python file.py` run."""
+
+    def __init__(self):
+        self._undo = []
+
+    def setenv(self, key, value):
+        import os
+        old = os.environ.get(key)
+        os.environ[key] = value
+        self._undo.append(lambda: os.environ.pop(key, None) if old is None
+                          else os.environ.__setitem__(key, old))
+
+    def delenv(self, key, raising=True):
+        import os
+        if key not in os.environ:
+            if raising:
+                raise KeyError(key)
+            return
+        old = os.environ.pop(key)
+        self._undo.append(lambda: os.environ.__setitem__(key, old))
+
+    def setattr(self, target, name, value):
+        old = getattr(target, name)
+        setattr(target, name, value)
+        self._undo.append(lambda: setattr(target, name, old))
+
+    def undo(self):
+        while self._undo:
+            self._undo.pop()()
+
+
+if __name__ == "__main__":
+    import inspect
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        mp = _MonkeyPatch()
+        try:
+            fn(mp) if inspect.signature(fn).parameters else fn()
+        finally:
+            mp.undo()
+        print(f"PASS  {fn.__name__}")
+    print(f"\n=== {len(fns)}/{len(fns)} notify-reach tests passed ===")

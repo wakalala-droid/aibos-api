@@ -18,6 +18,7 @@ land as additional helpers in this same module, mirroring how payroll grew.
 """
 
 import logging
+import re
 import secrets
 from datetime import date, datetime, timezone
 
@@ -32,7 +33,16 @@ PROPERTY_STATUSES = ("active", "inactive", "maintenance")
 
 PROPERTY_EDITABLE = (
     "name", "address", "latitude", "longitude", "description", "status",
+    # How the property writes to its guests (migration 0031). See guest_mail.py.
+    "guest_emails_enabled", "guest_email_from_name", "guest_email_from",
+    "guest_email_reply_to", "guest_contact_phone", "guest_payment_instructions",
 )
+GUEST_EMAIL_FIELDS = PROPERTY_EDITABLE[6:]
+GUEST_EMAILS_SETUP_NEEDED = (
+    "Emails to guests are not set up on this database yet. "
+    "Run migration 0031_guest_emails.sql in Supabase."
+)
+EMAIL_RE = re.compile(r"^[^@\s<>\"',;]+@[^@\s<>\"',;]+\.[a-z]{2,}$", re.I)
 
 UNIT_EDITABLE = (
     "unit_name", "bedrooms", "bathrooms", "max_guests", "amenities",
@@ -211,6 +221,30 @@ def _clean_property(data: dict, partial: bool = False) -> dict:
         if tkey in out and out[tkey] is not None:
             out[tkey] = str(out[tkey]).strip() or None
 
+    if "guest_emails_enabled" in out:
+        v = out["guest_emails_enabled"]
+        out["guest_emails_enabled"] = (v if isinstance(v, bool)
+                                       else str(v).strip().lower() in ("1", "true", "yes", "on"))
+
+    for ekey, label in (("guest_email_from", "The address emails are sent from"),
+                        ("guest_email_reply_to", "The address replies go to")):
+        if ekey in out:
+            val = str(out[ekey] or "").strip().lower()[:160]
+            if val and not EMAIL_RE.match(val):
+                raise ValueError(f"{label} is not a valid email address.")
+            out[ekey] = val or None
+
+    # A line break is how a header gets smuggled into an email. A sender name
+    # never needs one.
+    if "guest_email_from_name" in out:
+        name = " ".join(str(out["guest_email_from_name"] or "").split())[:80]
+        out["guest_email_from_name"] = name or None
+    if "guest_contact_phone" in out:
+        out["guest_contact_phone"] = " ".join(str(out["guest_contact_phone"] or "").split())[:40] or None
+    if "guest_payment_instructions" in out:
+        out["guest_payment_instructions"] = (str(out["guest_payment_instructions"] or "")
+                                             .strip()[:1500] or None)
+
     return out
 
 
@@ -294,8 +328,15 @@ def update_property(db, user_id: str, property_id: str, patch: dict) -> dict:
     clean = _clean_property(patch, partial=True)
     if not clean:
         raise ValueError("Nothing to update.")
-    res = (db.table("properties").update(clean)
-           .eq("id", property_id).eq("user_id", user_id).execute())
+    try:
+        res = (db.table("properties").update(clean)
+               .eq("id", property_id).eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        text = str(e)
+        if (any(k in clean for k in GUEST_EMAIL_FIELDS)
+                and ("PGRST204" in text or "schema cache" in text or _is_missing_column(e))):
+            raise SetupRequired(GUEST_EMAILS_SETUP_NEEDED) from e
+        raise
     rows = getattr(res, "data", None) or []
     if not rows:
         raise ValueError("Property not found.")

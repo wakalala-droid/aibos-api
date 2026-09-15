@@ -467,13 +467,6 @@ def test_results_come_back_in_arrival_order():
         ["2026-11-05", "2026-12-20"]
 
 
-if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items())
-           if k.startswith("test_") and callable(v)]
-    for fn in fns:
-        fn()
-        print(f"PASS  {fn.__name__}")
-    print(f"\n=== {len(fns)}/{len(fns)} booking-engine tests passed ===")
 
 
 # ── A booking is never lost to an unrun migration ──────────────────────────
@@ -682,3 +675,15 @@ def test_every_booking_says_whether_it_is_still_holding_its_nights():
     holding = {b["id"]: b["holding"] for b in hospitality.list_bookings(db, OWNER)}
     assert holding == {"b1": False, "b2": True, "b3": False}
     assert hospitality.get_booking(db, OWNER, "b1")["holding"] is False
+
+
+# Runs LAST. It used to sit half way down, so a plain `python test_booking_engine.py`
+# (which is how CI runs it) stopped collecting at that line and every test below
+# it, including the whole calendar-hold section, never ran in CI.
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items())
+           if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+        print(f"PASS  {fn.__name__}")
+    print(f"\n=== {len(fns)}/{len(fns)} booking-engine tests passed ===")
