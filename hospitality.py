@@ -41,7 +41,7 @@ PROPERTY_EDITABLE = (
 GUEST_EMAIL_FIELDS = PROPERTY_EDITABLE[6:]
 GUEST_EMAILS_SETUP_NEEDED = (
     "Emails to guests are not set up on this database yet. "
-    "Run migration 0031_guest_emails.sql in Supabase."
+    "Run migrations 0031_guest_emails.sql and 0032_guest_email_logo.sql in Supabase."
 )
 EMAIL_RE = re.compile(r"^[^@\s<>\"',;]+@[^@\s<>\"',;]+\.[a-z]{2,}$", re.I)
 

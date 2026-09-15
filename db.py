@@ -156,6 +156,7 @@ _SCHEMA_PROBES = (
     (29, "bookings", "reference"),
     (30, "notifications", "id"),
     (31, "properties", "guest_emails_enabled"),
+    (32, "properties", "guest_email_logo_url"),
 )
 
 _schema_cache: tuple[dict, float] | None = None
