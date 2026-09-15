@@ -36,6 +36,7 @@ PROPERTY_EDITABLE = (
     # How the property writes to its guests (migration 0031). See guest_mail.py.
     "guest_emails_enabled", "guest_email_from_name", "guest_email_from",
     "guest_email_reply_to", "guest_contact_phone", "guest_payment_instructions",
+    "guest_email_logo_url",
 )
 GUEST_EMAIL_FIELDS = PROPERTY_EDITABLE[6:]
 GUEST_EMAILS_SETUP_NEEDED = (
@@ -241,6 +242,15 @@ def _clean_property(data: dict, partial: bool = False) -> dict:
         out["guest_email_from_name"] = name or None
     if "guest_contact_phone" in out:
         out["guest_contact_phone"] = " ".join(str(out["guest_contact_phone"] or "").split())[:40] or None
+    if "guest_email_logo_url" in out:
+        url = str(out["guest_email_logo_url"] or "").strip()[:500]
+        # https only: a mail app blocks a plain http image, and anything else in
+        # an <img src> is somebody trying something.
+        if url and (not url.lower().startswith("https://") or any(c in url for c in ' "<>')):
+            raise ValueError("The logo must be a web address starting with https://")
+        if url.lower().split("?")[0].endswith(".svg"):
+            raise ValueError("Use a PNG or JPG logo. Most email apps cannot show an SVG.")
+        out["guest_email_logo_url"] = url or None
     if "guest_payment_instructions" in out:
         out["guest_payment_instructions"] = (str(out["guest_payment_instructions"] or "")
                                              .strip()[:1500] or None)

@@ -135,7 +135,7 @@ def test_a_database_without_the_migration_reads_as_off(monkeypatch):
     _wire(monkeypatch, out)
     db = _db()
     for k in hospitality.GUEST_EMAIL_FIELDS:
-        db.rows["properties"][0].pop(k)
+        db.rows["properties"][0].pop(k, None)
     res = guest_mail.deliver(db, OWNER, _row(db), "received")
     assert res["skipped"] == "off" and out.sent == []
     assert guest_mail.status(db.rows["properties"][0])["ready"] is False
@@ -275,6 +275,98 @@ def test_saving_before_the_migration_says_which_one_to_run():
         assert "0031" in str(e)
     else:
         raise AssertionError("an unrun migration came back as something else")
+
+
+# ── Whose logo ─────────────────────────────────────────────────────────────
+#
+# The owner's rule: every email AI-BOS sends in its own name carries the AI-BOS
+# logo, and a booking email to a guest carries the PROPERTY's logo. Never the
+# other way round.
+
+def test_a_guest_email_carries_the_propertys_logo(monkeypatch):
+    out = _Outbox()
+    _wire(monkeypatch, out)
+    db = _db({"guest_email_logo_url": "https://cdn.example.com/dunslim.png"})
+    guest_mail.deliver(db, OWNER, _row(db), "received")
+    html = out.sent[0]["html"]
+    assert 'src="https://cdn.example.com/dunslim.png"' in html
+    assert 'alt="Dunslim Apartments"' in html          # still says who, with images off
+    assert "aibos-email-logo" not in html
+
+
+def test_without_a_logo_the_guest_sees_the_propertys_name_not_ours(monkeypatch):
+    out = _Outbox()
+    _wire(monkeypatch, out)
+    db = _db({"guest_email_logo_url": None})
+    guest_mail.deliver(db, OWNER, _row(db), "received")
+    html = out.sent[0]["html"]
+    assert "<img" not in html
+    assert ">Dunslim Apartments</p>" in html
+
+
+def test_a_logo_address_cannot_break_out_of_the_image_tag():
+    for bad in ('https://x.com/a.png" onerror="alert(1)', "javascript:alert(1)",
+                "http://x.com/a.png", "https://x.com/logo.svg"):
+        try:
+            hospitality._clean_property({"guest_email_logo_url": bad}, partial=True)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted a logo address it should not: {bad}")
+
+
+def test_every_email_in_the_platforms_own_name_wears_the_aibos_logo(monkeypatch):
+    import notify
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://ai-bos.website")
+    monkeypatch.delenv("EMAIL_LOGO_URL", raising=False)
+    page = notify.aibos_email_html("New request.\n\nGrace wants <Mandela>.",
+                                   ("Answer this request", "https://ai-bos.website/x"))
+    assert 'src="https://ai-bos.website/brand/aibos-email-logo.png"' in page
+    assert "&lt;Mandela&gt;" in page and "<Mandela>" not in page
+    assert 'href="https://ai-bos.website/x"' in page
+
+
+def test_the_platforms_send_wraps_a_plain_body_in_the_logo_by_default(monkeypatch):
+    import notify
+    sent = []
+
+    class _R:
+        status_code, text = 200, "{}"
+
+    class _Httpx:
+        @staticmethod
+        def post(url, headers=None, json=None, timeout=None):
+            sent.append(json)
+            return _R()
+
+    import sys
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    # send_email imports httpx inside the call, so the stub goes in sys.modules.
+    real = sys.modules.get("httpx")
+    sys.modules["httpx"] = _Httpx
+    try:
+        assert notify.send_email("owner@example.com", "Subject", "Body text") is True
+    finally:
+        if real is not None:
+            sys.modules["httpx"] = real
+        else:
+            sys.modules.pop("httpx", None)
+    assert "aibos-email-logo.png" in sent[0]["html"]
+    assert sent[0]["text"] == "Body text"
+
+
+def test_the_emails_the_platform_writes_follow_the_house_style():
+    import inspect
+    import notify
+    src = inspect.getsource(notify.compose_brief)
+    # Only the words that reach a person: string literals, not comments.
+    import ast
+    tree = ast.parse(src)
+    docstrings = {id(n.value) for n in ast.walk(tree)
+                  if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
+    shipped = [n.value for n in ast.walk(tree)
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and id(n) not in docstrings]
+    assert not any("\u2014" in t for t in shipped), "an em-dash in the Morning Brief"
 
 
 class _MonkeyPatch:

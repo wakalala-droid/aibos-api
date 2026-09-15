@@ -93,6 +93,7 @@ def settings(prop: dict) -> dict:
         "phone": (prop.get("guest_contact_phone") or "").strip() or None,
         "payment_instructions": (prop.get("guest_payment_instructions") or "").strip() or None,
         "address": (prop.get("address") or "").strip() or None,
+        "logo_url": (prop.get("guest_email_logo_url") or "").strip() or None,
     }
 
 
@@ -221,7 +222,7 @@ def _render(s: dict, greeting: str, paragraphs: list[str], rows: list[tuple[str,
     page = (
         '<div style="background:#ffffff;padding:24px 12px;">'
         '<div style="max-width:560px;margin:0 auto;font-family:Helvetica,Arial,sans-serif;">'
-        f'<p style="margin:0 0 24px;font-size:22px;font-weight:700;color:#1a1a1a;">{e(s["from_name"])}</p>'
+        + _masthead(s)
         + body_p.format(e(greeting))
         + "".join(body_p.format(e(p)) for p in paragraphs)
         + '<table role="presentation" style="border-collapse:collapse;margin:0 0 22px;'
@@ -233,6 +234,21 @@ def _render(s: dict, greeting: str, paragraphs: list[str], rows: list[tuple[str,
         "</div></div>"
     )
     return text, page
+
+
+def _masthead(s: dict) -> str:
+    """The property's logo when it has one, its name in type when it does not.
+
+    Never the platform's. The alt text is the name, so a mail app that blocks
+    images until the guest allows them still says who this is from.
+    """
+    e = html.escape
+    if s["logo_url"]:
+        return (f'<p style="margin:0 0 28px;"><img src="{e(s["logo_url"], quote=True)}" '
+                f'alt="{e(s["from_name"], quote=True)}" width="220" '
+                'style="display:block;width:220px;max-width:100%;height:auto;border:0;"></p>')
+    return (f'<p style="margin:0 0 24px;font-size:22px;font-weight:700;color:#1a1a1a;">'
+            f'{e(s["from_name"])}</p>')
 
 
 def compose(kind: str, prop: dict, unit: dict, b: dict) -> tuple[str, str, str]:

@@ -39,6 +39,50 @@ log = logging.getLogger("aibos.notify")
 LUSAKA_UTC_OFFSET = 2
 
 
+# The AI-BOS logo on every email the platform sends in its own name: the Morning
+# Brief and the owner's alerts. Never on a guest email, which carries the
+# property's logo instead (guest_mail.py). Mark and wordmark side by side on
+# white, not the stacked lockup PNG, whose tagline reads "ARTFICIAL" and
+# "OPERATIING". EMAIL_LOGO_URL overrides it.
+def _app_url() -> str:
+    return (os.environ.get("PUBLIC_APP_URL") or "https://ai-bos.website").rstrip("/")
+
+
+def email_logo_url() -> str:
+    return os.environ.get("EMAIL_LOGO_URL") or f"{_app_url()}/brand/aibos-email-logo.png"
+
+
+def aibos_email_html(body: str, button: tuple[str, str] | None = None) -> str:
+    """A plain-text email body, wearing the AI-BOS logo.
+
+    The words are the text version's words, one paragraph per blank-line block,
+    so the two versions can never say different things.
+    """
+    import html as _html
+
+    e = _html.escape
+    paras = [p.strip() for p in str(body or "").split("\n\n") if p.strip()]
+    rows = "".join(
+        '<p style="margin:0 0 16px;font-size:18px;line-height:1.6;color:#1a1a1a;">'
+        + e(p).replace("\n", "<br>") + "</p>"
+        for p in paras
+    )
+    cta = ""
+    if button:
+        cta = ('<p style="margin:24px 0 8px;"><a href="' + e(button[1], quote=True) + '" '
+               'style="display:inline-block;padding:12px 22px;border-radius:8px;background:#0c1b2a;'
+               'color:#ffffff;font-size:17px;font-weight:700;text-decoration:none;">'
+               + e(button[0]) + "</a></p>")
+    return (
+        '<div style="background:#ffffff;padding:24px 12px;">'
+        '<div style="max-width:560px;margin:0 auto;font-family:Geist,Helvetica,Arial,sans-serif;">'
+        '<p style="margin:0 0 28px;"><img src="' + e(email_logo_url(), quote=True) + '" alt="AI-BOS" '
+        'width="134" style="display:block;width:134px;height:auto;border:0;"></p>'
+        + rows + cta +
+        "</div></div>"
+    )
+
+
 def email_enabled() -> bool:
     return bool(os.environ.get("RESEND_API_KEY"))
 
@@ -135,7 +179,7 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
         low_names = [f"{p.get('name')} ({int(float(p.get('on_hand') or 0))} left)" for p in low[:3]]
         if low:
             more = "…" if len(low) > 3 else ""
-            lines.append(f"Stock: {len(low)} item{'s' if len(low) != 1 else ''} low — {', '.join(low_names)}{more}.")
+            lines.append(f"Stock: {len(low)} item{'s' if len(low) != 1 else ''} low: {', '.join(low_names)}{more}.")
     except Exception as e:  # noqa: BLE001
         log.warning("[notify] products query failed for %s: %s", user_id, e)
 
@@ -156,7 +200,7 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
             p0 = exp[0].get("payload") or {}
             frm = f" from {p0.get('supplier')}" if p0.get("supplier") else ""
             extra = f" (+{len(exp) - 1} more)" if len(exp) > 1 else ""
-            lines.append(f"Expected today: {p0.get('item', 'a delivery')}{frm}{extra} — confirm it when it arrives.")
+            lines.append(f"Expected today: {p0.get('item', 'a delivery')}{frm}{extra}. Confirm it when it arrives.")
     except Exception as e:  # noqa: BLE001
         log.warning("[notify] receipts query failed for %s: %s", user_id, e)
 
@@ -168,15 +212,17 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
         lines.append(f"One thing today: collect part of the {_money(recv, sym)} customers owe you.")
 
     day = (datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET)).strftime("%a %d %b")
-    name = f" — {business_name}" if business_name else ""
+    name = f" for {business_name}" if business_name else ""
     subject = f"Your Morning Brief{name} · {day}"
-    body = "\n\n".join(lines) + "\n\n— AIBOS. Reply-worthy questions? Open the app and just ask."
+    body = "\n\n".join(lines) + "\n\nAny questions? Open AI-BOS and just ask."
     return subject, body
 
 
 # ── Senders ───────────────────────────────────────────────────────────────────
 
-def send_email(to: str, subject: str, body: str) -> bool:
+def send_email(to: str, subject: str, body: str, html: str | None = None) -> bool:
+    """Send as AI-BOS. Every email in the platform's own name wears its logo:
+    pass `html` to shape it, or get the plain body wrapped in the logo."""
     if not email_enabled():
         return False
     import httpx
@@ -189,6 +235,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
             "to": [to],
             "subject": subject,
             "text": body,
+            "html": html if html is not None else aibos_email_html(body),
         },
         timeout=15,
     )
@@ -264,7 +311,8 @@ def dispatch_briefs(db) -> dict:
             subject, body = brief
 
             if p.get("brief_email_enabled") and p.get("email") and can_access(tier, "scheduled_brief"):
-                if send_email(p["email"], subject, body):
+                if send_email(p["email"], subject, body,
+                              aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"))):
                     sent_email += 1
             if p.get("whatsapp_number") and can_access(tier, "morning_brief"):
                 if send_whatsapp(str(p["whatsapp_number"]), f"{subject}\n\n{body}"):
@@ -462,7 +510,10 @@ def booking_received(db, user_id: str, result: dict) -> dict:
     out["email"] = False
     if contacts["email"] and email_enabled():
         try:
-            out["email"] = send_email(contacts["email"], f"New booking request: {title}", body)
+            out["email"] = send_email(
+                contacts["email"], f"New booking request: {title}", body,
+                aibos_email_html(body, ("Answer this request",
+                                        f"{_app_url()}/dashboard/hospitality/bookings")))
         except Exception as e:  # noqa: BLE001
             log.warning("[notify] booking email failed: %s", e)
 
