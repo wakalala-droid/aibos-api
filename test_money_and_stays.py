@@ -126,6 +126,21 @@ def test_a_finished_stay_leaving_the_feed_is_not_called_off():
     assert by_uid["next@airbnb.com"]["status"] == "cancelled"
 
 
+def test_a_failed_sync_is_explained_in_plain_words():
+    import httpx
+    request = httpx.Request("GET", "https://example.com/cal.ics")
+    notes = [
+        hospitality.sync_error_note(httpx.UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol.")),
+        hospitality.sync_error_note(httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))),
+        hospitality.sync_error_note(httpx.ConnectTimeout("timed out")),
+        hospitality.sync_error_note(ValueError("A calendar link must start with https://")),
+    ]
+    assert "https://" in notes[0] and "UnsupportedProtocol" not in notes[0]
+    assert "(404)" in notes[1]
+    assert "did not answer" in notes[2]
+    assert notes[3] == "A calendar link must start with https://"
+
+
 def test_re_adding_a_channel_does_not_import_everything_twice():
     from datetime import date, timedelta
     db = _fresh()

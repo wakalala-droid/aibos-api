@@ -1591,6 +1591,27 @@ def _check_feed_url(url: str) -> str:
     return parts.geturl()
 
 
+def sync_error_note(exc: Exception) -> str:
+    """What went wrong with a calendar sync, in words the owner can act on.
+
+    The raw exception went on screen: "UnsupportedProtocol: Request URL is
+    missing an 'http://' or 'https://' protocol." under a unit on a live
+    account, for weeks, with nothing saying what to do about it."""
+    name = type(exc).__name__
+    if isinstance(exc, ValueError):
+        return str(exc)                       # our own checks already speak plainly
+    if name in ("UnsupportedProtocol", "InvalidURL"):
+        return ("That calendar link is not a full web address. Copy the export link again from "
+                "Airbnb or Booking.com (it starts with https://) and paste it in.")
+    if name == "HTTPStatusError":
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        return (f"The calendar link answered with an error{f' ({code})' if code else ''}. "
+                "The listing may have been removed or the link changed: copy it again and paste it in.")
+    if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "PoolTimeout", "RemoteProtocolError"):
+        return "The calendar site did not answer. Nothing was changed; it is tried again at the next sync."
+    return f"The sync could not finish ({name}). Nothing was changed; it is tried again at the next sync."
+
+
 def _fetch_ical(url: str) -> str:
     """Fetch a remote .ics. Public hosts only, every redirect re-checked, and
     stopped at ICAL_MAX_BYTES: an owner-supplied link that serves an endless
@@ -1739,8 +1760,9 @@ def sync_channel(db, user_id: str, channel_id: str) -> dict:
          .eq("id", channel_id).eq("user_id", user_id).execute())
         return {"ok": True, "status": "ok", "note": note, **counts}
     except Exception as exc:  # noqa: BLE001
-        note = f"{type(exc).__name__}: {exc}"[:400]
-        log.error("[hospitality] channel sync failed channel=%s: %s", channel_id, note)
+        log.error("[hospitality] channel sync failed channel=%s: %s: %s",
+                  channel_id, type(exc).__name__, exc)
+        note = sync_error_note(exc)[:400]
         (db.table("channels").update(
             {"sync_status": "error", "last_synced_at": now, "last_sync_note": note})
          .eq("id", channel_id).eq("user_id", user_id).execute())
