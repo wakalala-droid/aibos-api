@@ -4722,6 +4722,91 @@ def hospitality_ical_public_feed(token: str):
     return Response(content=ics, media_type="text/calendar")
 
 
+# ── Payments nobody is watching ──────────────────────────────────────────────
+#
+# A mobile money payment is only ever confirmed when something asks the
+# provider. That was the customer's own page, polling. Close the checkout (or
+# the invoice payment page) before approving the prompt on the phone and the
+# money leaves their wallet while nothing ever asks: the plan is not switched
+# on and the invoice is not settled. The provider's callback cannot rescue it
+# either, because MTN and Airtel cannot send our secret header.
+#
+# So the server asks too: every few minutes, for payments still pending from
+# the last two days, through the same _settle paths the pages use (their
+# conditional claims make a page and the sweep safe to race).
+
+PAYMENTS_SWEEP_SECONDS = int(os.environ.get("PAYMENTS_SWEEP_SECONDS", "300"))
+PAYMENTS_SWEEP_HOURS = 48
+
+
+def sweep_pending_payments(db) -> dict:
+    live = any(payments.configured_networks().values()) or payments.SIMULATION_ENABLED
+    if db is None or not live:
+        return {"ok": True, "skipped": "mobile money is not switched on"}
+    from datetime import datetime, timedelta, timezone
+    since = (datetime.now(timezone.utc) - timedelta(hours=PAYMENTS_SWEEP_HOURS)).isoformat()
+    out = {"ok": True, "subscriptions": 0, "invoices": 0, "errors": 0}
+
+    try:
+        subs = (db.table("subscription_payments").select("*").eq("status", "pending")
+                .gte("created_at", since).limit(200).execute())
+        for row in getattr(subs, "data", None) or []:
+            try:
+                rec = PAYMENTS.get(row["reference"]) or _sub_row_to_rec(row)
+                PAYMENTS.setdefault(row["reference"], rec)
+                before = rec.get("status")
+                _settle(rec, payments.status(rec["network"], rec["reference"], rec.get("created_at")))
+                out["subscriptions"] += rec.get("status") != before
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                out["errors"] += 1
+                log.warning("[payments] sweep of %s failed: %s", row.get("reference"), e)
+    except Exception as e:  # noqa: BLE001 — pre-0033: no table to sweep
+        log.info("[payments] subscription sweep skipped: %s", e)
+
+    try:
+        invs = (db.table("invoice_payments").select("*").eq("status", "pending")
+                .gte("created_at", since).limit(200).execute())
+        for row in getattr(invs, "data", None) or []:
+            try:
+                created = entitlements._parse_ts(row.get("created_at"))
+                new = payments.status(row["network"], row["reference"], created.timestamp() if created else None)
+                if _settle_invoice_payment(db, row, new) != "pending":
+                    out["invoices"] += 1
+            except Exception as e:  # noqa: BLE001
+                out["errors"] += 1
+                log.warning("[pay] sweep of %s failed: %s", row.get("reference"), e)
+    except Exception as e:  # noqa: BLE001 — pre-0025: no table to sweep
+        log.info("[pay] invoice sweep skipped: %s", e)
+    return out
+
+
+@app.post("/payments/sweep")
+def payments_sweep(x_cron_secret: Optional[str] = Header(default=None)):
+    """Settle pending mobile money payments now. Cron-only, like sync-all."""
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    return sweep_pending_payments(get_db())
+
+
+@app.on_event("startup")
+def _start_payments_sweeper() -> None:
+    if PAYMENTS_SWEEP_SECONDS <= 0:
+        return
+    import threading
+
+    def loop():
+        while True:
+            time.sleep(PAYMENTS_SWEEP_SECONDS)
+            try:
+                result = sweep_pending_payments(get_db())
+                if result.get("subscriptions") or result.get("invoices") or result.get("errors"):
+                    log.info("[payments] sweep: %s", result)
+            except Exception as e:  # noqa: BLE001 — the loop must outlive any one failure
+                log.warning("[payments] sweep crashed: %s", e)
+
+    threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
+
+
 @app.post("/hospitality/sync-all")
 def hospitality_sync_all(x_cron_secret: Optional[str] = Header(default=None)):
     """

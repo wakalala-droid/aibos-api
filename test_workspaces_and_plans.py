@@ -182,6 +182,41 @@ def test_a_checkout_survives_a_restart_and_grants_once():
         main.PAYMENTS.clear()
 
 
+def test_a_payment_nobody_is_watching_still_switches_the_plan_on():
+    import payments
+    db = _fresh()
+    db.rows["profiles"].append({"id": "u1", "tier": "free"})
+    db.rows["subscription_payments"] = [{
+        "reference": "ref-away", "user_id": "u1", "network": "mtn", "plan": "pro",
+        "billing": "monthly", "amount": 500, "currency": "ZMW", "status": "pending",
+        "granted": False, "created_at": datetime.now(timezone.utc).isoformat()}]
+    main.PAYMENTS.clear()                  # the customer closed the page long ago
+    real = (main.get_db, payments.configured_networks, payments.status)
+    main.get_db = lambda: db
+    payments.configured_networks = lambda: {"mtn": True, "airtel": False}
+    payments.status = lambda network, reference, created_at=None: "successful"
+    entitlements._CACHE.clear()
+    try:
+        out = main.sweep_pending_payments(db)
+        assert out["subscriptions"] == 1
+        assert db.rows["profiles"][0]["tier"] == "pro"
+        assert db.rows["subscription_payments"][0]["granted"] is True
+        again = main.sweep_pending_payments(db)          # nothing pending is left
+        assert again["subscriptions"] == 0
+    finally:
+        main.get_db, payments.configured_networks, payments.status = real
+        main.PAYMENTS.clear()
+
+
+def test_the_sweep_does_nothing_while_mobile_money_is_off():
+    import payments
+    real = payments.configured_networks
+    payments.configured_networks = lambda: {"mtn": False, "airtel": False}
+    try:
+        assert "skipped" in main.sweep_pending_payments(_fresh())
+    finally:
+        payments.configured_networks = real
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
