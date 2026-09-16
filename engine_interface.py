@@ -136,21 +136,35 @@ class CashRunwayEngine(Engine):
         monthly = twin.get("monthly") or []
         if not monthly:
             return []
-        months = max(len(monthly), 1)
-        avg_burn = _f(twin.get("total_costs")) / months
         cash = _f(twin.get("cash"))
+        out_of_cash = cash <= 0
+        # Burn is what cash SHRINKS by: costs minus what came in, over the last
+        # three months. Cash divided by costs alone ignored every sale, so a
+        # profitable business holding a normal float was told, at high
+        # priority, to extend a runway that was growing.
+        recent = monthly[-3:]
+        if any("costs" in m or "revenue" in m for m in recent):
+            gross = sum(_f(m.get("costs")) for m in recent) / len(recent)
+            avg_burn = sum(_f(m.get("costs")) - _f(m.get("revenue")) for m in recent) / len(recent)
+        else:  # months without their own figures: spread the totals evenly
+            gross = _f(twin.get("total_costs")) / len(monthly)
+            avg_burn = (_f(twin.get("total_costs")) - _f(twin.get("total_revenue"))) / len(monthly)
         if avg_burn <= 0:
-            return []
+            if not out_of_cash:
+                return []
+            # Below zero is worth saying even while the months are profitable.
+            avg_burn = gross
+            if avg_burn <= 0:
+                return []
         # Runway is never negative — a negative balance means you're already out.
         runway = max(cash, 0.0) / avg_burn
         if runway >= 3:
             return []
-        out_of_cash = cash <= 0
         rationale = (
             f"Your cash balance is {cash:,.0f} while you burn about {avg_burn:,.0f}/month — "
             "you're already out of runway."
             if out_of_cash else
-            f"At the current burn of about {avg_burn:,.0f}/month you have "
+            f"Spending about {avg_burn:,.0f}/month more than comes in, you have "
             f"roughly {runway:.1f} months of cash left."
         )
         return [Recommendation(
@@ -162,7 +176,7 @@ class CashRunwayEngine(Engine):
             source_engine=self.name,
             evidence=[
                 {"label": "Cash on hand", "value": f"{cash:,.0f}"},
-                {"label": "Avg monthly burn", "value": f"{avg_burn:,.0f}"},
+                {"label": "Avg monthly burn (last 3 months)", "value": f"{avg_burn:,.0f}"},
                 {"label": "Runway", "value": f"{runway:.1f} months"},
             ],
             alternatives=["Accelerate receivables collection", "Defer non-essential purchases",

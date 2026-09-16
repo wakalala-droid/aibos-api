@@ -191,9 +191,11 @@ def test_explainability_contract():
 
 def test_reference_engines_run():
     import engine_interface as ei
-    # Low cash + thin margin twin → both engines fire, all recs valid & explained.
-    twin = {"cash": 500, "total_costs": 6000, "total_revenue": 6300,
-            "total_profit": 300, "avg_margin": 4.8, "monthly": [{"month": "2026-01"}, {"month": "2026-02"}, {"month": "2026-03"}]}
+    # Low cash, spending more than comes in, margin below zero → both engines
+    # fire, all recs valid & explained. (A PROFITABLE twin no longer trips the
+    # runway engine: runway is cash over net burn, not over gross costs.)
+    twin = {"cash": 500, "total_costs": 6000, "total_revenue": 5400,
+            "total_profit": -600, "avg_margin": -11.1, "monthly": [{"month": "2026-01"}, {"month": "2026-02"}, {"month": "2026-03"}]}
     recs = ei.run_all(twin, [])
     names = {r["source_engine"] for r in recs}
     assert "cash_runway" in names and "profitability" in names
@@ -319,6 +321,14 @@ def test_run_all_skips_engine_atomically():
         assert ei.run_all({"monthly": []}, []) == []
     finally:
         ei._ENGINES[:] = saved
+
+
+def test_a_profitable_business_is_not_told_to_extend_its_runway():
+    import engine_interface as ei
+    twin = {"cash": 5000, "total_costs": 40000, "total_revenue": 60000, "total_profit": 20000,
+            "avg_margin": 33, "monthly": [{"month": "2026-07", "revenue": 30000, "costs": 20000},
+                                          {"month": "2026-08", "revenue": 30000, "costs": 20000}]}
+    assert not [r for r in ei.run_all(twin, []) if r["source_engine"] == "cash_runway"]
 
 
 def test_cash_runway_out_of_cash():
