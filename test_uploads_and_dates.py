@@ -122,7 +122,11 @@ def _import_client(db):
     import membership
     from fastapi.testclient import TestClient
     main.get_db = lambda: db
-    main.app.dependency_overrides[membership.require_write] = (
+    # The callable the routes actually hold: another suite may have reloaded
+    # membership, leaving membership.require_write a different function.
+    route = next(r for r in main.app.routes if getattr(r, "path", "") == "/events/excel/commit-file")
+    require_write = next(d.call for d in route.dependant.dependencies if d.call.__name__ == "require_write")
+    main.app.dependency_overrides[require_write] = (
         lambda: membership.Context(tenant="u1", actor="u1", role="owner", business_id="b1"))
     return TestClient(main.app)
 
