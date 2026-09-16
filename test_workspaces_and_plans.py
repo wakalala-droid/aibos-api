@@ -115,6 +115,22 @@ def test_a_paid_plan_works_through_the_grace_then_lapses():
     assert lapsed["paid_tier"] == "pro" and "Renew" in lapsed["note"]
 
 
+def test_a_cached_answer_still_says_lapsed_and_until_when():
+    now = datetime.now(timezone.utc)
+    for until, reason in ((now - timedelta(days=30), "expired"), (now + timedelta(days=20), "ok")):
+        db = _profile_db({"tier": "pro", "tier_source": "payment", "paid_until": until.isoformat()})
+        first = _detail(db)
+        real = entitlements.get_db
+        entitlements.get_db = lambda: db
+        try:
+            again = entitlements.tier_detail("u1")      # served from the cache
+        finally:
+            entitlements.get_db = real
+        assert again.get("cached") is True
+        assert again["reason"] == first["reason"] == reason
+        assert again["paid_until"] == first["paid_until"]
+
+
 def test_admin_grants_and_rows_without_a_period_never_lapse():
     old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
     assert _detail(_profile_db({"tier": "growth", "tier_source": "admin_demo",

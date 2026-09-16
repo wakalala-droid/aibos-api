@@ -76,8 +76,10 @@ _PAID_ORDER = ["pro", "proplus", "growth"]
 
 _VALID_TIERS = set(_ACCESS.keys())
 
-# Small TTL cache: user_id -> (tier, expires_at).
-_CACHE: dict[str, tuple[str, float]] = {}
+# Small TTL cache: user_id -> (tier, expires_at, detail). The detail keeps
+# why and until when, so a cached answer still says a plan has lapsed and when
+# it runs out instead of forgetting both for the rest of the minute.
+_CACHE: dict[str, tuple] = {}
 _TTL = 60.0
 _CACHE_MAX = 5000
 
@@ -128,7 +130,8 @@ def tier_detail(user_id: str) -> dict:
 
     hit = _CACHE.get(user_id)
     if hit and time.time() < hit[1]:
-        return {"tier": hit[0], "reason": "ok", "row": True, "cached": True}
+        extra = hit[2] if len(hit) > 2 else {}
+        return {"tier": hit[0], "reason": "ok", "row": True, **extra, "cached": True}
 
     db = get_db()
     if db is None:
@@ -181,22 +184,20 @@ def tier_detail(user_id: str) -> dict:
     if tier != "free" and until is not None:
         if datetime.now(timezone.utc) > until + timedelta(days=GRACE_DAYS):
             # Cached like any answer: a renewal calls invalidate().
-            _cache_put(user_id, "free")
-            return {"tier": "free", "reason": "expired", "row": True, "paid_tier": tier,
-                    "paid_until": until.isoformat(),
-                    "note": f"The {_TIER_LABEL.get(tier, tier)} plan ran until "
-                            f"{until.strftime('%d %B %Y')}. Renew it to switch everything back on."}
-    _cache_put(user_id, tier)
-    out = {"tier": tier, "reason": "ok", "row": True}
-    if until is not None:
-        out["paid_until"] = until.isoformat()
-    return out
+            lapsed = {"reason": "expired", "paid_tier": tier, "paid_until": until.isoformat(),
+                      "note": f"The {_TIER_LABEL.get(tier, tier)} plan ran until "
+                              f"{until.strftime('%d %B %Y')}. Renew it to switch everything back on."}
+            _cache_put(user_id, "free", lapsed)
+            return {"tier": "free", "row": True, **lapsed}
+    extra = {"paid_until": until.isoformat()} if until is not None else {}
+    _cache_put(user_id, tier, extra)
+    return {"tier": tier, "reason": "ok", "row": True, **extra}
 
 
-def _cache_put(user_id: str, tier: str) -> None:
+def _cache_put(user_id: str, tier: str, extra: dict | None = None) -> None:
     if len(_CACHE) >= _CACHE_MAX:
         _CACHE.clear()
-    _CACHE[user_id] = (tier, time.time() + _TTL)
+    _CACHE[user_id] = (tier, time.time() + _TTL, extra or {})
 
 
 def user_tier(user_id: str) -> str:
