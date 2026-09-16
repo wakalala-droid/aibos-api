@@ -1639,9 +1639,15 @@ def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
                 if not str(e["uid"]).endswith("@" + _ICAL_UID_DOMAIN)}
     skipped = len(events) - len(incoming)
 
-    existing_res = (db.table("bookings").select("id,external_uid,check_in,check_out,status")
-                    .eq("user_id", user_id).eq("channel_id", channel_id)
-                    .not_.is_("external_uid", "null").execute())
+    try:
+        existing_res = (db.table("bookings")
+                        .select("id,external_uid,check_in,check_out,status,cancelled_at,updated_at")
+                        .eq("user_id", user_id).eq("channel_id", channel_id)
+                        .not_.is_("external_uid", "null").execute())
+    except Exception:  # noqa: BLE001 — an older schema without those two columns
+        existing_res = (db.table("bookings").select("id,external_uid,check_in,check_out,status")
+                        .eq("user_id", user_id).eq("channel_id", channel_id)
+                        .not_.is_("external_uid", "null").execute())
     existing = {r["external_uid"]: r for r in (getattr(existing_res, "data", None) or [])}
 
     # Orphans: imported onto this unit by a channel that has since been removed
@@ -1682,15 +1688,26 @@ def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
 
     # Reconcile removals: imported blocks still blocking, no longer in the feed,
     # and not yet over. A stay that has ended leaves the feed because it ended.
+    restored = 0
     for uid, prev in existing.items():
-        if uid not in incoming and prev["status"] in BLOCKING_STATUSES \
-                and str(prev.get("check_out") or "")[:10] > today:
+        if uid in incoming:
+            continue
+        check_out = str(prev.get("check_out") or "")[:10]
+        if prev["status"] in BLOCKING_STATUSES and check_out > today:
             (db.table("bookings").update({"status": "cancelled"})
              .eq("id", prev["id"]).eq("user_id", user_id).execute())
             cancelled += 1
+        elif (prev["status"] == "cancelled" and not prev.get("cancelled_at") and check_out
+              and check_out <= today and str(prev.get("updated_at") or "")[:10] >= check_out):
+            # Undo the old mistake: the sync (never the owner, whose cancel sets
+            # cancelled_at) called this stay off on or after its last night,
+            # which is when a feed drops a stay that happened.
+            (db.table("bookings").update({"status": "confirmed"})
+             .eq("id", prev["id"]).eq("user_id", user_id).execute())
+            restored += 1
 
     return {"imported": imported, "updated": updated,
-            "cancelled": cancelled, "skipped_own": skipped}
+            "cancelled": cancelled, "skipped_own": skipped, "restored": restored}
 
 
 def sync_channel(db, user_id: str, channel_id: str) -> dict:
@@ -1715,7 +1732,8 @@ def sync_channel(db, user_id: str, channel_id: str) -> dict:
         events = parse_ical(text)
         counts = _apply_import(db, user_id, channel, events)
         note = (f"{counts['imported']} added, {counts['updated']} updated, "
-                f"{counts['cancelled']} cancelled ({counts['skipped_own']} own skipped).")
+                f"{counts['cancelled']} cancelled ({counts['skipped_own']} own skipped)."
+                + (f" {counts['restored']} finished stays restored." if counts.get("restored") else ""))
         (db.table("channels").update(
             {"sync_status": "ok", "last_synced_at": now, "last_sync_note": note})
          .eq("id", channel_id).eq("user_id", user_id).execute())

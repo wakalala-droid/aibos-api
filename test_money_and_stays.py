@@ -117,6 +117,14 @@ def test_a_finished_stay_leaving_the_feed_is_not_called_off():
     assert by_uid["past@airbnb.com"]["status"] == "confirmed"
     assert by_uid["next@airbnb.com"]["status"] == "cancelled" and counts["cancelled"] == 1
 
+    # A stay the old sync called off after it ended is put back; one the
+    # guest cancelled before arriving is left alone.
+    by_uid["past@airbnb.com"].update({"status": "cancelled", "updated_at": past_out + "T06:00:00+00:00"})
+    by_uid["next@airbnb.com"]["updated_at"] = (date.today() - timedelta(days=1)).isoformat()
+    later = hospitality._apply_import(db, "u1", channel, [])
+    assert by_uid["past@airbnb.com"]["status"] == "confirmed" and later["restored"] == 1
+    assert by_uid["next@airbnb.com"]["status"] == "cancelled"
+
 
 def test_re_adding_a_channel_does_not_import_everything_twice():
     from datetime import date, timedelta
