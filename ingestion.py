@@ -254,14 +254,46 @@ def infer_type(value: str, default: str) -> str:
     return default if default in EVENT_TYPES else "Expense"
 
 
+_ISO_DATE = re.compile(r"^\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
+
+# Excel stores a date as the number of days since 30 Dec 1899. A cell that was
+# never formatted as a date arrives as that bare number.
+_EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
+
+
 def _parse_date(value) -> str | None:
+    """A date from a spreadsheet cell, a QR code or a receipt, as ISO UTC.
+
+    Day-first is right for what a Zambian owner TYPES ("04/03/2026" is 4 March),
+    and it was applied to everything. pandas honours dayfirst even on ISO
+    strings, so "2026-03-04" came back as 3 April. Every real date cell in an
+    Excel import arrives in exactly that form, and so does every date the
+    receipt reader returns, so any day of the month up to the 12th was booked in
+    the wrong month. Year-first text is never day-first.
+    """
     if value is None or value == "":
         return None
     try:
-        ts = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        if pd.isna(ts):
-            return None
-        return ts.to_pydatetime().replace(tzinfo=timezone.utc).isoformat()
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            # A plausible Excel serial (1955..2119); anything else is not a date.
+            if not 20000 <= float(value) <= 80000:
+                return None
+            from datetime import timedelta
+            return (_EXCEL_EPOCH + timedelta(days=float(value))).isoformat()
+        else:
+            text = str(value).strip()
+            if re.fullmatch(r"\d{5}(\.\d+)?", text):
+                return _parse_date(float(text))
+            ts = pd.to_datetime(text, errors="coerce",
+                                dayfirst=not _ISO_DATE.match(text))
+            if pd.isna(ts):
+                return None
+            dt = ts.to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
     except Exception:  # noqa: BLE001
         return None
 

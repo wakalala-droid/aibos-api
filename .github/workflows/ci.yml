@@ -1,7 +1,7 @@
 # CI gate — audit item #12.
-# Railway pins the last good image when a deploy crashes, so a broken push
-# LOOKS live while serving old code (bitten 2026-07-05). This workflow is the
-# red/green truth: if it's red, the push never really shipped.
+# A host that fails to boot a new image keeps serving the last good one, so a
+# broken push LOOKS live while serving old code (bitten on Railway 2026-07-05).
+# This workflow is the red/green truth: if it's red, the push never really shipped.
 name: CI
 
 on:
@@ -22,117 +22,24 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
 
       - name: Import gate
         # The same pre-push ritual, enforced: if main.py cannot import,
-        # uvicorn cannot boot and Railway will silently keep the old image.
+        # uvicorn cannot boot and the host will silently keep the old image.
         run: python -c "import main"
 
-      - name: Spine tests
-        run: python test_spine.py
-
-      - name: Payroll tests
-        run: python test_payroll.py
-
-      - name: Parties & customer-intel tests
-        run: python test_parties.py
-
-      - name: Invoice tests
-        run: python test_invoices.py
-
-      - name: Invoice payment-link tests
-        run: python test_invoice_payments.py
-
-      - name: CFO tools tests
-        run: python test_cfo_tools.py
-
-      - name: Cabinet store tests
-        run: python test_cabinet_store.py
-
-      - name: WhatsApp bot tests
-        run: python test_whatsapp_bot.py
-
-      - name: Investigate tests
-        run: python test_investigate.py
-
-      - name: Debtors tests
-        run: python test_debtors.py
-
-      - name: Cash forecast tests
-        run: python test_cash_forecast.py
-
-      - name: Recommendations ledger tests
-        run: python test_rec_store.py
-
-      - name: LLM fallback tests
-        run: python test_llm.py
-
-      - name: Entitlements tests
-        run: python test_entitlements.py
-
-      - name: Booking-engine tests
-        # The owner's half: confirming, declining, the clash exception and the
-        # guest join. Also asserts BOOKING_STATUSES matches the CHECK constraint
-        # in the aibos repo's migration 0029 — a status Python accepts and
-        # Postgres rejects loses a real booking when somebody presses the button.
-        run: python test_booking_engine.py
-
-      - name: Public booking-surface tests
-        # /public/stay/* is unauthenticated by design. These hold the boundary:
-        # a token never reaches another owner's property, a request lands as
-        # pending, and nothing public can post revenue.
-        run: python test_public_stay.py
-
-      - name: Route scoping tests
-        # Asserts hospitality follows the business and payroll stays with the
-        # owner. These routes resolved their data from the CALLER's own id,
-        # which is identical to the business until somebody is invited.
-        run: python test_route_scoping.py
-
-      - name: Guest email tests
-        # The guest must never hear from AI-BOS: every email is read as a guest
-        # would and searched for the platform's name. Also holds off-by-default,
-        # never the same email twice, and never the owner's private reason.
-        run: python test_guest_mail.py
-
-      - name: Alert reach tests
-        # A mail key with no address on the profile sends nothing and says
-        # nothing. /notify/reach is what says so.
-        run: python test_notify_reach.py
-
-      - name: Compliance calendar tests
-        run: python test_compliance.py
-
-      - name: Loyverse importer tests
-        run: python test_loyverse.py
-
-      - name: Membership / team-roles tests
-        run: python test_membership.py
-
-      - name: Budgets tests
-        run: python test_budgets.py
-
-      - name: Exports tests
-        run: python test_exports.py
-
-      - name: Rate-limit tests
-        run: python test_rate_limit.py
-
-      - name: Multi-business tests
-        run: python test_businesses.py
-
-      - name: Chat context tests
-        run: python test_chat_context.py
-
-      - name: Schema (migration) contract tests
-        # Asserts main.EXPECTS_MIGRATION — what /health reports after a deploy —
-        # matches schema_contract.json, which the aibos repo checks against the
-        # migrations actually on disk. See schema_contract.json.
-        run: python test_schema_contract.py
-
-      - name: Tier contract tests
-        # Asserts entitlements.py + main.py PLAN_PRICES match tier_contract.json,
-        # which the aibos repo checks lib/tiers.ts against. The two repos cannot
-        # deploy atomically and used to drift silently — see tier_contract.json.
-        run: python test_tier_contract.py
+      - name: Every test file
+        # This used to be one step per file, listed by hand. A list maintained
+        # by hand is a list that goes stale: test_identity.py was never added to
+        # it, so its 24 tests never ran here. pytest finds every test_*.py.
+        #
+        # What the suites guard, for whoever reads a red run:
+        #   books_integrity / money_and_stays — every posting lands in real
+        #     books, the rebuild reads past 1,000 events, Start Fresh touches one
+        #     business, a sale or payment is posted once.
+        #   booking_engine / public_stay — BOOKING_STATUSES matches the CHECK in
+        #     migration 0029; the public site can never post revenue.
+        #   guest_mail — the guest never hears from AI-BOS by name.
+        #   tier_contract / schema_contract — the numbers the aibos repo checks.
+        run: python -m pytest -q

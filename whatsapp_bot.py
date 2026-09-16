@@ -109,8 +109,25 @@ _UNKNOWN = ("This number isn't linked to an AIBOS account yet. In the app: "
             "Profile → WhatsApp number, save this number, then text me again.")
 
 
-def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW") -> str:
+def _already_recorded(db, user_id: str, message_id: str | None) -> bool:
+    """Meta redelivers a webhook it did not see a 200 for. Without this each
+    redelivery recorded the same message again."""
+    if not message_id:
+        return False
+    try:
+        res = (db.table("business_events").select("id").eq("user_id", user_id)
+               .eq("payload->>whatsapp_message_id", message_id).limit(1).execute())
+        return bool(getattr(res, "data", None))
+    except Exception as exc:  # noqa: BLE001 — fail open: a duplicate beats a lost sale
+        log.info("[whatsapp] duplicate check failed: %s", exc)
+        return False
+
+
+def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW",
+                message_id: str | None = None) -> str:
     """Classify one message into a proposed event. Returns the reply text."""
+    if _already_recorded(db, user_id, message_id):
+        return "Already got that one. ✅"
     completion = llm.chat_create(
         client,
         messages=nervous.classify_prompt(text, currency),
@@ -120,13 +137,20 @@ def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW") -> s
     if not proposal.get("event_type"):
         return _HELP
 
-    ev = nervous.ingest(db, user_id, nervous.EventIn(
-        event_type=proposal["event_type"],
-        payload=proposal.get("payload") or {},
-        source="api",                                  # transport; stays PENDING
-        confidence=float(proposal.get("confidence") or 0.6),
-        note="recorded via WhatsApp",
-    ), default_currency=currency)
+    payload = dict(proposal.get("payload") or {})
+    if message_id:
+        payload["whatsapp_message_id"] = str(message_id)[:120]
+    try:
+        ev = nervous.ingest(db, user_id, nervous.EventIn(
+            event_type=proposal["event_type"],
+            payload=payload,
+            source="api",                              # transport; stays PENDING
+            confidence=float(proposal.get("confidence") or 0.6),
+            note="recorded via WhatsApp",
+        ), default_currency=currency)
+    except nervous.PipelineError as e:
+        # "sold some bread" has no amount. The owner used to hear nothing at all.
+        return f"I couldn't save that yet: {e}\n\n{_HELP}"
 
     amt = (ev.get("payload") or {}).get("amount")
     sym = "K" if currency == "ZMW" else currency
@@ -151,7 +175,8 @@ def process_webhook(db, payload: dict, client) -> dict:
                 _reply(msg["from"], "Recording by WhatsApp isn't switched on yet — use the app for now.")
                 skipped += 1
                 continue
-            reply = handle_text(db, user_id, msg["text"], client, currency)
+            reply = handle_text(db, user_id, msg["text"], client, currency,
+                                message_id=msg.get("message_id"))
             _reply(msg["from"], reply)
             handled += 1
         except Exception as exc:  # noqa: BLE001

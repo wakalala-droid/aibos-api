@@ -24,6 +24,38 @@ log = logging.getLogger("aibos.db")
 _client = None  # lazily created singleton
 
 
+# PostgREST never returns more than its max_rows setting in one response, and
+# Supabase ships that at 1000. A `.limit(10000)` does not raise it: the request
+# quietly comes back with 1000 rows and nothing says the rest exist. The twin
+# rebuild read every confirmed event in ONE request, so a business's books
+# stopped moving at its 1000th entry. Anything that needs more than a page
+# reads through fetch_all.
+PAGE_SIZE = 1000
+
+
+def fetch_all(make_query, limit: int | None = None, page_size: int = PAGE_SIZE) -> list:
+    """Every row a query matches, a page at a time.
+
+    `make_query` builds a FRESH query each call (the builders are mutable and
+    re-applying .range() to one of them stacks parameters). It must already
+    carry a deterministic order, or rows can move between pages. `limit` caps
+    the total; None reads to the end.
+    """
+    out: list = []
+    offset = 0
+    while True:
+        want = page_size if limit is None else min(page_size, limit - len(out))
+        if want <= 0:
+            break
+        res = make_query().range(offset, offset + want - 1).execute()
+        rows = getattr(res, "data", None) or []
+        out.extend(rows)
+        if len(rows) < want:
+            break
+        offset += len(rows)
+    return out
+
+
 def supabase_enabled() -> bool:
     """True when the backend has the config needed to talk to Supabase."""
     return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"))
@@ -157,6 +189,7 @@ _SCHEMA_PROBES = (
     (30, "notifications", "id"),
     (31, "properties", "guest_emails_enabled"),
     (32, "properties", "guest_email_logo_url"),
+    (33, "profiles", "paid_until"),
 )
 
 _schema_cache: tuple[dict, float] | None = None

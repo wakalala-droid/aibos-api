@@ -205,6 +205,10 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
         raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
 
     validate(ev)
+    # A caller with no request context (hospitality, payroll, WhatsApp) passes no
+    # business. The event must still land in real books: a NULL business_id row
+    # is invisible to every business-scoped read on a post-0023 database.
+    business_id = twin._books_for(db, user_id, business_id)
     payload = normalize(ev, default_currency=default_currency, db=db, user_id=user_id)
     confidence = decide_confidence(ev)
     status = decide_status(ev, confidence, actor_role=actor_role)
@@ -243,41 +247,93 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
     return saved
 
 
+BATCH_INSERT_SIZE = 500
+
+
 def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str = "ZMW",
-                 business_id: str | None = None) -> dict:
+                 business_id: str | None = None, actor_role: str = "owner",
+                 actor_id: str | None = None) -> dict:
     """
     Validate+publish many events, rebuilding the twin once at the end (efficient for
     Excel/POS imports). Per-row failures are collected, not fatal — partial import is
     a Directive requirement (Initiative 2). Returns {saved, errors}.
+
+    Built for a spreadsheet of a few thousand rows. It used to spend six database
+    round trips per row (three memory lookups, an insert, two party writes), so a
+    2,000-row import needed about 12,000 of them and ran out of time long before
+    the proxy did. Memory is read once, rows go in 500 at a time, and each party
+    is written once however many rows name it.
     """
     if db is None:
         raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
 
-    saved, errors = [], []
-    any_confirmed = False
+    business_id = twin._books_for(db, user_id, business_id)
+    actor = actor_id or user_id
+
+    # Business Memory, loaded once for the whole file (see normalize()).
+    learned = {kind: memory.recall_all(db, user_id, kind)
+               for kind in ("alias", "category_for_party")}
+
+    def _lookup(kind, key):
+        return (learned.get(kind) or {}).get(key)
+
+    prepared: list[tuple[int, dict]] = []
+    errors: list[dict] = []
     for i, ev in enumerate(events):
         try:
             validate(ev)
-            payload = normalize(ev, default_currency=default_currency, db=db, user_id=user_id)
+            payload = normalize(ev, default_currency=default_currency)
+            payload = memory.apply_memories(ev.event_type, payload, _lookup)
             confidence = decide_confidence(ev)
-            status = decide_status(ev, confidence)
+            status = decide_status(ev, confidence, actor_role=actor_role)
             row = {
                 "schema_version": 1, "user_id": user_id, "event_type": ev.event_type,
                 "occurred_at": ev.occurred_at or _now_iso(), "recorded_at": _now_iso(),
                 "source": ev.source, "confidence": confidence, "status": status,
                 "payload": payload, "corrections": {},
-                "audit": [_audit_entry(user_id, "created")], "created_by": user_id,
+                "audit": [_audit_entry(actor, "created",
+                                       note=f"by {actor_role}" if actor_role != "owner" else None)],
+                "created_by": actor,
             }
             if business_id is not None:
                 row["business_id"] = business_id
-            res = db.table("business_events").insert(row).execute()
-            saved.append((getattr(res, "data", None) or [row])[0])
-            parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"])
-            any_confirmed = any_confirmed or status == "confirmed"
+            prepared.append((i, row))
         except Exception as e:  # noqa: BLE001
             errors.append({"index": i, "error": str(e)})
 
-    if any_confirmed:
+    saved: list[dict] = []
+    for start in range(0, len(prepared), BATCH_INSERT_SIZE):
+        chunk = prepared[start:start + BATCH_INSERT_SIZE]
+        try:
+            res = db.table("business_events").insert([row for _, row in chunk]).execute()
+            data = getattr(res, "data", None)
+            saved.extend(data if data else [row for _, row in chunk])
+        except Exception:  # noqa: BLE001 — one bad row must not sink its 499 neighbours
+            for i, row in chunk:
+                try:
+                    res = db.table("business_events").insert(row).execute()
+                    saved.append((getattr(res, "data", None) or [row])[0])
+                except Exception as e:  # noqa: BLE001
+                    errors.append({"index": i, "error": str(e)})
+
+    # Parties: written once per distinct name (twice when it was seen on more
+    # than one date, so a new party's first_seen is its EARLIEST sighting and
+    # last_seen its latest), with every side of the counter it appeared on.
+    agg: dict[str, dict] = {}
+    for row in saved:
+        when = str(row.get("occurred_at") or "")
+        for mention in parties_api.extract_parties(row.get("payload") or {}):
+            a = agg.setdefault(mention["key"], {"names": {}, "first": when, "last": when})
+            a["names"][mention["kind"]] = mention["name"]
+            a["first"] = min(a["first"], when) if a["first"] else when
+            a["last"] = max(a["last"], when)
+    for a in agg.values():
+        parties_api.upsert_from_event(db, user_id, a["names"], a["first"] or None, business_id)
+        if a["last"] and a["last"] != a["first"]:
+            parties_api.upsert_from_event(db, user_id, a["names"], a["last"], business_id)
+
+    errors.sort(key=lambda e: e.get("index", 0))
+    if any(r.get("status") == "confirmed" for r in saved):
         twin.rebuild(db, user_id, business_id)
     return {"saved": saved, "errors": errors, "saved_count": len(saved), "error_count": len(errors)}
 
@@ -290,6 +346,18 @@ def _get_event(db, user_id: str, event_id: str) -> dict:
     if not rows:
         raise PipelineError("Event not found.")
     return rows[0]
+
+
+def _check_actor(ev: dict, actor_role: str, actor_id: str | None) -> None:
+    """Owners may change any entry. Staff may only fix their OWN entries that are
+    still waiting for the owner: once confirmed, an entry is the owner's record,
+    and a cashier voiding yesterday's takings is exactly what the trust gate is
+    for. Accountants never reach here (the route is write-only)."""
+    if actor_role == "owner":
+        return
+    if ev.get("status") != "pending" or (actor_id and ev.get("created_by") != actor_id):
+        raise PipelineError("Only the owner can change an entry once it is confirmed, "
+                            "or one somebody else recorded.")
 
 
 def confirm(db, user_id: str, event_id: str) -> dict:
@@ -306,7 +374,8 @@ def confirm(db, user_id: str, event_id: str) -> dict:
     return (getattr(res, "data", None) or [ev])[0]
 
 
-def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
+def correct(db, user_id: str, event_id: str, patch: dict,
+            actor_role: str = "owner", actor_id: str | None = None) -> dict:
     """
     Apply a user correction to an event. The diff is recorded in `corrections`
     (Business-Memory capture seam, Phase 5) and the change is audited. Only
@@ -315,6 +384,7 @@ def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
     ev = _get_event(db, user_id, event_id)
     if ev["status"] == "void":
         raise PipelineError("Cannot edit a voided event.")
+    _check_actor(ev, actor_role, actor_id)
 
     new_payload = dict(ev.get("payload") or {})
     changes = {}
@@ -326,9 +396,14 @@ def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
 
     update: dict[str, Any] = {"payload": new_payload}
     if patch.get("occurred_at"):
-        if ev.get("occurred_at") != patch["occurred_at"]:
-            changes["occurred_at"] = {"from": ev.get("occurred_at"), "to": patch["occurred_at"]}
-        update["occurred_at"] = patch["occurred_at"]
+        when = str(patch["occurred_at"])
+        try:
+            datetime.fromisoformat(when.replace("Z", "+00:00"))
+        except ValueError:
+            raise PipelineError("occurred_at must be a date, e.g. 2026-09-16.")
+        if ev.get("occurred_at") != when:
+            changes["occurred_at"] = {"from": ev.get("occurred_at"), "to": when}
+        update["occurred_at"] = when
     if patch.get("event_type"):
         if patch["event_type"] not in EVENT_TYPES:
             raise PipelineError(f"Unknown event_type '{patch['event_type']}'.")
@@ -336,12 +411,21 @@ def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
             changes["event_type"] = {"from": ev.get("event_type"), "to": patch["event_type"]}
         update["event_type"] = patch["event_type"]
 
+    # The corrected event must still be a valid event. Without this an edit
+    # could set amount to "abc" or -500 on a CONFIRMED entry, which ingest()
+    # would never have accepted, and the books would quietly count it as zero
+    # or as money flowing the wrong way.
+    validate(EventIn(event_type=update.get("event_type", ev.get("event_type")),
+                     payload=new_payload, source=ev.get("source") or "manual"))
+    if new_payload.get("amount") is not None:
+        new_payload["amount"] = float(new_payload["amount"])
+
     # Accumulate corrections (don't overwrite prior ones) + audit.
     corrections = dict(ev.get("corrections") or {})
     if changes:
         corrections[_now_iso()] = changes
     update["corrections"] = corrections
-    update["audit"] = (ev.get("audit") or []) + [_audit_entry(user_id, "corrected", note=json.dumps(changes) if changes else None)]
+    update["audit"] = (ev.get("audit") or []) + [_audit_entry(actor_id or user_id, "corrected", note=json.dumps(changes) if changes else None)]
 
     res = (
         db.table("business_events")
@@ -355,10 +439,14 @@ def correct(db, user_id: str, event_id: str, patch: dict) -> dict:
     return (getattr(res, "data", None) or [ev])[0]
 
 
-def void(db, user_id: str, event_id: str, reason: str | None = None) -> dict:
+def void(db, user_id: str, event_id: str, reason: str | None = None,
+         actor_role: str = "owner", actor_id: str | None = None) -> dict:
     """Soft-delete: never hard-delete (Initiative 5 audit trail / rollback)."""
     ev = _get_event(db, user_id, event_id)
-    audit = (ev.get("audit") or []) + [_audit_entry(user_id, "voided", note=reason)]
+    if ev["status"] == "void":
+        return ev                         # already void — a second press changes nothing
+    _check_actor(ev, actor_role, actor_id)
+    audit = (ev.get("audit") or []) + [_audit_entry(actor_id or user_id, "voided", note=reason)]
     res = (
         db.table("business_events")
         .update({"status": "void", "audit": audit})
@@ -372,7 +460,8 @@ def void(db, user_id: str, event_id: str, reason: str | None = None) -> dict:
 ARCHIVE_RETENTION_DAYS = 30
 
 
-def _archive_events(db, user_id: str, source: str | None) -> int:
+def _archive_events(db, user_id: str, source: str | None,
+                    business_id: str | None = None) -> int:
     """Copy the rows a reset is about to delete into business_events_archive
     (migration 0017), making an intentional reset recoverable for 30 days.
 
@@ -390,10 +479,16 @@ def _archive_events(db, user_id: str, source: str | None) -> int:
         db.table("business_events_archive").delete().eq("user_id", user_id) \
             .lt("archived_at", cutoff).execute()
 
-        q = db.table("business_events").select("*").eq("user_id", user_id)
-        if source:
-            q = q.eq("source", source)
-        rows = getattr(q.execute(), "data", None) or []
+        def _q():
+            q = db.table("business_events").select("*").eq("user_id", user_id)
+            if business_id is not None:
+                q = q.eq("business_id", business_id)
+            if source:
+                q = q.eq("source", source)
+            return q.order("occurred_at").order("id")
+
+        from db import fetch_all
+        rows = fetch_all(_q)
         if not rows:
             return 0
 
@@ -418,7 +513,8 @@ def _archive_events(db, user_id: str, source: str | None) -> int:
 def reset_business(db, user_id: str, *, source: str | None = None,
                    wipe_memory: bool = False, wipe_products: bool = False,
                    wipe_schedule: bool = False, wipe_parties: bool = False,
-                   reset_opening_cash: bool = False) -> dict:
+                   reset_opening_cash: bool = False,
+                   business_id: str | None = None) -> dict:
     """
     START AFRESH — delete this user's recorded data and replay what's left into
     the twin. This is the ONE sanctioned hard-delete in the spine: void() covers
@@ -442,27 +538,38 @@ def reset_business(db, user_id: str, *, source: str | None = None,
     if db is None:
         raise RuntimeError("Supabase not configured — the event pipeline is unavailable.")
 
-    def _wipe(table: str, **filters) -> int:
+    # ONE business's books. This used to delete by user_id alone, so an owner
+    # with a shop and a salon who pressed Start Fresh on the salon wiped the
+    # shop too, then rebuilt neither. Business Memory stays tenant-wide on
+    # purpose: learned supplier names belong to the owner, not one venture.
+    business_id = twin._books_for(db, user_id, business_id)
+
+    def _wipe(table: str, scoped: bool = True, **filters) -> int:
         q = db.table(table).delete().eq("user_id", user_id)
+        if scoped and business_id is not None:
+            q = q.eq("business_id", business_id)
         for k, v in filters.items():
             q = q.eq(k, v)
         res = q.execute()
         return len(getattr(res, "data", None) or [])
 
-    archived = _archive_events(db, user_id, source)  # abort-on-failure, before any delete
+    archived = _archive_events(db, user_id, source, business_id)  # abort-on-failure, before any delete
 
     summary = {
         "archived_events": archived,
         "deleted_events": _wipe("business_events", **({"source": source} if source else {})),
-        "deleted_memory": _wipe("business_memory") if wipe_memory else 0,
+        "deleted_memory": _wipe("business_memory", scoped=False) if wipe_memory else 0,
         "deleted_products": _wipe("products") if wipe_products else 0,
         "deleted_schedule": _wipe("schedule_items") if wipe_schedule else 0,
         "deleted_parties": _wipe("parties") if wipe_parties else 0,
     }
     if reset_opening_cash:
-        db.table("business_state").update({"opening_cash": 0}).eq("user_id", user_id).execute()
+        q = db.table("business_state").update({"opening_cash": 0}).eq("user_id", user_id)
+        if business_id is not None:
+            q = q.eq("business_id", business_id)
+        q.execute()
 
-    state = twin.rebuild(db, user_id)  # replay whatever survived (empty log → opening cash only)
+    state = twin.rebuild(db, user_id, business_id)  # replay whatever survived (empty log → opening cash only)
     log.warning("[nervous] %s RESET source=%s events=%d memory=%d products=%d schedule=%d",
                 user_id, source or "all", summary["deleted_events"], summary["deleted_memory"],
                 summary["deleted_products"], summary["deleted_schedule"])
@@ -470,16 +577,40 @@ def reset_business(db, user_id: str, *, source: str | None = None,
 
 
 def list_events(db, user_id: str, *, status: str | None = None, event_type: str | None = None,
-                limit: int = 200, offset: int = 0, business_id: str | None = None) -> list:
-    q = db.table("business_events").select("*").eq("user_id", user_id)
-    if business_id is not None:                       # multi-business scope (audit #16)
-        q = q.eq("business_id", business_id)
-    if status:
-        q = q.eq("status", status)
-    if event_type:
-        q = q.eq("event_type", event_type)
-    res = q.order("occurred_at", desc=True).range(offset, offset + max(0, limit - 1)).execute()
-    return getattr(res, "data", None) or []
+                limit: int = 200, offset: int = 0, business_id: str | None = None,
+                event_types: list[str] | tuple[str, ...] | None = None) -> list:
+    """Newest first. `limit` above one page is read a page at a time (see
+    db.fetch_all): asking PostgREST for 10,000 rows returns 1,000 and says
+    nothing, which is how every "all events" reader was quietly truncated."""
+    from db import PAGE_SIZE
+
+    def _q():
+        q = db.table("business_events").select("*").eq("user_id", user_id)
+        if business_id is not None:                   # multi-business scope (audit #16)
+            q = q.eq("business_id", business_id)
+        if status:
+            q = q.eq("status", status)
+        if event_type:
+            q = q.eq("event_type", event_type)
+        if event_types:
+            q = q.in_("event_type", list(event_types))
+        return q.order("occurred_at", desc=True).order("id", desc=True)
+
+    limit = max(0, int(limit))
+    if limit <= PAGE_SIZE:
+        res = _q().range(offset, offset + max(0, limit - 1)).execute()
+        return getattr(res, "data", None) or []
+
+    out: list = []
+    start = offset
+    while len(out) < limit:
+        want = min(PAGE_SIZE, limit - len(out))
+        rows = getattr(_q().range(start, start + want - 1).execute(), "data", None) or []
+        out.extend(rows)
+        if len(rows) < want:
+            break
+        start += len(rows)
+    return out
 
 
 # ── (4) Extract / Classify — free text → proposed event (Initiative 1) ────────────

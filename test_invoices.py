@@ -24,6 +24,7 @@ class _Q:
 
     def order(self, *a, **k): return self
     def limit(self, n): return self
+    def range(self, a, b): return self
 
     def _match(self, r):
         return all(r.get(k) == v for k, v in self.filters.items())

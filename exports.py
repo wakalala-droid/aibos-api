@@ -19,9 +19,29 @@ def _num(v, d=0.0):
 
 
 # Cash direction per type, mirroring the twin fold — for the ledger's Debit/Credit.
-_INFLOW = {"Sale", "CustomerPayment", "Loan", "Refund"}
+_INFLOW = {"Sale", "CustomerPayment"}
 _OUTFLOW = {"Purchase", "Expense", "Salary", "SupplierPayment", "TaxPayment",
             "AssetPurchase", "InventoryReceipt"}
+
+
+def _direction(event_type: str, payload: dict) -> str:
+    """Which way the money went. Loans and refunds go BOTH ways, decided by
+    payload.direction exactly as digital_twin.project folds them: every loan
+    repayment and every refund to a customer was exported as money IN."""
+    d = str((payload or {}).get("direction") or "").lower()
+    if event_type == "Loan":
+        return "out" if d == "repayment" else "in"
+    if event_type == "Refund":
+        return "in" if d == "from_supplier" else "out"
+    return "in" if event_type in _INFLOW else "out" if event_type in _OUTFLOW else ""
+
+
+def _cell(value) -> str:
+    """Text an accountant's spreadsheet will show as text. A cell starting with
+    = + - @ is run as a FORMULA by Excel, and notes, customer and supplier names
+    arrive from staff, WhatsApp and website forms."""
+    text = str(value or "").replace("\n", " ")
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def events_csv(events: list) -> str:
@@ -37,12 +57,11 @@ def events_csv(events: list) -> str:
             continue
         p = e.get("payload") or {}
         et = e.get("event_type")
-        direction = "in" if et in _INFLOW else "out" if et in _OUTFLOW else ""
         w.writerow([
             str(e.get("occurred_at") or "")[:10], et, e.get("status"),
-            f"{_num(p.get('amount')):.2f}", direction,
-            p.get("customer") or "", p.get("supplier") or "", p.get("category") or "",
-            p.get("payment_method") or "", (p.get("note") or "").replace("\n", " "),
+            f"{_num(p.get('amount')):.2f}", _direction(et, p),
+            _cell(p.get("customer")), _cell(p.get("supplier")), _cell(p.get("category")),
+            _cell(p.get("payment_method")), _cell(p.get("note")),
             e.get("id") or "",
         ])
     return buf.getvalue()

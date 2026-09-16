@@ -208,7 +208,7 @@ def test_staff_inherit_the_owners_plan():
     class _Ctx:
         def __init__(self, tenant): self.tenant = tenant
 
-    fake.resolve_context = lambda uid: _Ctx(owner if uid == staff else uid)
+    fake.resolve_context = lambda uid, acting_as=None: _Ctx(owner if uid == staff else uid)
     sys.modules["membership"] = fake
     try:
         _with_db(_Profiles([{"id": owner, "tier": "growth"}, {"id": staff, "tier": "free"}]))
@@ -224,7 +224,7 @@ def test_paying_account_falls_back_to_the_caller():
     import sys, types
     fake = types.ModuleType("membership")
 
-    def _boom(_uid):
+    def _boom(_uid, acting_as=None):
         raise Exception("business_members does not exist yet")
 
     fake.resolve_context = _boom

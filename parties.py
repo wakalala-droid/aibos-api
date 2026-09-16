@@ -227,15 +227,20 @@ def backfill(db, user_id: str, events: list) -> dict:
     "names in payloads" to entities for accounts that recorded before 0018.
     Aggregates in memory first so each unique party is written once.
     """
+    # Keyed per BUSINESS as well as per name: the same supplier used by a shop
+    # and a salon is two party rows, one in each set of books, exactly as the
+    # live pipeline (upsert_from_event) writes them.
     seen: dict = {}
     for ev in events or []:
         if ev.get("status") == "void":
             continue
         when = ev.get("occurred_at")
+        biz = ev.get("business_id")
         for mention in extract_parties(ev.get("payload") or {}):
-            cur = seen.get(mention["key"])
+            slot = (biz, mention["key"])
+            cur = seen.get(slot)
             if cur is None:
-                seen[mention["key"]] = {**mention, "first_seen_at": when, "last_seen_at": when}
+                seen[slot] = {**mention, "first_seen_at": when, "last_seen_at": when}
             else:
                 cur["kind"] = merge_kind(cur["kind"], mention["kind"])
                 if when and str(when) < str(cur["first_seen_at"] or ""):
@@ -244,10 +249,12 @@ def backfill(db, user_id: str, events: list) -> dict:
                     cur["last_seen_at"] = when
 
     created = updated = 0
-    for key, m in seen.items():
-        res = (db.table("parties").select("id,kind").eq("user_id", user_id)
-               .eq("normalized_key", key).limit(1).execute())
-        rows = getattr(res, "data", None) or []
+    for (biz, key), m in seen.items():
+        q = (db.table("parties").select("id,kind").eq("user_id", user_id)
+             .eq("normalized_key", key))
+        if biz is not None:
+            q = q.eq("business_id", biz)
+        rows = getattr(q.limit(1).execute(), "data", None) or []
         if rows:
             db.table("parties").update({
                 "kind": merge_kind(rows[0].get("kind", m["kind"]), m["kind"]),
@@ -255,10 +262,13 @@ def backfill(db, user_id: str, events: list) -> dict:
             }).eq("id", rows[0]["id"]).execute()
             updated += 1
         else:
-            db.table("parties").insert({
+            row = {
                 "user_id": user_id, "name": m["name"], "normalized_key": key,
                 "kind": m["kind"], "first_seen_at": m["first_seen_at"],
                 "last_seen_at": m["last_seen_at"],
-            }).execute()
+            }
+            if biz is not None:
+                row["business_id"] = biz
+            db.table("parties").insert(row).execute()
             created += 1
     return {"created": created, "updated": updated, "scanned": len(events or [])}

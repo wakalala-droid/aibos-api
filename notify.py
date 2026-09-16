@@ -111,7 +111,10 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
     Build (subject, plain-text body) for one user. Returns None when there's
     nothing real to say (no recorded activity) — we never send an empty brief.
     """
-    state = twin_mod.get_state(db, user_id)
+    # The owner's default business: one brief per owner, about the books they
+    # open first. (Reading with no business picked whichever row came back.)
+    business_id = twin_mod._books_for(db, user_id, None)
+    state = twin_mod.get_state(db, user_id, business_id)
     if not state or int(state.get("event_count") or 0) == 0:
         return None
 
@@ -132,16 +135,17 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
     # Yesterday / today sales from confirmed events.
     try:
         since = _day_start(1).isoformat()
-        res = (
+        q = (
             db.table("business_events")
             .select("occurred_at, payload, status, event_type")
             .eq("user_id", user_id)
             .eq("event_type", "Sale")
             .eq("status", "confirmed")
             .gte("occurred_at", since)
-            .limit(500)
-            .execute()
         )
+        if business_id is not None:
+            q = q.eq("business_id", business_id)
+        res = q.limit(1000).execute()
         rows = res.data or []
         today_start = _day_start(0)
         t_count = y_count = 0
@@ -170,13 +174,19 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
     # Stock watch.
     low_names: list[str] = []
     try:
-        prods = products_mod.list_products(db, user_id)
-        low = [
-            p for p in prods
-            if float(p.get("reorder_level") or 0) > 0
-            and float(p.get("on_hand") or 0) <= float(p.get("reorder_level") or 0)
-        ]
-        low_names = [f"{p.get('name')} ({int(float(p.get('on_hand') or 0))} left)" for p in low[:3]]
+        # On-hand is DERIVED (opening stock + movements), never a column.
+        # list_products does not attach it, so this read `on_hand` as 0 for
+        # every product and told every owner that everything they track was
+        # out of stock, every morning.
+        import nervous_system as nervous_mod
+        prods = products_mod.list_products(db, user_id, business_id=business_id)
+        moves = (nervous_mod.list_events(
+            db, user_id, status="confirmed", limit=100000, business_id=business_id,
+            event_types=("InventoryReceipt", "Sale", "InventoryAdjustment"))
+            if any(float(p.get("reorder_level") or 0) > 0 for p in prods) else [])
+        on_hand = products_mod.compute_stock(prods, moves)
+        low = products_mod.low_stock(prods, on_hand)
+        low_names = [f"{p.get('name')} ({p['on_hand']:g} left)" for p in low[:3]]
         if low:
             more = "…" if len(low) > 3 else ""
             lines.append(f"Stock: {len(low)} item{'s' if len(low) != 1 else ''} low: {', '.join(low_names)}{more}.")
@@ -185,22 +195,27 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
 
     # Expected deliveries = pending receipts dated today or later.
     try:
-        res = (
+        q = (
             db.table("business_events")
             .select("occurred_at, payload")
             .eq("user_id", user_id)
             .eq("event_type", "InventoryReceipt")
             .eq("status", "pending")
             .gte("occurred_at", _day_start(0).isoformat())
-            .limit(20)
-            .execute()
+            .lt("occurred_at", (_day_start(0) + timedelta(days=1)).isoformat())
         )
-        exp = res.data or []
+        if business_id is not None:
+            q = q.eq("business_id", business_id)
+        exp = q.order("occurred_at").limit(20).execute().data or []
         if exp:
             p0 = exp[0].get("payload") or {}
             frm = f" from {p0.get('supplier')}" if p0.get("supplier") else ""
             extra = f" (+{len(exp) - 1} more)" if len(exp) > 1 else ""
-            lines.append(f"Expected today: {p0.get('item', 'a delivery')}{frm}{extra}. Confirm it when it arrives.")
+            # A receipt names its goods in items[] (InventoryReceipt's required
+            # field); `item` never existed on it, so this always said "a delivery".
+            items = [str(x) for x in (p0.get("items") or []) if x]
+            what = ", ".join(items[:2]) + ("…" if len(items) > 2 else "") if items else "a delivery"
+            lines.append(f"Expected today: {what}{frm}{extra}. Confirm it when it arrives.")
     except Exception as e:  # noqa: BLE001
         log.warning("[notify] receipts query failed for %s: %s", user_id, e)
 
@@ -293,7 +308,7 @@ def dispatch_briefs(db) -> dict:
     """
     res = (
         db.table("profiles")
-        .select("id, email, business_name, brief_email_enabled, whatsapp_number")
+        .select("id, email, contact_email, business_name, brief_email_enabled, whatsapp_number")
         .or_("brief_email_enabled.eq.true,whatsapp_number.not.is.null")
         .limit(2000)
         .execute()
@@ -310,8 +325,11 @@ def dispatch_briefs(db) -> dict:
                 continue
             subject, body = brief
 
-            if p.get("brief_email_enabled") and p.get("email") and can_access(tier, "scheduled_brief"):
-                if send_email(p["email"], subject, body,
+            # The address the owner typed for the business wins, as it does for
+            # booking alerts (see _owner_contacts).
+            to = (p.get("contact_email") or p.get("email") or "").strip()
+            if p.get("brief_email_enabled") and to and can_access(tier, "scheduled_brief"):
+                if send_email(to, subject, body,
                               aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"))):
                     sent_email += 1
             if p.get("whatsapp_number") and can_access(tier, "morning_brief"):

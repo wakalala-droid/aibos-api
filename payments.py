@@ -71,18 +71,44 @@ def _normalize_msisdn(phone: str) -> str:
     return digits
 
 
+def _amount(amount: float) -> str:
+    """The amount to charge, to the ngwee. int() dropped everything after the
+    point, so a K1,234.50 invoice was collected as K1,234 and then marked PAID
+    in full. Whole amounts (every plan price) still go as "500"."""
+    value = round(float(amount), 2)
+    return str(int(value)) if value == int(value) else f"{value:.2f}"
+
+
+# Provider access tokens last about an hour. The payment page polls every few
+# seconds, and each poll used to fetch a brand-new token first: two calls to the
+# provider per poll, and a token endpoint that rate-limits.
+_TOKENS: dict[str, tuple[str, float]] = {}
+
+
+def _cached_token(name: str, fetch) -> str:
+    hit = _TOKENS.get(name)
+    if hit and time.time() < hit[1]:
+        return hit[0]
+    token, ttl = fetch()
+    _TOKENS[name] = (token, time.time() + max(60.0, float(ttl or 3600) - 60.0))
+    return token
+
+
 # ── MTN MoMo Collections ──────────────────────────────────────────────────────
 
 def _mtn_token() -> str:
-    import httpx
-    auth = base64.b64encode(f"{MTN_API_USER}:{MTN_API_KEY}".encode()).decode()
-    r = httpx.post(
-        f"{MTN_BASE}/collection/token/",
-        headers={"Authorization": f"Basic {auth}", "Ocp-Apim-Subscription-Key": MTN_SUB_KEY},
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
+    def fetch():
+        import httpx
+        auth = base64.b64encode(f"{MTN_API_USER}:{MTN_API_KEY}".encode()).decode()
+        r = httpx.post(
+            f"{MTN_BASE}/collection/token/",
+            headers={"Authorization": f"Basic {auth}", "Ocp-Apim-Subscription-Key": MTN_SUB_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
+        body = r.json()
+        return body["access_token"], body.get("expires_in")
+    return _cached_token("mtn", fetch)
 
 
 def _mtn_initiate(reference: str, amount: float, currency: str, phone: str, note: str) -> str:
@@ -98,7 +124,7 @@ def _mtn_initiate(reference: str, amount: float, currency: str, phone: str, note
             "Content-Type": "application/json",
         },
         json={
-            "amount": str(int(amount)),
+            "amount": _amount(amount),
             "currency": currency,
             "externalId": reference,
             "payer": {"partyIdType": "MSISDN", "partyId": _normalize_msisdn(phone)},
@@ -132,14 +158,17 @@ def _mtn_status(reference: str) -> str:
 # ── Airtel Money Collections ──────────────────────────────────────────────────
 
 def _airtel_token() -> str:
-    import httpx
-    r = httpx.post(
-        f"{AIRTEL_BASE}/auth/oauth2/token",
-        json={"client_id": AIRTEL_CLIENT_ID, "client_secret": AIRTEL_CLIENT_SECRET, "grant_type": "client_credentials"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
+    def fetch():
+        import httpx
+        r = httpx.post(
+            f"{AIRTEL_BASE}/auth/oauth2/token",
+            json={"client_id": AIRTEL_CLIENT_ID, "client_secret": AIRTEL_CLIENT_SECRET, "grant_type": "client_credentials"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        body = r.json()
+        return body["access_token"], body.get("expires_in")
+    return _cached_token("airtel", fetch)
 
 
 def _airtel_initiate(reference: str, amount: float, currency: str, phone: str) -> str:
@@ -157,7 +186,7 @@ def _airtel_initiate(reference: str, amount: float, currency: str, phone: str) -
         json={
             "reference": reference,
             "subscriber": {"country": AIRTEL_COUNTRY, "currency": currency, "msisdn": msisdn},
-            "transaction": {"amount": int(amount), "country": AIRTEL_COUNTRY, "currency": currency, "id": reference},
+            "transaction": {"amount": float(_amount(amount)), "country": AIRTEL_COUNTRY, "currency": currency, "id": reference},
         },
         timeout=20,
     )

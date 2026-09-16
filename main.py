@@ -408,6 +408,117 @@ def _detect_file_type(filename: str, df: pd.DataFrame) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MONTHLY ROWS — one builder for the first upload and every sheet switch
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MONTH_ABBR = ("jan", "feb", "mar", "apr", "may", "jun",
+               "jul", "aug", "sep", "oct", "nov", "dec")
+_MONTH_WORD = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?", re.I)
+_YEAR4 = re.compile(r"\b(19|20)\d{2}\b")
+_YEAR2_TAIL = re.compile(r"[-'\s/](\d{2})\s*$")
+_ISO_PERIOD = re.compile(r"^\s*(\d{4})[-/.](\d{1,2})(?:[-/.]\d{1,2})?")
+_DMY_PERIOD = re.compile(r"^\s*(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
+
+# Summary lines appended under many exports. Matched as WHOLE words: the old
+# substring test dropped any period merely containing "sum" or "mean", so a
+# "Summer sale" row vanished from the P&L.
+_SUMMARY_LABEL = re.compile(
+    r"\b(total|totals|grand total|sum|subtotal|average|avg|mean|ytd|year to date)\b", re.I)
+
+
+def _period_key(label) -> Optional[tuple]:
+    """(year, month) for a period label, or None when it has no dated month.
+
+    Years are required. "January 2024, January 2025" used to sort by month name
+    alone, which interleaved two years into Jan, Jan, Feb, Feb and scrambled
+    every trend, forecast and anomaly built on top. And a label with a month but
+    no year says nothing about order across a year end (Nov, Dec, Jan of a
+    financial year), so those keep the order the file gave them.
+    """
+    s = str(label or "").strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return None
+    m = _ISO_PERIOD.match(s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return (int(m.group(1)), int(m.group(2)))
+    m = _DMY_PERIOD.match(s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return (int(m.group(3)), int(m.group(2)))
+    word = _MONTH_WORD.search(s)
+    if not word:
+        return None
+    month = _MONTH_ABBR.index(word.group(1).lower()) + 1
+    y4 = _YEAR4.search(s)
+    if y4:
+        return (int(y4.group(0)), month)
+    y2 = _YEAR2_TAIL.search(s)
+    if y2:
+        return (2000 + int(y2.group(1)), month)
+    return None
+
+
+def _monthly_rows(df: pd.DataFrame, rev_col, cost_col, month_col) -> List[Dict[str, Any]]:
+    """[{month, revenue, costs, profit, margin}] in the order time actually ran."""
+    revenues = pd.to_numeric(df[rev_col], errors="coerce").fillna(0).tolist()
+    costs = pd.to_numeric(df[cost_col], errors="coerce").fillna(0).tolist()
+    months = (df[month_col].astype(str).tolist() if month_col
+              else [f"Period {i+1}" for i in range(len(revenues))])
+
+    rows = []
+    for m, r, c in zip(months, revenues, costs):
+        label = str(m).strip()
+        key = _period_key(label)
+        is_blank = label.lower() in ("", "nan", "none", "nat")
+        # Summary/total rows at the bottom of an export are not a period and
+        # would double-count. A row that names a real dated month is kept.
+        if (is_blank or _SUMMARY_LABEL.search(label)) and key is None:
+            continue
+        profit = r - c
+        rows.append({
+            "month": m,
+            "revenue": round(r, 2),
+            "costs": round(c, 2),
+            "profit": round(profit, 2),
+            "margin": round((profit / r * 100) if r else 0, 2),
+            "_key": key,
+        })
+
+    keys = [row["_key"] for row in rows]
+    if rows and all(k is not None for k in keys) and keys != sorted(keys):
+        rows.sort(key=lambda row: row["_key"])          # stable: equal periods keep file order
+    for row in rows:
+        row.pop("_key", None)
+    return rows
+
+
+def _engine1_file_analysis(df: pd.DataFrame, rev_col, cost_col, month_col) -> Dict[str, Any]:
+    """Everything the first upload derives from a sheet: rows, Engine 1, the
+    read-fidelity manifest, the per-item breakdown and the honesty gate. The
+    sheet switch used to rebuild only the first two, so a switched sheet kept
+    the PREVIOUS sheet's manifest, summary rows were counted as periods, and a
+    sheet with no dates still got a fabricated forecast."""
+    monthly_rows = _monthly_rows(df, rev_col, cost_col, month_col)
+    e1_result = run_engine1(monthly_rows)
+    manifest = _build_manifest(df, rev_col, cost_col, month_col)
+    units_col = next((c["name"] for c in manifest["columns"] if c["role"] == "units"), None)
+    breakdown = (
+        _build_item_breakdown(df, manifest["grouping_column"], rev_col, cost_col, units_col)
+        if manifest["data_shape"] == "cross_sectional" else []
+    )
+    # Honesty: with no time axis, a forecast / period-anomalies would be
+    # fabricated over non-time rows. Suppress them and say why.
+    if manifest["data_shape"] == "cross_sectional":
+        e1_result["forecast"] = None
+        e1_result["anomalies"] = []
+        e1_result["forecast_note"] = (
+            "Not available — this file has no time/period column, so a forecast "
+            "would be fabricated. Add a Month/Date column to unlock trends."
+        )
+    return {"monthly": monthly_rows, "analysis": e1_result,
+            "manifest": manifest, "breakdown": breakdown}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # READ-FIDELITY LAYER  (SAFEGUARD.md — Layer 1)
 # Classifies every column with a confidence, detects whether the file has a real
 # time axis, flags missing/unknown columns, and (for item-level files) produces a
@@ -657,7 +768,7 @@ def _build_ai_context(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upload")
-async def upload_file(
+def upload_file(
     file: UploadFile = File(...),
     sheet_name: Optional[str] = Query(None),
     cabinet_id: Optional[str] = Query(None),
@@ -668,7 +779,7 @@ async def upload_file(
     Returns full analysis + sheet list + cabinet_id for re-use.
     """
     try:
-        content = await file.read()
+        content = file.file.read()
         _enforce_upload_size(content)
         filename = file.filename or "upload"
         ext = filename.rsplit(".", 1)[-1].lower()
@@ -813,71 +924,12 @@ async def upload_file(
         # ── Detect engine ─────────────────────────────────────────────────────
         engine_type = _detect_file_type(filename, df)
 
-        # ── Build normalised monthly data ─────────────────────────────────────
-        monthly_rows = []
-        revenues = pd.to_numeric(df[rev_col], errors="coerce").fillna(0).tolist()
-        costs    = pd.to_numeric(df[cost_col], errors="coerce").fillna(0).tolist()
-        months   = (
-            df[month_col].astype(str).tolist()
-            if month_col
-            else [f"Period {i+1}" for i in range(len(revenues))]
-        )
-
-        MONTH_ORDER = [
-            "january","february","march","april","may","june",
-            "july","august","september","october","november","december",
-        ]
-
-        # Summary/total rows that get appended at the bottom of many exports
-        # (e.g. a blank-month "Total" line) must not be ingested as a period —
-        # doing so double-counts revenue. Detect them by label.
-        SUMMARY_LABELS = ("total", "totals", "grand total", "sum", "subtotal",
-                          "average", "avg", "mean", "ytd", "year to date")
-
-        for i, (m, r, c) in enumerate(zip(months, revenues, costs)):
-            label = str(m).strip()
-            label_lower = label.lower()
-            is_blank = label_lower in ("", "nan", "none", "nat")
-            is_summary = any(kw == label_lower or kw in label_lower for kw in SUMMARY_LABELS)
-            # Drop a blank/summary label only when it has no real month name in it
-            # (guards against a legitimate month being skipped).
-            if (is_blank or is_summary) and not any(mo in label_lower for mo in MONTH_ORDER):
-                continue
-
-            profit = r - c
-            margin = (profit / r * 100) if r else 0
-            monthly_rows.append({
-                "month": m,
-                "revenue": round(r, 2),
-                "costs": round(c, 2),
-                "profit": round(profit, 2),
-                "margin": round(margin, 2),
-                "sort_key": next(
-                    (j for j, mo in enumerate(MONTH_ORDER) if mo in label_lower), i
-                ),
-            })
-
-        monthly_rows.sort(key=lambda x: x["sort_key"])
-
-        # ── Run Engine 1 ──────────────────────────────────────────────────────
-        e1_result = run_engine1(monthly_rows)
-
-        # ── Read-fidelity layer (SAFEGUARD.md — Layer 1) ──────────────────────
-        manifest = _build_manifest(df, rev_col, cost_col, month_col)
-        units_col = next((c["name"] for c in manifest["columns"] if c["role"] == "units"), None)
-        breakdown = (
-            _build_item_breakdown(df, manifest["grouping_column"], rev_col, cost_col, units_col)
-            if manifest["data_shape"] == "cross_sectional" else []
-        )
-        # Honesty: with no time axis, a forecast / period-anomalies would be
-        # fabricated over non-time rows. Suppress them and say why.
-        if manifest["data_shape"] == "cross_sectional":
-            e1_result["forecast"] = None
-            e1_result["anomalies"] = []
-            e1_result["forecast_note"] = (
-                "Not available — this file has no time/period column, so a forecast "
-                "would be fabricated. Add a Month/Date column to unlock trends."
-            )
+        # ── Monthly rows, Engine 1, read-fidelity manifest (SAFEGUARD L1) ─────
+        built = _engine1_file_analysis(df, rev_col, cost_col, month_col)
+        monthly_rows = built["monthly"]
+        e1_result = built["analysis"]
+        manifest = built["manifest"]
+        breakdown = built["breakdown"]
 
         # ── Cabinet storage ───────────────────────────────────────────────────
         cab_id = cabinet_id or str(uuid.uuid4())
@@ -938,17 +990,23 @@ async def upload_file(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upload/switch-sheet")
-async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...),
+def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...),
                        user_id: str = Depends(require_user)):
     """Switch to a different sheet in a previously uploaded Excel file."""
     entry = _owned_cabinet(cabinet_id, user_id)
     content = entry.get("content")
     filename = entry.get("name", "upload.xlsx")
 
+    content = cabinet_store.content_bytes(content)
     if not content:
         raise HTTPException(status_code=400, detail="File content not cached")
+    if filename.rsplit(".", 1)[-1].lower() not in ("xlsx", "xlsm", "xls"):
+        raise HTTPException(status_code=400, detail="Only a spreadsheet has more than one sheet.")
 
-    df, all_sheets, selected = _load_sheet(content, filename, sheet_name)
+    try:
+        df, all_sheets, selected = _load_sheet(content, filename, sheet_name)
+    except Exception as exc:  # noqa: BLE001 — a corrupt or unreadable workbook is the caller's 400
+        raise HTTPException(status_code=400, detail=f"Could not read that sheet: {type(exc).__name__}")
     rev_col, cost_col, month_col = _resolve_columns(df)
 
     if rev_col is None:
@@ -964,31 +1022,21 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
                    f"Columns: {list(df.columns)}",
         )
 
-    revenues = pd.to_numeric(df[rev_col], errors="coerce").fillna(0).tolist()
-    costs    = pd.to_numeric(df[cost_col], errors="coerce").fillna(0).tolist()
-    months   = (
-        df[month_col].astype(str).tolist()
-        if month_col
-        else [f"Period {i+1}" for i in range(len(revenues))]
-    )
-
-    monthly_rows = []
-    for i, (m, r, c) in enumerate(zip(months, revenues, costs)):
-        profit = r - c
-        margin = (profit / r * 100) if r else 0
-        monthly_rows.append({
-            "month": m, "revenue": round(r, 2), "costs": round(c, 2),
-            "profit": round(profit, 2), "margin": round(margin, 2),
-        })
-
-    e1_result = run_engine1(monthly_rows)
+    built = _engine1_file_analysis(df, rev_col, cost_col, month_col)
+    monthly_rows, e1_result = built["monthly"], built["analysis"]
 
     # Update cabinet (+ re-persist so the sheet switch survives a deploy)
-    CABINET[cabinet_id]["active_sheet"] = selected
-    CABINET[cabinet_id]["monthly"] = monthly_rows
-    CABINET[cabinet_id]["analysis"] = e1_result
-    CABINET[cabinet_id]["df_json"] = df.to_json(orient="records")
-    cabinet_store.persist(get_db(), cabinet_id, CABINET[cabinet_id])
+    entry.update({
+        "active_sheet": selected,
+        "columns": {"revenue": rev_col, "cost": cost_col, "month": month_col},
+        "monthly": monthly_rows,
+        "analysis": e1_result,
+        "manifest": built["manifest"],
+        "breakdown": built["breakdown"],
+        "df_json": df.to_json(orient="records"),
+    })
+    CABINET[cabinet_id] = entry
+    cabinet_store.persist(get_db(), cabinet_id, entry)
 
     return {
         "success": True,
@@ -997,7 +1045,11 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
         "sheets": all_sheets,
         "columns_detected": {"revenue": rev_col, "cost": cost_col, "month": month_col},
         "monthly": monthly_rows,
+        "manifest": built["manifest"],
+        "breakdown": built["breakdown"],
+        "dataShape": built["manifest"]["data_shape"],
         **e1_result,
+        "engineFlags": {"e1": bool(monthly_rows), "e2": False, "e3": False},
     }
 
 
@@ -1008,7 +1060,7 @@ async def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/propose")
-async def propose(cabinet_id: str = Query(...), user_id: str = Depends(require_user)):
+def propose(cabinet_id: str = Query(...), user_id: str = Depends(require_user)):
     entry = _owned_cabinet(cabinet_id, user_id)
     manifest = entry.get("manifest")
     df_json = entry.get("df_json")
@@ -1033,7 +1085,7 @@ class ComputeRequest(BaseModel):
 
 
 @app.post("/compute-metrics")
-async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...),
+def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...),
                           user_id: str = Depends(require_user)):
     """Compute APPROVED metric formulas against a file, via the same safe sandbox
     used to critique them (AST-whitelisted, empty builtins). Returns values only —
@@ -1074,7 +1126,7 @@ async def compute_metrics(req: ComputeRequest, cabinet_id: str = Query(...),
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/cabinet")
-async def list_cabinet(user_id: str = Depends(require_user)):
+def list_cabinet(user_id: str = Depends(require_user)):
     """List the CALLER'S files only — never any other tenant's. The durable
     metadata table is authoritative (survives deploys); memory fills in
     anything persisted before migration 0020 or while Storage is down."""
@@ -1144,7 +1196,7 @@ def _frontend_payload(engine: str, analysis: Dict[str, Any], monthly: List[Dict[
 
 
 @app.get("/cabinet/{cabinet_id}")
-async def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
+def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
     """Load one of the caller's own files from the cabinet."""
     entry = _owned_cabinet(cabinet_id, user_id)
     engine = entry.get("engine", "engine1")
@@ -1160,7 +1212,7 @@ async def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user
 
 
 @app.delete("/cabinet/{cabinet_id}")
-async def delete_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
+def delete_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
     """Remove one of the caller's own files from the cabinet."""
     _owned_cabinet(cabinet_id, user_id)   # 404 if missing or not owned
     CABINET.pop(cabinet_id, None)
@@ -1180,7 +1232,7 @@ class StudioRequest(BaseModel):
 
 
 @app.post("/data-studio/compute")
-async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require_user)):
+def data_studio_compute(req: StudioRequest, user_id: str = Depends(require_user)):
     """
     Compute Excel-like formulas or AI-powered analysis.
     Supports: SUM, AVG, MAX, MIN, COUNT, IF, GROWTH, FORECAST, custom AI formulas.
@@ -1376,7 +1428,7 @@ async def data_studio_compute(req: StudioRequest, user_id: str = Depends(require
 
 
 @app.get("/data-studio/schema/{cabinet_id}")
-async def data_studio_schema(cabinet_id: str, user_id: str = Depends(require_user)):
+def data_studio_schema(cabinet_id: str, user_id: str = Depends(require_user)):
     """Return available columns/series for formula building (caller's file only)."""
     entry = _owned_cabinet(cabinet_id, user_id)
     monthly = entry.get("monthly", [])
@@ -1618,7 +1670,30 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
+# The legacy `messages` shape is the client's whole conversation, sent back
+# every turn. It was trusted wholesale: any role, any length. A "system" turn
+# there overrode the anti-fabrication rules above, a "tool" turn forged a lookup
+# result, and an unbounded history ran up the provider bill. Only the owner's
+# own words and the replies they were given come through, and not too many.
+_CHAT_ROLES = ("user", "assistant")
+_CHAT_MAX_TURNS = 20
+_CHAT_MAX_CHARS = 8000
+
+
+def _clean_history(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") not in _CHAT_ROLES:
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        out.append({"role": m["role"], "content": content[:_CHAT_MAX_CHARS]})
+    return out[-_CHAT_MAX_TURNS:]
+
+
+def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str] = None,
+                  x_acting_as: Optional[str] = None) -> dict:
     """
     Shared setup for /chat and /chat/stream (audit #21): the paid gate + free
     taster, the system prompt (context, currency, anti-fabrication), the tool
@@ -1634,18 +1709,26 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
     if not llm.configured():
         raise HTTPException(status_code=503, detail=llm.not_configured_message())
 
+    # Live frontend: single `message`. Legacy: full `messages` array. Checked
+    # before the taster too: an empty request must not cost a free question.
+    chat_messages = _clean_history(req.messages) if req.messages else []
+    if not chat_messages and req.message and req.message.strip():
+        chat_messages = [{"role": "user", "content": req.message[:_CHAT_MAX_CHARS]}]
+    if not chat_messages or chat_messages[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="No message provided.")
+
     taster_note = None
     # AI CFO chat is a paid capability — but Free gets a daily taster
     # (audit #24): 3 questions/day, counted server-side. Exhausted or
     # uncountable → the original paid gate stands.
     try:
-        entitlements.require_feature_for_caller(user_id, "ai_chat")
+        entitlements.require_feature_for_caller(user_id, "ai_chat", x_acting_as)
     except HTTPException as gate:
         # Counted against the BUSINESS, not the person: three free questions a
         # day is an allowance for the account, and inviting staff must not
         # multiply it.
         allowed, used = entitlements.chat_taster(
-            get_db(), entitlements.paying_account(user_id), qid=req.qid)
+            get_db(), entitlements.paying_account(user_id, x_acting_as), qid=req.qid)
         if not allowed:
             # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
             # feature" reads as a lie to someone who just asked three questions,
@@ -1722,13 +1805,13 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
             "the user to upload their financial data for specific analysis."
         )
 
-    # Live frontend: single `message`. Legacy: full `messages` array.
-    if req.messages:
-        chat_messages = list(req.messages)
-    elif req.message:
-        chat_messages = [{"role": "user", "content": req.message}]
-    else:
-        raise HTTPException(status_code=400, detail="No message provided.")
+    # Whose books the lookups read, and which lookups this person may use. The
+    # tools used to read the CALLER's own id: invited staff got an empty
+    # business, and an owner with two businesses got an answer about whichever
+    # one the database returned first.
+    ctx = membership.resolve_context(user_id, acting_as=x_acting_as)
+    business_id = businesses_api.resolve_business_id(get_db(), ctx.tenant, x_business_id,
+                                                     create=True)
 
     tool_system = "\n\n".join(system_parts + [
         "You have TOOLS over this business's real recorded data — the source of "
@@ -1751,6 +1834,9 @@ def _prepare_chat(req: "ChatRequest", user_id: str) -> dict:
         "client": llm.client(),
         "injected": injected,
         "db": get_db(),
+        "tenant": ctx.tenant,
+        "business_id": business_id,
+        "allowed_tools": cfo_tools.tools_for_role(ctx.role),
     }
 
 
@@ -1770,7 +1856,9 @@ def _safe_error(exc: Exception, limit: int = 240) -> str:
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
+def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60)),
+                x_business_id: Optional[str] = Header(default=None),
+                x_acting_as: Optional[str] = Header(default=None)):
     """
     The AI CFO, streamed (audit #21). Server-Sent Events: the answer arrives as
     the model writes it instead of after a 3–5s pause. Same gate, same tools,
@@ -1779,7 +1867,7 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limite
 
     Frames: {"tool": name} · {"t": "…"} · {"done": true, "tools_used": [...]}
     """
-    prep = _prepare_chat(req, user_id)          # raises 402/500 before any stream
+    prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)   # raises 402/500 before any stream
     db = prep["db"]
     taster_note = prep["taster_note"]
 
@@ -1789,7 +1877,8 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limite
                 for kind, data in cfo_tools.run_agent_loop_stream(
                     prep["client"], llm.chat_model(),
                     [{"role": "system", "content": prep["tool_system"]}, *prep["chat_messages"]],
-                    db, user_id,
+                    db, prep["tenant"],
+                    business_id=prep["business_id"], allowed=prep["allowed_tools"],
                 ):
                     if kind == "token":
                         yield f"data: {json.dumps({'t': data})}\n\n"
@@ -1833,7 +1922,9 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limite
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60))):
+def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60)),
+         x_business_id: Optional[str] = Header(default=None),
+         x_acting_as: Optional[str] = Header(default=None)):
     """AI CFO Chat. The model comes from llm.chat_model(), so which provider
     and which model answers is configuration, not code.
 
@@ -1845,7 +1936,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
     to one silently leaves the other behind.
     """
     try:
-        prep = _prepare_chat(req, user_id)
+        prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)
         taster_note = prep["taster_note"]
         injected = prep["injected"]
         chat_messages = prep["chat_messages"]
@@ -1861,7 +1952,8 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
                 out = cfo_tools.run_agent_loop(
                     client, llm.chat_model(),
                     [{"role": "system", "content": prep["tool_system"]}, *chat_messages],
-                    db, user_id,
+                    db, prep["tenant"],
+                    business_id=prep["business_id"], allowed=prep["allowed_tools"],
                 )
                 if (out.get("reply") or "").strip():
                     reply = out["reply"] + (taster_note or "")
@@ -1926,7 +2018,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 32
+EXPECTS_MIGRATION = 33
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -1964,7 +2056,7 @@ def _host_name() -> str:
 
 
 @app.get("/health")
-async def health():
+def health():
     """Deploy-verification at a glance (audit #12/#106): build SHA + the
     highest migration the code expects, so a green /health after a deploy
     proves the NEW image is actually live (Railway pins the last good image
@@ -2001,7 +2093,7 @@ async def health():
 
 
 @app.get("/health/setup")
-async def health_setup():
+def health_setup():
     """What is switched on, what is not, and what each missing key costs.
 
     Every optional capability here fails SILENTLY when its key is absent: the
@@ -2053,7 +2145,7 @@ async def health_setup():
 
 
 @app.get("/health/ai")
-async def health_ai(user_id: str = Depends(require_user)):
+def health_ai(user_id: str = Depends(require_user)):
     """Which calls to the AI provider actually work.
 
     "The answer stopped early. Please try again." was the whole of what an owner
@@ -2121,7 +2213,8 @@ async def health_ai(user_id: str = Depends(require_user)):
 
 
 @app.get("/me/entitlements")
-async def my_entitlements(user_id: str = Depends(require_user)):
+def my_entitlements(user_id: str = Depends(require_user),
+                    x_acting_as: Optional[str] = Header(default=None)):
     """What the SERVER believes this account may use — the authoritative answer.
 
     The browser keeps its own copy of the plan so the interface can gate
@@ -2133,11 +2226,19 @@ async def my_entitlements(user_id: str = Depends(require_user)):
     knows: `reason` says whether the plan was actually read, defaulted, or could
     not be established at all.
     """
-    detail = entitlements.tier_detail(user_id)
+    # The plan of the business this person works in. Staff sign in on their own
+    # (Free) account; answering with THAT plan made the app lock every paid
+    # screen for them while the server, which gates on the business, allowed it.
+    account = entitlements.paying_account(user_id, x_acting_as)
+    detail = entitlements.tier_detail(account)
     tier = detail["tier"]
     return {
         "ok": True,
         "tier": tier,
+        "own_plan": account == user_id,
+        "paid_until": detail.get("paid_until"),
+        "expired": detail.get("reason") == "expired",
+        "paid_tier": detail.get("paid_tier"),
         "reason": detail.get("reason", "ok"),
         "plan_readable": detail.get("reason") != "unreadable",
         "features": entitlements.features_for(tier),
@@ -2175,45 +2276,141 @@ CALLBACK_SECRET = os.environ.get("PAYMENTS_CALLBACK_SECRET")
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://ai-bos.website")
 
 
-def _grant_tier(user_id: Optional[str], plan: str) -> None:
+def _secret_ok(expected: Optional[str], given: Optional[str]) -> bool:
+    """A shared-secret check that takes the same time however much of it matches.
+    `!=` stops at the first differing character, which is measurable."""
+    import hmac
+    return bool(expected) and hmac.compare_digest(str(expected), str(given or ""))
+
+
+PERIOD_DAYS = {"monthly": 31, "annual": 366}
+
+
+def paid_period_end(now, current_until, current_tier: Optional[str], plan: str, billing: str):
+    """When a payment made `now` runs out. A renewal of the SAME plan made before
+    the old period ends extends it, so paying a week early loses nothing; any
+    other purchase starts today. Pure (unit-tested)."""
+    from datetime import timedelta
+    start = now
+    if current_until is not None and current_tier == plan and current_until > now:
+        start = current_until
+    return start + timedelta(days=PERIOD_DAYS.get(billing, 31))
+
+
+def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly") -> bool:
     """Server-authoritative tier grant. Writes profiles via the service-role
     client (the ONLY path allowed to set a tier — the client can't, see the
-    profiles guard trigger). Best-effort: never breaks the payment response."""
+    profiles guard trigger). Best-effort: never breaks the payment response.
+    Returns whether the grant was written."""
     if not user_id:
-        return
+        return False
     # Only known paid plans may be granted; anything unrecognised falls back to
     # the cheapest paid tier rather than silently escalating.
     tier = plan if plan in PLAN_PRICES else "pro"
     db = get_db()
     if db is None:
         log.warning("[payments] tier grant skipped — Supabase not configured (user=%s)", user_id)
-        return
+        return False
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    patch = {
+        "tier": tier,
+        "subscription_tier": tier,
+        "tier_source": "payment",
+        "tier_granted_by": "payment",
+        "tier_granted_at": now.isoformat(),
+    }
     try:
-        from datetime import datetime, timezone
-        db.table("profiles").update({
-            "tier": tier,
-            "subscription_tier": tier,
-            "tier_source": "payment",
-            "tier_granted_by": "payment",
-            "tier_granted_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", user_id).execute()
+        cur = (db.table("profiles").select("tier,paid_until").eq("id", user_id)
+               .limit(1).execute())
+        row = (getattr(cur, "data", None) or [{}])[0]
+        patch["paid_until"] = paid_period_end(
+            now, entitlements._parse_ts(row.get("paid_until")) if row.get("paid_until") else None,
+            row.get("tier"), tier, billing).isoformat()
+    except Exception as e:  # noqa: BLE001 — pre-0033: grant without a period
+        log.info("[payments] no paid_until for %s (%s)", user_id, e)
+    try:
+        try:
+            db.table("profiles").update(patch).eq("id", user_id).execute()
+        except Exception as e:  # noqa: BLE001
+            if "paid_until" not in patch or not entitlements._missing_column(e):
+                raise
+            patch.pop("paid_until")
+            db.table("profiles").update(patch).eq("id", user_id).execute()
         entitlements.invalidate(user_id)   # upgrade takes effect immediately
-        log.info("[payments] granted %s to user %s", tier, user_id)
+        log.info("[payments] granted %s to user %s until %s", tier, user_id, patch.get("paid_until"))
+        return True
     except Exception as e:  # noqa: BLE001
         log.error("[payments] tier grant failed (user=%s): %s", user_id, e)
+        return False
+
+
+# Subscription checkouts are persisted (migration 0033, subscription_payments)
+# as invoice payments already were. In memory alone, a restart between "approve
+# on your phone" and the confirmation, and Render restarts on every deploy and
+# after idling, took the customer's money and granted nothing. The dict stays as
+# a cache and as the store when the table does not exist yet.
+def _sub_row_to_rec(row: Dict[str, Any]) -> Dict[str, Any]:
+    rec = dict(row)
+    created = entitlements._parse_ts(row.get("created_at"))
+    rec["created_at"] = created.timestamp() if created else time.time()
+    return rec
+
+
+def _load_subscription_payment(reference: str) -> Optional[Dict[str, Any]]:
+    rec = PAYMENTS.get(reference)
+    if rec:
+        return rec
+    db = get_db()
+    if db is None or not reference:
+        return None
+    try:
+        res = (db.table("subscription_payments").select("*")
+               .eq("reference", reference).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — pre-0033
+        log.info("[payments] subscription lookup skipped: %s", e)
+        return None
+    if not rows:
+        return None
+    rec = _sub_row_to_rec(rows[0])
+    PAYMENTS[reference] = rec
+    return rec
 
 
 def _settle(rec: Dict[str, Any], new_status: str) -> None:
     """Apply a resolved status once. On first transition to 'successful', grant
-    the paid tier. Idempotent via the 'granted' flag so re-polls never double-grant."""
+    the paid tier. The persisted `granted` flag is claimed with a conditional
+    write, so a status poll and the provider webhook cannot both grant."""
+    if new_status not in ("successful", "failed") or rec.get("status") == new_status:
+        return
     rec["status"] = new_status
-    if new_status == "successful" and not rec.get("granted"):
-        rec["granted"] = True
-        _grant_tier(rec.get("user_id"), rec.get("plan", ""))
+    db = get_db()
+    persisted = False
+    if db is not None:
+        try:
+            upd = (db.table("subscription_payments").update({"status": new_status})
+                   .eq("reference", rec["reference"]).execute())
+            # Only a row that exists can carry the claim. If the checkout never
+            # reached the table (a failed insert), the memory flag decides, so
+            # a payment is never left ungranted by a claim on nothing.
+            persisted = bool(getattr(upd, "data", None))
+        except Exception as e:  # noqa: BLE001 — pre-0033
+            log.info("[payments] subscription status not persisted: %s", e)
+    if new_status != "successful" or rec.get("granted"):
+        return
+    if persisted:
+        claimed = (db.table("subscription_payments").update({"granted": True})
+                   .eq("reference", rec["reference"]).eq("granted", False).execute())
+        if not (getattr(claimed, "data", None) or []):
+            rec["granted"] = True          # someone else already granted it
+            return
+    rec["granted"] = True
+    _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly")
 
 
 @app.get("/payments/config")
-async def payments_config():
+def payments_config():
     """Which networks are live (real API) vs simulated (no creds yet)."""
     return {"networks": payments.configured_networks(), "mode": "live" if any(payments.configured_networks().values()) else "simulation"}
 
@@ -2227,7 +2424,7 @@ class PaymentInitiateRequest(BaseModel):
 
 
 @app.post("/payments/initiate")
-async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(require_user)):
+def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(require_user)):
     # The account to upgrade is ALWAYS the authenticated caller — never a
     # user_id from the request body (which any client could forge).
     network = (body.network or "").lower()
@@ -2274,12 +2471,25 @@ async def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends
     if state == "failed":
         raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
 
+    db = get_db()
+    if db is not None:
+        try:
+            db.table("subscription_payments").insert({
+                "reference": reference, "user_id": user_id, "network": network,
+                "plan": plan, "billing": billing, "amount": amount,
+                "currency": body.currency, "status": state, "granted": False,
+                "payer_phone": body.payer_phone.strip()[:32],
+            }).execute()
+        except Exception as e:  # noqa: BLE001 — pre-0033: memory only, as before
+            log.warning("[payments] checkout %s kept in memory only (run migration 0033): %s",
+                        reference, e)
+
     return {"reference": reference, "status": state, "amount": amount, "network": network, "plan": plan}
 
 
 @app.get("/payments/status/{reference}")
-async def payments_status(reference: str, user_id: str = Depends(require_user)):
-    rec = PAYMENTS.get(reference)
+def payments_status(reference: str, user_id: str = Depends(require_user)):
+    rec = _load_subscription_payment(reference)
     # Only the owner may poll a reference (and existence isn't leaked to others).
     if not rec or rec.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Unknown payment reference")
@@ -2293,12 +2503,12 @@ async def payments_status(reference: str, user_id: str = Depends(require_user)):
 
 
 @app.post("/payments/callback/{network}")
-async def payments_callback(network: str, body: Dict[str, Any],
+def payments_callback(network: str, body: Dict[str, Any],
                             x_callback_secret: Optional[str] = Header(default=None)):
     """Provider webhook — confirms a collection out-of-band. MUST present the
     shared secret; without it (or if none is configured) the call is rejected so
     the tier-grant path can't be triggered by an anonymous POST."""
-    if not CALLBACK_SECRET or x_callback_secret != CALLBACK_SECRET:
+    if not _secret_ok(CALLBACK_SECRET, x_callback_secret):
         raise HTTPException(status_code=403, detail="Invalid callback signature")
 
     reference = str(body.get("referenceId") or body.get("reference") or body.get("transaction", {}).get("id") or "")
@@ -2310,7 +2520,7 @@ async def payments_callback(network: str, body: Dict[str, Any],
     # (persisted, because the payer may approve minutes later and this callback
     # may arrive after a deploy). Subscriptions are checked first — that store
     # is a dict lookup — then the invoice table.
-    rec = PAYMENTS.get(reference)
+    rec = _load_subscription_payment(reference)
     if rec:
         if resolved:
             _settle(rec, resolved)
@@ -2335,13 +2545,13 @@ async def payments_callback(network: str, body: Dict[str, Any],
 # ── Morning Brief delivery (notify.py — ready-for-keys like payments) ────────
 
 @app.get("/notify/config")
-async def notify_config():
+def notify_config():
     """Which delivery channels are live. Booleans only — safe to expose."""
     return {"email": notify.email_enabled(), "whatsapp": notify.whatsapp_enabled()}
 
 
 @app.get("/notify/reach")
-async def notify_reach(ctx: membership.Context = Depends(membership.require_context)):
+def notify_reach(ctx: membership.Context = Depends(membership.require_context)):
     """Would a booking alert actually reach you?
 
     /health/setup answers whether the KEY is set. This answers the other half:
@@ -2354,14 +2564,13 @@ async def notify_reach(ctx: membership.Context = Depends(membership.require_cont
 
 
 @app.post("/notify/dispatch-briefs")
-async def notify_dispatch(x_cron_secret: Optional[str] = Header(default=None)):
+def notify_dispatch(x_cron_secret: Optional[str] = Header(default=None)):
     """
     Send the Morning Brief to every opted-in, entitled user. Called by the
     scheduled cron ONLY — must present CRON_SECRET; without it (or if none is
     configured) the call is rejected, so nobody can trigger a mass send.
     """
-    secret = os.environ.get("CRON_SECRET")
-    if not secret or x_cron_secret != secret:
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
         raise HTTPException(status_code=403, detail="Invalid cron secret")
     db = get_db()
     if db is None:
@@ -2396,7 +2605,7 @@ class ClassifyRequest(BaseModel):
 
 
 @app.post("/events/classify")
-async def classify_activity(req: ClassifyRequest,
+def classify_activity(req: ClassifyRequest,
                             user_id: str = Depends(rate_limit.limiter("classify", 40, 60))):
     """
     Record Business Activity (Initiative 1): turn free text into a PROPOSED event.
@@ -2424,7 +2633,7 @@ async def classify_activity(req: ClassifyRequest,
 
 
 @app.post("/events")
-async def create_event(ev: nervous.EventIn, ctx: membership.Context = Depends(membership.require_write)):
+def create_event(ev: nervous.EventIn, ctx: membership.Context = Depends(membership.require_write)):
     """Record one Business Activity into the tenant's books. Owner/staff only
     (accountants are read-only); staff events land pending (audit #27)."""
     db = _require_db()
@@ -2440,21 +2649,24 @@ async def create_event(ev: nervous.EventIn, ctx: membership.Context = Depends(me
 
 
 @app.post("/events/batch")
-async def create_events_batch(
+def create_events_batch(
     events: List[nervous.EventIn] = Body(..., embed=True),
-    user_id: str = Depends(require_user),
+    ctx: membership.Context = Depends(membership.require_write),
 ):
-    """Bulk ingest (Excel/POS import). Partial success allowed (Initiative 2)."""
+    """Bulk ingest (Excel/POS import). Partial success allowed (Initiative 2).
+    Lands in the business the owner is looking at, not always the default."""
     db = _require_db()
     try:
-        return {"ok": True, **nervous.ingest_batch(db, user_id, events)}
+        return {"ok": True, **nervous.ingest_batch(db, ctx.tenant, events,
+                                                   business_id=ctx.business_id,
+                                                   actor_role=ctx.role, actor_id=ctx.actor)}
     except Exception as exc:  # noqa: BLE001
         logger.error("create_events_batch error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Batch error: {type(exc).__name__}: {exc}")
 
 
 @app.get("/events")
-async def get_events(
+def get_events(
     ctx: membership.Context = Depends(membership.require_context),
     status: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
@@ -2470,7 +2682,7 @@ async def get_events(
 
 
 @app.post("/events/{event_id}/confirm")
-async def confirm_event(event_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+def confirm_event(event_id: str, ctx: membership.Context = Depends(membership.require_owner)):
     """Promote a pending event to confirmed. OWNER only — this is the trust
     gate: staff propose, the owner confirms (audit #27)."""
     db = _require_db()
@@ -2481,28 +2693,32 @@ async def confirm_event(event_id: str, ctx: membership.Context = Depends(members
 
 
 @app.patch("/events/{event_id}")
-async def patch_event(
+def patch_event(
     event_id: str,
     patch: Dict[str, Any] = Body(...),
-    user_id: str = Depends(require_user),
+    ctx: membership.Context = Depends(membership.require_write),
 ):
-    """Correct an event (Initiative 5). The diff is recorded for Business Memory."""
+    """Correct an event (Initiative 5). The diff is recorded for Business Memory.
+    Staff may fix only their own entries still waiting for the owner."""
     db = _require_db()
     try:
-        return {"ok": True, "event": nervous.correct(db, user_id, event_id, patch)}
+        return {"ok": True, "event": nervous.correct(db, ctx.tenant, event_id, patch,
+                                                      actor_role=ctx.role, actor_id=ctx.actor)}
     except nervous.PipelineError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/events/{event_id}")
-async def delete_event(event_id: str, user_id: str = Depends(require_user),
+def delete_event(event_id: str, ctx: membership.Context = Depends(membership.require_write),
                        reason: Optional[str] = Query(None)):
     """Soft-delete (void) an event — never hard-deleted (audit trail / rollback)."""
     db = _require_db()
     try:
-        return {"ok": True, "event": nervous.void(db, user_id, event_id, reason)}
+        return {"ok": True, "event": nervous.void(db, ctx.tenant, event_id, reason,
+                                                   actor_role=ctx.role, actor_id=ctx.actor)}
     except nervous.PipelineError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        code = 404 if "not found" in str(e).lower() else 403
+        raise HTTPException(status_code=code, detail=str(e))
 
 
 class ResetRequest(BaseModel):
@@ -2516,7 +2732,7 @@ class ResetRequest(BaseModel):
 
 
 @app.post("/events/reset")
-async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)):
+def reset_timeline(req: ResetRequest, ctx: membership.Context = Depends(membership.require_owner)):
     """
     Start afresh: delete the user's timeline (optionally scoped to one source,
     e.g. a bad Excel import) and rebuild the twin from what remains. Unlike
@@ -2531,10 +2747,12 @@ async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)
     if req.source is not None and req.source not in nervous.SOURCES:
         raise HTTPException(status_code=400, detail=f"Unknown source '{req.source}'.")
     try:
+        # The business the owner is looking at, and only that one.
         result = nervous.reset_business(
-            db, user_id, source=req.source, wipe_memory=req.wipe_memory,
+            db, ctx.tenant, source=req.source, wipe_memory=req.wipe_memory,
             wipe_products=req.wipe_products, wipe_schedule=req.wipe_schedule,
             wipe_parties=req.wipe_parties, reset_opening_cash=req.reset_opening_cash,
+            business_id=ctx.business_id,
         )
         return {"ok": True, **result}
     except Exception as exc:  # noqa: BLE001
@@ -2545,16 +2763,16 @@ async def reset_timeline(req: ResetRequest, user_id: str = Depends(require_user)
 # ── Ingestion: Excel → events & QR (Initiatives 2, 7) ─────────────────────────
 
 @app.post("/events/excel/preview")
-async def excel_preview(
+def excel_preview(
     file: UploadFile = File(...),
     sheet: Optional[str] = Query(None),
-    user_id: str = Depends(require_user),
+    ctx: membership.Context = Depends(membership.require_write),
 ):
     """Parse an uploaded spreadsheet and return columns, sample rows, and a
     suggested column→event-field mapping for the user to review (Initiative 2)."""
     _require_db()
     try:
-        content = await file.read()
+        content = file.file.read()
         _enforce_upload_size(content)
         df, all_sheets, selected = _load_sheet(content, file.filename or "upload.xlsx", sheet)
         df = df.where(pd.notna(df), None)  # JSON-safe (NaN → null)
@@ -2563,7 +2781,7 @@ async def excel_preview(
         # Prefer a remembered mapping template (Business Memory) when its columns
         # still fit this file; else fall back to the heuristic suggestion.
         suggestion = ingestion.excel_suggest_mapping(cols)
-        remembered = (memory.recall(get_db(), user_id, "excel_mapping", "default") or {})
+        remembered = (memory.recall(get_db(), ctx.tenant, "excel_mapping", "default") or {})
         if remembered and all(c in cols for c in remembered.values()):
             suggestion = {**suggestion, **remembered}
         return {
@@ -2592,17 +2810,20 @@ class ExcelCommitRequest(BaseModel):
 
 
 @app.post("/events/excel/commit")
-async def excel_commit(req: ExcelCommitRequest, user_id: str = Depends(require_user)):
-    """Map reviewed rows → events and bulk-ingest (partial import; per-row errors)."""
+def excel_commit(req: ExcelCommitRequest, ctx: membership.Context = Depends(membership.require_write)):
+    """Map reviewed rows → events and bulk-ingest (partial import; per-row errors).
+    Into the business being looked at: this used to write every import into the
+    default business whichever one the owner had switched to."""
     db = _require_db()
     events, map_errors = ingestion.rows_to_events(req.rows, req.mapping, req.defaults)
-    result = nervous.ingest_batch(db, user_id, events)
+    result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
+                                  actor_role=ctx.role, actor_id=ctx.actor)
     # Surface mapping errors alongside pipeline errors so nothing is silently dropped.
     result["errors"] = [*map_errors, *result.get("errors", [])]
     result["error_count"] = len(result["errors"])
     # Remember this column mapping (Business Memory) so the next import auto-fills it.
     if req.mapping:
-        memory.remember(db, user_id, "excel_mapping", "default", req.mapping)
+        memory.remember(db, ctx.tenant, "excel_mapping", "default", req.mapping)
     return {"ok": True, **result}
 
 
@@ -2612,7 +2833,7 @@ class QrRequest(BaseModel):
 
 
 @app.post("/ingest/qr")
-async def ingest_qr(req: QrRequest, user_id: str = Depends(require_user)):
+def ingest_qr(req: QrRequest, user_id: str = Depends(require_user)):
     """Decoded QR string → a PROPOSED event (reviewed before saving, like classify)."""
     _require_db()
     proposal = ingestion.parse_qr(req.payload, req.currency)
@@ -2620,7 +2841,7 @@ async def ingest_qr(req: QrRequest, user_id: str = Depends(require_user)):
 
 
 @app.post("/ingest/receipt")
-async def ingest_receipt(
+def ingest_receipt(
     file: UploadFile = File(...),
     currency: str = Query("ZMW"),
     user_id: str = Depends(require_user),
@@ -2628,7 +2849,7 @@ async def ingest_receipt(
     """Receipt photo/upload → vision-OCR → a PROPOSED Purchase (reviewed before saving)."""
     _require_db()
     try:
-        content = await file.read()
+        content = file.file.read()
         _enforce_upload_size(content)
         proposal = ocr.parse_receipt_image(content, file.content_type or "image/jpeg", currency)
         return {"ok": True, "proposal": proposal}
@@ -2640,7 +2861,7 @@ async def ingest_receipt(
 
 
 @app.get("/twin")
-async def get_twin(ctx: membership.Context = Depends(membership.require_context)):
+def get_twin(ctx: membership.Context = Depends(membership.require_context)):
     """
     The Digital Twin — current business state derived from confirmed events.
     Members read the tenant they belong to (staff/accountant see the owner's).
@@ -2651,7 +2872,7 @@ async def get_twin(ctx: membership.Context = Depends(membership.require_context)
 
 
 @app.post("/twin/rebuild")
-async def rebuild_twin(ctx: membership.Context = Depends(membership.require_context)):
+def rebuild_twin(ctx: membership.Context = Depends(membership.require_context)):
     """Force a full replay of the event log into the twin (idempotent recovery)."""
     db = _require_db()
     return {"ok": True, "twin": twin.rebuild(db, ctx.tenant, ctx.business_id)}
@@ -2663,31 +2884,43 @@ class TwinSeedRequest(BaseModel):
 
 
 @app.post("/twin/seed")
-async def seed_twin(req: TwinSeedRequest, ctx: membership.Context = Depends(membership.require_write)):
+def seed_twin(req: TwinSeedRequest, ctx: membership.Context = Depends(membership.require_write)):
     """Seed the twin's opening cash + currency (Setup Wizard, Initiative 1)."""
     db = _require_db()
     return {"ok": True, "twin": twin.seed(db, ctx.tenant, req.opening_cash, req.currency, ctx.business_id)}
 
 
+# Every stock movement, not the newest 1,000 events of any kind. On-hand is
+# opening stock plus EVERY receipt, sale and adjustment ever confirmed; reading
+# a capped slice of the whole log silently forgot a shop's older deliveries.
+_STOCK_EVENT_TYPES = ("InventoryReceipt", "Sale", "InventoryAdjustment")
+
+
+def _stock_events(db, ctx: "membership.Context") -> list:
+    return nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000,
+                               business_id=ctx.business_id, event_types=_STOCK_EVENT_TYPES)
+
+
 # ── Future hooks: engines, recommendations, simulation (Initiatives 10, 12) ───
 
 @app.get("/engines")
-async def list_engines(user_id: str = Depends(require_user)):
+def list_engines(user_id: str = Depends(require_user)):
     """The registered intelligence engines + which events each subscribes to."""
     return {"ok": True, "engines": engines_api.engine_catalog()}
 
 
 @app.get("/recommendations")
-async def get_recommendations(ctx: membership.Context = Depends(membership.require_context)):
+def get_recommendations(ctx: membership.Context = Depends(membership.require_context)):
     """Run every engine against the Digital Twin → explainable recommendations
     (Bible 9th Law: each carries what/why/evidence/confidence/alternatives)."""
     db = _require_db()
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     # Build the engine context once: catalog + derived stock + low-stock list.
     prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=1000, business_id=ctx.business_id) if prods else []
-    stock = products_api.compute_stock(prods, events)
+    stock = products_api.compute_stock(prods, _stock_events(db, ctx) if prods else [])
     context = {"products": prods, "stock": stock, "low_stock": products_api.low_stock(prods, stock)}
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=1000,
+                                 business_id=ctx.business_id)
     recs = engines_api.run_all(state, events, context)
     # Ledger the batch (audit #20): annotates each rec with rec_id/status/
     # times_shown so the UI can take feedback. Best-effort pre-migration-0021.
@@ -2696,32 +2929,31 @@ async def get_recommendations(ctx: membership.Context = Depends(membership.requi
 
 
 @app.post("/recommendations/{rec_id}/status")
-async def recommendation_feedback(rec_id: str, body: Dict[str, Any] = Body(...),
-                                  user_id: str = Depends(require_user)):
+def recommendation_feedback(rec_id: str, body: Dict[str, Any] = Body(...),
+                                  ctx: membership.Context = Depends(membership.require_write)):
     """Owner feedback on advice: accepted ('did this') or dismissed."""
     db = _require_db()
     try:
-        row = rec_store.set_status(db, user_id, rec_id, str(body.get("status") or ""))
+        row = rec_store.set_status(db, ctx.tenant, rec_id, str(body.get("status") or ""))
         return {"ok": True, "recommendation": row}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/recommendations/track-record")
-async def recommendations_track_record(user_id: str = Depends(require_user)):
+def recommendations_track_record(ctx: membership.Context = Depends(membership.require_context)):
     """AIBOS's own advice scoreboard — self-auditing intelligence."""
     db = _require_db()
-    return {"ok": True, **rec_store.track_record(db, user_id)}
+    return {"ok": True, **rec_store.track_record(db, ctx.tenant)}
 
 
 # ── Products catalog (Initiative 3) ───────────────────────────────────────────
 
 @app.get("/products")
-async def get_products(ctx: membership.Context = Depends(membership.require_context)):
+def get_products(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=1000, business_id=ctx.business_id) if prods else []
-    stock = products_api.compute_stock(prods, events)
+    stock = products_api.compute_stock(prods, _stock_events(db, ctx) if prods else [])
     # Attach derived on-hand so the catalog can show stock without a second call.
     for p in prods:
         p["on_hand"] = stock.get(products_api.normalize_name(p.get("name")), 0)
@@ -2729,7 +2961,7 @@ async def get_products(ctx: membership.Context = Depends(membership.require_cont
 
 
 @app.post("/products")
-async def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
         return {"ok": True, "product": products_api.create_product(db, ctx.tenant, body, business_id=ctx.business_id)}
@@ -2738,7 +2970,7 @@ async def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Conte
 
 
 @app.post("/products/stock-take")
-async def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     """Guided stock count (audit #49): the owner enters the ACTUAL on-hand for
     each product; AIBOS posts one InventoryAdjustment per discrepancy (delta =
     counted − current), through the spine like every other event. Nothing is
@@ -2749,8 +2981,7 @@ async def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context =
         raise HTTPException(status_code=400, detail="Provide counts: [{name, counted}].")
 
     prods = products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=2000, business_id=ctx.business_id)
-    stock = products_api.compute_stock(prods, events)
+    stock = products_api.compute_stock(prods, _stock_events(db, ctx))
 
     adjusted, skipped = 0, 0
     for c in counts:
@@ -2778,12 +3009,12 @@ async def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context =
 
 
 @app.post("/products/import/loyverse")
-async def import_loyverse_items(file: UploadFile = File(...), ctx: membership.Context = Depends(membership.require_write)):
+def import_loyverse_items(file: UploadFile = File(...), ctx: membership.Context = Depends(membership.require_write)):
     """Loyverse items export → the product catalog in one upload (audit #29).
     Idempotent by product name: re-importing refreshes nothing and duplicates
     nothing — existing names are skipped."""
     db = _require_db()
-    content = await file.read()
+    content = file.file.read()
     _enforce_upload_size(content)
     try:
         parsed = loyverse.parse_items_csv(content)
@@ -2806,25 +3037,26 @@ async def import_loyverse_items(file: UploadFile = File(...), ctx: membership.Co
 
 
 @app.patch("/products/{product_id}")
-async def patch_product(product_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+def patch_product(product_id: str, body: Dict[str, Any] = Body(...),
+                        ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "product": products_api.update_product(db, user_id, product_id, body)}
+        return {"ok": True, "product": products_api.update_product(db, ctx.tenant, product_id, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/products/{product_id}")
-async def remove_product(product_id: str, user_id: str = Depends(require_user)):
+def remove_product(product_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
-    products_api.delete_product(db, user_id, product_id)
+    products_api.delete_product(db, ctx.tenant, product_id)
     return {"ok": True}
 
 
 # ── Statutory compliance calendar (audit #25) ─────────────────────────────────
 
 @app.post("/schedule/statutory")
-async def seed_statutory_calendar(ctx: membership.Context = Depends(membership.require_write)):
+def seed_statutory_calendar(ctx: membership.Context = Depends(membership.require_write)):
     """One tap: recurring PAYE/NAPSA/NHIMA reminders on the 10th, pre-filled
     from the latest payroll run. Idempotent by title. Recurrence is the paid
     Scheduler layer — same gate."""
@@ -2846,13 +3078,15 @@ async def seed_statutory_calendar(ctx: membership.Context = Depends(membership.r
 # deals with. The paid layer is the intelligence computed OVER them (engine2).
 
 @app.get("/members/me")
-async def my_membership(ctx: membership.Context = Depends(membership.require_context)):
-    """The caller's own role + tenant — the frontend gates nav on this."""
-    return {"ok": True, "role": ctx.role, "tenant": ctx.tenant, "is_owner": ctx.is_owner}
+def my_membership(ctx: membership.Context = Depends(membership.require_context)):
+    """The caller's own role + tenant — the frontend gates nav on this — and
+    every set of books they can open, for the workspace switcher."""
+    return {"ok": True, "role": ctx.role, "tenant": ctx.tenant, "is_owner": ctx.is_owner,
+            "workspaces": membership.workspaces(get_db(), ctx.actor, ctx)}
 
 
 @app.post("/members/accept")
-async def accept_memberships(ctx_user: str = Depends(require_user)):
+def accept_memberships(ctx_user: str = Depends(require_user)):
     """On login: bind any pending invites for the caller's email to this
     account and activate them. Email is read from the caller's OWN profile
     (never the request body)."""
@@ -2865,13 +3099,13 @@ async def accept_memberships(ctx_user: str = Depends(require_user)):
 
 
 @app.get("/members")
-async def list_members(ctx: membership.Context = Depends(membership.require_owner)):
+def list_members(ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     return {"ok": True, "members": membership.list_members(db, ctx.tenant)}
 
 
 @app.post("/members")
-async def invite_member(body: Dict[str, Any] = Body(...),
+def invite_member(body: Dict[str, Any] = Body(...),
                         ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
@@ -2883,7 +3117,7 @@ async def invite_member(body: Dict[str, Any] = Body(...),
 
 
 @app.patch("/members/{member_row_id}")
-async def patch_member(member_row_id: str, body: Dict[str, Any] = Body(...),
+def patch_member(member_row_id: str, body: Dict[str, Any] = Body(...),
                        ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
@@ -2893,7 +3127,7 @@ async def patch_member(member_row_id: str, body: Dict[str, Any] = Body(...),
 
 
 @app.delete("/members/{member_row_id}")
-async def revoke_member(member_row_id: str,
+def revoke_member(member_row_id: str,
                         ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     membership.revoke_member(db, ctx.tenant, member_row_id)
@@ -2903,7 +3137,7 @@ async def revoke_member(member_row_id: str,
 # ── What AIBOS has learned (audit #57) ────────────────────────────────────────
 
 @app.get("/memory/summary")
-async def memory_summary(ctx: membership.Context = Depends(membership.require_context)):
+def memory_summary(ctx: membership.Context = Depends(membership.require_context)):
     """The corrections-learning loop, made visible: how many supplier/customer
     aliases and category rules AIBOS has picked up (Bible 8th Law: nothing
     entered twice)."""
@@ -2912,14 +3146,14 @@ async def memory_summary(ctx: membership.Context = Depends(membership.require_co
 
 
 @app.get("/memory/mappings")
-async def memory_mappings(ctx: membership.Context = Depends(membership.require_context)):
+def memory_mappings(ctx: membership.Context = Depends(membership.require_context)):
     """Every learned mapping, so the owner can review and correct them (audit #57)."""
     db = _require_db()
     return {"ok": True, "mappings": memory.list_mappings(db, ctx.tenant)}
 
 
 @app.delete("/memory/mappings/{mapping_id}")
-async def forget_mapping(mapping_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def forget_mapping(mapping_id: str, ctx: membership.Context = Depends(membership.require_write)):
     """Owner corrects AIBOS by deleting a wrong mapping (audit #57)."""
     db = _require_db()
     memory.forget(db, ctx.tenant, mapping_id)
@@ -2930,7 +3164,7 @@ async def forget_mapping(mapping_id: str, ctx: membership.Context = Depends(memb
 # Owner or accountant may pull the books out as CSV (read-only, so any role).
 
 @app.get("/export/events.csv")
-async def export_events(ctx: membership.Context = Depends(membership.require_context)):
+def export_events(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     events = nervous.list_events(db, ctx.tenant, limit=100000, business_id=ctx.business_id)
     return Response(content=exports_api.events_csv(events), media_type="text/csv",
@@ -2938,7 +3172,7 @@ async def export_events(ctx: membership.Context = Depends(membership.require_con
 
 
 @app.get("/export/pnl.csv")
-async def export_pnl(ctx: membership.Context = Depends(membership.require_context)):
+def export_pnl(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     return Response(content=exports_api.pnl_csv(state.get("monthly", [])), media_type="text/csv",
@@ -2949,7 +3183,7 @@ async def export_pnl(ctx: membership.Context = Depends(membership.require_contex
 # Actuals vs the owner's PLAN. Targets are stored; actuals derive from the twin.
 
 @app.get("/budgets")
-async def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
+def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     rows = budgets_api.list_budgets(db, ctx.tenant, month=month, business_id=ctx.business_id)
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
@@ -2958,7 +3192,7 @@ async def get_budgets(month: str = Query(...), ctx: membership.Context = Depends
 
 
 @app.post("/budgets")
-async def set_budget(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def set_budget(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
         row = budgets_api.set_budget(db, ctx.tenant, str(body.get("month") or ""),
@@ -2970,7 +3204,7 @@ async def set_budget(body: Dict[str, Any] = Body(...), ctx: membership.Context =
 
 
 @app.delete("/budgets/{budget_id}")
-async def remove_budget(budget_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def remove_budget(budget_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     budgets_api.delete_budget(db, ctx.tenant, budget_id, business_id=ctx.business_id)
     return {"ok": True}
@@ -2981,14 +3215,14 @@ async def remove_budget(budget_id: str, ctx: membership.Context = Depends(member
 # is the Growth capability — so a portfolio owner sees separate books per venture.
 
 @app.get("/businesses")
-async def get_businesses(ctx: membership.Context = Depends(membership.require_context)):
+def get_businesses(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     return {"ok": True, "businesses": businesses_api.list_businesses(db, ctx.tenant),
             "active": ctx.business_id}
 
 
 @app.post("/businesses")
-async def create_business(body: Dict[str, Any] = Body(...),
+def create_business(body: Dict[str, Any] = Body(...),
                           ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     existing = businesses_api.list_businesses(db, ctx.tenant)
@@ -3001,7 +3235,7 @@ async def create_business(body: Dict[str, Any] = Body(...),
 
 
 @app.patch("/businesses/{business_id}")
-async def patch_business(business_id: str, body: Dict[str, Any] = Body(...),
+def patch_business(business_id: str, body: Dict[str, Any] = Body(...),
                          ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
@@ -3011,7 +3245,7 @@ async def patch_business(business_id: str, body: Dict[str, Any] = Body(...),
 
 
 @app.post("/businesses/{business_id}/default")
-async def set_default_business(business_id: str,
+def set_default_business(business_id: str,
                                ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
@@ -3022,7 +3256,7 @@ async def set_default_business(business_id: str,
 
 
 @app.get("/parties")
-async def get_parties(kind: Optional[str] = Query(None),
+def get_parties(kind: Optional[str] = Query(None),
                       ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     rows = parties_api.list_parties(db, ctx.tenant, kind=kind, business_id=ctx.business_id)
@@ -3035,32 +3269,36 @@ async def get_parties(kind: Optional[str] = Query(None),
 
 
 @app.post("/parties")
-async def create_party(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def create_party(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "party": parties_api.create_party(db, ctx.tenant, body)}
+        # With its business: a party saved without one was invisible in the
+        # list the owner had just added it to.
+        return {"ok": True, "party": parties_api.create_party(db, ctx.tenant, body,
+                                                              business_id=ctx.business_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.patch("/parties/{party_id}")
-async def patch_party(party_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+def patch_party(party_id: str, body: Dict[str, Any] = Body(...),
+                      ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "party": parties_api.update_party(db, user_id, party_id, body)}
+        return {"ok": True, "party": parties_api.update_party(db, ctx.tenant, party_id, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/parties/{party_id}")
-async def remove_party(party_id: str, user_id: str = Depends(require_user)):
+def remove_party(party_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
-    parties_api.delete_party(db, user_id, party_id)
+    parties_api.delete_party(db, ctx.tenant, party_id)
     return {"ok": True}
 
 
 @app.post("/parties/{keep_id}/merge/{remove_id}")
-async def merge_parties(keep_id: str, remove_id: str,
+def merge_parties(keep_id: str, remove_id: str,
                         ctx: membership.Context = Depends(membership.require_write)):
     """Merge two duplicate parties (audit #6): keep one, fold the other in.
     Records an alias (removed name → kept name) in Business Memory so future
@@ -3080,13 +3318,13 @@ async def merge_parties(keep_id: str, remove_id: str,
 
 
 @app.post("/parties/backfill")
-async def backfill_parties(user_id: str = Depends(require_user)):
+def backfill_parties(ctx: membership.Context = Depends(membership.require_owner)):
     """Create parties from every existing event — idempotent, run-once bridge
     for accounts that recorded history before migration 0018."""
     db = _require_db()
-    events = nervous.list_events(db, user_id, limit=10000)
+    events = nervous.list_events(db, ctx.tenant, limit=100000)
     try:
-        return {"ok": True, **parties_api.backfill(db, user_id, events)}
+        return {"ok": True, **parties_api.backfill(db, ctx.tenant, events)}
     except Exception as exc:  # noqa: BLE001 — most likely: migration 0018 not run
         logger.error("parties backfill error: %s", exc)
         raise HTTPException(status_code=500,
@@ -3098,7 +3336,7 @@ async def backfill_parties(user_id: str = Depends(require_user)):
 # token); POST is HMAC-gated (deny-by-default without WHATSAPP_APP_SECRET).
 
 @app.get("/whatsapp/webhook")
-async def whatsapp_verify(request: Request):
+def whatsapp_verify(request: Request):
     challenge = whatsapp_bot.verify_challenge(dict(request.query_params))
     if challenge is None:
         raise HTTPException(status_code=403, detail="Verification failed.")
@@ -3121,7 +3359,11 @@ async def whatsapp_webhook(request: Request):
     if db is None:
         return {"ok": True, "skipped": "no database configured"}
     client = llm.client()
-    return {"ok": True, **whatsapp_bot.process_webhook(db, payload, client)}
+    # The model call and the database writes block; run them off the event loop
+    # so one WhatsApp delivery does not stall every other request.
+    from starlette.concurrency import run_in_threadpool
+    result = await run_in_threadpool(whatsapp_bot.process_webhook, db, payload, client)
+    return {"ok": True, **result}
 
 
 # ── Invoices: the get-paid loop (audit #7) ────────────────────────────────────
@@ -3129,14 +3371,14 @@ async def whatsapp_webhook(request: Request):
 # a confirmed credit Sale (+receivables); mark-paid posts the CustomerPayment.
 
 @app.get("/invoices")
-async def get_invoices(status: Optional[str] = Query(None),
+def get_invoices(status: Optional[str] = Query(None),
                        ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     return {"ok": True, "invoices": invoices_api.list_invoices(db, ctx.tenant, status=status, business_id=ctx.business_id)}
 
 
 @app.post("/invoices")
-async def create_invoice(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def create_invoice(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
         return {"ok": True, "invoice": invoices_api.create_invoice(db, ctx.tenant, body, business_id=ctx.business_id)}
@@ -3145,47 +3387,48 @@ async def create_invoice(body: Dict[str, Any] = Body(...), ctx: membership.Conte
 
 
 @app.patch("/invoices/{invoice_id}")
-async def patch_invoice(invoice_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+def patch_invoice(invoice_id: str, body: Dict[str, Any] = Body(...),
+                        ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "invoice": invoices_api.update_invoice(db, user_id, invoice_id, body)}
+        return {"ok": True, "invoice": invoices_api.update_invoice(db, ctx.tenant, invoice_id, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/invoices/{invoice_id}")
-async def remove_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+def remove_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        invoices_api.delete_invoice(db, user_id, invoice_id)
+        invoices_api.delete_invoice(db, ctx.tenant, invoice_id)
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/invoices/{invoice_id}/send")
-async def send_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+def send_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "invoice": invoices_api.send_invoice(db, user_id, invoice_id)}
+        return {"ok": True, "invoice": invoices_api.send_invoice(db, ctx.tenant, invoice_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/invoices/{invoice_id}/mark-paid")
-async def mark_invoice_paid(invoice_id: str, user_id: str = Depends(require_user)):
+def mark_invoice_paid(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "invoice": invoices_api.mark_paid(db, user_id, invoice_id)}
+        return {"ok": True, "invoice": invoices_api.mark_paid(db, ctx.tenant, invoice_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/invoices/{invoice_id}/cancel")
-async def cancel_invoice(invoice_id: str, user_id: str = Depends(require_user)):
+def cancel_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     try:
-        return {"ok": True, "invoice": invoices_api.cancel_invoice(db, user_id, invoice_id)}
+        return {"ok": True, "invoice": invoices_api.cancel_invoice(db, ctx.tenant, invoice_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3200,11 +3443,11 @@ MAX_VOICE_BYTES = 6 * 1024 * 1024
 
 
 @app.post("/transcribe")
-async def transcribe_voice(file: UploadFile = File(...),
+def transcribe_voice(file: UploadFile = File(...),
                            user_id: str = Depends(rate_limit.limiter("transcribe", 30, 60))):
     if not llm.configured():
         raise HTTPException(status_code=503, detail=llm.not_configured_message())
-    content = await file.read()
+    content = file.file.read()
     if len(content) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413, detail="Voice note too long — keep it under a minute or two.")
     if not content:
@@ -3223,7 +3466,7 @@ async def transcribe_voice(file: UploadFile = File(...),
 
 
 @app.get("/debtors")
-async def get_debtors(business_name: Optional[str] = Query(None),
+def get_debtors(business_name: Optional[str] = Query(None),
                       ctx: membership.Context = Depends(membership.require_context)):
     """AR aging per customer (audit #15): sent invoices (exact) + the loose
     credit book (credit Sales net of untied payments, oldest-first). Each
@@ -3241,9 +3484,9 @@ async def get_debtors(business_name: Optional[str] = Query(None),
 
 
 @app.get("/invoices/{invoice_id}/share-text")
-async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(None),
+def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(None),
                              pay_note: Optional[str] = Query(None),
-                             user_id: str = Depends(require_user)):
+                             ctx: membership.Context = Depends(membership.require_context)):
     """WhatsApp-ready message for the OWNER to send from their own phone —
     AIBOS never messages a customer itself (automation.ts precedent).
 
@@ -3253,9 +3496,9 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
     """
     db = _require_db()
     try:
-        inv = invoices_api._get(db, user_id, invoice_id)
+        inv = invoices_api._get(db, ctx.tenant, invoice_id)
         if inv.get("status") == "sent" and not inv.get("pay_token"):
-            inv = invoices_api.ensure_pay_token(db, user_id, invoice_id)
+            inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -3266,12 +3509,12 @@ async def invoice_share_text(invoice_id: str, business_name: Optional[str] = Que
 
 
 @app.post("/invoices/{invoice_id}/pay-link")
-async def invoice_pay_link(invoice_id: str, user_id: str = Depends(require_user)):
+def invoice_pay_link(invoice_id: str, ctx: membership.Context = Depends(membership.require_context)):
     """Mint (or return) the invoice's public payment link, for the owner to copy
     anywhere — SMS, email, a printed QR. Sent invoices only."""
     db = _require_db()
     try:
-        inv = invoices_api.ensure_pay_token(db, user_id, invoice_id)
+        inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "url": invoices_api.build_pay_url(PUBLIC_APP_URL, inv["pay_token"])}
@@ -3354,7 +3597,7 @@ def _business_name_for(db, user_id: str) -> Optional[str]:
 
 
 @app.get("/pay/{token}")
-async def public_invoice(token: str, request: Request):
+def public_invoice(token: str, request: Request):
     """What the customer sees. Whitelisted fields only (public_view)."""
     # Generous: a customer refreshing, or a shared carrier IP, must not be locked
     # out of simply LOOKING at what they owe.
@@ -3375,7 +3618,7 @@ class PublicPayRequest(BaseModel):
 
 
 @app.post("/pay/{token}/initiate")
-async def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
+def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
     """Start a mobile-money collection against this invoice."""
     # The token limit is the real guard against prompt-bombing (see the section
     # note above): 5 attempts a minute is more than any honest payer needs, and
@@ -3446,7 +3689,13 @@ def _settle_invoice_payment(db, row: Dict[str, Any], new_status: str) -> str:
     row["status"] = new_status
 
     if new_status == "successful" and not row.get("settled"):
-        db.table("invoice_payments").update({"settled": True}).eq("id", row["id"]).execute()
+        # Conditional, so of a poll and a webhook arriving together exactly one
+        # flips it and goes on to settle. Reading `settled` and then writing it
+        # let both through.
+        claimed = (db.table("invoice_payments").update({"settled": True})
+                   .eq("id", row["id"]).eq("settled", False).execute())
+        if not (getattr(claimed, "data", None) or []):
+            return new_status
         row["settled"] = True
         try:
             invoices_api.mark_paid(db, row["user_id"], row["invoice_id"],
@@ -3475,7 +3724,7 @@ def _payment_row(db, token: str, reference: str) -> Dict[str, Any]:
 
 
 @app.get("/pay/{token}/status/{reference}")
-async def public_pay_status(token: str, reference: str, request: Request):
+def public_pay_status(token: str, reference: str, request: Request):
     """Poll a collection. The page calls this every few seconds while the
     customer approves the prompt on their handset."""
     # The page polls every 3s for up to ~3 minutes = ~60 calls per payment. This
@@ -3505,7 +3754,7 @@ async def public_pay_status(token: str, reference: str, request: Request):
 # rest of the Engine-1 sub-features' free preview (see entitlements.py note).
 
 @app.get("/forecast/cash")
-async def cash_forecast_route(ctx: membership.Context = Depends(membership.require_context)):
+def cash_forecast_route(ctx: membership.Context = Depends(membership.require_context)):
     """P10/P50/P90 cash bands from the caller's own monthly history (audit
     #19). Ungated like the other Engine-1 sub-features' free preview."""
     db = _require_db()
@@ -3514,7 +3763,7 @@ async def cash_forecast_route(ctx: membership.Context = Depends(membership.requi
 
 
 @app.get("/investigate")
-async def investigate_anomaly(month: Optional[str] = Query(None),
+def investigate_anomaly(month: Optional[str] = Query(None),
                               ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
@@ -3526,7 +3775,7 @@ async def investigate_anomaly(month: Optional[str] = Query(None),
 # ── Live customer intelligence: Engine 2 over the spine (audit #5) ────────────
 
 @app.get("/intelligence/customers")
-async def customers_intelligence(ctx: membership.Context = Depends(membership.require_context)):
+def customers_intelligence(ctx: membership.Context = Depends(membership.require_context)):
     """Engine 2 (RFM/CLV/churn/basket) computed from recorded events — the
     living-model counterpart of the upload flow. Pro feature, same gate."""
     entitlements.require_feature(ctx.tenant, "engine2")
@@ -3547,7 +3796,7 @@ async def customers_intelligence(ctx: membership.Context = Depends(membership.re
 # entitlements so a Free caller can't obtain it by hitting the API directly.
 
 @app.get("/schedule")
-async def get_schedule(horizon_days: int = Query(60, ge=1, le=366),
+def get_schedule(horizon_days: int = Query(60, ge=1, le=366),
                        ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     items = schedule_api.list_items(db, ctx.tenant, horizon_days=horizon_days, business_id=ctx.business_id)
@@ -3555,7 +3804,7 @@ async def get_schedule(horizon_days: int = Query(60, ge=1, le=366),
 
 
 @app.post("/schedule")
-async def create_schedule_item(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def create_schedule_item(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     if schedule_api.wants_paid_features(body):
         entitlements.require_feature(ctx.tenant, "schedule")
@@ -3566,12 +3815,13 @@ async def create_schedule_item(body: Dict[str, Any] = Body(...), ctx: membership
 
 
 @app.patch("/schedule/{item_id}")
-async def patch_schedule_item(item_id: str, body: Dict[str, Any] = Body(...), user_id: str = Depends(require_user)):
+def patch_schedule_item(item_id: str, body: Dict[str, Any] = Body(...),
+                              ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
     if schedule_api.wants_paid_features(body):
-        entitlements.require_feature_for_caller(user_id, "schedule")
+        entitlements.require_feature(ctx.tenant, "schedule")
     try:
-        return {"ok": True, "item": schedule_api.update_item(db, user_id, item_id, body)}
+        return {"ok": True, "item": schedule_api.update_item(db, ctx.tenant, item_id, body)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3582,20 +3832,21 @@ class ScheduleStatusRequest(BaseModel):
 
 
 @app.post("/schedule/{item_id}/status")
-async def set_schedule_status(item_id: str, req: ScheduleStatusRequest, user_id: str = Depends(require_user)):
+def set_schedule_status(item_id: str, req: ScheduleStatusRequest,
+                              ctx: membership.Context = Depends(membership.require_write)):
     """Resolve an item (done/missed/cancelled). Recurring items roll forward to
     their next occurrence; linked_event_id is the record bridge to the spine."""
     db = _require_db()
     try:
-        return {"ok": True, "item": schedule_api.set_status(db, user_id, item_id, req.status, req.linked_event_id)}
+        return {"ok": True, "item": schedule_api.set_status(db, ctx.tenant, item_id, req.status, req.linked_event_id)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/schedule/{item_id}")
-async def remove_schedule_item(item_id: str, user_id: str = Depends(require_user)):
+def remove_schedule_item(item_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
-    schedule_api.delete_item(db, user_id, item_id)
+    schedule_api.delete_item(db, ctx.tenant, item_id)
     return {"ok": True}
 
 
@@ -3605,13 +3856,13 @@ async def remove_schedule_item(item_id: str, user_id: str = Depends(require_user
 # capability, enforced server-side via entitlements ("payroll" → Pro).
 
 @app.get("/employees")
-async def get_employees(ctx: membership.Context = Depends(membership.require_owner)):
+def get_employees(ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     return {"ok": True, "employees": payroll_api.list_employees(db, ctx.tenant)}
 
 
 @app.post("/employees")
-async def create_employee(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_owner)):
+def create_employee(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
         return {"ok": True, "employee": payroll_api.create_employee(db, ctx.tenant, body)}
@@ -3620,7 +3871,7 @@ async def create_employee(body: Dict[str, Any] = Body(...), ctx: membership.Cont
 
 
 @app.patch("/employees/{employee_id}")
-async def patch_employee(employee_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_owner)):
+def patch_employee(employee_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
         return {"ok": True, "employee": payroll_api.update_employee(db, ctx.tenant, employee_id, body)}
@@ -3629,26 +3880,26 @@ async def patch_employee(employee_id: str, body: Dict[str, Any] = Body(...), ctx
 
 
 @app.delete("/employees/{employee_id}")
-async def remove_employee(employee_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+def remove_employee(employee_id: str, ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     payroll_api.delete_employee(db, ctx.tenant, employee_id)
     return {"ok": True}
 
 
 @app.get("/payroll/rates")
-async def get_payroll_rates(ctx: membership.Context = Depends(membership.require_owner)):
+def get_payroll_rates(ctx: membership.Context = Depends(membership.require_owner)):
     """The statutory rates AIBOS applies (transparency — the owner reads, never edits)."""
     return {"ok": True, "rates": payroll_api.public_rates(payroll_api.current_rates(None, "ZMW"))}
 
 
 @app.get("/payroll/runs")
-async def get_payroll_runs(ctx: membership.Context = Depends(membership.require_owner)):
+def get_payroll_runs(ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     return {"ok": True, "runs": payroll_api.list_runs(db, ctx.tenant)}
 
 
 @app.get("/payroll/runs/{run_id}")
-async def get_payroll_run(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+def get_payroll_run(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
         return {"ok": True, "run": payroll_api.get_run(db, ctx.tenant, run_id)}
@@ -3657,7 +3908,7 @@ async def get_payroll_run(run_id: str, ctx: membership.Context = Depends(members
 
 
 @app.get("/payroll/runs/{run_id}/compliance-text")
-async def payroll_compliance_text(run_id: str, business_name: Optional[str] = Query(None),
+def payroll_compliance_text(run_id: str, business_name: Optional[str] = Query(None),
                                   ctx: membership.Context = Depends(membership.require_owner)):
     """A shareable monthly statutory summary — PAYE/NAPSA/NHIMA owed for the
     period (audit #66). Owner sends/keeps it; nothing is auto-filed."""
@@ -3671,7 +3922,7 @@ async def payroll_compliance_text(run_id: str, business_name: Optional[str] = Qu
 
 
 @app.get("/payroll/runs/{run_id}/payslip.pdf")
-async def payslip_pdf(run_id: str, employee_id: str = Query(...),
+def payslip_pdf(run_id: str, employee_id: str = Query(...),
                       business_name: Optional[str] = Query(None),
                       ctx: membership.Context = Depends(membership.require_owner)):
     """Printable payslip PDF (audit #26). Falls back to .txt if the PDF lib
@@ -3696,7 +3947,7 @@ async def payslip_pdf(run_id: str, employee_id: str = Query(...),
 
 
 @app.get("/payroll/runs/{run_id}/compliance.pdf")
-async def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
+def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
                          ctx: membership.Context = Depends(membership.require_owner)):
     """Printable statutory compliance pack PDF (audit #66)."""
     entitlements.require_feature(ctx.tenant, "payroll")
@@ -3715,7 +3966,7 @@ async def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None)
 
 
 @app.get("/payroll/runs/{run_id}/payslip-text")
-async def payslip_share_text(run_id: str, employee_id: str = Query(...),
+def payslip_share_text(run_id: str, employee_id: str = Query(...),
                              business_name: Optional[str] = Query(None),
                              ctx: membership.Context = Depends(membership.require_owner)):
     """WhatsApp-ready payslip for one employee (audit #26) — the owner sends
@@ -3741,7 +3992,7 @@ class PayrollRunRequest(BaseModel):
 
 
 @app.post("/payroll/run")
-async def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(membership.require_owner)):
+def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(membership.require_owner)):
     """Compute a pay period. Preview is free (the on-screen table); committing —
     which posts Salary events into the books — is the Pro payroll capability."""
     db = _require_db()
@@ -3760,7 +4011,7 @@ async def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(
 # Throttled hard because every miss costs a Places call: the wizard debounces
 # to a pause in typing, and identity.py caches identical queries in-process.
 @app.get("/identity/lookup")
-async def identity_lookup(
+def identity_lookup(
     q: str = Query(..., min_length=2, max_length=120),
     country: str = Query("ZM", max_length=2),
     phone: Optional[str] = Query(None, max_length=32),
@@ -3796,14 +4047,14 @@ def _require_hospitality(tenant_id: str):
 
 
 @app.get("/hospitality/properties")
-async def hospitality_list_properties(ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_list_properties(ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     return {"ok": True, "properties": hospitality_api.list_properties(db, ctx.tenant)}
 
 
 @app.post("/hospitality/properties")
-async def hospitality_create_property(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_property(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3813,7 +4064,7 @@ async def hospitality_create_property(body: Dict[str, Any] = Body(...), ctx: mem
 
 
 @app.get("/hospitality/properties/{property_id}")
-async def hospitality_get_property(property_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_get_property(property_id: str, ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3823,7 +4074,7 @@ async def hospitality_get_property(property_id: str, ctx: membership.Context = D
 
 
 @app.patch("/hospitality/properties/{property_id}")
-async def hospitality_patch_property(property_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_property(property_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3835,7 +4086,7 @@ async def hospitality_patch_property(property_id: str, body: Dict[str, Any] = Bo
 
 
 @app.get("/hospitality/properties/{property_id}/guest-emails")
-async def hospitality_guest_email_status(property_id: str,
+def hospitality_guest_email_status(property_id: str,
                                          ctx: membership.Context = Depends(membership.require_context)):
     """How this property writes to its guests, and who the guest will see it from."""
     _require_hospitality(ctx.tenant)
@@ -3848,7 +4099,7 @@ async def hospitality_guest_email_status(property_id: str,
 
 
 @app.post("/hospitality/properties/{property_id}/guest-emails/samples")
-async def hospitality_guest_email_samples(property_id: str,
+def hospitality_guest_email_samples(property_id: str,
                                           ctx: membership.Context = Depends(membership.require_write)):
     """All three guest emails, filled with example details, to the person asking.
 
@@ -3864,7 +4115,7 @@ async def hospitality_guest_email_samples(property_id: str,
 
 
 @app.delete("/hospitality/properties/{property_id}")
-async def hospitality_delete_property(property_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_delete_property(property_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_property(db, ctx.tenant, property_id)
@@ -3872,14 +4123,14 @@ async def hospitality_delete_property(property_id: str, ctx: membership.Context 
 
 
 @app.get("/hospitality/units")
-async def hospitality_list_units(property_id: Optional[str] = Query(None), ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_list_units(property_id: Optional[str] = Query(None), ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     return {"ok": True, "units": hospitality_api.list_units(db, ctx.tenant, property_id)}
 
 
 @app.post("/hospitality/units")
-async def hospitality_create_unit(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_unit(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3889,7 +4140,7 @@ async def hospitality_create_unit(body: Dict[str, Any] = Body(...), ctx: members
 
 
 @app.get("/hospitality/units/{unit_id}")
-async def hospitality_get_unit(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_get_unit(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3899,7 +4150,7 @@ async def hospitality_get_unit(unit_id: str, ctx: membership.Context = Depends(m
 
 
 @app.patch("/hospitality/units/{unit_id}")
-async def hospitality_patch_unit(unit_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_unit(unit_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3909,7 +4160,7 @@ async def hospitality_patch_unit(unit_id: str, body: Dict[str, Any] = Body(...),
 
 
 @app.delete("/hospitality/units/{unit_id}")
-async def hospitality_delete_unit(unit_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_delete_unit(unit_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_unit(db, ctx.tenant, unit_id)
@@ -3921,14 +4172,14 @@ async def hospitality_delete_unit(unit_id: str, ctx: membership.Context = Depend
 # Guests — id_document_number is sealed at rest; the raw value is only ever
 # returned on an explicit ?reveal=true single-guest read (owner path).
 @app.get("/hospitality/guests")
-async def hospitality_list_guests(search: Optional[str] = Query(None), ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_list_guests(search: Optional[str] = Query(None), ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     return {"ok": True, "guests": hospitality_api.list_guests(db, ctx.tenant, search)}
 
 
 @app.post("/hospitality/guests")
-async def hospitality_create_guest(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_guest(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3940,7 +4191,7 @@ async def hospitality_create_guest(body: Dict[str, Any] = Body(...), ctx: member
 
 
 @app.get("/hospitality/guests/{guest_id}")
-async def hospitality_get_guest(guest_id: str, reveal: bool = Query(False), ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_get_guest(guest_id: str, reveal: bool = Query(False), ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     # The rest of the guest record is what staff need to run a stay. The sealed
     # ID document number is not: it is a passport or an NRC, kept encrypted for
@@ -3959,7 +4210,7 @@ async def hospitality_get_guest(guest_id: str, reveal: bool = Query(False), ctx:
 
 
 @app.patch("/hospitality/guests/{guest_id}")
-async def hospitality_patch_guest(guest_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_guest(guest_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -3971,7 +4222,7 @@ async def hospitality_patch_guest(guest_id: str, body: Dict[str, Any] = Body(...
 
 
 @app.delete("/hospitality/guests/{guest_id}")
-async def hospitality_delete_guest(guest_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_delete_guest(guest_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_guest(db, ctx.tenant, guest_id)
@@ -3979,7 +4230,7 @@ async def hospitality_delete_guest(guest_id: str, ctx: membership.Context = Depe
 
 
 @app.get("/hospitality/guests/{guest_id}/bookings")
-async def hospitality_guest_bookings(guest_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_guest_bookings(guest_id: str, ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     return {"ok": True, "bookings": hospitality_api.list_guest_bookings(db, ctx.tenant, guest_id)}
@@ -3988,7 +4239,7 @@ async def hospitality_guest_bookings(guest_id: str, ctx: membership.Context = De
 # Bookings — the P0 core loop. A confirmed booking posts a Sale to the spine and
 # a double-booking is blocked at write time.
 @app.get("/hospitality/bookings")
-async def hospitality_list_bookings(
+def hospitality_list_bookings(
     unit_id: Optional[str] = Query(None), status: Optional[str] = Query(None),
     from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
     statuses: Optional[str] = Query(None, description="comma-separated, e.g. pending,confirmed"),
@@ -4015,7 +4266,7 @@ async def hospitality_list_bookings(
 
 
 @app.post("/hospitality/bookings")
-async def hospitality_create_booking(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_booking(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4031,7 +4282,7 @@ async def hospitality_create_booking(body: Dict[str, Any] = Body(...), ctx: memb
 
 
 @app.get("/hospitality/availability")
-async def hospitality_availability(
+def hospitality_availability(
     unit_id: str = Query(...),
     from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
     ctx: membership.Context = Depends(membership.require_context),
@@ -4045,7 +4296,7 @@ async def hospitality_availability(
 
 
 @app.get("/hospitality/bookings/{booking_id}")
-async def hospitality_get_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_get_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4055,7 +4306,7 @@ async def hospitality_get_booking(booking_id: str, ctx: membership.Context = Dep
 
 
 @app.patch("/hospitality/bookings/{booking_id}")
-async def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4069,7 +4320,7 @@ async def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body
 
 
 @app.post("/hospitality/bookings/{booking_id}/confirm")
-async def hospitality_confirm_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_confirm_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
     """Accept a request. This is what puts the stay in the books.
 
     The dashboard could cancel a booking and could not accept one, so a request
@@ -4092,7 +4343,7 @@ async def hospitality_confirm_booking(booking_id: str, ctx: membership.Context =
 
 
 @app.post("/hospitality/bookings/{booking_id}/decline")
-async def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Body(default={}),
+def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Body(default={}),
                                       ctx: membership.Context = Depends(membership.require_write)):
     """Turn down a request that was never agreed to. Frees the dates, records a
     reason, and touches nothing in the books because nothing was ever posted."""
@@ -4110,7 +4361,7 @@ async def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Bo
 
 
 @app.post("/hospitality/bookings/{booking_id}/cancel")
-async def hospitality_cancel_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_cancel_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4121,7 +4372,7 @@ async def hospitality_cancel_booking(booking_id: str, ctx: membership.Context = 
 
 # Expenses — every cost posts an Expense to the spine, feeding engine.py P&L.
 @app.get("/hospitality/expenses")
-async def hospitality_list_expenses(
+def hospitality_list_expenses(
     property_id: Optional[str] = Query(None), unit_id: Optional[str] = Query(None),
     from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = Query(None),
     category: Optional[str] = Query(None), ctx: membership.Context = Depends(membership.require_context),
@@ -4132,7 +4383,7 @@ async def hospitality_list_expenses(
 
 
 @app.post("/hospitality/expenses")
-async def hospitality_create_expense(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_expense(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4142,7 +4393,7 @@ async def hospitality_create_expense(body: Dict[str, Any] = Body(...), ctx: memb
 
 
 @app.patch("/hospitality/expenses/{expense_id}")
-async def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4152,7 +4403,7 @@ async def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body
 
 
 @app.delete("/hospitality/expenses/{expense_id}")
-async def hospitality_delete_expense(expense_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_delete_expense(expense_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_expense(db, ctx.tenant, expense_id)
@@ -4164,7 +4415,7 @@ async def hospitality_delete_expense(expense_id: str, ctx: membership.Context = 
 # token that serves a public .ics feed every OTA imports — the interim channel
 # manager that fixes "conflicting availability" without full OTA API partnership.
 @app.get("/hospitality/units/{unit_id}/channels")
-async def hospitality_list_channels(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_list_channels(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4174,7 +4425,7 @@ async def hospitality_list_channels(unit_id: str, ctx: membership.Context = Depe
 
 
 @app.post("/hospitality/units/{unit_id}/channels")
-async def hospitality_create_channel(unit_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_create_channel(unit_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4184,7 +4435,7 @@ async def hospitality_create_channel(unit_id: str, body: Dict[str, Any] = Body(.
 
 
 @app.patch("/hospitality/channels/{channel_id}")
-async def hospitality_patch_channel(channel_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_patch_channel(channel_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4194,7 +4445,7 @@ async def hospitality_patch_channel(channel_id: str, body: Dict[str, Any] = Body
 
 
 @app.delete("/hospitality/channels/{channel_id}")
-async def hospitality_delete_channel(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_delete_channel(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_channel(db, ctx.tenant, channel_id)
@@ -4202,7 +4453,7 @@ async def hospitality_delete_channel(channel_id: str, ctx: membership.Context = 
 
 
 @app.post("/hospitality/channels/{channel_id}/rotate-token")
-async def hospitality_rotate_token(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_rotate_token(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -4212,7 +4463,7 @@ async def hospitality_rotate_token(channel_id: str, ctx: membership.Context = De
 
 
 @app.post("/hospitality/channels/{channel_id}/sync")
-async def hospitality_sync_channel(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_sync_channel(channel_id: str, ctx: membership.Context = Depends(membership.require_write)):
     """Manual 'sync now' — pull this channel's OTA feed into the calendar."""
     _require_hospitality(ctx.tenant)
     db = _require_db()
@@ -4223,7 +4474,7 @@ async def hospitality_sync_channel(channel_id: str, ctx: membership.Context = De
 
 
 @app.get("/hospitality/units/{unit_id}/ical-export.ics")
-async def hospitality_ical_export_authed(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
+def hospitality_ical_export_authed(unit_id: str, ctx: membership.Context = Depends(membership.require_context)):
     """Authenticated export — owner preview of a unit's outbound feed."""
     _require_hospitality(ctx.tenant)
     db = _require_db()
@@ -4235,7 +4486,7 @@ async def hospitality_ical_export_authed(unit_id: str, ctx: membership.Context =
 
 
 @app.get("/hospitality/ical/{token}.ics")
-async def hospitality_ical_public_feed(token: str):
+def hospitality_ical_public_feed(token: str):
     """
     PUBLIC iCal feed for OTAs to import — no auth, no entitlement gate: the
     unguessable token is the capability. Exposes only occupied dates + "Reserved",
@@ -4252,13 +4503,12 @@ async def hospitality_ical_public_feed(token: str):
 
 
 @app.post("/hospitality/sync-all")
-async def hospitality_sync_all(x_cron_secret: Optional[str] = Header(default=None)):
+def hospitality_sync_all(x_cron_secret: Optional[str] = Header(default=None)):
     """
     Nightly iCal pull across ALL tenants. Cron-only — must present CRON_SECRET,
     mirroring /notify/dispatch-briefs. Point a Vercel cron route at this.
     """
-    secret = os.environ.get("CRON_SECRET")
-    if not secret or x_cron_secret != secret:
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
         raise HTTPException(status_code=403, detail="Invalid cron secret")
     db = get_db()
     if db is None:
@@ -4282,7 +4532,7 @@ class SimulateRequest(BaseModel):
 
 
 @app.post("/hospitality/properties/{property_id}/site-token")
-async def hospitality_mint_site_token(property_id: str,
+def hospitality_mint_site_token(property_id: str,
                                       ctx: membership.Context = Depends(membership.require_owner)):
     """Mint or rotate the token the property's website uses. Owner only: it is a
     key to a public door, and rotating it cuts off whoever holds the old one."""
@@ -4298,7 +4548,7 @@ async def hospitality_mint_site_token(property_id: str,
 
 
 @app.delete("/hospitality/properties/{property_id}/site-token")
-async def hospitality_clear_site_token(property_id: str,
+def hospitality_clear_site_token(property_id: str,
                                        ctx: membership.Context = Depends(membership.require_owner)):
     """Take the public site offline."""
     _require_hospitality(ctx.tenant)
@@ -4313,7 +4563,7 @@ async def hospitality_clear_site_token(property_id: str,
 
 
 @app.get("/public/stay/{site_token}/units")
-async def public_stay_units(site_token: str):
+def public_stay_units(site_token: str):
     """The rooms this site may show, with their rates. No ids, no guest data."""
     db = _require_db()
     try:
@@ -4325,7 +4575,7 @@ async def public_stay_units(site_token: str):
 
 
 @app.get("/public/stay/{site_token}/availability")
-async def public_stay_availability(site_token: str,
+def public_stay_availability(site_token: str,
                                    unit_slug: str = Query(...),
                                    from_: str = Query(..., alias="from"),
                                    to: str = Query(...)):
@@ -4342,7 +4592,7 @@ async def public_stay_availability(site_token: str,
 
 
 @app.post("/public/stay/{site_token}/booking-request")
-async def public_stay_booking_request(site_token: str, request: Request,
+def public_stay_booking_request(site_token: str, request: Request,
                                       body: Dict[str, Any] = Body(...)):
     """Take a booking request from the property's website.
 
@@ -4418,7 +4668,7 @@ async def public_stay_booking_request(site_token: str, request: Request,
 # depend on a mail key being set, which is why the promise rests on it.
 
 @app.get("/notifications")
-async def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),
+def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),
                              ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     try:
@@ -4437,7 +4687,7 @@ async def list_notifications(unread_only: bool = Query(False), limit: int = Quer
 
 
 @app.post("/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: str,
+def mark_notification_read(notification_id: str,
                                  ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     from datetime import datetime, timezone
@@ -4447,7 +4697,7 @@ async def mark_notification_read(notification_id: str,
 
 
 @app.post("/notifications/read-all")
-async def mark_all_notifications_read(ctx: membership.Context = Depends(membership.require_context)):
+def mark_all_notifications_read(ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     from datetime import datetime, timezone
     (db.table("notifications").update({"read_at": datetime.now(timezone.utc).isoformat()})
@@ -4456,16 +4706,18 @@ async def mark_all_notifications_read(ctx: membership.Context = Depends(membersh
 
 
 @app.post("/simulate")
-async def post_simulate(req: SimulateRequest, user_id: str = Depends(require_user)):
-    """What-if against a COPY of the twin — never touches production (Initiative 12)."""
+def post_simulate(req: SimulateRequest, ctx: membership.Context = Depends(membership.require_context)):
+    """What-if against a COPY of the twin — never touches production (Initiative 12).
+    The business being looked at: this read the caller's default books, so a
+    what-if on a second business was run against the first one's numbers."""
     db = _require_db()
-    state = twin.get_state(db, user_id)
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
     scenario = {k: v for k, v in req.dict().items() if v is not None}
     return simulation.simulate(state, scenario)
 
 
 @app.get("/twin/financials")
-async def twin_financials(ctx: membership.Context = Depends(membership.require_context)):
+def twin_financials(ctx: membership.Context = Depends(membership.require_context)):
     """
     Backward-compat bridge (Roadmap 1.6 / Initiative 9): run the EXISTING Engine 1
     over the Digital Twin's monthly[] — proving the legacy engine reasons against

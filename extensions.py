@@ -56,18 +56,43 @@ class FormulaError(Exception):
     pass
 
 
+# Bounds on the numbers a formula may write down. Python integers have no size
+# limit, so `9**9**9` is perfectly legal arithmetic that never finishes: one
+# signed-in request could hold the whole API. Exponents stay small constants and
+# literals stay inside a sane range.
+MAX_LITERAL = 1e12
+MAX_EXPONENT = 10
+
+
 def _validate_ast(tree: ast.AST, allowed_names: set) -> None:
     for node in ast.walk(tree):
         if not isinstance(node, _ALLOWED_NODES):
             raise FormulaError(f"disallowed syntax: {type(node).__name__}")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            exp = node.right
+            if isinstance(exp, ast.UnaryOp) and isinstance(exp.op, (ast.USub, ast.UAdd)):
+                exp = exp.operand
+            if not (isinstance(exp, ast.Constant) and isinstance(exp.value, (int, float))
+                    and not isinstance(exp.value, bool) and abs(exp.value) <= MAX_EXPONENT):
+                raise FormulaError(f"powers must be a small number (at most {MAX_EXPONENT})")
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in SAFE_FUNCS:
                 raise FormulaError("only whitelisted aggregate functions are allowed")
         if isinstance(node, ast.Name):
             if node.id not in allowed_names and node.id not in SAFE_FUNCS:
                 raise FormulaError(f"unknown name: {node.id}")
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            raise FormulaError("only numeric literals are allowed")
+        if isinstance(node, ast.Constant):
+            if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
+                raise FormulaError("only numeric literals are allowed")
+            if abs(node.value) > MAX_LITERAL:
+                raise FormulaError("that number is too large for a formula")
+
+
+class _FloatLiterals(ast.NodeTransformer):
+    def visit_Constant(self, node):
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return ast.copy_location(ast.Constant(value=float(node.value)), node)
+        return node
 
 
 def safe_eval(formula: str, columns: Dict[str, np.ndarray]):
@@ -78,8 +103,16 @@ def safe_eval(formula: str, columns: Dict[str, np.ndarray]):
     _validate_ast(tree, set(columns.keys()))
     env: Dict[str, Any] = dict(columns)
     env.update(SAFE_FUNCS)
+    # Whole-number literals become floats. Nested small powers,
+    # ((9**10)**10)**10..., are still an unbounded Python integer; as floats
+    # they overflow at once with an error instead of computing for ever.
+    tree = ast.fix_missing_locations(_FloatLiterals().visit(tree))
     code = compile(tree, "<formula>", "eval")
-    return eval(code, {"__builtins__": {}}, env)  # noqa: S307 — AST-whitelisted, empty builtins
+    # Every column is a float array, so even an allowed power runs in numpy
+    # float space (overflow → inf, flagged by the critique) and never in
+    # Python's unbounded integers.
+    with np.errstate(all="ignore"):
+        return eval(code, {"__builtins__": {}}, env)  # noqa: S307 — AST-whitelisted, empty builtins
 
 
 # ── Column tokenisation (formulas reference safe tokens, not raw names) ────────
@@ -297,8 +330,11 @@ def _llm_proposals(df, manifest, token_map, arrays, max_props=3) -> List[Dict[st
             "tokens), formula (arithmetic over tokens using + - * / and "
             "sum()/mean()/min()/max()/abs() only). No prose, JSON only."
         )
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        # The configured provider's model. This named a Groq model directly, so
+        # once the platform moved to Gemini every call failed and the AI
+        # proposals quietly stopped appearing.
+        resp = llm.chat_create(
+            client,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
@@ -347,8 +383,8 @@ def _llm_critic(name, purpose, formula, inputs, preview) -> Dict[str, Any]:
             "Mark sound=false if the math is wrong, it double-counts, mixes incompatible "
             "units, is trivial, or could mislead a business owner."
         )
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        resp = llm.chat_create(
+            client,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )

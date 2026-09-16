@@ -353,9 +353,26 @@ def update_property(db, user_id: str, property_id: str, patch: dict) -> dict:
     return rows[0]
 
 
+def _void_stays_on_units(db, user_id: str, unit_ids: list, reason: str) -> None:
+    """Deleting a unit cascades its bookings away (0015 FK), and the Sale each
+    confirmed stay posted stayed in the P&L with nothing left to cancel it by.
+    Take that revenue out of the books BEFORE the rows disappear."""
+    if not unit_ids:
+        return
+    try:
+        res = (db.table("bookings").select("id,linked_event_id")
+               .eq("user_id", user_id).in_("unit_id", list(unit_ids)).execute())
+        for b in getattr(res, "data", None) or []:
+            _void_event(db, user_id, b.get("linked_event_id"), reason)
+    except Exception as exc:  # noqa: BLE001 — never block a delete on the bridge
+        log.error("[hospitality] could not unwind stays before delete: %s", exc)
+
+
 def delete_property(db, user_id: str, property_id: str) -> None:
     """Hard delete. Units cascade (FK on delete cascade); expenses keep the row
     with property_id → null so historical costs already in the books survive."""
+    units = [u["id"] for u in list_units(db, user_id, property_id)]
+    _void_stays_on_units(db, user_id, units, "Property deleted")
     db.table("properties").delete().eq("id", property_id).eq("user_id", user_id).execute()
 
 
@@ -405,6 +422,7 @@ def update_unit(db, user_id: str, unit_id: str, patch: dict) -> dict:
 
 def delete_unit(db, user_id: str, unit_id: str) -> None:
     """Hard delete the unit. Bookings/channels cascade per the 0015 FKs."""
+    _void_stays_on_units(db, user_id, [unit_id], "Unit deleted")
     db.table("units").delete().eq("id", unit_id).eq("user_id", user_id).execute()
 
 
@@ -504,14 +522,19 @@ def _guest_for_read(row: dict, reveal: bool = False) -> dict:
 
 
 def list_guests(db, user_id: str, search: str | None = None) -> list:
-    q = db.table("guests").select("*").eq("user_id", user_id)
-    if search:
-        s = str(search).strip()
-        if s:
-            # name OR email OR phone contains the term (case-insensitive).
-            q = q.or_(f"full_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
-    res = q.order("full_name").execute()
+    """Guests, optionally narrowed to those whose name, email or phone contains
+    the search. Matched here, not in the query: the search used to be pasted
+    into a PostgREST or=() filter, where a comma or bracket is syntax, so
+    looking up "Banda, Mary" returned an error instead of Mary."""
+    res = db.table("guests").select("*").eq("user_id", user_id).order("full_name").execute()
     rows = getattr(res, "data", None) or []
+    needle = str(search or "").strip().lower()
+    if needle:
+        words = needle.replace(",", " ").split()
+        def hit(r):
+            hay = " ".join(str(r.get(k) or "") for k in ("full_name", "email", "phone")).lower()
+            return needle in hay or all(w in hay for w in words)
+        rows = [r for r in rows if hit(r)]
     return [_guest_for_read(r) for r in rows]
 
 
@@ -941,9 +964,11 @@ def create_booking(db, user_id: str, data: dict) -> dict:
     res = _insert_booking(db, row)
     saved = (getattr(res, "data", None) or [row])[0]
 
-    # Record bridge: a confirmed booking with revenue posts a Sale and links back.
+    # Record bridge: a stay with revenue posts a Sale and links back. A stay
+    # entered after the fact as COMPLETED earned its money too; only confirmed
+    # used to count, so a past stay typed in as completed never reached the P&L.
     amount = _num(saved.get("total_amount"), 0.0)
-    if status == "confirmed" and amount > 0:
+    if status in STAY_STATUSES and amount > 0:
         event_id = _post_event(
             db, user_id, "Sale",
             _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW")),
@@ -996,25 +1021,41 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     elif was_stay and not now_stay:
         _drop_guest_stay(db, user_id, saved.get("guest_id"))
 
-    # Keep the books honest as status crosses the confirmed boundary.
+    # Keep the books honest as the stay changes.
+    #
+    # Only the status crossing was handled. Changing the PRICE of a confirmed
+    # stay (the owner agreeing a discount, or correcting a typo) left the Sale at
+    # the old figure for ever, and so did moving its dates or unit. A stay going
+    # back to pending kept its revenue too. The Sale now always describes the
+    # stay as it is: unwound when the stay stops counting, reposted when what it
+    # says changes.
     was_live = current.get("linked_event_id")
-    if new_status in ("cancelled", "no_show", "declined") and was_live:
-        _void_event(db, user_id, was_live, reason=f"Booking {new_status}")
+    amount = _num(saved.get("total_amount"), 0.0)
+    counts = new_status in STAY_STATUSES and amount > 0
+    def _same(k):
+        a, b = current.get(k), saved.get(k)
+        if k == "total_amount":
+            return abs(_num(a, 0.0) - _num(b, 0.0)) < 0.005
+        return str(a or "")[:10 if k in ("check_in", "check_out") else None] ==             str(b or "")[:10 if k in ("check_in", "check_out") else None]
+    changed = any(k in clean and not _same(k)
+                  for k in ("total_amount", "currency", "unit_id", "check_in", "check_out", "guest_id"))
+    if was_live and (not counts or changed):
+        _void_event(db, user_id, was_live,
+                    reason=f"Booking {new_status}" if not counts else "Booking changed")
         (db.table("bookings").update({"linked_event_id": None})
          .eq("id", booking_id).eq("user_id", user_id).execute())
         saved["linked_event_id"] = None
-    elif new_status == "confirmed" and not was_live:
-        amount = _num(saved.get("total_amount"), 0.0)
-        if amount > 0:
-            event_id = _post_event(
-                db, user_id, "Sale",
-                _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW")),
-                note=f"Booking confirmed {saved.get('check_in')}→{saved.get('check_out')}",
-            )
-            if event_id:
-                (db.table("bookings").update({"linked_event_id": event_id})
-                 .eq("id", booking_id).eq("user_id", user_id).execute())
-                saved["linked_event_id"] = event_id
+        was_live = None
+    if counts and not was_live:
+        event_id = _post_event(
+            db, user_id, "Sale",
+            _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW")),
+            note=f"Booking {new_status} {saved.get('check_in')}→{saved.get('check_out')}",
+        )
+        if event_id:
+            (db.table("bookings").update({"linked_event_id": event_id})
+             .eq("id", booking_id).eq("user_id", user_id).execute())
+            saved["linked_event_id"] = event_id
     return saved
 
 
@@ -1203,11 +1244,16 @@ def update_expense(db, user_id: str, expense_id: str, patch: dict) -> dict:
         raise ValueError("Expense not found.")
     saved = rows[0]
 
-    # If the amount changed, correct the linked Expense event so the books track it.
-    if "amount" in clean and saved.get("linked_event_id"):
+    # Correct the linked Expense event so the books track the edit. Only the
+    # amount used to follow, so re-filing a cost from "other" to "utilities"
+    # changed the expenses screen and never the P&L's categories.
+    fields = {k: saved.get(k) for k in ("amount", "category", "currency", "property_id", "unit_id")
+              if k in clean}
+    if fields and saved.get("linked_event_id"):
+        if "amount" in fields:
+            fields["amount"] = _num(fields["amount"], 0.0)
         try:
-            nervous.correct(db, user_id, saved["linked_event_id"],
-                            {"payload": {"amount": _num(saved.get("amount"), 0.0)}})
+            nervous.correct(db, user_id, saved["linked_event_id"], {"payload": fields})
         except Exception as exc:  # noqa: BLE001
             log.error("[hospitality] expense event correct failed: %s", exc)
     return saved
@@ -1385,6 +1431,9 @@ def _clean_channel(data: dict, partial: bool = False) -> dict:
     for tkey in ("external_listing_id", "ical_import_url"):
         if tkey in out and out[tkey] is not None:
             out[tkey] = str(out[tkey]).strip() or None
+    url = out.get("ical_import_url")
+    if url and not url.lower().startswith(("https://", "http://")):
+        raise ValueError("A calendar link must start with https://")
     return out
 
 
@@ -1500,13 +1549,65 @@ def ical_export_by_token(db, token: str) -> str:
 
 # ── Import: pull an OTA feed into bookings ───────────────────────────────────
 
+ICAL_MAX_BYTES = 5 * 1024 * 1024       # a year of a busy unit is a few KB
+ICAL_MAX_REDIRECTS = 3
+
+
+def _public_address(host: str) -> bool:
+    """True only when every address a hostname resolves to is on the public
+    internet. The import URL is whatever an owner pastes, and the server fetches
+    it: without this it could be pointed at the host's own private network."""
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified):
+            return False
+    return True
+
+
+def _check_feed_url(url: str) -> str:
+    from urllib.parse import urlparse
+    parts = urlparse(str(url or "").strip())
+    if parts.scheme not in ("https", "http") or not parts.hostname:
+        raise ValueError("A calendar link must start with https://")
+    if parts.username or parts.password:
+        raise ValueError("A calendar link must not contain a username or password.")
+    if not _public_address(parts.hostname):
+        raise ValueError("That calendar link does not point at a public website.")
+    return parts.geturl()
+
+
 def _fetch_ical(url: str) -> str:
-    """Fetch a remote .ics over HTTPS. Small, bounded, no redirects surprise."""
+    """Fetch a remote .ics. Public hosts only, every redirect re-checked, and
+    stopped at ICAL_MAX_BYTES: an owner-supplied link that serves an endless
+    file must not fill a 512MB server's memory."""
     import httpx
-    with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-        resp = client.get(url, headers={"User-Agent": "AIBOS-Hospitality/1.0"})
-        resp.raise_for_status()
-        return resp.text
+    current = _check_feed_url(url)
+    with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+        for _ in range(ICAL_MAX_REDIRECTS + 1):
+            with client.stream("GET", current,
+                               headers={"User-Agent": "AIBOS-Hospitality/1.0"}) as resp:
+                if resp.is_redirect:
+                    nxt = resp.headers.get("location") or ""
+                    current = _check_feed_url(str(resp.url.join(nxt)))
+                    continue
+                resp.raise_for_status()
+                chunks, size = [], 0
+                for chunk in resp.iter_bytes():
+                    size += len(chunk)
+                    if size > ICAL_MAX_BYTES:
+                        raise ValueError("That calendar feed is too large to be a calendar.")
+                    chunks.append(chunk)
+                return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+    raise ValueError("That calendar link redirects too many times.")
 
 
 def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
@@ -1824,6 +1925,43 @@ def _capped(data: dict, key: str) -> str:
     return str(data.get(key) or "").strip()[:_PUBLIC_LIMITS.get(key, 200)]
 
 
+def _max_site_discount() -> float:
+    """The deepest discount a property's website may show below the unit's own
+    nightly rate before the quote is not believed. Sites give long-stay bands
+    (Dunslim: 10% from six nights, 15% from fifteen), so the default leaves room."""
+    import os
+    try:
+        return min(0.9, max(0.0, float(os.environ.get("PUBLIC_SITE_MAX_DISCOUNT") or 0.4)))
+    except (TypeError, ValueError):
+        return 0.4
+
+
+def _checked_total(unit: dict, nights: int, quoted: float) -> tuple[float, str]:
+    """What a website booking request will actually be charged, and why.
+
+    The total used to be taken straight from the request body. The endpoint is
+    public, so anyone could post a week in the best apartment at K1, and a busy
+    owner pressing Confirm put K1 in the books and in the guest's confirmation
+    email. The unit's rate is the reference: a quote at or above the deepest
+    allowed discount stands (so real long-stay prices pass untouched); anything
+    lower is charged at the listed rate and the booking says what happened.
+    """
+    rate = _num(unit.get("base_nightly_rate"), 0.0)
+    listed = round(rate * max(nights, 0), 2)
+    if listed <= 0:
+        return quoted, ("" if quoted <= 0 else
+                        "No nightly rate is set for this unit, so the website's price "
+                        "could not be checked.")
+    if quoted <= 0:
+        return listed, "The website sent no price, so the unit's nightly rate was used."
+    floor = listed * (1 - _max_site_discount())
+    if quoted + 0.5 < floor:
+        return listed, (f"CHECK THE PRICE: the website asked for {quoted:,.2f} but "
+                        f"{nights} night(s) at the unit's rate is {listed:,.2f}. "
+                        "The rate was used.")
+    return quoted, ""
+
+
 def public_booking_request(db, token: str, data: dict) -> dict:
     """Take a booking request from a website. Creates a `pending` booking."""
     prop = _site_for_token(db, token)
@@ -1883,6 +2021,7 @@ def public_booking_request(db, token: str, data: dict) -> dict:
 
     reference = _capped(data, "reference")
     quoted = max(_num(data.get("totalZmw"), 0.0), 0.0)
+    total, price_note = _checked_total(unit, (check_out - check_in).days, quoted)
 
     booking = create_booking(db, owner, {
         "unit_id": unit["id"],
@@ -1890,10 +2029,10 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         "check_in": check_in.isoformat(),
         "check_out": check_out.isoformat(),
         "guests_count": guests,
-        # The total the site quoted. Recorded in BOTH places on purpose:
-        # total_amount is what will be charged and an owner may adjust it,
-        # quoted_total is what the guest was shown and must not move.
-        "total_amount": quoted,
+        # quoted_total is what the guest was SHOWN and never moves. total_amount
+        # is what will be charged: the quote when it is believable, otherwise
+        # the room's own rate, with a note saying so (see _checked_total).
+        "total_amount": total,
         "quoted_total": quoted,
         "currency": unit.get("currency") or "ZMW",
         "status": "pending",
@@ -1912,7 +2051,8 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         # source_notes goes back to being what its name says: where this came
         # from. The guest's own words live in guest_notes now, so a plain
         # "show the notes" screen no longer mixes two unrelated things.
-        "source_notes": "Booking request from the property website.",
+        "source_notes": "Booking request from the property website."
+                        + (f" {price_note}" if price_note else ""),
     })
     return {
         # Stripped off by the route before it answers the website: the owner's

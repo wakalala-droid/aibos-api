@@ -283,6 +283,11 @@ def set_status(db, user_id: str, item_id: str, status: str,
             child = {k: item.get(k) for k in _OCCURRENCE_FIELDS}
             child.update({"user_id": user_id, "parent_id": item["id"],
                           "status": status, "linked_event_id": linked_event_id})
+            # The finished occurrence belongs to the same books as its template.
+            # Without this it was written with no business and vanished from the
+            # schedule the moment the owner ticked it off.
+            if item.get("business_id") is not None:
+                child["business_id"] = item["business_id"]
             ins = db.table("schedule_items").insert(child).execute()
             child_row = (getattr(ins, "data", None) or [child])[0]
 

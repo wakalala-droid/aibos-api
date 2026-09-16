@@ -28,6 +28,7 @@ someone else's tenant.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException
@@ -62,37 +63,110 @@ class Context:
 # ── Resolution ────────────────────────────────────────────────────────────────
 
 
-def resolve_context(caller_uid: str, db=None) -> Context:
-    """Map a verified caller to (tenant, actor, role). Pure of FastAPI."""
-    db = db if db is not None else get_db()
-    if db is None or not caller_uid:
-        return Context(tenant=caller_uid, actor=caller_uid, role="owner")
+# "self" in X-Acting-As means: my own business, even though I am also invited
+# into someone else's.
+ACT_AS_SELF = "self"
+
+_OWN_BOOKS: dict[str, tuple[object, bool, float]] = {}
+_OWN_BOOKS_TTL = 60.0
+
+
+def _keeps_own_books(db, uid: str) -> bool:
+    """Has this person recorded anything in their OWN books? Cached briefly."""
+    hit = _OWN_BOOKS.get(uid)
+    if hit and hit[0] is db and time.time() < hit[2]:
+        return hit[1]
     try:
-        res = (db.table("business_members")
-               .select("owner_id, role, status")
-               .eq("member_id", caller_uid).eq("status", "active")
-               .limit(1).execute())
-        rows = getattr(res, "data", None) or []
+        res = db.table("business_events").select("id").eq("user_id", uid).limit(1).execute()
+        own = bool(getattr(res, "data", None))
+    except Exception:  # noqa: BLE001 — unknown → behave as before (membership wins)
+        own = False
+    _OWN_BOOKS[uid] = (db, own, time.time() + _OWN_BOOKS_TTL)
+    return own
+
+
+def _active_memberships(db, caller_uid: str) -> list:
+    res = (db.table("business_members")
+           .select("owner_id, role, status")
+           .eq("member_id", caller_uid).eq("status", "active")
+           .limit(50).execute())
+    return getattr(res, "data", None) or []
+
+
+def resolve_context(caller_uid: str, db=None, acting_as: str | None = None) -> Context:
+    """Map a verified caller to (tenant, actor, role). Pure of FastAPI.
+
+    WHICH BOOKS, WHEN SOMEONE HAS TWO. Membership used to win outright: the
+    first active membership decided everything. Invites are accepted
+    automatically on login, so an owner who was invited to help with another
+    business (as its accountant, say) signed in the next day and could no
+    longer reach their OWN books at all, with nothing on screen saying why.
+
+    Now the caller chooses (X-Acting-As: an owner's id, or "self"), and with no
+    choice made, someone who keeps their own books stays in them. A person who
+    has only ever worked in the business that invited them lands there, as
+    before.
+    """
+    own = Context(tenant=caller_uid, actor=caller_uid, role="owner")
+    db = db if db is not None else get_db()
+    if db is None or not caller_uid or acting_as == ACT_AS_SELF:
+        return own
+    try:
+        rows = _active_memberships(db, caller_uid)
         if rows:
-            row = rows[0]
+            row = next((r for r in rows if acting_as and r.get("owner_id") == acting_as), None)
+            if row is None:
+                if _keeps_own_books(db, caller_uid):
+                    return own
+                row = rows[0]
             role = row.get("role") if row.get("role") in ROLES else "staff"
             return Context(tenant=row["owner_id"], actor=caller_uid, role=role)
     except Exception as e:  # noqa: BLE001 — pre-0022 / infra → owner-of-self (safe)
         log.info("[membership] resolve failed for %s: %s", caller_uid, e)
-    return Context(tenant=caller_uid, actor=caller_uid, role="owner")
+    return own
+
+
+def workspaces(db, caller_uid: str, current: Context) -> list:
+    """Every set of books this person can open: their own, and each business
+    that has invited them. Names come from the owners' profiles."""
+    out = [{"tenant": caller_uid, "role": "owner", "acting_as": ACT_AS_SELF,
+            "current": current.tenant == caller_uid}]
+    if db is None:
+        return out
+    try:
+        rows = _active_memberships(db, caller_uid)
+    except Exception:  # noqa: BLE001
+        return out
+    ids = [caller_uid] + [r["owner_id"] for r in rows if r.get("owner_id")]
+    names: dict = {}
+    try:
+        prof = db.table("profiles").select("id,business_name").in_("id", ids).execute()
+        names = {r["id"]: r.get("business_name") for r in (getattr(prof, "data", None) or [])}
+    except Exception:  # noqa: BLE001 — a name is nice, not required
+        pass
+    out[0]["name"] = names.get(caller_uid) or "My business"
+    for r in rows:
+        out.append({"tenant": r["owner_id"], "role": r.get("role") or "staff",
+                    "acting_as": r["owner_id"], "name": names.get(r["owner_id"]) or "Invited business",
+                    "current": current.tenant == r["owner_id"]})
+    return out
 
 
 # ── FastAPI dependencies ──────────────────────────────────────────────────────
 
 
 def require_context(user_id: str = Depends(require_user),
-                    x_business_id: str | None = Header(default=None)) -> Context:
+                    x_business_id: str | None = Header(default=None),
+                    x_acting_as: str | None = Header(default=None)) -> Context:
     """Any authenticated member. Scope data by ctx.tenant + ctx.business_id.
     The active business comes from the X-Business-Id header, VALIDATED to belong
     to the tenant (never trusted raw); defaults to the tenant's default
     business, or None pre-migration-0023 (single-book behaviour)."""
-    ctx = resolve_context(user_id)
-    ctx.business_id = businesses.resolve_business_id(get_db(), ctx.tenant, x_business_id)
+    ctx = resolve_context(user_id, acting_as=x_acting_as)
+    # create=True: an account with no business yet gets its default here, at
+    # the door, so nothing below ever has to write books with no business.
+    ctx.business_id = businesses.resolve_business_id(get_db(), ctx.tenant, x_business_id,
+                                                     create=True)
     return ctx
 
 

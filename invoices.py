@@ -216,8 +216,25 @@ def create_invoice(db, user_id: str, data: dict, business_id: str | None = None)
     }
     if business_id is not None:
         row["business_id"] = business_id
-    out = db.table("invoices").insert(row).execute()
+    try:
+        out = db.table("invoices").insert(row).execute()
+    except Exception as e:  # noqa: BLE001
+        # Migration 0019 made numbers unique per OWNER, while each business counts
+        # its own INV-0001. Until migration 0033 widens that to per business, a
+        # second business's first invoice collides with the first business's.
+        # Take the next number free across the whole account rather than fail.
+        if not _is_duplicate(e) or business_id is None:
+            raise
+        every = getattr(db.table("invoices").select("number").eq("user_id", user_id)
+                        .execute(), "data", None) or []
+        row["number"] = next_number([r["number"] for r in every])
+        out = db.table("invoices").insert(row).execute()
     return (getattr(out, "data", None) or [row])[0]
+
+
+def _is_duplicate(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "23505" in text or "duplicate key" in text
 
 
 def update_invoice(db, user_id: str, invoice_id: str, patch: dict) -> dict:
@@ -246,13 +263,39 @@ def delete_invoice(db, user_id: str, invoice_id: str) -> None:
     db.table("invoices").delete().eq("id", invoice_id).eq("user_id", user_id).execute()
 
 
+def _claim(db, user_id: str, invoice_id: str, expect: str, patch: dict) -> dict | None:
+    """Move an invoice out of `expect` only if it is STILL in `expect`.
+
+    Reading the status and then writing it left a gap: two taps on "Send" (or
+    the owner's "Mark paid" landing with a mobile-money confirmation) both saw
+    the old status and both posted, so one invoice put two Sales, or two
+    payments, into the books. The status change is now a conditional write, and
+    only the request that actually made it goes on to post.
+    """
+    res = (db.table("invoices").update(patch)
+           .eq("id", invoice_id).eq("user_id", user_id).eq("status", expect).execute())
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
 def send_invoice(db, user_id: str, invoice_id: str) -> dict:
     """Draft → sent. Posts the confirmed credit Sale (the receivable is born)."""
     inv = _get(db, user_id, invoice_id)
     if inv["status"] != "draft":
         raise ValueError(f"Only a draft can be sent (this one is {inv['status']}).")
 
-    ev = nervous.ingest(db, user_id, nervous.EventIn(
+    # Mint the payment token here so EVERY sent invoice is payable the moment it
+    # exists — the share text is built straight after this and must be able to
+    # carry the link. (ensure_pay_token backfills invoices sent before 0025.)
+    claim = {"status": "sent", "issued_at": _now_iso()}
+    if not inv.get("pay_token"):
+        claim["pay_token"] = new_pay_token()
+    claimed = _claim(db, user_id, invoice_id, "draft", claim)
+    if claimed is None:
+        raise ValueError("This invoice has just been sent.")
+
+    try:
+        ev = nervous.ingest(db, user_id, nervous.EventIn(
         event_type="Sale",
         payload={
             "amount": _num(inv["total"]),
@@ -263,17 +306,17 @@ def send_invoice(db, user_id: str, invoice_id: str) -> dict:
             "note": f"Invoice {inv['number']} issued",
         },
         source="manual", status="confirmed",
-    ), business_id=inv.get("business_id"))
+        ), business_id=inv.get("business_id"))
+    except Exception:
+        # Nothing reached the books, so the invoice goes back to being a draft
+        # the owner can send again, instead of a "sent" invoice with no Sale.
+        _claim(db, user_id, invoice_id, "sent", {"status": "draft", "issued_at": None})
+        raise
 
-    # Mint the payment token here so EVERY sent invoice is payable the moment it
-    # exists — the share text is built straight after this and must be able to
-    # carry the link. (ensure_pay_token backfills invoices sent before 0025.)
-    patch = {"status": "sent", "issued_at": _now_iso(), "sale_event_id": ev.get("id")}
-    if not inv.get("pay_token"):
-        patch["pay_token"] = new_pay_token()
+    patch = {"sale_event_id": ev.get("id")}
     res = (db.table("invoices").update(patch)
            .eq("id", invoice_id).eq("user_id", user_id).execute())
-    return (getattr(res, "data", None) or [{**inv, **patch}])[0]
+    return (getattr(res, "data", None) or [{**inv, **claim, **patch}])[0]
 
 
 def ensure_pay_token(db, user_id: str, invoice_id: str) -> dict:
@@ -321,6 +364,9 @@ def mark_paid(db, user_id: str, invoice_id: str,
     inv = _get(db, user_id, invoice_id)
     if inv["status"] != "sent":
         raise ValueError(f"Only a sent invoice can be marked paid (this one is {inv['status']}).")
+    claimed = _claim(db, user_id, invoice_id, "sent", {"status": "paid", "paid_at": _now_iso()})
+    if claimed is None:
+        raise ValueError("This invoice has just been marked paid.")
 
     note = f"Payment for invoice {inv['number']}"
     if method != "manual":
@@ -337,32 +383,29 @@ def mark_paid(db, user_id: str, invoice_id: str,
     if reference:
         payload["payment_reference"] = reference
 
-    ev = nervous.ingest(db, user_id, nervous.EventIn(
-        event_type="CustomerPayment",
-        payload=payload,
-        source="manual" if method == "manual" else "api",
-        status="confirmed",
-        # EXPLICIT, and load-bearing. decide_confidence() defaults any
-        # non-'manual' source to 0.7, and decide_status() demotes a confirmed
-        # event below AUTO_CONFIRM_THRESHOLD (0.99) to 'pending'. That default
-        # is right for AI extractions and wrong here: a settled mobile-money
-        # collection is a fact the provider confirmed, not a guess. Without
-        # this the invoice would read "paid" while the cash never reached the
-        # twin — a silent hole between the two.
-        confidence=1.0,
-        # EXPLICIT, and load-bearing. decide_confidence() defaults any
-        # non-'manual' source to 0.7, and decide_status() demotes a confirmed
-        # event below AUTO_CONFIRM_THRESHOLD (0.99) to 'pending'. That default
-        # is right for AI extractions and wrong here: a settled mobile-money
-        # collection is a fact the provider confirmed, not a guess. Without
-        # this the invoice would read "paid" while the cash never reached the
-        # twin — a silent hole between the two.
-    ), business_id=inv.get("business_id"))
+    try:
+        ev = nervous.ingest(db, user_id, nervous.EventIn(
+            event_type="CustomerPayment",
+            payload=payload,
+            source="manual" if method == "manual" else "api",
+            status="confirmed",
+            # EXPLICIT, and load-bearing. decide_confidence() defaults any
+            # non-'manual' source to 0.7, and decide_status() demotes a confirmed
+            # event below AUTO_CONFIRM_THRESHOLD (0.99) to 'pending'. That default
+            # is right for AI extractions and wrong here: a settled mobile-money
+            # collection is a fact the provider confirmed, not a guess. Without
+            # this the invoice would read "paid" while the cash never reached the
+            # twin — a silent hole between the two.
+            confidence=1.0,
+        ), business_id=inv.get("business_id"))
+    except Exception:
+        _claim(db, user_id, invoice_id, "paid", {"status": "sent", "paid_at": None})
+        raise
 
-    patch = {"status": "paid", "paid_at": _now_iso(), "payment_event_id": ev.get("id")}
+    patch = {"payment_event_id": ev.get("id")}
     res = (db.table("invoices").update(patch)
            .eq("id", invoice_id).eq("user_id", user_id).execute())
-    return (getattr(res, "data", None) or [{**inv, **patch}])[0]
+    return (getattr(res, "data", None) or [{**inv, **claimed, **patch}])[0]
 
 
 def cancel_invoice(db, user_id: str, invoice_id: str) -> dict:
@@ -374,11 +417,12 @@ def cancel_invoice(db, user_id: str, invoice_id: str) -> dict:
     if inv["status"] == "cancelled":
         return inv
 
+    # Claimed first, for the same reason as send and mark-paid: a cancel racing
+    # a mobile-money payment must not leave a paid invoice with its Sale voided.
+    claimed = _claim(db, user_id, invoice_id, inv["status"], {"status": "cancelled"})
+    if claimed is None:
+        raise ValueError("This invoice changed a moment ago. Refresh and try again.")
     if inv["status"] == "sent" and inv.get("sale_event_id"):
         nervous.void(db, user_id, inv["sale_event_id"],
                      reason=f"Invoice {inv['number']} cancelled")
-
-    patch = {"status": "cancelled"}
-    res = (db.table("invoices").update(patch)
-           .eq("id", invoice_id).eq("user_id", user_id).execute())
-    return (getattr(res, "data", None) or [{**inv, **patch}])[0]
+    return claimed

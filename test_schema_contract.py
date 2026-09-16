@@ -43,9 +43,9 @@ def test_expects_migration_matches_the_contract():
 def test_health_reports_the_declared_migration():
     # The whole point of the number is that it reaches /health, where the owner
     # reads it after a deploy. An inlined literal here would defeat the guard.
-    import asyncio
-
-    body = asyncio.run(main.health())
+    # (A plain function now: routes that block on the database run in the
+    # threadpool instead of stalling the event loop for everyone.)
+    body = main.health()
     assert body["expects_migration"] == CONTRACT["expects_migration"]
     assert "build_sha" in body
 

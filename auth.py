@@ -54,10 +54,33 @@ def _cache_get(token: str):
     return user_id
 
 
+def _token_expiry(token: str) -> float | None:
+    """The `exp` a token claims, read without verifying (it has just BEEN
+    verified). Used only to stop the cache outliving the token itself."""
+    try:
+        import base64
+        import json
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return float(claims["exp"]) if "exp" in claims else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _cache_put(token: str, user_id: str):
     if len(_CACHE) >= _CACHE_MAX:
-        _CACHE.clear()  # cheap eviction; tokens are short-lived anyway
-    _CACHE[token] = (user_id, time.time() + _CACHE_TTL)
+        now = time.time()
+        for k, (_uid, exp) in list(_CACHE.items()):
+            if exp <= now:
+                _CACHE.pop(k, None)
+        if len(_CACHE) >= _CACHE_MAX:
+            _CACHE.clear()
+    until = time.time() + _CACHE_TTL
+    exp = _token_expiry(token)
+    if exp is not None:
+        # A token with two minutes left used to stay accepted for five.
+        until = min(until, exp)
+    _CACHE[token] = (user_id, until)
 
 
 def _verify_local(token: str):

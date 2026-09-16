@@ -21,6 +21,7 @@ It is cached briefly to avoid a DB round-trip per request. `_grant_tier` calls
 
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
@@ -81,6 +82,27 @@ _TTL = 60.0
 _CACHE_MAX = 5000
 
 
+# A plan bought with mobile money is bought for a PERIOD (migration 0033 adds
+# profiles.paid_until). The grant used to write the tier and nothing else, so a
+# single K500 payment unlocked Pro for ever. After paid_until the plan keeps
+# working through a short grace, then reads as Free until it is renewed.
+# Admin grants and any row without paid_until never lapse.
+GRACE_DAYS = 7
+
+
+def _parse_ts(v):
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _missing_column(exc: Exception) -> bool:
+    text = str(exc)
+    return "PGRST204" in text or "42703" in text or "does not exist" in text or "schema cache" in text
+
+
 def invalidate(user_id: str) -> None:
     """Drop a cached tier so the next lookup re-reads it (call after a grant)."""
     _CACHE.pop(user_id, None)
@@ -115,7 +137,14 @@ def tier_detail(user_id: str) -> dict:
                 "note": "Supabase is not configured on the API, so no plan can be read."}
 
     try:
-        res = db.table("profiles").select("tier").eq("id", user_id).limit(1).execute()
+        try:
+            res = (db.table("profiles").select("tier,tier_source,paid_until")
+                   .eq("id", user_id).limit(1).execute())
+        except Exception as e:  # noqa: BLE001
+            if not _missing_column(e):
+                raise
+            # Migration 0033 not run yet: plans simply do not lapse.
+            res = db.table("profiles").select("tier").eq("id", user_id).limit(1).execute()
         rows = getattr(res, "data", None) or []
     except Exception as e:  # noqa: BLE001 — infra error → fail open, don't cache
         log.warning("[entitlements] tier lookup failed for %s: %s", user_id, e)
@@ -148,8 +177,20 @@ def tier_detail(user_id: str) -> dict:
     if value and value not in _VALID_TIERS:
         log.warning("[entitlements] profiles.tier for %s is %r, which is not a plan "
                     "this build knows about — treating as free", user_id, value)
+    until = _parse_ts(rows[0].get("paid_until")) if rows[0].get("tier_source") == "payment" else None
+    if tier != "free" and until is not None:
+        if datetime.now(timezone.utc) > until + timedelta(days=GRACE_DAYS):
+            # Cached like any answer: a renewal calls invalidate().
+            _cache_put(user_id, "free")
+            return {"tier": "free", "reason": "expired", "row": True, "paid_tier": tier,
+                    "paid_until": until.isoformat(),
+                    "note": f"The {_TIER_LABEL.get(tier, tier)} plan ran until "
+                            f"{until.strftime('%d %B %Y')}. Renew it to switch everything back on."}
     _cache_put(user_id, tier)
-    return {"tier": tier, "reason": "ok", "row": True}
+    out = {"tier": tier, "reason": "ok", "row": True}
+    if until is not None:
+        out["paid_until"] = until.isoformat()
+    return out
 
 
 def _cache_put(user_id: str, tier: str) -> None:
@@ -266,7 +307,7 @@ def chat_taster(db, user_id: str, limit: int = CHAT_TASTER_PER_DAY,
         return False, 0
 
 
-def paying_account(user_id: str) -> str:
+def paying_account(user_id: str, acting_as: str | None = None) -> str:
     """The account whose PLAN applies to this caller.
 
     A plan belongs to a business, not to a person. When an owner on Pro invites
@@ -286,15 +327,15 @@ def paying_account(user_id: str) -> str:
         return user_id
     try:
         import membership  # local import: membership imports db, not this module
-        return membership.resolve_context(user_id).tenant or user_id
+        return membership.resolve_context(user_id, acting_as=acting_as).tenant or user_id
     except Exception as e:  # noqa: BLE001 — pre-0022 / infra → owner-of-self
         log.info("[entitlements] could not resolve the paying account for %s: %s", user_id, e)
         return user_id
 
 
-def require_feature_for_caller(user_id: str, feature: str) -> str:
+def require_feature_for_caller(user_id: str, feature: str, acting_as: str | None = None) -> str:
     """Gate on the plan of the business this caller works in, not their own."""
-    return require_feature(paying_account(user_id), feature)
+    return require_feature(paying_account(user_id, acting_as), feature)
 
 
 def _sentence(label: str) -> str:
@@ -331,6 +372,12 @@ def require_feature(user_id: str, feature: str) -> str:
         need = _required_tier(feature)
         need_label = _TIER_LABEL.get(need, need.capitalize())
         label = _sentence(_FEATURE_LABEL.get(feature, feature))
+
+        if detail.get("reason") == "expired":
+            raise HTTPException(
+                status_code=402,
+                detail=f"{label} is locked because {detail.get('note') or 'the paid plan has ended.'}",
+            )
 
         # Do not sell an upgrade we are not sure they need. When the plan could
         # not be read, "upgrade to Pro" is a guess aimed at someone who may

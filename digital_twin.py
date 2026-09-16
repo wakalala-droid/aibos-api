@@ -292,6 +292,21 @@ def _scoped(query, user_id: str, business_id: str | None):
     return query
 
 
+def _books_for(db, user_id: str, business_id: str | None) -> str | None:
+    """Which business's books a call means when it does not say.
+
+    Several callers (hospitality, payroll, the WhatsApp bot) have no request
+    context and pass no business. On a pre-0023 database None is right. On
+    this one it is not: business_state is keyed (user_id, business_id), so a
+    None rebuild could not be written at all, and a None read returned
+    whichever business's row came back first. The answer is the default.
+    """
+    if business_id is not None or db is None:
+        return business_id
+    import businesses  # local: businesses has no imports of ours, but keep the graph flat
+    return businesses.default_business_id(db, user_id)
+
+
 def _load_state_row(db, user_id: str, business_id: str | None = None) -> dict | None:
     res = _scoped(db.table("business_state").select("*"), user_id, business_id).limit(1).execute()
     rows = getattr(res, "data", None) or []
@@ -306,16 +321,17 @@ def rebuild(db, user_id: str, business_id: str | None = None) -> dict:
     """
     if db is None:
         raise RuntimeError("Supabase not configured — cannot rebuild the Digital Twin.")
+    business_id = _books_for(db, user_id, business_id)
 
     # Preserve operator-seeded fields (opening cash, currency) across rebuilds.
     existing = _load_state_row(db, user_id, business_id) or {}
     opening_cash = _num(existing.get("opening_cash"))
     currency = existing.get("currency") or "ZMW"
 
-    res = _scoped(
+    from db import fetch_all
+    events = fetch_all(lambda: _scoped(
         db.table("business_events").select("*"), user_id, business_id
-    ).eq("status", "confirmed").order("occurred_at", desc=False).execute()
-    events = getattr(res, "data", None) or []
+    ).eq("status", "confirmed").order("occurred_at", desc=False).order("id"))
 
     state = project(events, opening_cash=opening_cash, currency=currency)
 
@@ -336,7 +352,7 @@ def get_state(db, user_id: str, business_id: str | None = None) -> dict:
     """Return the persisted twin row, or an empty state if none exists yet."""
     if db is None:
         return {"user_id": user_id, **_empty_state()}
-    row = _load_state_row(db, user_id, business_id)
+    row = _load_state_row(db, user_id, _books_for(db, user_id, business_id))
     return row if row else {"user_id": user_id, **_empty_state()}
 
 
@@ -349,6 +365,7 @@ def seed(db, user_id: str, opening_cash: float | None = None, currency: str | No
     """
     if db is None:
         raise RuntimeError("Supabase not configured — cannot seed the Digital Twin.")
+    business_id = _books_for(db, user_id, business_id)
     existing = _load_state_row(db, user_id, business_id) or {}
     patch = {"user_id": user_id}
     if business_id is not None:
