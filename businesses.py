@@ -187,9 +187,16 @@ def heal_unscoped_rows(db, owner_id: str, business_id: str | None) -> dict:
     try:
         orphan = (db.table("business_events").select("id").eq("user_id", owner_id)
                   .is_("business_id", "null").limit(1).execute())
-        if getattr(orphan, "data", None):
+        invoice_posting = (db.table("business_events").select("id").eq("user_id", owner_id)
+                           .not_.is_("payload->>invoice_number", "null").limit(1).execute())
+        if getattr(orphan, "data", None) or getattr(invoice_posting, "data", None):
             import books_repair
             out["repair"] = books_repair.repair(db, owner_id)
+            if out["repair"].get("voided") or out["repair"].get("linked"):
+                import digital_twin
+                for bid in {business_id, *[r.get("id") for r in _business_rows(db, owner_id)]}:
+                    if bid:
+                        digital_twin.rebuild(db, owner_id, bid)
         for table in SCOPED_TABLES:
             try:
                 res = (db.table(table).update({"business_id": business_id})

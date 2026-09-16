@@ -3182,10 +3182,20 @@ def export_pnl(ctx: membership.Context = Depends(membership.require_context)):
 # ── Budgets & targets (audit #37) ─────────────────────────────────────────────
 # Actuals vs the owner's PLAN. Targets are stored; actuals derive from the twin.
 
+_BUDGETS_SETUP = ("Budgets are not set up on this database yet. "
+                  "Run migration 0024_budgets.sql (or 0033, which includes it) in Supabase.")
+
+
 @app.get("/budgets")
 def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    rows = budgets_api.list_budgets(db, ctx.tenant, month=month, business_id=ctx.business_id)
+    try:
+        rows = budgets_api.list_budgets(db, ctx.tenant, month=month, business_id=ctx.business_id)
+    except Exception as e:  # noqa: BLE001
+        from db import missing_schema
+        if missing_schema(e, "budgets"):
+            raise HTTPException(status_code=503, detail=_BUDGETS_SETUP)
+        raise
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     var = budgets_api.variance(state.get("monthly", []), rows, month)
     return {"ok": True, "budgets": rows, **var}
@@ -3201,6 +3211,11 @@ def set_budget(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depen
         return {"ok": True, "budget": row}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        from db import missing_schema
+        if missing_schema(e, "budgets"):
+            raise HTTPException(status_code=503, detail=_BUDGETS_SETUP)
+        raise
 
 
 @app.delete("/budgets/{budget_id}")
@@ -3498,7 +3513,10 @@ def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(Non
     try:
         inv = invoices_api._get(db, ctx.tenant, invoice_id)
         if inv.get("status") == "sent" and not inv.get("pay_token"):
-            inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
+            try:
+                inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
+            except invoices_api.PaymentLinksNotSetUp:
+                pass                      # share without a link rather than not at all
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -3515,6 +3533,8 @@ def invoice_pay_link(invoice_id: str, ctx: membership.Context = Depends(membersh
     db = _require_db()
     try:
         inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
+    except invoices_api.PaymentLinksNotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "url": invoices_api.build_pay_url(PUBLIC_APP_URL, inv["pay_token"])}
@@ -3567,7 +3587,10 @@ def _throttle_public(request: Request, bucket: str, limit: int, window_s: int,
 
 
 def _pay_invoice_or_404(db, token: str) -> Dict[str, Any]:
-    inv = invoices_api.get_by_pay_token(db, token)
+    try:
+        inv = invoices_api.get_by_pay_token(db, token)
+    except invoices_api.PaymentLinksNotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
     # One message for "no such token" and "token exists but isn't payable" would
     # be tidier, but an owner debugging a link needs to tell them apart, and a
     # 404 here leaks nothing an attacker could use — they already need the token.

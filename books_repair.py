@@ -17,6 +17,13 @@ visible as they are would put cancelled stays and duplicate invoice sales into
 the P&L. So before a NULL-business event is given its business, this links the
 one that still describes something real and voids the rest.
 
+INVOICES FAILED A SECOND WAY, IN PLAIN SIGHT. The live database never had
+migration 0025, so every Send wrote its Sale (with a business, so VISIBLE) and
+then failed writing the payment-link column. The invoice stayed a draft, the
+owner pressed Send again, and each press added another credit Sale to revenue
+and receivables. Unlinked invoice postings are therefore repaired whatever
+their business.
+
 Run once per owner by businesses.heal_unscoped_rows, on their first request
 after this shipped, so it works whether or not migration 0033 has been run.
 
@@ -119,12 +126,21 @@ def repair(db, owner_id: str) -> dict:
             return query.order(order)
         return fetch_all(q)
 
+    cols = "id,event_type,status,payload,recorded_at,audit"
     try:
-        events = _rows("business_events", "id,event_type,status,payload,recorded_at,audit",
-                       null_business=True)
+        events = _rows("business_events", cols, null_business=True)
     except Exception as e:  # noqa: BLE001
         log.info("[books_repair] no events to repair for %s: %s", owner_id, e)
-        return {"linked": 0, "voided": 0}
+        events = []
+    try:
+        seen = {e["id"] for e in events}
+        invoice_postings = fetch_all(lambda: (
+            db.table("business_events").select(cols).eq("user_id", owner_id)
+            .eq("status", "confirmed").not_.is_("payload->>invoice_number", "null")
+            .order("id")))
+        events += [e for e in invoice_postings if e["id"] not in seen]
+    except Exception as e:  # noqa: BLE001
+        log.info("[books_repair] invoice postings unreadable for %s: %s", owner_id, e)
     if not events:
         return {"linked": 0, "voided": 0}
     try:

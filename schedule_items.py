@@ -288,7 +288,16 @@ def set_status(db, user_id: str, item_id: str, status: str,
             # schedule the moment the owner ticked it off.
             if item.get("business_id") is not None:
                 child["business_id"] = item["business_id"]
-            ins = db.table("schedule_items").insert(child).execute()
+            try:
+                ins = db.table("schedule_items").insert(child).execute()
+            except Exception as e:  # noqa: BLE001
+                # The live table was created from an early draft of 0012 without
+                # parent_id, so ticking off a recurring item failed outright.
+                from db import missing_schema
+                if not missing_schema(e, "parent_id"):
+                    raise
+                child.pop("parent_id", None)
+                ins = db.table("schedule_items").insert(child).execute()
             child_row = (getattr(ins, "data", None) or [child])[0]
 
             patch: dict = {"starts_at": nxt.isoformat()}

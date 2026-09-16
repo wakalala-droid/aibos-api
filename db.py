@@ -181,8 +181,48 @@ def db_health(force: bool = False) -> dict:
 # Each probe asks PostgREST for one column and reads nothing: the column either
 # resolves or it answers PGRST204. Cheap, and it cannot be wrong.
 
+def missing_schema(exc: Exception, name: str | None = None) -> bool:
+    """Did this fail because a table or column is not there (a migration not
+    run), rather than for some other reason? With `name`, only when the error
+    is about that table or column."""
+    text = str(exc)
+    shaped = any(t in text for t in ("PGRST204", "PGRST205", "42703", "42P01", "schema cache",
+                                     "does not exist"))
+    return shaped and (name is None or name in text)
+
+
+# One probe per migration, from the first table the API depends on. This list
+# started at 27, so /health said "migrations_missing: []" on a database that
+# had never had 0024, 0025 or 0026 run: budgets had no table, invoices could not
+# be sent, and onboarding could not be finished, all while the health check
+# was green. Every migration that creates or adds something is listed now.
 _SCHEMA_PROBES = (
     # (migration, table, column that migration added)
+    (1, "profiles", "tier_source"),
+    (3, "function_proposals", "id"),
+    (4, "function_proposals", "monitor_until"),
+    (5, "business_events", "occurred_at"),
+    (6, "business_state", "opening_cash"),
+    (7, "profiles", "onboarded_at"),
+    (8, "business_memory", "hits"),
+    (9, "products", "reorder_level"),
+    (11, "profiles", "referred_by"),
+    (12, "schedule_items", "parent_id"),
+    (13, "profiles", "brief_email_enabled"),
+    (14, "payslips", "net"),
+    (15, "bookings", "linked_event_id"),
+    (16, "bookings", "external_uid"),
+    (17, "business_events_archive", "archived_at"),
+    (18, "parties", "normalized_key"),
+    (19, "invoices", "sale_event_id"),
+    (20, "cabinet_files", "engine"),
+    (21, "recommendations", "fingerprint"),
+    (22, "business_members", "member_id"),
+    (23, "businesses", "is_default"),
+    (24, "budgets", "metric"),
+    (25, "invoices", "pay_token"),
+    (25, "invoice_payments", "settled"),
+    (26, "profiles", "identity_place_id"),
     (27, "properties", "public_site_token"),
     (28, "profiles", "welcome_seen_tier"),
     (29, "bookings", "reference"),
@@ -213,11 +253,15 @@ def schema_health(force: bool = False) -> dict:
     for number, table, column in _SCHEMA_PROBES:
         try:
             db.table(table).select(column).limit(1).execute()
-            out["applied"].append(number)
+            if number not in out["applied"] and number not in out["missing"]:
+                out["applied"].append(number)
         except Exception as e:  # noqa: BLE001
             text = str(e)
-            if "PGRST204" in text or "schema cache" in text or "does not exist" in text:
-                out["missing"].append(number)
+            if missing_schema(e):
+                if number in out["applied"]:
+                    out["applied"].remove(number)
+                if number not in out["missing"]:
+                    out["missing"].append(number)
             else:
                 # A real fault, not a missing column. Say so rather than
                 # reporting a migration as un-run because the network blipped.

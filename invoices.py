@@ -232,6 +232,16 @@ def create_invoice(db, user_id: str, data: dict, business_id: str | None = None)
     return (getattr(out, "data", None) or [row])[0]
 
 
+class PaymentLinksNotSetUp(ValueError):
+    """Migration 0025 (invoices.pay_token, invoice_payments) is not on this
+    database. Invoices still work; they just carry no payment link."""
+
+
+def _no_pay_token_column(exc: Exception) -> bool:
+    from db import missing_schema
+    return missing_schema(exc, "pay_token")
+
+
 def _is_duplicate(exc: Exception) -> bool:
     text = str(exc).lower()
     return "23505" in text or "duplicate key" in text
@@ -290,7 +300,15 @@ def send_invoice(db, user_id: str, invoice_id: str) -> dict:
     claim = {"status": "sent", "issued_at": _now_iso()}
     if not inv.get("pay_token"):
         claim["pay_token"] = new_pay_token()
-    claimed = _claim(db, user_id, invoice_id, "draft", claim)
+    try:
+        claimed = _claim(db, user_id, invoice_id, "draft", claim)
+    except Exception as e:  # noqa: BLE001
+        # Without migration 0025 there is no pay_token column, and naming it made
+        # every Send fail, after posting the Sale. Send without a link instead.
+        if "pay_token" not in claim or not _no_pay_token_column(e):
+            raise
+        claim.pop("pay_token")
+        claimed = _claim(db, user_id, invoice_id, "draft", claim)
     if claimed is None:
         raise ValueError("This invoice has just been sent.")
 
@@ -334,8 +352,15 @@ def ensure_pay_token(db, user_id: str, invoice_id: str) -> dict:
     if inv.get("pay_token"):
         return inv
     patch = {"pay_token": new_pay_token()}
-    res = (db.table("invoices").update(patch)
-           .eq("id", invoice_id).eq("user_id", user_id).execute())
+    try:
+        res = (db.table("invoices").update(patch)
+               .eq("id", invoice_id).eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        if _no_pay_token_column(e):
+            raise PaymentLinksNotSetUp(
+                "Payment links are not switched on for this database yet "
+                "(run migration 0025).") from e
+        raise
     return (getattr(res, "data", None) or [{**inv, **patch}])[0]
 
 
@@ -345,8 +370,13 @@ def get_by_pay_token(db, token: str) -> dict | None:
     caller must pass the result through public_view() before returning it."""
     if not token:
         return None
-    res = (db.table("invoices").select("*")
-           .eq("pay_token", token).limit(1).execute())
+    try:
+        res = (db.table("invoices").select("*")
+               .eq("pay_token", token).limit(1).execute())
+    except Exception as e:  # noqa: BLE001
+        if _no_pay_token_column(e):
+            raise PaymentLinksNotSetUp("Payment links are not switched on yet.") from e
+        raise
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
 

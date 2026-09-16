@@ -34,11 +34,13 @@ class _Q:
         self.db, self.name, self.op = db, name, op
         self.payload, self.on_conflict = payload, on_conflict
         self.filters = []
+        self.cols = set()
         self._range = None
         self._limit = None
         self._order = []
 
     def eq(self, k, v):
+        self.cols.add(k)
         self.filters.append(lambda r, k=k, v=v: r.get(k) == v)
         return self
 
@@ -71,9 +73,15 @@ class _Q:
     def not_(self):
         outer = self
 
+        def _get(r, k):
+            if "->>" in k:                      # a JSON path, as PostgREST reads it
+                col, key = k.split("->>", 1)
+                return (r.get(col) or {}).get(key)
+            return r.get(k)
+
         class _Not:
             def is_(self, k, v):
-                outer.filters.append(lambda r, k=k: r.get(k) is not None)
+                outer.filters.append(lambda r, k=k: _get(r, k) is not None)
                 return outer
         return _Not()
 
@@ -98,6 +106,18 @@ class _Q:
 
     def execute(self):
         self.db.calls += 1
+        # A column a migration would have added, on a database where it was
+        # never run: PostgREST refuses the whole request, naming it.
+        touched = set(self.cols)
+        if isinstance(self.payload, dict):
+            touched |= set(self.payload)
+        elif isinstance(self.payload, list):
+            for r in self.payload:
+                touched |= set(r)
+        for col in touched:
+            if (self.name, col) in self.db.missing_columns:
+                raise Exception(f"PGRST204: Could not find the '{col}' column of "
+                                f"'{self.name}' in the schema cache")
         rows = self.db.rows.setdefault(self.name, [])
         if self.op == "select":
             if self.name in self.db.missing_tables:
@@ -167,6 +187,7 @@ class _DB:
                      "products": [], "schedule_items": [], "invoices": [], "budgets": [],
                      "business_events_archive": []}
         self.missing_tables = set()
+        self.missing_columns = set()
         self.seq = 0
         self.calls = 0
 
@@ -255,6 +276,34 @@ def test_the_repair_voids_cancelled_and_duplicate_postings_before_filing_them():
     assert db.rows["invoices"][0]["sale_event_id"] == "inv_b"
     assert {e["business_id"] for e in db.rows["business_events"]} == {bid}
     assert twin.get_state(db, "u1", bid)["total_revenue"] == 2000 + 500 + 75
+
+
+def test_the_repair_voids_visible_duplicate_invoice_sales_from_failed_sends():
+    """No migration 0025: each Send posted a Sale WITH a business, then failed."""
+    db = _fresh()
+    bid = businesses.ensure_default_business(db, "u1")
+    db.rows["invoices"] = [{"id": "inv9", "user_id": "u1", "business_id": bid,
+                            "number": "INV-0009", "status": "draft",
+                            "customer_name": "Chanda", "total": 400, "currency": "ZMW",
+                            "lines": [{"description": "Catering", "qty": 1, "unit_price": 400}],
+                            "sale_event_id": None, "payment_event_id": None}]
+    for i in range(3):                       # three presses of Send, all failed
+        db.rows["business_events"].append({
+            "id": f"try{i}", "user_id": "u1", "business_id": bid, "status": "confirmed",
+            "event_type": "Sale", "occurred_at": "2026-09-01", "recorded_at": f"2026-09-01T0{i}",
+            "payload": {"amount": 400, "payment_method": "credit", "invoice_number": "INV-0009"},
+            "audit": []})
+    twin.rebuild(db, "u1", bid)
+    assert twin.get_state(db, "u1", bid)["receivables"] == 1200     # the bug, visible
+
+    businesses.resolve_business_id(db, "u1", None, create=True)
+    assert {e["status"] for e in db.rows["business_events"]} == {"void"}
+    state = twin.get_state(db, "u1", bid)
+    assert state["total_revenue"] == 0 and state["receivables"] == 0
+    # The owner sends it again, once, and it counts once.
+    import invoices
+    invoices.send_invoice(db, "u1", "inv9")
+    assert twin.get_state(db, "u1", bid)["receivables"] == 400
 
 
 def test_a_pre_0023_database_stays_single_book():

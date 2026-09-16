@@ -242,6 +242,78 @@ def test_a_second_business_can_issue_its_first_invoice():
     assert a["number"] == "INV-0001" and b["number"] == "INV-0002"
 
 
+# ── A database missing migrations the code expects (the live one was) ───────
+
+def test_an_invoice_can_be_sent_before_migration_0025():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    db.missing_columns.add(("invoices", "pay_token"))
+    inv = _draft(db)
+    sent = invoices.send_invoice(db, "u1", inv["id"])
+    assert sent["status"] == "sent" and sent.get("sale_event_id")
+    assert len([e for e in db.rows["business_events"] if e["event_type"] == "Sale"]) == 1
+    try:
+        invoices.ensure_pay_token(db, "u1", inv["id"])
+        assert False
+    except invoices.PaymentLinksNotSetUp:
+        pass
+
+
+def test_a_recurring_item_can_be_ticked_off_before_parent_id_exists():
+    import schedule_items
+    db = _fresh()
+    db.missing_columns.add(("schedule_items", "parent_id"))
+    item = schedule_items.create_item(db, "u1", {
+        "title": "NAPSA", "starts_at": "2026-10-10T08:00:00+00:00",
+        "recurrence": {"freq": "monthly", "interval": 1}})
+    done = schedule_items.set_status(db, "u1", item["id"], "done")
+    assert done["status"] == "done"
+    template = next(r for r in db.rows["schedule_items"] if r["id"] == item["id"])
+    assert template["starts_at"].startswith("2026-11-10")
+
+
+def test_health_names_every_missing_migration():
+    import db as dbmod
+    fake = _fresh()
+    fake.missing_tables.update({"budgets", "invoice_payments"})
+    fake.missing_columns.update({("profiles", "identity_place_id"), ("invoices", "pay_token")})
+
+    class _Missing(Exception):
+        pass
+
+    real_select = fake.table
+
+    def table(name):
+        t = real_select(name)
+        orig = t.select
+
+        def select(col="*", **k):
+            q = orig(col)
+            q.cols.add(col)
+            ex = q.execute
+
+            def execute():
+                if name in fake.missing_tables:
+                    raise Exception(f"PGRST205: Could not find the table 'public.{name}' in the schema cache")
+                return ex()
+            q.execute = execute
+            return q
+        t.select = select
+        return t
+
+    fake.table = table
+    real_get = dbmod.get_db
+    dbmod.get_db = lambda: fake
+    dbmod._schema_cache = None
+    try:
+        out = dbmod.schema_health(force=True)
+    finally:
+        dbmod.get_db = real_get
+        dbmod._schema_cache = None
+    assert {24, 25, 26} <= set(out["missing"])
+    assert 23 in out["applied"] and 25 not in out["applied"]
+
+
 # ── Mobile money ─────────────────────────────────────────────────────────────
 
 def test_mobile_money_charges_the_ngwee():
