@@ -800,7 +800,9 @@ def upload_file(
     file: UploadFile = File(...),
     sheet_name: Optional[str] = Query(None),
     cabinet_id: Optional[str] = Query(None),
-    user_id: str = Depends(require_user),
+    # Each upload runs pandas over up to 15 MB and can ask the AI model for a
+    # summary: throttled so one account cannot tie up the server or the bill.
+    user_id: str = Depends(rate_limit.limiter("upload", 20, 60)),
 ):
     """
     Upload a file and run engine analysis.
@@ -2196,7 +2198,7 @@ def health_setup():
 
 
 @app.get("/health/ai")
-def health_ai(user_id: str = Depends(require_user)):
+def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     """Which calls to the AI provider actually work.
 
     "The answer stopped early. Please try again." was the whole of what an owner
