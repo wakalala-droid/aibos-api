@@ -1624,7 +1624,13 @@ def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
         collected the money; importing is availability truth, not revenue).
       • a known UID with shifted dates is updated in place.
       • a previously-imported block the feed no longer lists is cancelled (the OTA
-        freed those dates). Reconciliation is what keeps the one calendar honest.
+        freed those dates), but only if it has not ended yet. Airbnb and
+        Booking.com drop a stay from the feed once it is over, and reading that
+        as "freed" marked every finished stay as called off, which emptied the
+        owner's occupancy history one sync at a time.
+      • a block left behind when this unit's channel was removed is adopted, not
+        imported again. Removing a channel and adding it back used to put every
+        reservation on the calendar twice.
     Returns counts for last_sync_note. Never calls the write-time double-booking
     guard: an OTA block is ground truth about a stay that already happened.
     """
@@ -1638,9 +1644,26 @@ def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
                     .not_.is_("external_uid", "null").execute())
     existing = {r["external_uid"]: r for r in (getattr(existing_res, "data", None) or [])}
 
+    # Orphans: imported onto this unit by a channel that has since been removed
+    # (bookings.channel_id is set null when a channel is deleted).
+    orphans: dict = {}
+    try:
+        orphan_res = (db.table("bookings").select("id,external_uid,check_in,check_out,status")
+                      .eq("user_id", user_id).eq("unit_id", unit_id).is_("channel_id", "null")
+                      .not_.is_("external_uid", "null").execute())
+        orphans = {r["external_uid"]: r for r in (getattr(orphan_res, "data", None) or [])}
+    except Exception as exc:  # noqa: BLE001 — adoption is a nicety; the sync still runs
+        log.info("[hospitality] orphan lookup skipped: %s", exc)
+
+    today = date.today().isoformat()
     imported = updated = cancelled = 0
     for uid, ev in incoming.items():
         prev = existing.get(uid)
+        if prev is None and uid in orphans:
+            prev = orphans[uid]
+            (db.table("bookings").update({"channel_id": channel_id})
+             .eq("id", prev["id"]).eq("user_id", user_id).execute())
+            existing[uid] = prev
         if prev is None:
             db.table("bookings").insert({
                 "user_id": user_id, "unit_id": unit_id, "channel_id": channel_id,
@@ -1657,9 +1680,11 @@ def _apply_import(db, user_id: str, channel: dict, events: list[dict]) -> dict:
              .eq("id", prev["id"]).eq("user_id", user_id).execute())
             updated += 1
 
-    # Reconcile removals: imported blocks still blocking but no longer in the feed.
+    # Reconcile removals: imported blocks still blocking, no longer in the feed,
+    # and not yet over. A stay that has ended leaves the feed because it ended.
     for uid, prev in existing.items():
-        if uid not in incoming and prev["status"] in BLOCKING_STATUSES:
+        if uid not in incoming and prev["status"] in BLOCKING_STATUSES \
+                and str(prev.get("check_out") or "")[:10] > today:
             (db.table("bookings").update({"status": "cancelled"})
              .eq("id", prev["id"]).eq("user_id", user_id).execute())
             cancelled += 1

@@ -99,6 +99,40 @@ def test_deleting_a_unit_takes_its_stays_out_of_the_books():
     assert _revenue(db) == 0
 
 
+def test_a_finished_stay_leaving_the_feed_is_not_called_off():
+    from datetime import date, timedelta
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    channel = {"id": "ch1", "unit_id": unit["id"], "channel_type": "airbnb"}
+    past_in, past_out = (date.today() - timedelta(days=10)).isoformat(), (date.today() - timedelta(days=7)).isoformat()
+    fut_in, fut_out = (date.today() + timedelta(days=5)).isoformat(), (date.today() + timedelta(days=8)).isoformat()
+    feed = [{"uid": "past@airbnb.com", "check_in": past_in, "check_out": past_out},
+            {"uid": "next@airbnb.com", "check_in": fut_in, "check_out": fut_out}]
+    assert hospitality._apply_import(db, "u1", channel, feed)["imported"] == 2
+
+    # Airbnb drops the stay that has ended; the future one is really cancelled.
+    counts = hospitality._apply_import(db, "u1", channel, [])
+    by_uid = {b["external_uid"]: b for b in db.rows["bookings"]}
+    assert by_uid["past@airbnb.com"]["status"] == "confirmed"
+    assert by_uid["next@airbnb.com"]["status"] == "cancelled" and counts["cancelled"] == 1
+
+
+def test_re_adding_a_channel_does_not_import_everything_twice():
+    from datetime import date, timedelta
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    fut_in, fut_out = (date.today() + timedelta(days=5)).isoformat(), (date.today() + timedelta(days=8)).isoformat()
+    feed = [{"uid": "r1@airbnb.com", "check_in": fut_in, "check_out": fut_out}]
+    hospitality._apply_import(db, "u1", {"id": "ch1", "unit_id": unit["id"]}, feed)
+    for b in db.rows["bookings"]:                  # the channel is removed: ON DELETE SET NULL
+        b["channel_id"] = None
+    counts = hospitality._apply_import(db, "u1", {"id": "ch2", "unit_id": unit["id"]}, feed)
+    assert counts["imported"] == 0
+    assert len(db.rows["bookings"]) == 1 and db.rows["bookings"][0]["channel_id"] == "ch2"
+
+
 def test_the_booking_sale_lands_in_the_default_business():
     db = _fresh()
     bid = businesses.ensure_default_business(db, "u1")
