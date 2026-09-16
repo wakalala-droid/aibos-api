@@ -21,6 +21,7 @@ the twin so the dashboards reflect it.
 
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -78,6 +79,36 @@ class PipelineError(ValueError):
 
 # ── (2) Validate ────────────────────────────────────────────────────────────────
 
+# Payload fields that hold a quantity of money or stock. A string in one of
+# these is read as a number further down the line, so "NaN" is as dangerous
+# there as the float itself.
+_NUMERIC_KEYS = ("amount", "quantity", "quantities", "qty", "unit_price", "unit_cost",
+                 "price", "cost", "total", "tax", "vat", "discount", "fee")
+
+
+def _non_finite(value, numeric: bool = False) -> bool:
+    """True if a NaN or infinity hides anywhere in this value.
+
+    Python's float() accepts "nan" and "inf", and so do JSON bodies and
+    spreadsheet cells. One such amount made the twin's cash NaN, and a response
+    holding NaN cannot be encoded, so every read of the books failed from then
+    on, not just the one entry."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, str) and numeric:
+        try:
+            return not math.isfinite(float(value))
+        except ValueError:
+            return False
+    if isinstance(value, dict):
+        return any(_non_finite(v, numeric or str(k).lower() in _NUMERIC_KEYS) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_non_finite(v, numeric) for v in value)
+    return False
+
+
 def validate(ev: EventIn) -> None:
     if ev.event_type not in EVENT_TYPES:
         raise PipelineError(
@@ -103,8 +134,13 @@ def validate(ev: EventIn) -> None:
             amt = float(payload.get("amount"))
         except (TypeError, ValueError):
             raise PipelineError("amount must be a number.")
+        if not math.isfinite(amt):
+            raise PipelineError("amount must be a real number.")
         if amt < 0:
             raise PipelineError("amount must be a positive magnitude; direction is implied by event_type.")
+
+    if _non_finite(payload):
+        raise PipelineError("Numbers must be real numbers (not NaN or infinity).")
 
     # Parallel-array contract for inventory receipts (RFC-001 §5).
     if ev.event_type == "InventoryReceipt":

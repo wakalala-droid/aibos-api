@@ -29,9 +29,10 @@ def normalize_name(s) -> str:
 
 def _num(v, d=0.0) -> float:
     try:
-        return float(v)
+        out = float(v)
     except (TypeError, ValueError):
         return d
+    return out if out == out and out not in (float("inf"), float("-inf")) else d   # NaN/inf are not numbers
 
 
 def _clean(data: dict) -> dict:

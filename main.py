@@ -81,7 +81,34 @@ logger = logging.getLogger("aibos")
 # One alias fixes all of them and keeps both spellings working.
 log = logger
 
-app = FastAPI(title="AIBOS API", version="3.0.0")
+def _finite_only(value):
+    """Every NaN or infinity in a response body becomes null."""
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, dict):
+        return {k: _finite_only(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_only(v) for v in value]
+    return value
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSON that survives a NaN.
+
+    The analysis engines run pandas over customers' own spreadsheets, and a
+    blank or a division by zero there comes out as NaN. Standard JSON has no
+    NaN, so the whole response failed to encode and the customer got a server
+    error in place of every other figure that was fine. Only a body that
+    actually holds one pays for the clean-up pass."""
+
+    def render(self, content) -> bytes:
+        try:
+            return super().render(content)
+        except ValueError:
+            return super().render(_finite_only(content))
+
+
+app = FastAPI(title="AIBOS API", version="3.0.0", default_response_class=SafeJSONResponse)
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 # Browsers never call this API directly — the Next.js app talks to it
@@ -2762,6 +2789,15 @@ def reset_timeline(req: ResetRequest, ctx: membership.Context = Depends(membersh
 
 # ── Ingestion: Excel → events & QR (Initiatives 2, 7) ─────────────────────────
 
+def _json_safe_frame(df):
+    """Blanks become null. `df.where(pd.notna(df), None)` does NOT do this for a
+    number column: pandas turns the None straight back into NaN to keep the
+    column numeric, and a response holding NaN cannot be sent. Any sheet with
+    one empty cell in a column of numbers failed to preview with a server
+    error. As plain objects first, the None stays None."""
+    return df.astype(object).where(pd.notna(df), None)
+
+
 @app.post("/events/excel/preview")
 def excel_preview(
     file: UploadFile = File(...),
@@ -2775,7 +2811,7 @@ def excel_preview(
         content = file.file.read()
         _enforce_upload_size(content)
         df, all_sheets, selected = _load_sheet(content, file.filename or "upload.xlsx", sheet)
-        df = df.where(pd.notna(df), None)  # JSON-safe (NaN → null)
+        df = _json_safe_frame(df)
         cols = [str(c) for c in df.columns]
         rows = df.head(2000).to_dict(orient="records")
         # Prefer a remembered mapping template (Business Memory) when its columns

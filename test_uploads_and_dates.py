@@ -104,6 +104,26 @@ def test_uploads_saved_before_the_fix_are_recovered():
     assert cabinet_store.content_bytes("not bytes at all") is None
 
 
+def test_a_sheet_with_a_blank_number_cell_previews():
+    import numpy as np
+    import pandas as pd
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.responses import JSONResponse
+    import main
+    df = pd.DataFrame({"Amount": [1500.0, np.nan], "Item": ["rice", None],
+                       "Date": pd.to_datetime(["2026-09-01", None])})
+    rows = main._json_safe_frame(df).to_dict(orient="records")
+    assert rows[1] == {"Amount": None, "Item": None, "Date": None}
+    JSONResponse(jsonable_encoder({"rows": rows}))       # would raise on NaN
+
+
+def test_a_nan_anywhere_in_a_response_becomes_null():
+    import json
+    import main
+    body = main.SafeJSONResponse({"pnl": {"margin": float("nan")}, "series": [1.0, float("inf")], "ok": True}).body
+    assert json.loads(body) == {"pnl": {"margin": None}, "series": [1.0, None], "ok": True}
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

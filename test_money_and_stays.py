@@ -322,6 +322,32 @@ def test_mobile_money_charges_the_ngwee():
     assert payments._amount(99.999) == "100"
 
 
+def test_nan_and_infinity_never_reach_the_books():
+    import nervous_system as nervous
+    for bad in ("NaN", "inf", float("nan"), float("-inf")):
+        try:
+            nervous.validate(nervous.EventIn(event_type="Sale", payload={"amount": bad}, source="manual"))
+            assert False, bad
+        except nervous.PipelineError:
+            pass
+    try:
+        nervous.validate(nervous.EventIn(event_type="InventoryReceipt", source="manual",
+                                         payload={"items": ["rice"], "quantities": ["nan"], "amount": 10}))
+        assert False
+    except nervous.PipelineError:
+        pass
+    # A free-text field that happens to say "inf" is not a number.
+    nervous.validate(nervous.EventIn(event_type="Expense", source="manual",
+                                     payload={"amount": 5, "category": "inf", "note": "nan bread"}))
+    # One already in the log counts as nothing instead of poisoning every figure.
+    assert twin._num("NaN") == 0.0 and twin._num(float("inf")) == 0.0 and twin._num("12.5") == 12.5
+    try:
+        invoices.validate_lines([{"description": "x", "qty": "nan", "unit_price": 1}])
+        assert False
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

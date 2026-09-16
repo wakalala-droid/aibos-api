@@ -40,6 +40,7 @@ receivables/payables instead of cash.
 """
 
 import logging
+import math
 from collections import OrderedDict
 
 log = logging.getLogger("aibos.twin")
@@ -52,10 +53,13 @@ EVENT_TYPES = (
 
 
 def _num(v, default=0.0) -> float:
+    # A NaN or infinity already in the log counts as nothing: one of them used
+    # to turn every figure it touched into NaN (see nervous_system._non_finite).
     try:
         if v is None:
             return float(default)
-        return float(v)
+        out = float(v)
+        return out if math.isfinite(out) else float(default)
     except (TypeError, ValueError):
         return float(default)
 
