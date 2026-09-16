@@ -322,6 +322,20 @@ def test_mobile_money_charges_the_ngwee():
     assert payments._amount(99.999) == "100"
 
 
+def test_a_resent_offline_entry_is_recorded_once():
+    import nervous_system as nervous
+    db = _fresh()
+    db.rows["profiles"].append({"id": "u1", "currency": "ZMW"})
+    businesses.resolve_business_id(db, "u1", None, create=True)
+    ev = nervous.EventIn(event_type="Sale", payload={"amount": 250, "client_ref": "ob-123"}, source="manual")
+    first = nervous.ingest(db, "u1", ev)
+    again = nervous.ingest(db, "u1", ev)                   # the outbox, re-posting
+    assert again["id"] == first["id"]
+    assert len([e for e in db.rows["business_events"] if e["event_type"] == "Sale"]) == 1
+    other = nervous.ingest(db, "u1", nervous.EventIn(event_type="Sale", payload={"amount": 250}, source="manual"))
+    assert other["id"] != first["id"]                       # no ref, no dedupe
+
+
 def test_nan_and_infinity_never_reach_the_books():
     import nervous_system as nervous
     for bad in ("NaN", "inf", float("nan"), float("-inf")):

@@ -40,6 +40,12 @@ class _Q:
         self._order = []
 
     def eq(self, k, v):
+        if "->>" in k:                          # a JSON path: text comparison, as PostgREST does
+            col, key = k.split("->>", 1)
+            self.cols.add(col)
+            self.filters.append(lambda r, col=col, key=key, v=v:
+                                (r.get(col) or {}).get(key) is not None and str((r.get(col) or {}).get(key)) == str(v))
+            return self
         self.cols.add(k)
         self.filters.append(lambda r, k=k, v=v: r.get(k) == v)
         return self

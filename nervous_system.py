@@ -245,6 +245,22 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
     # business. The event must still land in real books: a NULL business_id row
     # is invisible to every business-scoped read on a post-0023 database.
     business_id = twin._books_for(db, user_id, business_id)
+
+    # ONCE, however many times it is sent. The phone's offline outbox re-posts
+    # anything whose reply never arrived, and a reply lost AFTER the event was
+    # saved used to record the sale twice. The client stamps each entry with a
+    # client_ref before the first attempt; a repeat returns the first one.
+    client_ref = str((ev.payload or {}).get("client_ref") or "").strip()[:64]
+    if client_ref:
+        try:
+            dup = (db.table("business_events").select("*").eq("user_id", user_id)
+                   .eq("payload->>client_ref", client_ref).limit(1).execute())
+            if getattr(dup, "data", None):
+                log.info("[nervous] %s repeat of client_ref %s ignored", user_id, client_ref)
+                return dup.data[0]
+        except Exception as e:  # noqa: BLE001 — cannot check: record it, as before
+            log.info("[nervous] client_ref check skipped: %s", e)
+
     payload = normalize(ev, default_currency=default_currency, db=db, user_id=user_id)
     confidence = decide_confidence(ev)
     status = decide_status(ev, confidence, actor_role=actor_role)
