@@ -2881,12 +2881,28 @@ def excel_commit(req: ExcelCommitRequest, ctx: membership.Context = Depends(memb
     result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
                                   actor_role=ctx.role, actor_id=ctx.actor)
     # Surface mapping errors alongside pipeline errors so nothing is silently dropped.
-    result["errors"] = [*map_errors, *result.get("errors", [])]
+    result["errors"] = _errors_by_row(len(req.rows), map_errors, result.get("errors", []))
     result["error_count"] = len(result["errors"])
     # Remember this column mapping (Business Memory) so the next import auto-fills it.
     if req.mapping:
         memory.remember(db, ctx.tenant, "excel_mapping", "default", req.mapping)
     return {"ok": True, **result}
+
+
+def _errors_by_row(row_count: int, map_errors: list, batch_errors: list) -> list:
+    """Every skipped row named by its row in the sheet.
+
+    A batch error counts events, not rows: once one row had failed mapping,
+    "Row 12" pointed at the wrong line of the spreadsheet. Events are built in
+    row order from the rows that mapped, so the n-th event is the n-th of those."""
+    failed = {e.get("row") for e in map_errors}
+    event_rows = [i for i in range(row_count) if i not in failed]
+    out = list(map_errors)
+    for e in batch_errors:
+        i = e.get("index")
+        row = event_rows[i] if isinstance(i, int) and 0 <= i < len(event_rows) else None
+        out.append({"row": row, "error": e.get("error")} if row is not None else e)
+    return sorted(out, key=lambda e: e.get("row", e.get("index", 0)) or 0)
 
 
 def _import_fingerprint(content: bytes, sheet: Optional[str], business_id: Optional[str]) -> str:
@@ -2944,7 +2960,7 @@ def excel_commit_file(
     events, map_errors = ingestion.rows_to_events(rows, mapping_d, defaults_d)
     result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
                                   actor_role=ctx.role, actor_id=ctx.actor)
-    result["errors"] = [*map_errors, *result.get("errors", [])]
+    result["errors"] = _errors_by_row(len(rows), map_errors, result.get("errors", []))
     result["error_count"] = len(result["errors"])
     if mapping_d:
         memory.remember(db, ctx.tenant, "excel_mapping", "default", mapping_d)
