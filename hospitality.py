@@ -839,7 +839,8 @@ def list_bookings(db, user_id: str, unit_id: str | None = None, status: str | No
                   frm: str | None = None, to: str | None = None,
                   statuses: list | None = None, source: str | None = None,
                   search: str | None = None, order: str = "check_in",
-                  limit: int | None = None, with_guest: bool = True) -> list:
+                  limit: int | None = None, with_guest: bool = True,
+                  newest_first: bool | None = None) -> list:
     """Bookings for this account, newest filters last so old callers are unchanged.
 
     `statuses` takes a set where `status` takes one, because the question an
@@ -864,7 +865,11 @@ def list_bookings(db, user_id: str, unit_id: str | None = None, status: str | No
     if frm:
         q = q.gt("check_out", frm)
     if order in ("check_in", "check_out", "created_at"):
-        q = q.order(order)
+        # "When it came in" means the newest first, and so does any list of
+        # stays already over. Oldest-first with a limit of 200 showed a property
+        # with history its first 200 bookings, never the recent ones.
+        desc = (order == "created_at") if newest_first is None else bool(newest_first)
+        q = q.order(order, desc=desc)
     if limit:
         q = q.limit(int(limit))
     res = q.execute()

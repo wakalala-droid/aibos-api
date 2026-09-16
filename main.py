@@ -4437,6 +4437,7 @@ def hospitality_list_bookings(
     statuses: Optional[str] = Query(None, description="comma-separated, e.g. pending,confirmed"),
     source: Optional[str] = Query(None), search: Optional[str] = Query(None),
     order: str = Query("check_in"), limit: Optional[int] = Query(None),
+    newest_first: Optional[bool] = Query(None),
     ctx: membership.Context = Depends(membership.require_context),
 ):
     """Bookings, each carrying the guest it belongs to.
@@ -4452,6 +4453,7 @@ def hospitality_list_bookings(
             db, ctx.tenant, unit_id, status, from_, to,
             statuses=[x.strip() for x in statuses.split(",") if x.strip()] if statuses else None,
             source=source, search=search, order=order, limit=limit,
+            newest_first=newest_first,
         )}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
