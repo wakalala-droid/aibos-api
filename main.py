@@ -1259,8 +1259,52 @@ class StudioRequest(BaseModel):
     ai_mode: bool = False             # True = use AI to interpret natural language
 
 
+# The data studio's AI mode reaches the same paid model as the chat. It had no
+# plan check, no size cap and no throttle, so any signed-in account (and email
+# sign-up is open) could run unlimited prompts of any size on the platform's
+# bill. It now counts against the same free allowance as the chat, is
+# throttled, and sends a bounded prompt.
+def _charge_ai_question(user_id: str, x_acting_as: Optional[str], qid: Optional[str] = None):
+    """The ONE gate on the paid AI model. None when the plan includes it, else
+    how many free questions are left today after this one; raises 402 when none.
+
+    AI CFO chat is a paid capability, but Free gets a daily taster (audit #24):
+    3 questions a day, counted server-side. Exhausted or uncountable: the paid
+    gate stands. Chat and the data studio's AI mode both charge here, so the
+    allowance is one allowance and neither keeps its own copy of the rules.
+    """
+    try:
+        entitlements.require_feature_for_caller(user_id, "ai_chat", x_acting_as)
+        return None
+    except HTTPException as gate:
+        # Counted against the BUSINESS, not the person: three free questions a
+        # day is an allowance for the account, and inviting staff must not
+        # multiply it.
+        allowed, used = entitlements.chat_taster(
+            get_db(), entitlements.paying_account(user_id, x_acting_as), qid=qid)
+        if not allowed:
+            # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
+            # feature" reads as a lie to someone who just asked three questions,
+            # so say what actually happened. used==0 means we couldn't count them
+            # at all (deny-safe on infra failure) — there the plain gate stands.
+            if used >= entitlements.CHAT_TASTER_PER_DAY:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"That's all {entitlements.CHAT_TASTER_PER_DAY} of your free "
+                           "questions for today — they reset overnight. Pro makes them unlimited.",
+                ) from gate
+            raise gate
+        return entitlements.CHAT_TASTER_PER_DAY - used
+
+
+_STUDIO_FORMULA_MAX = 500
+_STUDIO_CONTEXT_MAX = 6000
+
+
 @app.post("/data-studio/compute")
-def data_studio_compute(req: StudioRequest, user_id: str = Depends(require_user)):
+def data_studio_compute(req: StudioRequest,
+                        user_id: str = Depends(rate_limit.limiter("studio", 60, 60)),
+                        x_acting_as: Optional[str] = Header(default=None)):
     """
     Compute Excel-like formulas or AI-powered analysis.
     Supports: SUM, AVG, MAX, MIN, COUNT, IF, GROWTH, FORECAST, custom AI formulas.
@@ -1290,11 +1334,12 @@ def data_studio_compute(req: StudioRequest, user_id: str = Depends(require_user)
     if req.ai_mode or formula.upper().startswith("AI:"):
         if not llm.configured():
             raise HTTPException(status_code=503, detail=llm.not_configured_message())
+        _charge_ai_question(user_id, x_acting_as)
 
-        clean_formula = formula[3:].strip() if formula.upper().startswith("AI:") else formula
+        clean_formula = (formula[3:].strip() if formula.upper().startswith("AI:") else formula)[:_STUDIO_FORMULA_MAX]
         context_str = "\n".join(
             f"{k}: {v}" for k, v in data.items()
-        )
+        )[:_STUDIO_CONTEXT_MAX]
         prompt = (
             f"You are a financial analyst. Given this data:\n{context_str}\n\n"
             f"Compute or explain: {clean_formula}\n\n"
@@ -1746,30 +1791,8 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
         raise HTTPException(status_code=400, detail="No message provided.")
 
     taster_note = None
-    # AI CFO chat is a paid capability — but Free gets a daily taster
-    # (audit #24): 3 questions/day, counted server-side. Exhausted or
-    # uncountable → the original paid gate stands.
-    try:
-        entitlements.require_feature_for_caller(user_id, "ai_chat", x_acting_as)
-    except HTTPException as gate:
-        # Counted against the BUSINESS, not the person: three free questions a
-        # day is an allowance for the account, and inviting staff must not
-        # multiply it.
-        allowed, used = entitlements.chat_taster(
-            get_db(), entitlements.paying_account(user_id, x_acting_as), qid=req.qid)
-        if not allowed:
-            # SPENT is not the same as FORBIDDEN. "The AI CFO chat is a Pro
-            # feature" reads as a lie to someone who just asked three questions,
-            # so say what actually happened. used==0 means we couldn't count them
-            # at all (deny-safe on infra failure) — there the plain gate stands.
-            if used >= entitlements.CHAT_TASTER_PER_DAY:
-                raise HTTPException(
-                    status_code=402,
-                    detail=f"That's all {entitlements.CHAT_TASTER_PER_DAY} of your free "
-                           "questions for today — they reset overnight. Pro makes them unlimited.",
-                ) from gate
-            raise gate
-        remaining = entitlements.CHAT_TASTER_PER_DAY - used
+    remaining = _charge_ai_question(user_id, x_acting_as, qid=req.qid)
+    if remaining is not None:
         taster_note = (
             "\n\n_(That was your last free question today — Pro makes this unlimited.)_"
             if remaining == 0 else
@@ -2993,7 +3016,8 @@ def ingest_qr(req: QrRequest, user_id: str = Depends(require_user)):
 def ingest_receipt(
     file: UploadFile = File(...),
     currency: str = Query("ZMW"),
-    user_id: str = Depends(require_user),
+    # A vision-model call per photo: throttled like classify and transcribe.
+    user_id: str = Depends(rate_limit.limiter("receipt", 20, 60)),
 ):
     """Receipt photo/upload → vision-OCR → a PROPOSED Purchase (reviewed before saving)."""
     _require_db()
