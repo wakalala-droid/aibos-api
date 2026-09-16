@@ -231,6 +231,39 @@ def test_stream_tool_then_prose():
     assert json.loads(convo[-1]["content"])["total_amount"] == 1000
 
 
+def test_gemini_thought_signatures_go_back_with_the_tool_call():
+    """Gemini refuses the round after a lookup ("400 Request contains an invalid
+    argument") unless each function call's thought signature is echoed back.
+    Real SDK objects, because the signature only survives as a pydantic extra."""
+    from openai.types.chat import ChatCompletionMessageToolCall
+    from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
+    sig = {"google": {"thought_signature": "sig-123"}}
+
+    # Streaming: the signature arrives on a delta and must reach the echo.
+    delta = ChoiceDeltaToolCall.model_validate({
+        "index": 0, "id": "c1", "function": {"name": "query_events", "arguments": "{}"},
+        "extra_content": sig})
+    client = _FakeStreamClient([[_chunk(tool_calls=[delta])], [_chunk("Done.")]])
+    list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "biggest expense?"}], _seeded_db(), "u1"))
+    echoed = client.calls[1]["messages"][-2]["tool_calls"][0]
+    assert echoed["extra_content"] == sig
+
+    # Buffered: the same, on a whole tool call.
+    tc = ChatCompletionMessageToolCall.model_validate({
+        "id": "c1", "type": "function", "function": {"name": "query_events", "arguments": "{}"},
+        "extra_content": sig})
+    client = _FakeClient([NS(content=None, tool_calls=[tc]), NS(content="Done.", tool_calls=None)])
+    cfo_tools.run_agent_loop(client, "m", [{"role": "user", "content": "x"}], _seeded_db(), "u1")
+    assert client.calls[1]["messages"][-2]["tool_calls"][0]["extra_content"] == sig
+
+    # A provider that sends nothing extra gets nothing extra back.
+    client = _FakeClient([NS(content=None, tool_calls=[_tool_call("query_events", {})]),
+                          NS(content="Done.", tool_calls=None)])
+    cfo_tools.run_agent_loop(client, "m", [{"role": "user", "content": "x"}], _seeded_db(), "u1")
+    assert "extra_content" not in client.calls[1]["messages"][-2]["tool_calls"][0]
+
+
 def test_stream_round_budget_forces_prose():
     endless = [[_chunk(tool_calls=[_tc_delta(0, id=f"c{i}", name="get_business_snapshot", arguments="{}")])]
                for i in range(cfo_tools.MAX_TOOL_ROUNDS)]

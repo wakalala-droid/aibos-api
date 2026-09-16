@@ -378,13 +378,43 @@ def tool_schemas(allowed: frozenset | None = None) -> list:
     return out
 
 
+def _extra_content(obj):
+    """The provider's own extra data on a tool call, if it sent any.
+
+    Gemini attaches a thought signature to every function call it makes
+    (tool_calls[i].extra_content.google.thought_signature on its OpenAI
+    endpoint) and refuses the next request, with a bare "400 Request contains
+    an invalid argument", unless that signature comes back with the call. It was
+    being dropped, so every question that needed a lookup died on the second
+    round: the stream broke before a word, the fallback answered without the
+    records, and the owner was asked to "provide a breakdown of your costs" that
+    AI-BOS already had."""
+    extra = getattr(obj, "model_extra", None) or {}
+    if isinstance(obj, dict):
+        extra = obj
+    value = extra.get("extra_content") if isinstance(extra, dict) else None
+    return value if value else None
+
+
+def _echo_tool_call(call_id: str, name: str, arguments: str, extra_content=None) -> dict:
+    """An assistant tool call, as it is sent back to the provider."""
+    out = {"id": call_id, "type": "function",
+           "function": {"name": name, "arguments": arguments}}
+    if extra_content:
+        out["extra_content"] = extra_content
+    return out
+
+
 def _accumulate_tool_deltas(acc: dict, deltas) -> None:
     """Fold streamed tool_call deltas into {index: {id, name, arguments}}.
     Streaming sends a tool call in pieces: the id/name arrive first, then the
     JSON arguments in fragments that must be concatenated in order."""
     for d in deltas or []:
         i = getattr(d, "index", 0) or 0
-        slot = acc.setdefault(i, {"id": None, "name": None, "arguments": ""})
+        slot = acc.setdefault(i, {"id": None, "name": None, "arguments": "", "extra_content": None})
+        extra = _extra_content(d)
+        if extra:
+            slot["extra_content"] = extra
         if getattr(d, "id", None):
             slot["id"] = d.id
         fn = getattr(d, "function", None)
@@ -462,10 +492,10 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         convo.append({
             "role": "assistant",
             "content": None,
-            "tool_calls": [{
-                "id": c["id"] or f"call_{i}", "type": "function",
-                "function": {"name": c["name"] or "", "arguments": c["arguments"] or "{}"},
-            } for i, c in sorted(pending.items())],
+            "tool_calls": [
+                _echo_tool_call(c["id"] or f"call_{i}", c["name"] or "", c["arguments"] or "{}",
+                                c.get("extra_content"))
+                for i, c in sorted(pending.items())],
         })
         for i, c in sorted(pending.items()):
             name = c["name"] or ""
@@ -526,10 +556,9 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
         convo.append({
             "role": "assistant",
             "content": msg.content or None,
-            "tool_calls": [{
-                "id": tc.id, "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            } for tc in tool_calls],
+            "tool_calls": [
+                _echo_tool_call(tc.id, tc.function.name, tc.function.arguments, _extra_content(tc))
+                for tc in tool_calls],
         })
         for tc in tool_calls:
             try:
