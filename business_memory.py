@@ -150,6 +150,12 @@ def recall_all(db, user_id: str, kind: str) -> dict:
         return {}
 
 
+# Bookkeeping the app keeps for itself (the last column mapping, which files
+# were imported), not something AIBOS learned about the business. Shown in the
+# "What AIBOS has learned" list they read as nonsense like "excel_import: 3f9a…".
+_INTERNAL_KINDS = ("excel_mapping", "excel_import")
+
+
 def list_mappings(db, user_id: str) -> list:
     """All learned mappings with their ids, for the manage/correct UI (audit #57)."""
     if db is None:
@@ -157,7 +163,7 @@ def list_mappings(db, user_id: str) -> list:
     try:
         res = (db.table("business_memory").select("id,kind,key,value,hits")
                .eq("user_id", user_id).order("hits", desc=True).execute())
-        return getattr(res, "data", None) or []
+        return [r for r in (getattr(res, "data", None) or []) if r.get("kind") not in _INTERNAL_KINDS]
     except Exception:  # noqa: BLE001
         return []
 
@@ -176,7 +182,7 @@ def summary(db, user_id: str) -> dict:
         return {"available": False}
     try:
         res = db.table("business_memory").select("kind,key,value,hits").eq("user_id", user_id).execute()
-        rows = getattr(res, "data", None) or []
+        rows = [r for r in (getattr(res, "data", None) or []) if r.get("kind") not in _INTERNAL_KINDS]
     except Exception:  # noqa: BLE001
         return {"available": False}
 

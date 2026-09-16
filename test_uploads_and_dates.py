@@ -117,6 +117,50 @@ def test_a_sheet_with_a_blank_number_cell_previews():
     JSONResponse(jsonable_encoder({"rows": rows}))       # would raise on NaN
 
 
+def _import_client(db):
+    import main
+    import membership
+    from fastapi.testclient import TestClient
+    main.get_db = lambda: db
+    main.app.dependency_overrides[membership.require_write] = (
+        lambda: membership.Context(tenant="u1", actor="u1", role="owner", business_id="b1"))
+    return TestClient(main.app)
+
+
+def test_a_csv_imports_every_row_and_a_repeat_is_caught():
+    import json
+    import main
+    from test_books_integrity import _fresh
+    real_get_db = main.get_db
+    db = _fresh()
+    db.rows["businesses"].append({"id": "b1", "owner_id": "u1", "name": "Shop", "is_default": True})
+    lines = ["Date;Amount;Item"] + [f"2026-0{1 + i % 9}-1{i % 9};{100 + i};item {i}" for i in range(2500)]
+    csv = (chr(10).join(lines)).encode()
+    client = _import_client(db)
+    try:
+        pv = client.post("/events/excel/preview", files={"file": ("history.csv", csv, "text/csv")})
+        assert pv.status_code == 200, pv.text
+        assert pv.json()["row_count"] == 2500 and pv.json()["columns"] == ["Date", "Amount", "Item"]
+
+        form = {"mapping": json.dumps({"date": "Date", "amount": "Amount", "description": "Item"}),
+                "defaults": json.dumps({"event_type": "Sale", "currency": "ZMW"})}
+        first = client.post("/events/excel/commit-file", files={"file": ("history.csv", csv, "text/csv")}, data=form)
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert body["saved_count"] == 2500 and "saved" not in body       # every row, not the first 2,000
+        assert len([e for e in db.rows["business_events"] if e.get("source") == "excel"]) == 2500
+
+        again = client.post("/events/excel/commit-file", files={"file": ("history.csv", csv, "text/csv")}, data=form)
+        assert again.status_code == 409 and again.json()["detail"]["code"] == "already_imported"
+
+        forced = client.post("/events/excel/commit-file", files={"file": ("history.csv", csv, "text/csv")},
+                             data={**form, "force": "true"})
+        assert forced.status_code == 200 and forced.json()["saved_count"] == 2500
+    finally:
+        main.get_db = real_get_db
+        main.app.dependency_overrides.clear()
+
+
 def test_a_nan_anywhere_in_a_response_becomes_null():
     import json
     import main

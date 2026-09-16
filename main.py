@@ -7,6 +7,7 @@ import os
 import re
 import io
 import json
+import hashlib
 import time
 import uuid
 import logging
@@ -16,7 +17,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, Header, Request
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Query, Depends, Body, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -2789,6 +2790,31 @@ def reset_timeline(req: ResetRequest, ctx: membership.Context = Depends(membersh
 
 # ── Ingestion: Excel → events & QR (Initiatives 2, 7) ─────────────────────────
 
+def _load_import_table(content: bytes, filename: str, sheet: Optional[str] = None) -> tuple:
+    """(df, sheet names, chosen sheet) for the Import screen, Excel OR CSV.
+
+    The screen has always said "Excel (.xlsx/.xls) or CSV", but the preview only
+    ever opened files as Excel workbooks, so every CSV failed with "Could not
+    read that file: BadZipFile". A CSV is read with the separator sniffed (many
+    exports use semicolons) and the usual encoding fallbacks."""
+    ext = (filename or "").rsplit(".", 1)[-1].lower()
+    if ext not in ("csv", "txt"):
+        return _load_sheet(content, filename, sheet)
+    last: Exception | None = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            df = pd.read_csv(io.BytesIO(content), encoding=enc, sep=None, engine="python")
+            break
+        except Exception as e:  # noqa: BLE001
+            last = e
+    else:
+        raise ValueError(f"Could not read the CSV ({last}). Try saving it as CSV UTF-8.")
+    df.dropna(how="all", inplace=True)
+    df.dropna(axis=1, how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df, [], None
+
+
 def _json_safe_frame(df):
     """Blanks become null. `df.where(pd.notna(df), None)` does NOT do this for a
     number column: pandas turns the None straight back into NaN to keep the
@@ -2810,7 +2836,7 @@ def excel_preview(
     try:
         content = file.file.read()
         _enforce_upload_size(content)
-        df, all_sheets, selected = _load_sheet(content, file.filename or "upload.xlsx", sheet)
+        df, all_sheets, selected = _load_import_table(content, file.filename or "upload.xlsx", sheet)
         df = _json_safe_frame(df)
         cols = [str(c) for c in df.columns]
         rows = df.head(2000).to_dict(orient="records")
@@ -2861,6 +2887,77 @@ def excel_commit(req: ExcelCommitRequest, ctx: membership.Context = Depends(memb
     if req.mapping:
         memory.remember(db, ctx.tenant, "excel_mapping", "default", req.mapping)
     return {"ok": True, **result}
+
+
+def _import_fingerprint(content: bytes, sheet: Optional[str], business_id: Optional[str]) -> str:
+    """Same file, same sheet, same books: the import that would double the history."""
+    h = hashlib.sha256(content)
+    h.update(f"|{sheet or ''}|{business_id or ''}".encode())
+    return h.hexdigest()[:32]
+
+
+@app.post("/events/excel/commit-file")
+def excel_commit_file(
+    file: UploadFile = File(...),
+    mapping: str = Form(...),
+    defaults: str = Form("{}"),
+    sheet: Optional[str] = Form(None),
+    force: bool = Form(False),
+    ctx: membership.Context = Depends(membership.require_write),
+):
+    """Import EVERY row of the file, read here from the file itself.
+
+    The screen used to send back the rows the preview had given it, and the
+    preview only ever gives the first 2,000. The button said "Import 5,000 rows"
+    and the other 3,000 were silently never recorded. Sending the file again
+    also keeps the request inside what the web proxy will carry, where a
+    history's worth of rows as JSON would not.
+
+    The same file imported twice into the same books doubled every figure, so a
+    repeat is refused (409) unless the owner confirms it with force."""
+    db = _require_db()
+    try:
+        mapping_d = json.loads(mapping or "{}")
+        defaults_d = json.loads(defaults or "{}")
+        if not isinstance(mapping_d, dict) or not isinstance(defaults_d, dict):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="mapping and defaults must be JSON objects.")
+    content = file.file.read()
+    _enforce_upload_size(content)
+    try:
+        df, _sheets, selected = _load_import_table(content, file.filename or "upload.xlsx", sheet)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("excel_commit_file read error: %s", exc)
+        raise HTTPException(status_code=400, detail=f"Could not read that file: {type(exc).__name__}")
+
+    fingerprint = _import_fingerprint(content, selected, ctx.business_id)
+    before = memory.recall(db, ctx.tenant, "excel_import", fingerprint)
+    if before and not force:
+        raise HTTPException(status_code=409, detail={
+            "code": "already_imported",
+            "message": "This file has already been imported into these books. Importing it again records every row a second time.",
+            "imported_at": before.get("at"), "saved_count": before.get("saved"),
+        })
+
+    rows = _json_safe_frame(df).to_dict(orient="records")
+    events, map_errors = ingestion.rows_to_events(rows, mapping_d, defaults_d)
+    result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
+                                  actor_role=ctx.role, actor_id=ctx.actor)
+    result["errors"] = [*map_errors, *result.get("errors", [])]
+    result["error_count"] = len(result["errors"])
+    if mapping_d:
+        memory.remember(db, ctx.tenant, "excel_mapping", "default", mapping_d)
+    if result.get("saved_count"):
+        from datetime import datetime, timezone
+        memory.remember(db, ctx.tenant, "excel_import", fingerprint, {
+            "at": datetime.now(timezone.utc).isoformat(), "saved": result.get("saved_count"),
+            "file": (file.filename or "")[:120], "rows": len(rows)})
+    # Not the saved rows themselves: for a big history that list alone outgrew
+    # what the web proxy can carry back, and the screen needs only the counts.
+    result.pop("saved", None)
+    result["errors"] = result["errors"][:200]
+    return {"ok": True, "row_count": len(rows), **result}
 
 
 class QrRequest(BaseModel):
