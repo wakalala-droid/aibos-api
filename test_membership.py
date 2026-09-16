@@ -23,12 +23,18 @@ class _Q:
         self.neg[k] = v
         return self
 
+    def in_(self, k, vs):
+        self.any = getattr(self, "any", {})
+        self.any[k] = list(vs)
+        return self
+
     def order(self, *a, **k): return self
     def limit(self, n): return self
 
     def _match(self, r):
         return (all(r.get(k) == v for k, v in self.filters.items())
-                and all(r.get(k) != v for k, v in self.neg.items()))
+                and all(r.get(k) != v for k, v in self.neg.items())
+                and all(r.get(k) in vs for k, vs in getattr(self, "any", {}).items()))
 
     def execute(self):
         class R:
@@ -143,6 +149,71 @@ def test_reinvite_updates_same_row():
     membership.invite_member(db, "owner1", "s@x.z", "accountant", invited_by="owner1")
     assert len(db.rows["business_members"]) == 1
     assert db.rows["business_members"][0]["role"] == "accountant"
+
+
+def test_reinviting_an_active_member_keeps_their_access():
+    db = _DB()
+    db.rows["profiles"] = [{"id": "owner1", "email": "o@x.z"}]
+    membership.invite_member(db, "owner1", "s@x.z", "staff", invited_by="owner1")
+    membership.accept_pending(db, "staff1", {"s@x.z"})
+    membership.invite_member(db, "owner1", "s@x.z", "accountant", invited_by="owner1")
+    row = db.rows["business_members"][0]
+    assert row["status"] == "active" and row["role"] == "accountant"
+
+
+class _Ident:
+    def __init__(self, provider, email, verified=True):
+        self.provider = provider
+        self.identity_data = {"email": email, "email_verified": verified}
+
+
+def _auth_db(identities=None, boom=False):
+    db = _DB()
+
+    class _Admin:
+        def get_user_by_id(self, uid):
+            if boom:
+                raise Exception("auth server down")
+            class R: pass
+            r = R()
+            class U: pass
+            r.user = U()
+            r.user.identities = identities or []
+            return r
+
+    class _Auth:
+        admin = _Admin()
+
+    db.auth = _Auth()
+    return db
+
+
+def test_only_a_proven_address_can_take_an_invite():
+    # Google proved it: accepted.
+    assert membership.verified_emails(_auth_db([_Ident("google", "Cashier@Shop.zm")]), "u") == {"cashier@shop.zm"}
+    # An email sign-up proves nothing while auto-confirm is on.
+    assert membership.verified_emails(_auth_db([_Ident("email", "cashier@shop.zm")]), "u") == set()
+    # Not verified by the provider either.
+    assert membership.verified_emails(_auth_db([_Ident("google", "c@shop.zm", verified=False)]), "u") == set()
+    # Cannot ask the auth server: nothing is accepted.
+    assert membership.verified_emails(_auth_db(boom=True), "u") == set()
+
+
+def test_accept_ignores_an_email_typed_into_the_profile():
+    import main
+    db = _auth_db([_Ident("email", "cashier@shop.zm")])
+    db.rows["profiles"] = [{"id": "owner1", "email": "owner@shop.zm"},
+                           {"id": "intruder", "email": "cashier@shop.zm"}]   # self-edited
+    membership.invite_member(db, "owner1", "cashier@shop.zm", "accountant", invited_by="owner1")
+    real = main.get_db
+    main.get_db = lambda: db
+    try:
+        out = main.accept_memberships(ctx_user="intruder")
+    finally:
+        main.get_db = real
+    assert out["activated"] == 0
+    assert db.rows["business_members"][0]["status"] == "pending"
+    assert membership.resolve_context("intruder", db).tenant == "intruder"
 
 
 # ── The staff-pending gate in the pipeline ────────────────────────────────────

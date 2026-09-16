@@ -208,12 +208,17 @@ def invite_member(db, owner_id: str, email: str, role: str, invited_by: str) -> 
     row = {"owner_id": owner_id, "email": email, "role": role,
            "status": "pending", "invited_by": invited_by}
     # Re-inviting the same address updates the existing row (unique owner,email).
-    existing = (db.table("business_members").select("id")
+    existing = (db.table("business_members").select("id,status")
                 .eq("owner_id", owner_id).eq("email", email).limit(1).execute())
     if getattr(existing, "data", None):
+        found = existing.data[0]
+        # Inviting someone who is already on the team changes their role and
+        # nothing else. Setting them back to pending took their access away
+        # until they next signed in.
+        patch = {"role": role} if found.get("status") == "active" else {"role": role, "status": "pending"}
         res = (db.table("business_members")
-               .update({"role": role, "status": "pending"})
-               .eq("id", existing.data[0]["id"]).execute())
+               .update(patch)
+               .eq("id", found["id"]).execute())
         return (getattr(res, "data", None) or [row])[0]
     res = db.table("business_members").insert(row).execute()
     return (getattr(res, "data", None) or [row])[0]
@@ -238,17 +243,55 @@ def revoke_member(db, owner_id: str, member_row_id: str) -> None:
         .eq("id", member_row_id).eq("owner_id", owner_id).execute()
 
 
-def accept_pending(db, caller_uid: str, email: str) -> int:
-    """On login, bind any pending invites for this email to this user id and
-    activate them. Returns how many memberships were activated."""
-    email = str(email or "").strip().lower()
-    if not email:
+# Sign-in providers that prove the person owns the address they sign in with.
+# The email provider is left out on purpose: with auto-confirm switched on it
+# proves nothing, anyone can sign up as anyone.
+VERIFYING_PROVIDERS = {"google"}
+
+
+def verified_emails(db, caller_uid: str) -> set:
+    """The addresses this account has PROVEN it owns, read from the auth server.
+
+    An invite hands over a seat in someone's books to whoever holds the invited
+    address, so the address has to be proven. It used to be read from
+    profiles.email, which a signed-in user can edit on their own row, and email
+    sign-ups are auto-confirmed. Knowing the address a business had invited was
+    enough to take the seat: an accountant's view of every figure, or staff
+    access to record. Fail closed: if the auth server cannot be asked, nothing
+    is accepted this time and the invite waits for the next sign-in.
+    """
+    try:
+        res = db.auth.admin.get_user_by_id(caller_uid)
+        user = getattr(res, "user", None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[membership] could not verify the email of %s: %s", caller_uid, e)
+        return set()
+    out = set()
+    for ident in (getattr(user, "identities", None) or []):
+        provider = getattr(ident, "provider", None)
+        data = getattr(ident, "identity_data", None) or {}
+        email = str(data.get("email") or "").strip().lower()
+        # Google only signs people in with an address it has checked. A flag
+        # that says otherwise is honoured; one that is simply absent is not a
+        # reason to lock a real teammate out.
+        if provider in VERIFYING_PROVIDERS and email and data.get("email_verified") not in (False, "false"):
+            out.add(email)
+    return out
+
+
+def accept_pending(db, caller_uid: str, email) -> int:
+    """On login, bind any pending invites for these PROVEN addresses (see
+    verified_emails) to this user id and activate them. Returns how many
+    memberships were activated."""
+    emails = [email] if isinstance(email, str) else list(email or [])
+    emails = sorted({str(e or "").strip().lower() for e in emails} - {""})
+    if not emails:
         return 0
     from datetime import datetime, timezone
     res = (db.table("business_members")
            .update({"member_id": caller_uid, "status": "active",
                     "accepted_at": datetime.now(timezone.utc).isoformat()})
-           .eq("email", email).eq("status", "pending").execute())
+           .in_("email", emails).eq("status", "pending").execute())
     return len(getattr(res, "data", None) or [])
 
 

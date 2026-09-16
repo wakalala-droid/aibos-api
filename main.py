@@ -3088,13 +3088,12 @@ def my_membership(ctx: membership.Context = Depends(membership.require_context))
 @app.post("/members/accept")
 def accept_memberships(ctx_user: str = Depends(require_user)):
     """On login: bind any pending invites for the caller's email to this
-    account and activate them. Email is read from the caller's OWN profile
-    (never the request body)."""
+    account and activate them. Only an address the auth server says this
+    account has PROVEN is used, never profiles.email (which the user can edit)
+    and never the request body. See membership.verified_emails."""
     db = _require_db()
-    prof = db.table("profiles").select("email").eq("id", ctx_user).limit(1).execute()
-    rows = getattr(prof, "data", None) or []
-    email = (rows[0].get("email") if rows else None)
-    activated = membership.accept_pending(db, ctx_user, email) if email else 0
+    emails = membership.verified_emails(db, ctx_user)
+    activated = membership.accept_pending(db, ctx_user, emails) if emails else 0
     return {"ok": True, "activated": activated}
 
 
