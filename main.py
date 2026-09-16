@@ -2244,6 +2244,12 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
             break
     probe("streaming_with_tools", _stream)
 
+    # The round AFTER a lookup: the model asks for a tool, gets the result back,
+    # and answers. The three probes above all stop at the first call, so they
+    # stayed green while every real lookup died on this second request.
+    round_trip = _tool_round_trip_probe(client, model)
+    probes["tool_round_trip"] = {"ok": round_trip["ok"], "error": round_trip.get("error", "")}
+
     if not probes["plain"]["ok"]:
         verdict = ("The provider will not answer at all. Usually the key or the model id: "
                    + probes["plain"]["error"])
@@ -2253,6 +2259,10 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     elif not probes["streaming_with_tools"]["ok"]:
         verdict = ("Answers work but streaming does not, so the chat falls back to waiting "
                    "for the whole reply: " + probes["streaming_with_tools"]["error"])
+    elif not probes["tool_round_trip"]["ok"]:
+        verdict = ("The chat can ask for a lookup but the provider refuses the result being "
+                   "sent back, so answers that need your records fail: "
+                   + probes["tool_round_trip"]["error"])
     else:
         verdict = "The AI chat is working."
 
@@ -2261,8 +2271,76 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
         "provider": llm.provider(),
         "model": model,
         "probes": probes,
+        "round_trip": round_trip,
         "verdict": verdict,
     }
+
+
+def _shape(obj, depth: int = 0):
+    """The structure of a provider object with every string replaced by its
+    length, so a signature or an answer is described, never echoed."""
+    if depth > 6:
+        return "…"
+    if hasattr(obj, "model_dump"):
+        obj = obj.model_dump()
+    if isinstance(obj, dict):
+        return {k: _shape(v, depth + 1) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_shape(v, depth + 1) for v in obj[:3]]
+    if isinstance(obj, str):
+        return f"str({len(obj)})"
+    return obj
+
+
+def _tool_round_trip_probe(client, model: str) -> dict:
+    """Ask for one trivial lookup, then send its result back in each candidate
+    shape, and report which shapes the provider accepts."""
+    tools = [{"type": "function", "function": {
+        "name": "get_number", "description": "Returns the number the user needs.",
+        "parameters": {"type": "object", "properties": {"label": {"type": "string"}}}}}]
+    msgs = [{"role": "system", "content": "Always call get_number before answering."},
+            {"role": "user", "content": "What is the number? Use the tool."}]
+    try:
+        first = client.chat.completions.create(model=model, messages=msgs, tools=tools,
+                                               tool_choice="auto", max_tokens=200)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "first call: " + _safe_error(e)}
+    msg = first.choices[0].message
+    calls = getattr(msg, "tool_calls", None) or []
+    out = {"message_shape": _shape(msg)}
+    if not calls:
+        out.update(ok=True, note="the model answered without calling the tool")
+        return out
+
+    def follow(variant: str, assistant: dict, tool_msg: dict):
+        try:
+            client.chat.completions.create(model=model, messages=[*msgs, assistant, tool_msg],
+                                           tools=tools, tool_choice="auto", max_tokens=50)
+            return {"ok": True, "error": ""}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": _safe_error(e)}
+
+    tc = calls[0]
+    extra = (getattr(tc, "model_extra", None) or {}).get("extra_content")
+    base_call = {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"}}
+    result = {"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"number": 42})}
+    variants = {
+        "echo_with_extra": ({"role": "assistant", "content": None,
+                             "tool_calls": [dict(base_call, **({"extra_content": extra} if extra else {}))]}, result),
+        "echo_plain": ({"role": "assistant", "content": None, "tool_calls": [base_call]}, result),
+        "empty_string_content": ({"role": "assistant", "content": "",
+                                  "tool_calls": [dict(base_call, **({"extra_content": extra} if extra else {}))]}, result),
+        "whole_message_dump": (msg.model_dump(exclude_none=True), result),
+        "tool_with_name": ({"role": "assistant", "content": None,
+                            "tool_calls": [dict(base_call, **({"extra_content": extra} if extra else {}))]},
+                           dict(result, name=tc.function.name)),
+    }
+    out["variants"] = {k: follow(k, a, t) for k, (a, t) in variants.items()}
+    out["ok"] = out["variants"]["echo_with_extra"]["ok"]
+    if not out["ok"]:
+        out["error"] = out["variants"]["echo_with_extra"]["error"]
+    return out
 
 
 @app.get("/me/entitlements")
