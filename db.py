@@ -56,6 +56,56 @@ def fetch_all(make_query, limit: int | None = None, page_size: int = PAGE_SIZE) 
     return out
 
 
+# ── A dropped connection is not a failed request ─────────────────────────────
+#
+# The REST client keeps one HTTP/2 connection open and reuses it. When the far
+# end quietly closes it while it sits idle, the next request dies with
+# "Server disconnected" and the customer gets a server error for nothing they
+# did. /health showed it live ("Could not check migration 12: Server
+# disconnected"), and every other request is exposed in exactly the same way.
+#
+# HTTP/1.1 connections are checked before they are reused and are let go after
+# a few idle seconds, which removes nearly all of it. What is left is retried,
+# but only where a retry cannot record anything twice: reads, and requests that
+# never reached the server. An insert whose connection broke midway is not sent
+# again, because it may already have been saved.
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _retrying_client_class():
+    import httpx
+    from postgrest.utils import SyncClient
+
+    class RetryingClient(SyncClient):
+        def request(self, method, url, *args, **kwargs):  # noqa: D401
+            try:
+                return super().request(method, url, *args, **kwargs)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                log.info("[db] %s %s could not connect (%s); retrying once", method, url, e)
+            except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+                if str(method).upper() not in _SAFE_METHODS:
+                    raise
+                log.info("[db] %s %s lost its connection (%s); retrying once", method, url, e)
+            return super().request(method, url, *args, **kwargs)
+
+    return RetryingClient
+
+
+def harden_rest_session(client) -> None:
+    """Give the Supabase REST client an HTTP/1.1 session that retries safely."""
+    try:
+        pg = client.postgrest
+        old = pg.session
+        pg.session = _retrying_client_class()(
+            base_url=old.base_url, headers=old.headers, timeout=old.timeout,
+            follow_redirects=True, http2=False,
+        )
+        old.close()
+    except Exception as e:  # noqa: BLE001 — the stock session still works
+        log.warning("[db] could not harden the REST session: %s", e)
+
+
 def supabase_enabled() -> bool:
     """True when the backend has the config needed to talk to Supabase."""
     return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"))
@@ -84,6 +134,7 @@ def get_db():
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_SERVICE_KEY"],
         )
+        harden_rest_session(_client)
         log.info("[db] Supabase service-role client ready")
         return _client
     except Exception as e:  # noqa: BLE001
