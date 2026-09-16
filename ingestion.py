@@ -92,8 +92,12 @@ def _qr_to_dict(payload: str) -> dict:
 
 
 def _coerce_amount(v) -> float | None:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return None
+    # A number cell arrives as a number. Read through the text pattern below,
+    # 1e-05 or 2.5e+16 lost its exponent and became 1 and 2.5.
+    if isinstance(v, (int, float)):
+        return abs(float(v)) if v == v and v not in (float("inf"), float("-inf")) else None
     m = re.search(r"-?\d[\d,]*\.?\d*", str(v))
     if not m:
         return None

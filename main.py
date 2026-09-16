@@ -3761,11 +3761,32 @@ def _settle_invoice_payment(db, row: Dict[str, Any], new_status: str) -> str:
             log.info("[pay] invoice %s settled by %s %s",
                      row["invoice_id"], row["network"], row["reference"])
         except ValueError as e:
-            # Most likely the owner already pressed "Mark paid" between the
-            # prompt and the confirmation. The money is real either way, and the
-            # invoice is already settled — log it, don't fail the payer's page.
+            # The owner pressed "Mark paid" or "Cancel" between the prompt and
+            # the confirmation. The customer's money arrived either way, so this
+            # must not stop at a log line nobody reads: a second payment for a
+            # paid invoice is owed back, and a payment for a cancelled one is
+            # money the books do not show. Tell the owner in the app.
             log.warning("[pay] collection %s succeeded but invoice %s was not in "
                         "'sent' state: %s", row["reference"], row["invoice_id"], e)
+            try:
+                inv = invoices_api._get(db, row["user_id"], row["invoice_id"])
+                number, state = inv.get("number") or "an invoice", inv.get("status") or "closed"
+                amount = row.get("amount")
+                money = " ".join(str(x) for x in (row.get("currency"), amount) if x not in (None, ""))
+                notify.record_notification(
+                    db, row["user_id"], "invoice_payment_unmatched",
+                    f"Payment received for {number}, which is already {state}",
+                    f"{row['network'].upper()} mobile money reference {row['reference']}"
+                    + (f" for {money}" if amount is not None else "") + ". "
+                    + ("The customer may have paid twice. Check and refund if so."
+                       if state == "paid" else
+                       "The invoice was cancelled, so this money is not in your books. Record it or refund it."),
+                    link="/dashboard/invoices",
+                    # booking_id is the dedupe key (migration 0030): one alert per collection.
+                    meta={"booking_id": row["reference"], "invoice_id": row["invoice_id"]},
+                )
+            except Exception as ne:  # noqa: BLE001 — telling the owner must never fail the payer
+                log.warning("[pay] could not alert the owner about %s: %s", row["reference"], ne)
     return new_status
 
 

@@ -251,6 +251,30 @@ def test_momo_settlement_posts_a_confirmed_payment_the_twin_folds():
     assert float(state["cash"]) == 1200.0, f"cash did not follow the payment: {state['cash']}"
 
 
+def test_a_payment_for_a_closed_invoice_tells_the_owner():
+    """The owner cancelled (or marked paid) while the customer was approving the
+    prompt. The money is real, so it has to reach the owner, not only a log."""
+    import main
+    import notify
+    db = _DB()
+    inv = _sent(db, 700.0)
+    invoices.cancel(db, "u1", inv["id"]) if hasattr(invoices, "cancel") else invoices.cancel_invoice(db, "u1", inv["id"])
+    row = {"id": "pay_1", "invoice_id": inv["id"], "user_id": "u1", "reference": "ref-9",
+           "network": "mtn", "amount": 700.0, "currency": "ZMW", "status": "pending", "settled": False}
+    db.rows["invoice_payments"] = [dict(row)]
+    told = []
+    real = notify.record_notification
+    notify.record_notification = lambda *a, **k: told.append((a, k)) or True
+    try:
+        assert main._settle_invoice_payment(db, dict(row), "successful") == "successful"
+    finally:
+        notify.record_notification = real
+    assert len(told) == 1
+    (args, kw) = told[0]
+    assert args[1] == "u1" and "cancelled" in args[3] and "not in your books" in args[4]
+    assert kw["meta"]["booking_id"] == "ref-9"
+
+
 def test_manual_and_momo_settlement_agree_on_the_accounting():
     """Two callers, one path. If these ever diverge, the books depend on HOW the
     customer paid, which is the bug this shared function exists to prevent."""
