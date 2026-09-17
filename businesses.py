@@ -209,6 +209,15 @@ def heal_unscoped_rows(db, owner_id: str, business_id: str | None) -> dict:
         if out.get("business_events"):
             import digital_twin
             digital_twin.rebuild(db, owner_id, business_id)
+        # After the stamping, so a Sale that already exists is visible to the
+        # check and is linked rather than posted twice.
+        try:
+            import hospitality
+            repaired = hospitality.post_missing_booking_sales(db, owner_id)
+            if repaired.get("linked") or repaired.get("posted"):
+                out["booking_income"] = repaired
+        except Exception as e:  # noqa: BLE001
+            log.info("[businesses] booking income repair skipped for %s: %s", owner_id, e)
         if out:
             log.warning("[businesses] healed rows with no business for %s: %s", owner_id, out)
     except Exception as e:  # noqa: BLE001 — a repair must never cost the request

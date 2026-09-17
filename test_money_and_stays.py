@@ -156,6 +156,40 @@ def test_re_adding_a_channel_does_not_import_everything_twice():
     assert len(db.rows["bookings"]) == 1 and db.rows["bookings"][0]["channel_id"] == "ch2"
 
 
+def test_a_stay_whose_income_never_posted_is_repaired_once():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    lost = hospitality.create_booking(db, "u1", {"unit_id": unit["id"], "check_in": "2026-07-05",
+                                                 "check_out": "2026-07-06", "total_amount": 1444,
+                                                 "status": "confirmed"})
+    # The old failure: no Sale in the books and no link on the booking.
+    db.rows["business_events"] = [e for e in db.rows["business_events"] if e["id"] != lost["linked_event_id"]]
+    for row in db.rows["bookings"]:
+        row["linked_event_id"] = None
+    twin.rebuild(db, "u1", businesses.resolve_business_id(db, "u1", None))
+    assert _revenue(db) == 0
+
+    first = hospitality.post_missing_booking_sales(db, "u1")
+    assert first == {"linked": 0, "posted": 1} and _revenue(db) == 1444
+    assert hospitality.post_missing_booking_sales(db, "u1") == {"linked": 0, "posted": 0}
+    assert _revenue(db) == 1444
+
+
+def test_a_stay_with_its_sale_but_no_link_is_linked_not_posted_again():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    hospitality.create_booking(db, "u1", {"unit_id": unit["id"], "check_in": "2026-09-07",
+                                          "check_out": "2026-09-08", "total_amount": 2000,
+                                          "status": "confirmed"})
+    for row in db.rows["bookings"]:
+        row["linked_event_id"] = None
+    assert hospitality.post_missing_booking_sales(db, "u1") == {"linked": 1, "posted": 0}
+    assert _revenue(db) == 2000
+    assert db.rows["bookings"][0]["linked_event_id"]
+
+
 def test_the_booking_sale_lands_in_the_default_business():
     db = _fresh()
     bid = businesses.ensure_default_business(db, "u1")

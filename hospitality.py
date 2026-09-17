@@ -434,7 +434,8 @@ def delete_unit(db, user_id: str, unit_id: str) -> None:
 # costs flow into the existing P&L / cashflow / anomaly reports for free.
 # linked_event_id on the row is the bridge back.
 
-def _post_event(db, user_id: str, event_type: str, payload: dict, note: str) -> str | None:
+def _post_event(db, user_id: str, event_type: str, payload: dict, note: str,
+                occurred_at: str | None = None) -> str | None:
     """
     Publish one confirmed Business Event and return its id (to store as
     linked_event_id). source='api' + confidence 1.0 clears the auto-confirm gate,
@@ -444,13 +445,70 @@ def _post_event(db, user_id: str, event_type: str, payload: dict, note: str) -> 
     try:
         ev = nervous.EventIn(
             event_type=event_type, payload=payload, source="api",
-            confidence=1.0, status="confirmed", note=note,
+            confidence=1.0, status="confirmed", note=note, occurred_at=occurred_at,
         )
         saved = nervous.ingest(db, user_id, ev)
         return (saved or {}).get("id")
     except Exception as exc:  # noqa: BLE001 — never let bookkeeping break the booking
         log.error("[hospitality] spine post failed type=%s: %s", event_type, exc)
         return None
+
+
+def post_missing_booking_sales(db, user_id: str) -> dict:
+    """Put the income of every counting stay that never reached the books there.
+
+    A confirmed or completed booking posts its Sale when it is saved. Until the
+    September 2026 fix that post could fail silently (a caller with no business
+    wrote nothing the books could see), and the booking kept no link, so the
+    calendar said "posts to your books" over revenue the books did not have: a
+    live account showed K4,000 booked this month and K2,000 in the P&L, and two
+    July stays were missing entirely.
+
+    For each such stay, a Sale already in the books for it (payload.booking_id)
+    is linked rather than posted again; otherwise one is posted, dated when the
+    booking was made, exactly as it would have been. Imported channel blocks
+    carry no amount and are left alone. Best-effort, never raises."""
+    out = {"linked": 0, "posted": 0}
+    if db is None or not user_id:
+        return out
+    try:
+        res = (db.table("bookings")
+               .select("id,unit_id,status,total_amount,currency,linked_event_id,check_in,check_out,"
+                       "guest_id,reference,source,created_at")
+               .eq("user_id", user_id).is_("linked_event_id", "null")
+               .in_("status", list(STAY_STATUSES)).limit(500).execute())
+        missing = [b for b in (getattr(res, "data", None) or []) if _num(b.get("total_amount"), 0.0) > 0]
+    except Exception as exc:  # noqa: BLE001 — pre-0015, or a column not there yet
+        log.info("[hospitality] booking income check skipped for %s: %s", user_id, exc)
+        return out
+    for b in missing:
+        try:
+            found = (db.table("business_events").select("id").eq("user_id", user_id)
+                     .eq("event_type", "Sale").eq("payload->>booking_id", b["id"])
+                     .neq("status", "void").limit(1).execute())
+            rows = getattr(found, "data", None) or []
+            if rows:
+                event_id = rows[0]["id"]
+                out["linked"] += 1
+            else:
+                event_id = _post_event(
+                    db, user_id, "Sale",
+                    _sale_payload(b.get("unit_id"), b, _num(b.get("total_amount"), 0.0),
+                                  b.get("currency") or "ZMW"),
+                    note=(f"Booking {b.get('check_in')}→{b.get('check_out')}: income that had not "
+                          "reached the books, posted by repair"),
+                    occurred_at=b.get("created_at") or b.get("check_in"),
+                )
+                if not event_id:
+                    continue
+                out["posted"] += 1
+            (db.table("bookings").update({"linked_event_id": event_id})
+             .eq("id", b["id"]).eq("user_id", user_id).execute())
+        except Exception as exc:  # noqa: BLE001 — one stay must not stop the rest
+            log.warning("[hospitality] could not repair income for booking %s: %s", b.get("id"), exc)
+    if out["linked"] or out["posted"]:
+        log.warning("[hospitality] %s: booking income repaired %s", user_id, out)
+    return out
 
 
 def _void_event(db, user_id: str, event_id: str | None, reason: str) -> None:
