@@ -105,8 +105,13 @@ def aging_report(invoices: list, events: list, today: str | None = None) -> dict
         et = ev.get("event_type")
         if et == "Sale" and str(p.get("payment_method") or "").lower() == "credit" \
                 and not p.get("invoice_number"):
+            at = str(ev.get("occurred_at") or today)
+            # A stay is owed from the day the guest arrives, not the day it was
+            # booked: a December stay booked in September is not three months late.
+            if p.get("source") == "hospitality_booking" and str(p.get("check_in") or "")[:10] > at[:10]:
+                at = str(p["check_in"])[:10]
             loose_sales.setdefault(key, {"name": name, "rows": []})["rows"].append(
-                {"amount": _num(p.get("amount")), "at": str(ev.get("occurred_at") or today)})
+                {"amount": _num(p.get("amount")), "at": at})
         elif et == "CustomerPayment" and not p.get("invoice_number"):
             payments[key] = payments.get(key, 0.0) + _num(p.get("amount"))
 

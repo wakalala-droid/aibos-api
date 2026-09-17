@@ -365,6 +365,8 @@ def _void_stays_on_units(db, user_id: str, unit_ids: list, reason: str) -> None:
                .eq("user_id", user_id).in_("unit_id", list(unit_ids)).execute())
         for b in getattr(res, "data", None) or []:
             _void_event(db, user_id, b.get("linked_event_id"), reason)
+            for p in _booking_payments(db, user_id, b["id"]):
+                _void_event(db, user_id, p["id"], reason)
     except Exception as exc:  # noqa: BLE001 — never block a delete on the bridge
         log.error("[hospitality] could not unwind stays before delete: %s", exc)
 
@@ -474,10 +476,11 @@ def post_missing_booking_sales(db, user_id: str) -> dict:
     try:
         res = (db.table("bookings")
                .select("id,unit_id,status,total_amount,currency,linked_event_id,check_in,check_out,"
-                       "guest_id,reference,source,created_at")
+                       "guest_id,guest_name,reference,source,created_at,payment_status,deposit_amount,"
+                       "payment_method")
                .eq("user_id", user_id).is_("linked_event_id", "null")
                .in_("status", list(STAY_STATUSES)).limit(500).execute())
-        missing = [b for b in (getattr(res, "data", None) or []) if _num(b.get("total_amount"), 0.0) > 0]
+        missing = [b for b in (getattr(res, "data", None) or []) if _counts_as_income(b)]
     except Exception as exc:  # noqa: BLE001 — pre-0015, or a column not there yet
         log.info("[hospitality] booking income check skipped for %s: %s", user_id, exc)
         return out
@@ -491,17 +494,27 @@ def post_missing_booking_sales(db, user_id: str) -> dict:
                 event_id = rows[0]["id"]
                 out["linked"] += 1
             else:
+                posted_at = b.get("created_at") or b.get("check_in")
                 event_id = _post_event(
                     db, user_id, "Sale",
                     _sale_payload(b.get("unit_id"), b, _num(b.get("total_amount"), 0.0),
-                                  b.get("currency") or "ZMW"),
+                                  b.get("currency") or "ZMW", _customer_name(db, user_id, b)),
                     note=(f"Booking {b.get('check_in')}→{b.get('check_out')}: income that had not "
                           "reached the books, posted by repair"),
-                    occurred_at=b.get("created_at") or b.get("check_in"),
+                    occurred_at=posted_at,
                 )
                 if not event_id:
                     continue
                 out["posted"] += 1
+                b["linked_event_id"] = event_id
+                # A stay that is over was paid for, as move_booking_income_to_accrual
+                # treats every other stay from before payments could be marked.
+                if (str(b.get("check_out") or "")[:10] <= date.today().isoformat()
+                        and (b.get("payment_status") or "unpaid") in ("unpaid", "partial")):
+                    b["payment_status"] = "paid"
+                    (db.table("bookings").update({"payment_status": "paid"})
+                     .eq("id", b["id"]).eq("user_id", user_id).execute())
+                sync_booking_payment(db, user_id, b, paid_at=posted_at)
             (db.table("bookings").update({"linked_event_id": event_id})
              .eq("id", b["id"]).eq("user_id", user_id).execute())
         except Exception as exc:  # noqa: BLE001 — one stay must not stop the rest
@@ -841,7 +854,8 @@ def _assert_free(db, user_id: str, unit_id: str, check_in: str, check_out: str,
         )
 
 
-def _sale_payload(unit_id: str, booking: dict, amount: float, currency: str) -> dict:
+def _sale_payload(unit_id: str, booking: dict, amount: float, currency: str,
+                  customer: str | None = None) -> dict:
     """The Sale event a confirmed booking posts to the spine.
 
     booking_id and guest_id are carried so revenue in the books can be traced
@@ -849,10 +863,17 @@ def _sale_payload(unit_id: str, booking: dict, amount: float, currency: str) -> 
     in the P&L as an anonymous accommodation line, and "what did this corporate
     account spend with us" has no answer even though every fact needed to
     answer it exists one table away.
+
+    It posts ON CREDIT: the stay is income the moment it is agreed, and money
+    owed until the guest pays (sync_booking_payment). It used to post as cash,
+    so a December stay booked in September sat in the bank balance three months
+    before the guest paid anything.
     """
     return {
         "amount": amount,
         "currency": currency,
+        "payment_method": "credit",
+        "customer": customer or _customer_name(None, None, booking),
         "category": "accommodation",
         "unit_id": unit_id,
         "booking_id": booking.get("id"),
@@ -863,6 +884,214 @@ def _sale_payload(unit_id: str, booking: dict, amount: float, currency: str) -> 
         "check_out": booking.get("check_out"),
         "source": "hospitality_booking",
     }
+
+
+# ── What the guest has paid ──────────────────────────────────────────────────
+#
+# A stay's Sale is money owed. What the guest has actually handed over posts as
+# CustomerPayments carrying the booking_id, and follows payment_status: paid is
+# the whole amount, a deposit is deposit_amount, unpaid is nothing. A refunded
+# stay is not income at all, so its Sale goes too.
+
+def _customer_name(db, user_id: str | None, booking: dict) -> str:
+    """Who owes the money, as the debtors list will show it."""
+    name = ""
+    if db is not None and user_id and booking.get("guest_id"):
+        try:
+            name = str(get_guest(db, user_id, booking["guest_id"]).get("full_name") or "").strip()
+        except Exception:  # noqa: BLE001 — a missing guest still leaves the booking's own name
+            name = ""
+    name = name or str(booking.get("guest_name") or "").strip()
+    if name:
+        return name[:120]
+    ref = str(booking.get("reference") or "").strip()
+    return f"Booking {ref}" if ref else f"Booking {str(booking.get('check_in') or '')[:10]}".strip()
+
+
+def _counts_as_income(booking: dict) -> bool:
+    return (booking.get("status") in STAY_STATUSES
+            and _num(booking.get("total_amount"), 0.0) > 0
+            and booking.get("payment_status") != "refunded")
+
+
+def _paid_target(booking: dict) -> float:
+    """How much of the stay the booking says the guest has paid."""
+    if not _counts_as_income(booking):
+        return 0.0
+    total = _num(booking.get("total_amount"), 0.0)
+    status = booking.get("payment_status") or "unpaid"
+    if status == "paid":
+        return round(total, 2)
+    if status == "partial":
+        return round(max(0.0, min(_num(booking.get("deposit_amount"), 0.0), total)), 2)
+    return 0.0
+
+
+def _is_credit(sale: dict | None) -> bool:
+    return str(((sale or {}).get("payload") or {}).get("payment_method") or "").lower() == "credit"
+
+
+def _move_sale_to_credit(db, user_id: str, sale: dict, customer: str) -> None:
+    """Turn a booking Sale that went straight to cash into money owed, in place.
+
+    Written directly rather than through nervous.correct: this is the system
+    changing how a posting is booked, not an owner correcting a fact, and a
+    correction teaches Business Memory. The audit trail still says what
+    happened. The caller rebuilds the books."""
+    payload = {**(sale.get("payload") or {}), "payment_method": "credit", "customer": customer}
+    audit = list(sale.get("audit") or []) + [{
+        "at": _now_iso(), "actor": "system", "action": "corrected",
+        "note": "Booking income moved to money owed until the guest pays",
+    }]
+    (db.table("business_events").update({"payload": payload, "audit": audit})
+     .eq("id", sale["id"]).eq("user_id", user_id).execute())
+    sale["payload"], sale["audit"] = payload, audit
+
+
+def _booking_payments(db, user_id: str, booking_id: str) -> list:
+    res = (db.table("business_events").select("id,payload,occurred_at,status")
+           .eq("user_id", user_id).eq("event_type", "CustomerPayment")
+           .eq("payload->>booking_id", booking_id).neq("status", "void").limit(50).execute())
+    return getattr(res, "data", None) or []
+
+
+def _payment_payload(booking: dict, sale_payload: dict, amount: float) -> dict:
+    method = str(booking.get("payment_method") or "").strip().lower()
+    return {
+        "amount": round(amount, 2),
+        "currency": sale_payload.get("currency") or booking.get("currency") or "ZMW",
+        "customer": sale_payload.get("customer") or _customer_name(None, None, booking),
+        "payment_method": method if method in ("cash", "mobile_money", "card", "bank") else "cash",
+        "unit_id": booking.get("unit_id"),
+        "booking_id": booking.get("id"),
+        "guest_id": booking.get("guest_id"),
+        "reference": booking.get("reference"),
+        "source": "hospitality_booking",
+    }
+
+
+def sync_booking_payment(db, user_id: str, booking: dict, paid_at: str | None = None) -> None:
+    """Make what the books hold as paid for a stay match what the booking says.
+
+    More paid than before posts only the difference, so a deposit keeps the day
+    it came in. Less, or a different guest, puts the whole figure back in one
+    payment dated when the first one was. A Sale that still went to cash is
+    moved to money owed first. Best-effort: never costs the booking."""
+    bid = booking.get("id")
+    if db is None or not bid:
+        return
+    try:
+        sale = None
+        if booking.get("linked_event_id"):
+            res = (db.table("business_events").select("id,payload,audit,status,occurred_at,business_id")
+                   .eq("id", booking["linked_event_id"]).eq("user_id", user_id).limit(1).execute())
+            rows = getattr(res, "data", None) or []
+            sale = rows[0] if rows and rows[0].get("status") != "void" else None
+        moved = False
+        if sale and not _is_credit(sale) and _counts_as_income(booking):
+            _move_sale_to_credit(db, user_id, sale, _customer_name(db, user_id, booking))
+            moved = True
+        target = _paid_target(booking) if sale and _is_credit(sale) else 0.0
+        sale_payload = (sale or {}).get("payload") or {}
+
+        existing = _booking_payments(db, user_id, bid)
+        have = round(sum(_num((e.get("payload") or {}).get("amount"), 0.0) for e in existing), 2)
+        # By guest id, not name: Business Memory can alias a name on one posting
+        # and not the other, and every edit would then void and repost.
+        other_guest = target > 0 and any(
+            (e.get("payload") or {}).get("guest_id") != sale_payload.get("guest_id") for e in existing)
+        first_paid = min((str(e.get("occurred_at") or "") for e in existing), default="") or None
+
+        posted = False
+        if other_guest or have > target + 0.005:
+            for e in existing:
+                _void_event(db, user_id, e["id"], "Booking payment changed")
+            have = 0.0
+            paid_at = paid_at or first_paid
+        due = round(target - have, 2)
+        if due > 0.005:
+            posted = bool(_post_event(
+                db, user_id, "CustomerPayment", _payment_payload(booking, sale_payload, due),
+                note=f"Guest payment for booking {booking.get('check_in')}→{booking.get('check_out')}",
+                occurred_at=paid_at,
+            ))
+        if moved and not posted:
+            import digital_twin as twin
+            twin.rebuild(db, user_id, sale.get("business_id"))
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never break the booking
+        log.error("[hospitality] payment sync failed booking=%s: %s", bid, exc)
+
+
+def move_booking_income_to_accrual(db, user_id: str) -> dict:
+    """Move every booking Sale that went straight to cash onto money owed.
+
+    Stays that have already ended are marked paid, with the payment dated when
+    the Sale was, so the bank balance does not move by a ngwee: the owner had no
+    way to say a stay was paid, and money for a stay that is over was collected.
+    Stays still to come stay unpaid, and their money leaves cash for money owed
+    until the owner marks it paid. Runs once per owner from the heal; a Sale
+    already on credit is left alone, so a second run changes nothing."""
+    out = {"moved": 0, "marked_paid": 0}
+    if db is None or not user_id:
+        return out
+    try:
+        res = (db.table("bookings")
+               .select("id,unit_id,status,total_amount,deposit_amount,payment_status,payment_method,"
+                       "currency,linked_event_id,check_in,check_out,guest_id,guest_name,reference")
+               .eq("user_id", user_id).not_.is_("linked_event_id", "null")
+               .in_("status", list(STAY_STATUSES)).limit(1000).execute())
+        stays = [b for b in (getattr(res, "data", None) or []) if _counts_as_income(b)]
+        if not stays:
+            return out
+        ev_res = (db.table("business_events").select("id,payload,audit,status,occurred_at,business_id")
+                  .eq("user_id", user_id).in_("id", [b["linked_event_id"] for b in stays]).execute())
+        sales = {e["id"]: e for e in (getattr(ev_res, "data", None) or []) if e.get("status") != "void"}
+    except Exception as exc:  # noqa: BLE001 — pre-0015, or a column not there yet
+        log.info("[hospitality] accrual move skipped for %s: %s", user_id, exc)
+        return out
+
+    today = date.today().isoformat()
+    touched: set = set()
+    payments: dict = {}
+    for b in stays:
+        sale = sales.get(b["linked_event_id"])
+        if not sale or _is_credit(sale):
+            continue
+        try:
+            _move_sale_to_credit(db, user_id, sale, _customer_name(db, user_id, b))
+            out["moved"] += 1
+            touched.add(sale.get("business_id"))
+            if str(b.get("check_out") or "")[:10] <= today and (b.get("payment_status") or "unpaid") in ("unpaid", "partial"):
+                (db.table("bookings").update({"payment_status": "paid"})
+                 .eq("id", b["id"]).eq("user_id", user_id).execute())
+                b["payment_status"] = "paid"
+                out["marked_paid"] += 1
+            target = _paid_target(b)
+            if target > 0 and not _booking_payments(db, user_id, b["id"]):
+                payments.setdefault(sale.get("business_id"), []).append(nervous.EventIn(
+                    event_type="CustomerPayment",
+                    payload=_payment_payload(b, sale["payload"], target),
+                    source="api", confidence=1.0, status="confirmed",
+                    note="Guest payment for a stay already in the books",
+                    occurred_at=sale.get("occurred_at"),
+                ))
+        except Exception as exc:  # noqa: BLE001 — one stay must not stop the rest
+            log.warning("[hospitality] could not move booking %s to money owed: %s", b.get("id"), exc)
+
+    import digital_twin as twin
+    for business_id, evs in payments.items():
+        try:
+            nervous.ingest_batch(db, user_id, evs, business_id=business_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[hospitality] accrual payments failed for %s: %s", user_id, exc)
+    for business_id in touched:
+        try:
+            twin.rebuild(db, user_id, business_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[hospitality] rebuild after accrual move failed for %s: %s", user_id, exc)
+    if out["moved"]:
+        log.warning("[hospitality] %s: booking income moved to money owed %s", user_id, out)
+    return out
 
 
 def attach_guests(db, user_id: str, bookings: list) -> list:
@@ -1032,16 +1261,18 @@ def create_booking(db, user_id: str, data: dict) -> dict:
     # entered after the fact as COMPLETED earned its money too; only confirmed
     # used to count, so a past stay typed in as completed never reached the P&L.
     amount = _num(saved.get("total_amount"), 0.0)
-    if status in STAY_STATUSES and amount > 0:
+    if _counts_as_income({**saved, "status": status}):
         event_id = _post_event(
             db, user_id, "Sale",
-            _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW")),
+            _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW"),
+                          _customer_name(db, user_id, saved)),
             note=f"Booking {unit.get('unit_name', unit_id)} {saved.get('check_in')}→{saved.get('check_out')}",
         )
         if event_id:
             upd = (db.table("bookings").update({"linked_event_id": event_id})
                    .eq("id", saved["id"]).eq("user_id", user_id).execute())
             saved = (getattr(upd, "data", None) or [{**saved, "linked_event_id": event_id}])[0]
+            sync_booking_payment(db, user_id, {**saved, "status": status})
 
     if status in STAY_STATUSES:
         _bump_guest_stay(db, user_id, saved.get("guest_id"))
@@ -1095,7 +1326,7 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     # says changes.
     was_live = current.get("linked_event_id")
     amount = _num(saved.get("total_amount"), 0.0)
-    counts = new_status in STAY_STATUSES and amount > 0
+    counts = _counts_as_income({**saved, "status": new_status})
     def _same(k):
         a, b = current.get(k), saved.get(k)
         if k == "total_amount":
@@ -1104,8 +1335,10 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     changed = any(k in clean and not _same(k)
                   for k in ("total_amount", "currency", "unit_id", "check_in", "check_out", "guest_id"))
     if was_live and (not counts or changed):
+        refunded = saved.get("payment_status") == "refunded" and new_status in STAY_STATUSES
         _void_event(db, user_id, was_live,
-                    reason=f"Booking {new_status}" if not counts else "Booking changed")
+                    reason="Booking refunded" if refunded and not counts
+                    else f"Booking {new_status}" if not counts else "Booking changed")
         (db.table("bookings").update({"linked_event_id": None})
          .eq("id", booking_id).eq("user_id", user_id).execute())
         saved["linked_event_id"] = None
@@ -1113,13 +1346,15 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     if counts and not was_live:
         event_id = _post_event(
             db, user_id, "Sale",
-            _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW")),
+            _sale_payload(unit_id, saved, amount, saved.get("currency", "ZMW"),
+                          _customer_name(db, user_id, saved)),
             note=f"Booking {new_status} {saved.get('check_in')}→{saved.get('check_out')}",
         )
         if event_id:
             (db.table("bookings").update({"linked_event_id": event_id})
              .eq("id", booking_id).eq("user_id", user_id).execute())
             saved["linked_event_id"] = event_id
+    sync_booking_payment(db, user_id, {**saved, "status": new_status})
     return saved
 
 

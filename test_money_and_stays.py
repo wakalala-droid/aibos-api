@@ -156,6 +156,127 @@ def test_re_adding_a_channel_does_not_import_everything_twice():
     assert len(db.rows["bookings"]) == 1 and db.rows["bookings"][0]["channel_id"] == "ch2"
 
 
+# ── A stay is owed until the guest pays ──────────────────────────────────────
+
+def _books(db, owner="u1"):
+    s = twin.get_state(db, owner)
+    return s["total_revenue"], s["cash"], s["receivables"]
+
+
+def _live_payments(db):
+    return [e for e in db.rows["business_events"]
+            if e["event_type"] == "CustomerPayment" and e["status"] != "void"]
+
+
+def _stay(db, unit, **extra):
+    return hospitality.create_booking(db, "u1", {"unit_id": unit["id"], "check_in": "2026-12-01",
+                                                 "check_out": "2026-12-03", "total_amount": 3000,
+                                                 "status": "confirmed", **extra})
+
+
+def test_an_unpaid_stay_is_money_owed_not_cash():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    guest = hospitality.create_guest(db, "u1", {"full_name": "Mary Banda"})
+    b = _stay(db, unit, guest_id=guest["id"])
+    assert _books(db) == (3000, 0, 3000)
+    sale = next(e for e in db.rows["business_events"] if e["id"] == b["linked_event_id"])
+    assert sale["payload"]["payment_method"] == "credit"
+    assert sale["payload"]["customer"] == "Mary Banda"
+
+
+def test_a_deposit_then_the_rest_moves_money_owed_into_cash():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    b = _stay(db, unit)
+    hospitality.update_booking(db, "u1", b["id"], {"payment_status": "partial", "deposit_amount": 1000})
+    assert _books(db) == (3000, 1000, 2000)
+    hospitality.update_booking(db, "u1", b["id"], {"payment_status": "paid"})
+    assert _books(db) == (3000, 3000, 0)
+    # The deposit keeps the day it came in; only the rest is new.
+    assert sorted(p["payload"]["amount"] for p in _live_payments(db)) == [1000, 2000]
+    hospitality.update_booking(db, "u1", b["id"], {"guest_notes": "late arrival"})
+    assert len(_live_payments(db)) == 2                 # an unrelated edit posts nothing
+    hospitality.update_booking(db, "u1", b["id"], {"payment_status": "unpaid"})
+    assert _books(db) == (3000, 0, 3000) and not _live_payments(db)
+
+
+def test_a_stay_booked_as_paid_is_cash_at_once():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    _stay(db, unit, payment_status="paid")
+    assert _books(db) == (3000, 3000, 0)
+
+
+def test_a_cheaper_paid_stay_keeps_one_payment_on_its_first_day():
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    b = _stay(db, unit, payment_status="paid")
+    first_day = _live_payments(db)[0]["occurred_at"]
+    hospitality.update_booking(db, "u1", b["id"], {"total_amount": 2500})
+    pays = _live_payments(db)
+    assert _books(db) == (2500, 2500, 0)
+    assert len(pays) == 1 and pays[0]["occurred_at"] == first_day
+
+
+def test_cancelling_refunding_or_deleting_a_paid_stay_clears_it_from_the_books():
+    for finish in ("cancel", "refund", "delete"):
+        db = _fresh()
+        businesses.ensure_default_business(db, "u1")
+        unit = _unit(db)
+        b = _stay(db, unit, payment_status="paid")
+        if finish == "cancel":
+            hospitality.cancel_booking(db, "u1", b["id"])
+        elif finish == "refund":
+            hospitality.update_booking(db, "u1", b["id"], {"payment_status": "refunded"})
+        else:
+            hospitality.delete_unit(db, "u1", unit["id"])
+        assert _books(db) == (0, 0, 0), finish
+        assert not _live_payments(db), finish
+
+
+def test_old_stays_move_to_money_owed_and_finished_ones_leave_the_bank_alone():
+    from datetime import date, timedelta
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    day = lambda n: (date.today() + timedelta(days=n)).isoformat()
+    past = hospitality.create_booking(db, "u1", {"unit_id": unit["id"], "check_in": day(-10),
+                                                 "check_out": day(-8), "total_amount": 1200,
+                                                 "status": "completed"})
+    hospitality.create_booking(db, "u1", {"unit_id": unit["id"], "check_in": day(20),
+                                          "check_out": day(22), "total_amount": 800,
+                                          "status": "confirmed"})
+    # As they were posted before: straight to cash, with no one owing anything.
+    for e in db.rows["business_events"]:
+        if e["event_type"] == "Sale":
+            e["payload"] = {k: v for k, v in e["payload"].items() if k not in ("payment_method", "customer")}
+    twin.rebuild(db, "u1", businesses.resolve_business_id(db, "u1", None))
+    assert _books(db) == (2000, 2000, 0)
+
+    assert hospitality.move_booking_income_to_accrual(db, "u1") == {"moved": 2, "marked_paid": 1}
+    assert _books(db) == (2000, 1200, 800)
+    assert {b["id"]: b for b in db.rows["bookings"]}[past["id"]]["payment_status"] == "paid"
+    sale = next(e for e in db.rows["business_events"] if e["id"] == past["linked_event_id"])
+    assert _live_payments(db)[0]["occurred_at"] == sale["occurred_at"]
+
+    assert hospitality.move_booking_income_to_accrual(db, "u1") == {"moved": 0, "marked_paid": 0}
+    assert _books(db) == (2000, 1200, 800)
+
+
+def test_a_stay_is_not_late_before_the_guest_arrives():
+    import debtors
+    events = [{"status": "confirmed", "event_type": "Sale", "occurred_at": "2026-09-01T10:00:00+00:00",
+               "payload": {"amount": 2000, "payment_method": "credit", "customer": "Mary Banda",
+                           "source": "hospitality_booking", "check_in": "2026-12-01"}}]
+    assert debtors.aging_report([], events, today="2026-11-15")["totals"]["current"] == 2000
+    assert debtors.aging_report([], events, today="2026-12-20")["totals"]["1-30"] == 2000
+
+
 def test_a_stay_whose_income_never_posted_is_repaired_once():
     db = _fresh()
     businesses.ensure_default_business(db, "u1")

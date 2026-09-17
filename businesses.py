@@ -216,6 +216,9 @@ def heal_unscoped_rows(db, owner_id: str, business_id: str | None) -> dict:
             repaired = hospitality.post_missing_booking_sales(db, owner_id)
             if repaired.get("linked") or repaired.get("posted"):
                 out["booking_income"] = repaired
+            moved = hospitality.move_booking_income_to_accrual(db, owner_id)
+            if moved.get("moved"):
+                out["booking_accrual"] = moved
         except Exception as e:  # noqa: BLE001
             log.info("[businesses] booking income repair skipped for %s: %s", owner_id, e)
         try:
