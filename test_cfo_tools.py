@@ -264,6 +264,40 @@ def test_gemini_thought_signatures_go_back_with_the_tool_call():
     assert "extra_content" not in client.calls[1]["messages"][-2]["tool_calls"][0]
 
 
+def test_a_signature_on_the_streamed_delta_reaches_the_tool_call():
+    from openai.types.chat.chat_completion_chunk import ChoiceDelta
+    sig = {"google": {"thought_signature": "sig-delta"}}
+    delta = ChoiceDelta.model_validate({"content": None, "extra_content": sig, "tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "query_events", "arguments": "{}"}}]})
+    chunk = NS(choices=[NS(delta=delta)])
+    client = _FakeStreamClient([[chunk], [_chunk("Done.")]])
+    list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "x"}], _seeded_db(), "u1"))
+    assert client.calls[1]["messages"][-2]["tool_calls"][0]["extra_content"] == sig
+
+
+def test_a_spent_quota_is_not_retried_without_tools():
+    class _Quota(Exception):
+        status_code = 429
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise _Quota("Error code: 429 - You exceeded your current quota")
+    client = NS(chat=NS(completions=NS(create=create)))
+    for loop in (cfo_tools.run_agent_loop, lambda *a, **k: list(cfo_tools.run_agent_loop_stream(*a, **k))):
+        calls.clear()
+        try:
+            loop(client, "m", [{"role": "user", "content": "x"}], _seeded_db(), "u1")
+            assert False, "a 429 must surface"
+        except _Quota:
+            pass
+        # The fallback model gets one go (quotas are per model); there is never
+        # a third request stripped of its tools.
+        assert len(calls) == 2
+        assert calls[1]["model"] != "m" and "tools" in calls[1]
+
+
 def test_stream_round_budget_forces_prose():
     endless = [[_chunk(tool_calls=[_tc_delta(0, id=f"c{i}", name="get_business_snapshot", arguments="{}")])]
                for i in range(cfo_tools.MAX_TOOL_ROUNDS)]

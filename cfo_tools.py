@@ -456,12 +456,23 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         try:
             stream = client.chat.completions.create(**kwargs)
         except Exception as e:  # noqa: BLE001
+            # A spent quota on the first request: Gemini's free limits are per
+            # model, so the fallback model can still answer (the buffered loop
+            # already does this through llm.chat_create). Only before any
+            # lookup, because a thought signature belongs to the model that
+            # made it. Any later quota refusal surfaces as it is.
+            if llm.is_quota_error(e) and round_no == 0 and model != llm.fallback_model():
+                log.warning("[cfo] %s quota spent, streaming on %s", model, llm.fallback_model())
+                model = llm.fallback_model()
+                kwargs["model"] = model
+                stream = client.chat.completions.create(**kwargs)
             # A provider that refuses the TOOL declarations refuses the whole
             # request, so the owner got nothing at all. An answer without
             # lookups is worth far more than "the answer stopped early", and
             # the log line names the provider's own words so the cause is
-            # findable rather than guessed at.
-            if force_prose or "tools" not in kwargs:
+            # findable rather than guessed at. A spent quota is not that: the
+            # retry would be refused too, so it is not attempted.
+            elif force_prose or "tools" not in kwargs or llm.is_quota_error(e):
                 raise
             log.warning("[cfo] the provider refused the tool declarations, "
                         "answering without lookups: %s", e)
@@ -471,13 +482,21 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
 
         pending: dict = {}
         said_anything = False
+        # When streaming, the provider's extra data (Gemini's thought signature)
+        # is not guaranteed to sit on the tool-call delta itself: it can come on
+        # the delta, the choice or the chunk, even in a chunk with no call in
+        # it. Whatever arrives is kept and given to the first call that lacks it.
+        stream_extra = None
         for chunk in stream:
+            stream_extra = _extra_content(chunk) or stream_extra
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
+            stream_extra = _extra_content(choices[0]) or stream_extra
             delta = getattr(choices[0], "delta", None)
             if delta is None:
                 continue
+            stream_extra = _extra_content(delta) or stream_extra
             text = getattr(delta, "content", None)
             if text:
                 said_anything = True
@@ -487,6 +506,9 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         if not pending:                    # the model answered in prose — done
             yield ("done", {"tools_used": tools_used})
             return
+        first = pending[min(pending)]
+        if stream_extra and not first.get("extra_content"):
+            first["extra_content"] = stream_extra
 
         # Echo the assistant turn (with its tool calls), then answer each call.
         convo.append({
@@ -538,7 +560,7 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                 **tool_kwargs,
             )
         except Exception as e:  # noqa: BLE001 — see the streaming twin above
-            if not tool_kwargs:
+            if not tool_kwargs or llm.is_quota_error(e):
                 raise
             log.warning("[cfo] the provider refused the tool declarations, "
                         "answering without lookups: %s", e)

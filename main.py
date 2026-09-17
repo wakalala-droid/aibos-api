@@ -1964,8 +1964,13 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
             # Every message failed identically because the provider was refusing
             # the tool declarations, and the owner was told to do the one thing
             # guaranteed not to work. Say what actually went wrong.
-            detail = 'The answer stopped early. ' + _safe_error(exc)
-            yield f"data: {json.dumps({'error': detail})}\n\n"
+            if llm.is_quota_error(exc):
+                # retry:false — the browser's buffered fallback would only spend
+                # another request against the same spent quota.
+                yield f"data: {json.dumps({'error': llm.QUOTA_MESSAGE, 'retry': False})}\n\n"
+            else:
+                detail = 'The answer stopped early. ' + _safe_error(exc)
+                yield f"data: {json.dumps({'error': detail})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
@@ -2019,6 +2024,8 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
                     }
                 logger.warning("chat tool-loop returned empty reply — using single-shot fallback")
             except Exception as exc:  # noqa: BLE001
+                if llm.is_quota_error(exc):
+                    raise HTTPException(status_code=503, detail=llm.QUOTA_MESSAGE)
                 logger.warning("chat tool-loop failed (%s) — using single-shot fallback", exc)
 
         completion = llm.chat_create(
@@ -2044,6 +2051,8 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
     except HTTPException:
         raise
     except Exception as exc:
+        if llm.is_quota_error(exc):
+            raise HTTPException(status_code=503, detail=llm.QUOTA_MESSAGE)
         logger.error("Chat error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(
             status_code=500,
@@ -2250,7 +2259,12 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     round_trip = _tool_round_trip_probe(client, model)
     probes["tool_round_trip"] = {"ok": round_trip["ok"], "error": round_trip.get("error", "")}
 
-    if not probes["plain"]["ok"]:
+    quota = [p for p in probes.values() if not p["ok"] and
+             ("429" in p["error"] or "quota" in p["error"].lower())]
+    if quota:
+        verdict = ("The AI key has used up its quota, so the chat is refusing questions until "
+                   "it resets. A paid Gemini plan raises the limit.")
+    elif not probes["plain"]["ok"]:
         verdict = ("The provider will not answer at all. Usually the key or the model id: "
                    + probes["plain"]["error"])
     elif not probes["with_tools"]["ok"]:

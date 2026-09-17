@@ -169,6 +169,21 @@ def _model_shaped_error(exc: Exception) -> bool:
     ))
 
 
+QUOTA_MESSAGE = ("The AI assistant has reached its usage limit for now, so it cannot answer "
+                 "this minute. Your records are all still there, and every other page works. "
+                 "Please try again a little later.")
+
+
+def is_quota_error(exc: Exception) -> bool:
+    """The provider refused because the account's quota is spent (HTTP 429).
+
+    Retrying cannot help, and every retry spends one more request against the
+    same exhausted limit, so callers stop and say so instead."""
+    text = str(exc)
+    return (getattr(exc, "status_code", None) == 429 or "429" in text
+            or "RESOURCE_EXHAUSTED" in text or "exceeded your current quota" in text)
+
+
 def chat_create(client, **kwargs):
     """client.chat.completions.create with a one-shot model fallback.
     `model` defaults to chat_model(); everything else passes through."""
