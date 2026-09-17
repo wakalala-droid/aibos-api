@@ -190,6 +190,34 @@ def test_a_stay_with_its_sale_but_no_link_is_linked_not_posted_again():
     assert db.rows["bookings"][0]["linked_event_id"]
 
 
+def _employee(i, name, pay):
+    return {"id": f"e{i}", "user_id": "u1", "name": name, "status": "active", "basic_pay": pay,
+            "employment_type": "permanent", "pay_day": 28, "gratuity_eligible": False,
+            "loan_balance": 0, "loan_monthly": 0, "created_at": f"2026-01-0{i}T00:00:00+00:00"}
+
+
+def test_a_zero_pay_payslip_posts_no_salary_and_lost_wages_are_repaired_once():
+    import payroll
+    db = _fresh()
+    bid = businesses.ensure_default_business(db, "u1")
+    db.rows["employees"] = [_employee(1, "Wakalala", 15000), _employee(2, "Mulyokela", 0)]
+    payroll.run_payroll(db, "u1", "2026-07")
+    salaries = [e for e in db.rows["business_events"] if e["event_type"] == "Salary"]
+    assert [s["payload"]["employee"] for s in salaries] == ["Wakalala"]      # no K0 line
+    net = salaries[0]["payload"]["amount"]
+
+    # The old failure: the Salary never reached the books and the payslip kept no link.
+    db.rows["business_events"] = [e for e in db.rows["business_events"] if e["event_type"] != "Salary"]
+    for s in db.rows["payslips"]:
+        s["linked_event_id"] = None
+    twin.rebuild(db, "u1", bid)
+    assert twin.get_state(db, "u1")["total_costs"] == 0
+
+    assert payroll.post_missing_salaries(db, "u1") == {"linked": 0, "posted": 1}
+    assert twin.get_state(db, "u1")["total_costs"] == net
+    assert payroll.post_missing_salaries(db, "u1") == {"linked": 0, "posted": 0}
+
+
 def test_the_booking_sale_lands_in_the_default_business():
     db = _fresh()
     bid = businesses.ensure_default_business(db, "u1")

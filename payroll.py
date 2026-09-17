@@ -394,6 +394,77 @@ def preview_run(db, user_id: str, period: str, pay_date=None) -> dict:
             "rates": public_rates(rates)}
 
 
+class _NothingToPost(Exception):
+    """A payslip with no net pay: kept as a payslip, not posted as a salary."""
+
+
+def post_missing_salaries(db, user_id: str) -> dict:
+    """Put the wages a payroll run paid, and the books never received, there.
+
+    run_payroll posts one Salary per payslip, and until the September 2026 fix
+    that post could fail silently (no business, no rebuild) while the payslip was
+    kept with no linked event. A live account's July run showed K11,128.75 paid
+    and its books held no July wages at all.
+
+    For each payslip with pay and no link: a Salary already in the books for
+    that employee and period is linked, otherwise one is posted on the run's pay
+    date with the payslip's own figures. Best-effort, never raises."""
+    import nervous_system as nervous
+    out = {"linked": 0, "posted": 0}
+    if db is None or not user_id:
+        return out
+    try:
+        res = (db.table("payslips").select("*").eq("user_id", user_id)
+               .is_("linked_event_id", "null").limit(500).execute())
+        slips = [s for s in (getattr(res, "data", None) or []) if _num(s.get("net")) > 0]
+        if not slips:
+            return out
+        runs_res = (db.table("payroll_runs").select("id,pay_date,currency")
+                    .eq("user_id", user_id).limit(500).execute())
+        runs = {r["id"]: r for r in (getattr(runs_res, "data", None) or [])}
+    except Exception as exc:  # noqa: BLE001 — pre-0014
+        log.info("[payroll] salary repair skipped for %s: %s", user_id, exc)
+        return out
+    for s in slips:
+        try:
+            found = (db.table("business_events").select("id").eq("user_id", user_id)
+                     .eq("event_type", "Salary").eq("payload->>period", s.get("period"))
+                     .eq("payload->>employee", s.get("employee_name"))
+                     .neq("status", "void").limit(1).execute())
+            rows = getattr(found, "data", None) or []
+            if rows:
+                event_id = rows[0]["id"]
+                out["linked"] += 1
+            else:
+                run = runs.get(s.get("run_id")) or {}
+                pay_iso = str(run.get("pay_date") or f"{s.get('period')}-28")[:10]
+                ev = nervous.ingest(db, user_id, nervous.EventIn(
+                    event_type="Salary",
+                    payload={
+                        "amount": _num(s.get("net")), "currency": run.get("currency") or "ZMW",
+                        "employee": s.get("employee_name"), "period": s.get("period"),
+                        "payment_method": "bank",
+                        "gross": _num(s.get("gross")), "net": _num(s.get("net")), "paye": _num(s.get("paye")),
+                        "napsa": _num(s.get("napsa_employee")), "nhima": _num(s.get("nhima_employee")),
+                        "loan_deduction": _num(s.get("loan_deduction")),
+                        "note": "Salary from a payroll run that had not reached the books, posted by repair.",
+                    },
+                    source="manual", status="confirmed",
+                    occurred_at=f"{pay_iso}T00:00:00+00:00",
+                ))
+                event_id = (ev or {}).get("id")
+                if not event_id:
+                    continue
+                out["posted"] += 1
+            (db.table("payslips").update({"linked_event_id": event_id})
+             .eq("id", s["id"]).eq("user_id", user_id).execute())
+        except Exception as exc:  # noqa: BLE001 — one payslip must not stop the rest
+            log.warning("[payroll] could not repair salary for payslip %s: %s", s.get("id"), exc)
+    if out["linked"] or out["posted"]:
+        log.warning("[payroll] %s: salaries repaired %s", user_id, out)
+    return out
+
+
 def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     """
     Compute + persist a pay period: writes the run + a payslip per active employee,
@@ -436,6 +507,10 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     for emp, slip in zip(emps, slips):
         event_id = None
         try:
+            # Nothing was paid, so nothing is posted: a K0 salary is an empty
+            # line in the activity feed, not a record of money leaving.
+            if _num(slip["net"]) <= 0:
+                raise _NothingToPost()
             ev = nervous.ingest(db, user_id, nervous.EventIn(
                 event_type="Salary",
                 payload={
@@ -450,6 +525,8 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
                 occurred_at=f"{pay_iso}T00:00:00+00:00",
             ))
             event_id = ev.get("id")
+        except _NothingToPost:
+            pass
         except Exception as exc:  # noqa: BLE001 — a books-posting hiccup must not lose the payslip
             log.warning("[payroll] Salary event post failed for %s: %s", emp.get("name"), exc)
 

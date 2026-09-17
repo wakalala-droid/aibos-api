@@ -218,6 +218,13 @@ def heal_unscoped_rows(db, owner_id: str, business_id: str | None) -> dict:
                 out["booking_income"] = repaired
         except Exception as e:  # noqa: BLE001
             log.info("[businesses] booking income repair skipped for %s: %s", owner_id, e)
+        try:
+            import payroll
+            repaired = payroll.post_missing_salaries(db, owner_id)
+            if repaired.get("linked") or repaired.get("posted"):
+                out["salaries"] = repaired
+        except Exception as e:  # noqa: BLE001
+            log.info("[businesses] salary repair skipped for %s: %s", owner_id, e)
         if out:
             log.warning("[businesses] healed rows with no business for %s: %s", owner_id, out)
     except Exception as e:  # noqa: BLE001 — a repair must never cost the request
