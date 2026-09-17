@@ -75,17 +75,26 @@ def test_the_workspace_list_names_every_set_of_books():
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
 
 
-def test_a_monthly_payment_buys_a_month():
+def test_a_monthly_payment_buys_a_calendar_month():
     end = main.paid_period_end(NOW, None, "free", "pro", "monthly")
-    assert end == NOW + timedelta(days=31)
-    assert main.paid_period_end(NOW, None, "free", "pro", "annual") == NOW + timedelta(days=366)
+    assert end == datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+    assert main.paid_period_end(NOW, None, "free", "pro", "annual") == datetime(2027, 9, 16, 12, 0, tzinfo=timezone.utc)
 
 
 def test_renewing_early_extends_instead_of_losing_the_days_left():
     current = NOW + timedelta(days=5)
-    assert main.paid_period_end(NOW, current, "pro", "pro", "monthly") == current + timedelta(days=31)
+    assert main.paid_period_end(NOW, current, "pro", "pro", "monthly") == current.replace(month=10)
     # A different plan starts today.
-    assert main.paid_period_end(NOW, current, "pro", "growth", "monthly") == NOW + timedelta(days=31)
+    assert main.paid_period_end(NOW, current, "pro", "growth", "monthly") == NOW.replace(month=10)
+
+
+def test_paying_late_in_the_grace_keeps_the_billing_day():
+    due = datetime(2026, 9, 7, 14, 29, tzinfo=timezone.utc)
+    paid_late = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+    assert main.paid_period_end(paid_late, due, "growth", "growth", "monthly") == due.replace(month=10)
+    # After the grace it is a new purchase, starting the day it is paid.
+    lapsed = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+    assert main.paid_period_end(lapsed, due, "growth", "growth", "monthly") == lapsed.replace(month=10)
 
 
 def _profile_db(row):

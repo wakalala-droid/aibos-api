@@ -29,6 +29,7 @@ from engine3 import run_engine3
 from intelligence import run_cross_engine
 from extensions import generate_proposals  # SAFEGUARD Layer 2 (isolated from core)
 import payments
+import billing as billing_api
 
 # ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
 # Isolated modules; the existing file-analysis endpoints above are untouched.
@@ -2428,18 +2429,21 @@ def _secret_ok(expected: Optional[str], given: Optional[str]) -> bool:
     return bool(expected) and hmac.compare_digest(str(expected), str(given or ""))
 
 
-PERIOD_DAYS = {"monthly": 31, "annual": 366}
+def paid_period_end(now, current_until, current_tier: Optional[str], plan: str, billing: str,
+                    anchor_day: Optional[int] = None):
+    """When a payment made `now` runs out. Pure (unit-tested).
 
-
-def paid_period_end(now, current_until, current_tier: Optional[str], plan: str, billing: str):
-    """When a payment made `now` runs out. A renewal of the SAME plan made before
-    the old period ends extends it, so paying a week early loses nothing; any
-    other purchase starts today. Pure (unit-tested)."""
+    A renewal of the SAME plan, paid before the old period ends or during the
+    week of grace after it, runs on from the old end date, on the same day of
+    the month: paying early loses no days and paying late does not move the
+    customer's billing day. Any other purchase starts today. Periods are
+    calendar months (years), not 31 days, which walked the billing day forward
+    through every short month."""
     from datetime import timedelta
-    start = now
-    if current_until is not None and current_tier == plan and current_until > now:
-        start = current_until
-    return start + timedelta(days=PERIOD_DAYS.get(billing, 31))
+    if (current_until is not None and current_tier == plan
+            and now < current_until + timedelta(days=entitlements.GRACE_DAYS)):
+        return billing_api.add_period(current_until, billing, anchor_day or current_until.day)
+    return billing_api.add_period(now, billing)
 
 
 def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly") -> bool:
@@ -2466,12 +2470,16 @@ def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly") -> 
         "tier_granted_at": now.isoformat(),
     }
     try:
-        cur = (db.table("profiles").select("tier,paid_until").eq("id", user_id)
+        cur = (db.table("profiles").select("tier,tier_source,paid_until,created_at").eq("id", user_id)
                .limit(1).execute())
         row = (getattr(cur, "data", None) or [{}])[0]
+        # Only a plan bought for a period has an end to run on from; a demo
+        # grant's leftover date must not decide when a real payment ends.
+        until = (entitlements._parse_ts(row.get("paid_until"))
+                 if row.get("paid_until") and row.get("tier_source") == "payment" else None)
         patch["paid_until"] = paid_period_end(
-            now, entitlements._parse_ts(row.get("paid_until")) if row.get("paid_until") else None,
-            row.get("tier"), tier, billing).isoformat()
+            now, until, row.get("tier"), tier, billing,
+            billing_api.anchor_for(until, entitlements._parse_ts(row.get("created_at")))).isoformat()
     except Exception as e:  # noqa: BLE001 — pre-0033: grant without a period
         log.info("[payments] no paid_until for %s (%s)", user_id, e)
     try:
@@ -2581,14 +2589,22 @@ def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(requi
         raise HTTPException(status_code=400, detail="plan must be 'pro', 'proplus' or 'growth'")
 
     billing = body.billing if body.billing in ("monthly", "annual") else "monthly"
-    amount = PLAN_PRICES[plan][billing]
 
     if not (body.payer_phone or "").strip():
         raise HTTPException(status_code=400, detail="payer_phone is required")
 
+    return _begin_subscription_payment(user_id, network, plan, billing, body.payer_phone, body.currency)
+
+
+def _begin_subscription_payment(user_id: str, network: str, plan: str, billing: str,
+                                payer_phone: str, currency: str = "ZMW") -> dict:
+    """Ask the payer's phone for a plan's price and remember that we asked.
+    Shared by the checkout and by the renewal run, so a renewal settles, grants
+    and extends exactly as a checkout does."""
+    amount = PLAN_PRICES[plan][billing]
     reference = str(uuid.uuid4())
     note = f"AIBOS {PLAN_LABEL.get(plan, plan.capitalize())} ({billing})"
-    state = payments.initiate(network, reference, amount, body.currency, body.payer_phone, note)
+    state = payments.initiate(network, reference, amount, currency, payer_phone, note)
 
     # Bound the store so a flood of initiations can't exhaust memory.
     while len(PAYMENTS) >= MAX_PAYMENTS:
@@ -2600,7 +2616,7 @@ def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(requi
         "plan": plan,
         "billing": billing,
         "amount": amount,
-        "currency": body.currency,
+        "currency": currency,
         "user_id": user_id,           # from the verified JWT, not the body
         "status": state,
         "granted": False,
@@ -2622,8 +2638,8 @@ def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(requi
             db.table("subscription_payments").insert({
                 "reference": reference, "user_id": user_id, "network": network,
                 "plan": plan, "billing": billing, "amount": amount,
-                "currency": body.currency, "status": state, "granted": False,
-                "payer_phone": body.payer_phone.strip()[:32],
+                "currency": currency, "status": state, "granted": False,
+                "payer_phone": payer_phone.strip()[:32],
             }).execute()
         except Exception as e:  # noqa: BLE001 — pre-0033: memory only, as before
             log.warning("[payments] checkout %s kept in memory only (run migration 0033): %s",
@@ -4872,6 +4888,57 @@ def sweep_pending_payments(db) -> dict:
     return out
 
 
+def _renewal_request(user_id: str, plan: str, billing: str) -> Optional[str]:
+    """Send a renewal's payment request to the phone this account last paid
+    with. Returns the last digits of that phone when a request went out.
+
+    Nothing is sent while the network's collections are off, to an account
+    that has never paid by phone, or when a request already went out in the
+    last day (the customer is still looking at the first one)."""
+    db = get_db()
+    if db is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    res = (db.table("subscription_payments").select("network,payer_phone,status,created_at")
+           .eq("user_id", user_id).order("created_at", desc=True).limit(20).execute())
+    rows = getattr(res, "data", None) or []
+    since = (datetime.now(timezone.utc) - timedelta(hours=20)).isoformat()
+    last = next((r for r in rows if r.get("status") == "successful" and r.get("payer_phone")), None)
+    if not last or not payments.provider_configured(last.get("network") or ""):
+        return None
+    phone = str(last["payer_phone"])
+    tail = re.sub(r"\D", "", phone)[-4:]
+    if any(r.get("status") == "pending" and str(r.get("created_at") or "") >= since for r in rows):
+        return tail
+    try:
+        _begin_subscription_payment(user_id, last["network"], plan, billing, phone)
+    except HTTPException as e:
+        log.warning("[billing] renewal request for %s not sent: %s", user_id, e.detail)
+        return None
+    return tail
+
+
+def run_plan_renewals() -> dict:
+    db = get_db()
+
+    def _email(to, subject, body, button):
+        label, link = button
+        url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
+        return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url)))
+
+    return billing_api.run_renewals(db, PLAN_PRICES, request_payment=_renewal_request,
+                                    send_email=_email, record=notify.record_notification)
+
+
+@app.post("/payments/renewals")
+def payments_renewals(x_cron_secret: Optional[str] = Header(default=None)):
+    """Send the plan renewal reminders and payment requests that are due.
+    Cron-only; the API also runs it every hour by itself."""
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    return run_plan_renewals()
+
+
 @app.post("/payments/sweep")
 def payments_sweep(x_cron_secret: Optional[str] = Header(default=None)):
     """Settle pending mobile money payments now. Cron-only, like sync-all."""
@@ -4887,6 +4954,7 @@ def _start_payments_sweeper() -> None:
     import threading
 
     def loop():
+        last_renewals = 0.0
         while True:
             time.sleep(PAYMENTS_SWEEP_SECONDS)
             try:
@@ -4895,6 +4963,14 @@ def _start_payments_sweeper() -> None:
                     log.info("[payments] sweep: %s", result)
             except Exception as e:  # noqa: BLE001 — the loop must outlive any one failure
                 log.warning("[payments] sweep crashed: %s", e)
+            # Renewals by the hour: each reminder is sent once per period, so
+            # running often costs nothing and a restart never skips a day.
+            if time.time() - last_renewals >= 3600:
+                last_renewals = time.time()
+                try:
+                    run_plan_renewals()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[billing] renewal run crashed: %s", e)
 
     threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
 
