@@ -276,6 +276,33 @@ def test_a_signature_on_the_streamed_delta_reaches_the_tool_call():
     assert client.calls[1]["messages"][-2]["tool_calls"][0]["extra_content"] == sig
 
 
+def test_a_whole_call_sent_twice_is_one_call_with_valid_json():
+    whole = '{"category": "fuel"}'
+    round1 = [
+        _chunk(tool_calls=[NS(index=None, id="c1", function=NS(name="query_events", arguments=whole))]),
+        _chunk(tool_calls=[NS(index=None, id="c1", function=NS(name="query_events", arguments=whole))]),
+    ]
+    client = _FakeStreamClient([round1, [_chunk("Fuel is K1,000.")]])
+    out = list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "fuel?"}], _seeded_db(), "u1"))
+    echoed = client.calls[1]["messages"][-2]["tool_calls"]
+    assert len(echoed) == 1
+    assert json.loads(echoed[0]["function"]["arguments"]) == {"category": "fuel"}
+    assert json.loads(client.calls[1]["messages"][-1]["content"])["total_amount"] == 1000
+    assert [d for k, d in out if k == "tool"] == ["query_events"]
+
+
+def test_two_calls_without_an_index_stay_two_calls():
+    round1 = [_chunk(tool_calls=[
+        NS(index=None, id="a", function=NS(name="get_business_snapshot", arguments="{}")),
+        NS(index=None, id="b", function=NS(name="who_owes_me", arguments="{}")),
+    ])]
+    client = _FakeStreamClient([round1, [_chunk("Done.")]])
+    list(cfo_tools.run_agent_loop_stream(client, "m", [{"role": "user", "content": "x"}], _seeded_db(), "u1"))
+    assert [c["function"]["name"] for c in client.calls[1]["messages"][-3]["tool_calls"]] == \
+        ["get_business_snapshot", "who_owes_me"]
+
+
 def test_a_spent_quota_is_not_retried_without_tools():
     class _Quota(Exception):
         status_code = 429

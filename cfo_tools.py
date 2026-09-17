@@ -396,13 +396,44 @@ def _extra_content(obj):
     return value if value else None
 
 
-def _echo_tool_call(call_id: str, name: str, arguments: str, extra_content=None) -> dict:
-    """An assistant tool call, as it is sent back to the provider."""
+def _parse_args(raw) -> dict:
+    """The arguments of a tool call as a dict, from whatever text arrived.
+
+    Streaming providers do not all send arguments in fragments. Gemini sends a
+    whole call in one piece, and can send it again, so appending every piece
+    produced '{"a":1}{"a":1}': not JSON. The tool ran with nothing and the text
+    went back to the provider, which refused the next request as an invalid
+    argument. The first complete object wins."""
+    if isinstance(raw, dict):
+        return raw
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            value, _ = json.JSONDecoder().raw_decode(text)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _echo_tool_call(call_id: str, name: str, arguments, extra_content=None) -> dict:
+    """An assistant tool call, as it is sent back to the provider. The
+    arguments go back as canonical JSON, exactly what the tool was run with."""
     out = {"id": call_id, "type": "function",
-           "function": {"name": name, "arguments": arguments}}
+           "function": {"name": name, "arguments": json.dumps(_parse_args(arguments))}}
     if extra_content:
         out["extra_content"] = extra_content
     return out
+
+
+def _is_whole_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except (TypeError, ValueError):
+        return False
 
 
 def _accumulate_tool_deltas(acc: dict, deltas) -> None:
@@ -410,19 +441,35 @@ def _accumulate_tool_deltas(acc: dict, deltas) -> None:
     Streaming sends a tool call in pieces: the id/name arrive first, then the
     JSON arguments in fragments that must be concatenated in order."""
     for d in deltas or []:
-        i = getattr(d, "index", 0) or 0
+        did = getattr(d, "id", None)
+        i = getattr(d, "index", None)
+        if i is None:
+            # No index: match by id, else a new id is a new call, else the last.
+            same = [k for k, s in acc.items() if did and s["id"] == did]
+            if same:
+                i = same[0]
+            elif did and acc and acc[max(acc)]["id"] not in (None, did):
+                i = max(acc) + 1
+            else:
+                i = max(acc) if acc else 0
         slot = acc.setdefault(i, {"id": None, "name": None, "arguments": "", "extra_content": None})
         extra = _extra_content(d)
         if extra:
             slot["extra_content"] = extra
-        if getattr(d, "id", None):
-            slot["id"] = d.id
+        if did:
+            slot["id"] = did
         fn = getattr(d, "function", None)
         if fn is not None:
             if getattr(fn, "name", None):
                 slot["name"] = fn.name
-            if getattr(fn, "arguments", None):
-                slot["arguments"] += fn.arguments
+            piece = getattr(fn, "arguments", None)
+            if piece:
+                # A piece that is itself a whole object, arriving after a whole
+                # object, is the call sent again: keep one, never glue two.
+                if _is_whole_object(slot["arguments"]) and _is_whole_object(piece):
+                    slot["arguments"] = piece
+                else:
+                    slot["arguments"] += piece
 
 
 def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
@@ -521,10 +568,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         })
         for i, c in sorted(pending.items()):
             name = c["name"] or ""
-            try:
-                args = json.loads(c["arguments"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
+            args = _parse_args(c["arguments"])
             tools_used.append(name)
             yield ("tool", name)
             result = run_tool(db, user_id, name, args, business_id, allowed)
@@ -583,10 +627,7 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                 for tc in tool_calls],
         })
         for tc in tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
+            args = _parse_args(tc.function.arguments)
             tools_used.append(tc.function.name)
             result = run_tool(db, user_id, tc.function.name, args, business_id, allowed)
             convo.append({
