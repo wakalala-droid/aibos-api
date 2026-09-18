@@ -1992,23 +1992,35 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
 
     `ms` on the last frame says where the time went (setup, first word,
     whole answer), so a slow answer can be diagnosed from the browser.
+
+    SETUP RUNS INSIDE THE STREAM. The gate, the plan lookup and the business
+    lookup take a few seconds on a small server, and they used to run before
+    the response began, so the browser heard nothing at all meanwhile and could
+    not tell a slow start from a connection that never opened. Now the answer
+    begins at once (an opening frame) and a refusal arrives as a frame:
+    {"gate": 402 | 503 | 400, "detail": "..."}.
     """
     started = time.monotonic()
-    prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)   # raises 402/500 before any stream
-    prepared = time.monotonic()
-    db = prep["db"]
-    taster_note = prep["taster_note"]
-    deadline = time.monotonic() + _CHAT_BUDGET_SECONDS
+    deadline = started + _CHAT_BUDGET_SECONDS
     timing: Dict[str, float] = {}
 
     def _ms() -> Dict[str, int]:
         now = time.monotonic()
         first = timing.get("first_word")
+        prepared = timing.get("prepared", now)
         return {"setup": int((prepared - started) * 1000),
                 "first_word": int((first - started) * 1000) if first else None,
                 "total": int((now - started) * 1000)}
 
     def events():
+        try:
+            prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)
+        except HTTPException as gate:
+            yield f"data: {json.dumps({'gate': gate.status_code, 'detail': gate.detail})}\n\n"
+            return
+        timing["prepared"] = time.monotonic()
+        db = prep["db"]
+        taster_note = prep["taster_note"]
         try:
             if db is not None:
                 for kind, data in cfo_tools.run_agent_loop_stream(

@@ -293,3 +293,20 @@ def test_a_conversation_that_does_not_alternate_is_made_to():
     assert [m["role"] for m in kept] == ["user", "assistant", "user"]
     assert kept[0]["content"].count("How much cash") == 2
     assert kept[-1]["content"] == "And last month?"
+
+
+def test_the_stream_answers_at_once_even_when_it_must_refuse(monkeypatch):
+    """Setup runs inside the stream, so the browser gets its answer headers
+    straight away and a refusal arrives as a frame, not as a silent wait."""
+    import auth
+    import main
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(auth, "verify_token", lambda token: "u1")
+    monkeypatch.setattr(llm, "configured", lambda: False)
+    res = TestClient(main.app).post("/chat/stream", json={"message": "hi"},
+                                    headers={"Authorization": "Bearer t"})
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    frames = [f for f in res.text.split("\n\n") if f.startswith("data:")]
+    assert '"thinking"' in frames[0]
+    assert '"gate": 503' in frames[1]

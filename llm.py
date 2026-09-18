@@ -264,9 +264,9 @@ def quota_message(exc: Exception | None = None) -> str:
         return ("The AI assistant is answering a lot of questions right now. Please ask "
                 "again in a minute. Your records are all still there.")
     if "PerDay" in text or "per day" in text.lower() or provider() == "gemini":
-        return ("The AI assistant has used up today's free allowance and is resting until "
-                f"{_daily_reset_lusaka()}. Your records are all still there and every other "
-                "page works, including Record and the reports.")
+        return ("The AI assistant has used up today's free allowance, so it is resting. It "
+                f"will be back {_daily_reset_lusaka()}. Your records are all still there and "
+                "every other page works, including Record and the reports.")
     return QUOTA_MESSAGE
 
 
