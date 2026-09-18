@@ -486,6 +486,38 @@ def _create(client, kwargs: dict):
         raise
 
 
+def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
+    """The first request was refused because an allowance is spent.
+
+    Gemini's free limits are per model, so the smaller model gets one go; then
+    the second provider, when one is set (llm.secondary). Only on the first
+    request, before any lookup, because a lookup's thought signature belongs to
+    the model that made it. Returns (client, model, stream, thinking) or raises
+    the last refusal.
+
+    This used to fall through after the smaller model answered and send the
+    question a third time with its lookups stripped, so the answer that came
+    back had been written blind."""
+    fb = llm.fallback_model()
+    if model != fb:
+        log.warning("[cfo] %s quota spent, streaming on %s", model, fb)
+        kwargs["model"] = fb
+        try:
+            return client, fb, _create(client, kwargs), True
+        except Exception as e2:  # noqa: BLE001
+            if not llm.is_quota_error(e2):
+                raise
+            exc = e2
+    second = llm.secondary()
+    if second is None:
+        raise exc
+    client2, model2 = second
+    log.warning("[cfo] allowance spent (%s); answering on the second provider %s", exc, model2)
+    kwargs["model"] = model2
+    kwargs.pop("reasoning_effort", None)
+    return client2, model2, client2.chat.completions.create(**kwargs), False
+
+
 def _out_of_time(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
@@ -516,10 +548,12 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
     convo = list(messages)
     tools_used: list[str] = []
 
+    thinking = True                     # off once the second provider answers
     for round_no in range(max_rounds + 1):
         force_prose = round_no == max_rounds or (round_no > 0 and _out_of_time(deadline))
         kwargs = dict(model=model, messages=convo, temperature=temperature,
-                      max_tokens=max_tokens, stream=True, **llm.reasoning_kwargs())
+                      max_tokens=max_tokens, stream=True,
+                      **(llm.reasoning_kwargs() if thinking else {}))
         schemas = tool_schemas(allowed)
         if not force_prose and schemas:
             kwargs.update(tools=schemas, tool_choice="auto")
@@ -527,16 +561,11 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         try:
             stream = _create(client, kwargs)
         except Exception as e:  # noqa: BLE001
-            # A spent quota on the first request: Gemini's free limits are per
-            # model, so the fallback model can still answer (the buffered loop
-            # already does this through llm.chat_create). Only before any
-            # lookup, because a thought signature belongs to the model that
-            # made it. Any later quota refusal surfaces as it is.
-            if llm.is_quota_error(e) and round_no == 0 and model != llm.fallback_model():
-                log.warning("[cfo] %s quota spent, streaming on %s", model, llm.fallback_model())
-                model = llm.fallback_model()
-                kwargs["model"] = model
-                stream = _create(client, kwargs)
+            # A spent quota on the first request: the smaller model, then the
+            # second provider (see _first_round_elsewhere). Any later quota
+            # refusal surfaces as it is.
+            if llm.is_quota_error(e) and round_no == 0:
+                client, model, stream, thinking = _first_round_elsewhere(client, model, kwargs, e)
             # A provider that refuses the TOOL declarations refuses the whole
             # request, so the owner got nothing at all. An answer without
             # lookups is worth far more than "the answer stopped early", and
@@ -545,11 +574,12 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
             # retry would be refused too, so it is not attempted.
             elif force_prose or "tools" not in kwargs or llm.is_quota_error(e):
                 raise
-            log.warning("[cfo] the provider refused the tool declarations, "
-                        "answering without lookups: %s", e)
-            kwargs.pop("tools", None)
-            kwargs.pop("tool_choice", None)
-            stream = _create(client, kwargs)
+            else:
+                log.warning("[cfo] the provider refused the tool declarations, "
+                            "answering without lookups: %s", e)
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                stream = _create(client, kwargs)
 
         pending: dict = {}
         said_anything = False

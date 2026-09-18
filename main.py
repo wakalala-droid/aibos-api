@@ -2278,6 +2278,10 @@ def health_setup():
         {"key": "ai_chat", "live": llm.configured(),
          "needs": ["GEMINI_API_KEY"],
          "without_it": "The AI CFO chat cannot answer at all."},
+        {"key": "ai_second_provider", "live": llm.secondary_configured(),
+         "needs": ["SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL"],
+         "without_it": "When the free Gemini allowance runs out (most days) the chat and the "
+                       "other AI features stop until about 09:00 Lusaka time."},
         {"key": "booking_email_alerts", "live": on("RESEND_API_KEY"),
          "needs": ["RESEND_API_KEY", "BRIEF_FROM_EMAIL"],
          "without_it": "A booking request reaches the owner in the app only. "

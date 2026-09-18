@@ -310,3 +310,72 @@ def test_the_stream_answers_at_once_even_when_it_must_refuse(monkeypatch):
     frames = [f for f in res.text.split("\n\n") if f.startswith("data:")]
     assert '"thinking"' in frames[0]
     assert '"gate": 503' in frames[1]
+
+
+# ── A second provider when the first has spent its allowance ─────────────────
+
+class _Quota(Exception):
+    status_code = 429
+
+
+def _refusing(calls):
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise _Quota("Error code: 429 - RESOURCE_EXHAUSTED")
+    return NS(chat=NS(completions=NS(create=create)))
+
+
+def test_the_second_provider_is_read_from_three_settings(monkeypatch):
+    for k in ("SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL", "GROQ_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    assert llm.secondary() is None and not llm.secondary_configured()
+    monkeypatch.setenv("SECOND_AI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("SECOND_AI_API_KEY", "k")
+    monkeypatch.setenv("SECOND_AI_MODEL", "some/model")
+    client2, model2 = llm.secondary()
+    assert model2 == "some/model" and client2.max_retries == 0
+    assert llm.secondary_configured()
+
+
+def test_when_every_gemini_model_is_spent_the_second_provider_answers(monkeypatch):
+    calls, second_calls = [], []
+
+    def second_create(**kwargs):
+        second_calls.append(kwargs)
+        return iter([_chunk("Answered by the second provider.")])
+
+    monkeypatch.setattr(llm, "secondary",
+                        lambda: (NS(chat=NS(completions=NS(create=second_create))), "backup-model"))
+    out = list(cfo_tools.run_agent_loop_stream(_refusing(calls), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Answered by the second provider."
+    assert len(calls) == 2                                   # the main model, then the smaller one
+    assert second_calls[0]["model"] == "backup-model"
+    assert "tools" in second_calls[0] and "reasoning_effort" not in second_calls[0]
+
+
+def test_when_the_smaller_model_answers_the_question_is_not_sent_again(monkeypatch):
+    """The smaller model answering used to fall through to a third request with
+    the lookups stripped, so the answer shown had been written blind."""
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _Quota("429 RESOURCE_EXHAUSTED")
+        return iter([_chunk("From the smaller model.")])
+
+    out = list(cfo_tools.run_agent_loop_stream(NS(chat=NS(completions=NS(create=create))), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "From the smaller model."
+    assert len(calls) == 2 and "tools" in calls[1]
+
+
+def test_other_ai_features_also_use_the_second_provider(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, "secondary", lambda: (
+        NS(chat=NS(completions=NS(create=lambda **k: seen.append(k) or "ok"))), "backup-model"))
+    calls = []
+    assert llm.chat_create(_refusing(calls), messages=[], reasoning_effort="low") == "ok"
+    assert seen[0]["model"] == "backup-model" and "reasoning_effort" not in seen[0]

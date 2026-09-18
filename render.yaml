@@ -59,6 +59,15 @@ services:
       - key: GEMINI_API_KEY
         sync: false
 
+      # ── Optional: a second AI for when Gemini's free allowance runs out ─
+      # Any OpenAI-compatible service. All three together, or none.
+      - key: SECOND_AI_BASE_URL
+        sync: false
+      - key: SECOND_AI_API_KEY
+        sync: false
+      - key: SECOND_AI_MODEL
+        sync: false
+
       # ── Without this the browser blocks every call from the site ─────────
       # Comma separated, no trailing slash, e.g.
       #   https://ai-bos.website,https://www.ai-bos.website,https://aibos.vercel.app

@@ -61,6 +61,13 @@ existing prompt and `chat.completions` call carried over untouched.
 if `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) is set, Groq if only `GROQ_API_KEY` is,
 and Gemini wins when both are — so an old key can stay put without fighting it.
 
+**A second AI for when Gemini's free allowance runs out.** Set
+`SECOND_AI_BASE_URL`, `SECOND_AI_API_KEY` and `SECOND_AI_MODEL` to any
+OpenAI-compatible service and every AI feature moves to it when Gemini refuses
+for a spent allowance, then back the next day. `/health/setup` shows it as
+`ai_second_provider`. Without it the chat says it is resting and when it will
+be back.
+
 **One thing does not carry over: audio.** Gemini's compatibility layer has no
 `/audio/transcriptions`, so voice notes go in as `input_audio` inside an ordinary
 chat message instead. `llm.transcribe()` hides the difference; the endpoint calls

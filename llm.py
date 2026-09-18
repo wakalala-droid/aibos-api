@@ -211,6 +211,39 @@ def note_reasoning_rejected() -> None:
     _reasoning_rejected = True
 
 
+# ── A second provider, for when the first has spent its allowance ────────────
+# The free Gemini allowance runs out most days, and until it resets (09:00 in
+# Lusaka) the chat can only say it is resting. A second provider answers
+# instead. Any service with an OpenAI-compatible endpoint works (OpenRouter,
+# Groq, Mistral, Cerebras, OpenAI itself), set with three variables:
+#
+#     SECOND_AI_BASE_URL   e.g. https://openrouter.ai/api/v1
+#     SECOND_AI_API_KEY    the key from that service
+#     SECOND_AI_MODEL      a model there that can call tools
+#
+# With Gemini as the first provider, a GROQ_API_KEY on its own also counts.
+
+def secondary():
+    """(client, model) for the second provider, or None when none is set."""
+    base = (os.environ.get("SECOND_AI_BASE_URL") or "").strip()
+    key = (os.environ.get("SECOND_AI_API_KEY") or "").strip()
+    model = (os.environ.get("SECOND_AI_MODEL") or "").strip()
+    if base and key and model:
+        from openai import OpenAI
+        return (OpenAI(api_key=key, base_url=base, timeout=request_timeout(), max_retries=0), model)
+    if provider() == "gemini" and os.environ.get("GROQ_API_KEY"):
+        from groq import Groq
+        return (Groq(api_key=os.environ["GROQ_API_KEY"], timeout=request_timeout(), max_retries=0),
+                _DEFAULTS["groq"]["chat"])
+    return None
+
+
+def secondary_configured() -> bool:
+    return bool((os.environ.get("SECOND_AI_BASE_URL") and os.environ.get("SECOND_AI_API_KEY")
+                 and os.environ.get("SECOND_AI_MODEL"))
+                or (provider() == "gemini" and os.environ.get("GROQ_API_KEY")))
+
+
 def not_configured_message() -> str:
     return (
         "The AI is not set up on the server. Set GEMINI_API_KEY (a free key "
@@ -293,11 +326,30 @@ def chat_create(client, **kwargs):
             return chat_create(client, **kwargs)
         fb = fallback_model()
         if kwargs.get("model") == fb or not _model_shaped_error(exc):
+            if is_quota_error(exc):
+                return _on_second_provider(kwargs, exc)
             raise
         log.warning("[llm] %s failed on %s (%s) — retrying on %s",
                     "chat", kwargs.get("model"), exc, fb)
         kwargs["model"] = fb
-        return client.chat.completions.create(**kwargs)
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc2:  # noqa: BLE001
+            if is_quota_error(exc2):
+                return _on_second_provider(kwargs, exc2)
+            raise
+
+
+def _on_second_provider(kwargs: dict, exc: Exception):
+    """The same request on the second provider, or the refusal as it was."""
+    second = secondary()
+    if second is None:
+        raise exc
+    client2, model2 = second
+    log.warning("[llm] allowance spent (%s); answering on the second provider %s", exc, model2)
+    retry = {k: v for k, v in kwargs.items() if k != "reasoning_effort"}
+    retry["model"] = model2
+    return client2.chat.completions.create(**retry)
 
 
 # Formats the OpenAI audio message type understands. A voice note recorded in
