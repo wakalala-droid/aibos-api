@@ -20,6 +20,7 @@ Discipline:
 
 import json
 import logging
+import time
 
 import digital_twin as twin
 import nervous_system as nervous
@@ -472,10 +473,28 @@ def _accumulate_tool_deltas(acc: dict, deltas) -> None:
                     slot["arguments"] += piece
 
 
+def _create(client, kwargs: dict):
+    """One provider call, sent again without reasoning_effort if that is what
+    the provider refused (see llm.reasoning_kwargs)."""
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        if "reasoning_effort" in kwargs and llm.is_reasoning_rejection(e):
+            llm.note_reasoning_rejected()
+            kwargs.pop("reasoning_effort", None)
+            return client.chat.completions.create(**kwargs)
+        raise
+
+
+def _out_of_time(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
                           max_rounds: int = MAX_TOOL_ROUNDS,
                           temperature: float = 0.4, max_tokens: int = 1024,
-                          business_id: str | None = None, allowed: frozenset | None = None):
+                          business_id: str | None = None, allowed: frozenset | None = None,
+                          deadline: float | None = None):
     """
     Streaming twin of run_agent_loop (audit #21). Yields (kind, data) tuples:
 
@@ -488,20 +507,25 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
     execute, loop). So an answer that needs no lookup starts typing at once,
     and one that does starts typing the moment the lookups land — no wasted
     extra round-trip either way.
+
+    `deadline` (a time.monotonic() value) bounds the lookups: once it passes,
+    the next round is asked for prose with no tools, so the owner gets an
+    answer from what was found instead of a request that runs until something
+    between them and the server gives up on it.
     """
     convo = list(messages)
     tools_used: list[str] = []
 
     for round_no in range(max_rounds + 1):
-        force_prose = round_no == max_rounds
+        force_prose = round_no == max_rounds or (round_no > 0 and _out_of_time(deadline))
         kwargs = dict(model=model, messages=convo, temperature=temperature,
-                      max_tokens=max_tokens, stream=True)
+                      max_tokens=max_tokens, stream=True, **llm.reasoning_kwargs())
         schemas = tool_schemas(allowed)
         if not force_prose and schemas:
             kwargs.update(tools=schemas, tool_choice="auto")
 
         try:
-            stream = client.chat.completions.create(**kwargs)
+            stream = _create(client, kwargs)
         except Exception as e:  # noqa: BLE001
             # A spent quota on the first request: Gemini's free limits are per
             # model, so the fallback model can still answer (the buffered loop
@@ -512,7 +536,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
                 log.warning("[cfo] %s quota spent, streaming on %s", model, llm.fallback_model())
                 model = llm.fallback_model()
                 kwargs["model"] = model
-                stream = client.chat.completions.create(**kwargs)
+                stream = _create(client, kwargs)
             # A provider that refuses the TOOL declarations refuses the whole
             # request, so the owner got nothing at all. An answer without
             # lookups is worth far more than "the answer stopped early", and
@@ -525,7 +549,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
                         "answering without lookups: %s", e)
             kwargs.pop("tools", None)
             kwargs.pop("tool_choice", None)
-            stream = client.chat.completions.create(**kwargs)
+            stream = _create(client, kwargs)
 
         pending: dict = {}
         said_anything = False
@@ -584,7 +608,8 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
 def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                    max_rounds: int = MAX_TOOL_ROUNDS,
                    temperature: float = 0.4, max_tokens: int = 1024,
-                   business_id: str | None = None, allowed: frozenset | None = None) -> dict:
+                   business_id: str | None = None, allowed: frozenset | None = None,
+                   deadline: float | None = None) -> dict:
     """
     Tool loop: call the model, execute any tool calls, feed results back,
     repeat until it answers in prose (or the round budget runs out — then one
@@ -594,14 +619,15 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
     tools_used: list[str] = []
 
     for round_no in range(max_rounds + 1):
-        force_prose = round_no == max_rounds
+        force_prose = round_no == max_rounds or (round_no > 0 and _out_of_time(deadline))
         schemas = tool_schemas(allowed)
         tool_kwargs = {} if (force_prose or not schemas) else {"tools": schemas, "tool_choice": "auto"}
+        thinking = llm.reasoning_kwargs()
         try:
             completion = llm.chat_create(
                 client,
                 model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
-                **tool_kwargs,
+                **tool_kwargs, **thinking,
             )
         except Exception as e:  # noqa: BLE001 — see the streaming twin above
             if not tool_kwargs or llm.is_quota_error(e):
@@ -611,6 +637,7 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
             completion = llm.chat_create(
                 client,
                 model=model, messages=convo, temperature=temperature, max_tokens=max_tokens,
+                **llm.reasoning_kwargs(),
             )
         msg = completion.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None) or []

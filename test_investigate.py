@@ -80,3 +80,35 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} investigate tests passed ===")
+
+
+def test_a_credit_sale_and_its_payment_are_money_in_once():
+    """A booking posts as a sale on credit and is paid later. "Money in" is
+    cash: the payment, not the sale as well. Counting both made a K2,000 stay
+    read as K4,000 in "why did this month change"."""
+    events = [
+        _ev(1, "Sale", "09-01", 2000, customer="Guest", payment_method="credit"),
+        _ev(2, "CustomerPayment", "09-03", 2000, customer="Guest"),
+        _ev(3, "Sale", "09-05", 300, customer="Walk-in"),               # cash
+    ]
+    flows = investigate.monthly_flows(events)
+    assert flows["2026-09"]["in"] == 2300
+
+
+def test_money_in_and_out_follow_the_cash_figure():
+    """The same events through the twin fold and through here agree on cash."""
+    import digital_twin
+    events = [
+        _ev(1, "Sale", "08-01", 2000, payment_method="credit"),
+        _ev(2, "CustomerPayment", "08-02", 1500),
+        _ev(3, "Purchase", "08-03", 800, payment_method="credit"),
+        _ev(4, "SupplierPayment", "08-04", 500),
+        _ev(5, "InventoryReceipt", "08-05", 400, payment_method="credit"),
+        _ev(6, "Expense", "08-06", 100),
+        _ev(7, "Loan", "08-07", 1000),
+        _ev(8, "Loan", "08-08", 200, direction="repayment"),
+        _ev(9, "Refund", "08-09", 50),
+    ]
+    flows = investigate.monthly_flows(events)["2026-08"]
+    state = digital_twin.project(events)
+    assert round(flows["in"] - flows["out"], 2) == round(state["cash"], 2)

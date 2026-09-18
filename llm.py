@@ -135,11 +135,30 @@ def whisper_model() -> str:
     return transcribe_model()
 
 
+def request_timeout() -> float:
+    """Seconds to wait on the provider before giving up on one request.
+
+    The SDK's own default is ten minutes. The owner waits in front of the chat
+    far less than that, so a stuck request is abandoned and reported instead.
+    For a streamed answer this is the longest gap between two pieces of it."""
+    try:
+        return max(5.0, float(os.environ.get("LLM_TIMEOUT_SECONDS", "40")))
+    except ValueError:
+        return 40.0
+
+
 def client():
     """An OpenAI-shaped client for whichever provider is configured, or None.
 
     Returning None rather than raising lets a caller answer "the AI is not set
     up" in its own words instead of every one of them repeating the check.
+
+    NO AUTOMATIC RETRIES. The SDK retries a refused request twice by default,
+    waiting between tries as long as the provider asks. When the free Gemini
+    allowance is spent every try is refused, and the waiting alone ran past the
+    website's 60 second limit: the chat showed its dots for a minute and then a
+    bare 504. Every caller here already has its own fallback, so a refusal is
+    reported at once instead of being slept on.
     """
     kind, key = provider(), api_key()
     if not kind or not key:
@@ -147,10 +166,49 @@ def client():
 
     if kind == "gemini":
         from openai import OpenAI          # the SDK, pointed at Google
-        return OpenAI(api_key=key, base_url=GEMINI_OPENAI_BASE)
+        return OpenAI(api_key=key, base_url=GEMINI_OPENAI_BASE,
+                      timeout=request_timeout(), max_retries=0)
 
     from groq import Groq
-    return Groq(api_key=key)
+    return Groq(api_key=key, timeout=request_timeout(), max_retries=0)
+
+
+# ── How long the model thinks before it answers ──────────────────────────────
+# Gemini's Flash models think before answering, and left to choose they can
+# think for tens of seconds on a question about a shop's takings. Asking for a
+# low effort answers in a few seconds. The setting is not accepted by every
+# model, so the first refusal switches it off for the life of the process and
+# the request is sent again without it: the chat never breaks over it.
+_reasoning_rejected = False
+
+
+def reasoning_kwargs() -> dict:
+    """{"reasoning_effort": ...} for a chat request, or {} when not to send it.
+
+    LLM_REASONING_EFFORT overrides the default ("low" on Gemini, nothing on
+    Groq); set it to "off" to never send it."""
+    if _reasoning_rejected:
+        return {}
+    value = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
+    if value in ("off", "none-sent", "0", "false"):
+        return {}
+    if not value:
+        value = "low" if provider() == "gemini" else ""
+    return {"reasoning_effort": value} if value else {}
+
+
+def is_reasoning_rejection(exc: Exception) -> bool:
+    """The provider refused the request because of reasoning_effort."""
+    text = str(exc).lower()
+    return ("reasoning" in text or "thinking" in text) and (
+        "400" in text or "invalid" in text or "unsupported" in text or "not supported" in text)
+
+
+def note_reasoning_rejected() -> None:
+    global _reasoning_rejected
+    if not _reasoning_rejected:
+        log.warning("[llm] the provider refused reasoning_effort; not sending it again")
+    _reasoning_rejected = True
 
 
 def not_configured_message() -> str:
@@ -174,6 +232,44 @@ QUOTA_MESSAGE = ("The AI assistant has reached its usage limit for now, so it ca
                  "Please try again a little later.")
 
 
+def _daily_reset_lusaka(now=None) -> str:
+    """When a spent daily allowance comes back, as a Lusaka clock time.
+
+    Google reset the free Gemini allowance at midnight Pacific time, which is
+    09:00 in Lusaka for most of the year and 10:00 in the northern winter.
+    Worked out rather than written down so the hour stays right all year."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        pacific, lusaka = ZoneInfo("America/Los_Angeles"), ZoneInfo("Africa/Lusaka")
+    except Exception:  # noqa: BLE001 — no timezone data on the box
+        return "tomorrow morning"
+    now = now or datetime.now(timezone.utc)
+    here = now.astimezone(pacific)
+    midnight = (here + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    back = midnight.astimezone(lusaka)
+    today = now.astimezone(lusaka).date()
+    when = "today" if back.date() == today else "tomorrow"
+    return f"at about {back.strftime('%H:%M')} Lusaka time {when}"
+
+
+def quota_message(exc: Exception | None = None) -> str:
+    """What to tell the owner when the AI's allowance is spent, and when it returns.
+
+    A per-minute limit clears within a minute; a daily one not until the
+    provider's reset. Saying which is the difference between "wait a moment"
+    and "come back tomorrow"."""
+    text = str(exc or "")
+    if "PerMinute" in text or "per minute" in text.lower():
+        return ("The AI assistant is answering a lot of questions right now. Please ask "
+                "again in a minute. Your records are all still there.")
+    if "PerDay" in text or "per day" in text.lower() or provider() == "gemini":
+        return ("The AI assistant has used up today's free allowance and is resting until "
+                f"{_daily_reset_lusaka()}. Your records are all still there and every other "
+                "page works, including Record and the reports.")
+    return QUOTA_MESSAGE
+
+
 def is_quota_error(exc: Exception) -> bool:
     """The provider refused because the account's quota is spent (HTTP 429).
 
@@ -191,6 +287,10 @@ def chat_create(client, **kwargs):
     try:
         return client.chat.completions.create(**kwargs)
     except Exception as exc:  # noqa: BLE001
+        if "reasoning_effort" in kwargs and is_reasoning_rejection(exc):
+            note_reasoning_rejected()
+            kwargs.pop("reasoning_effort", None)
+            return chat_create(client, **kwargs)
         fb = fallback_model()
         if kwargs.get("model") == fb or not _model_shaped_error(exc):
             raise

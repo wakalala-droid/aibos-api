@@ -10,6 +10,8 @@ record), so a bookkeeper can reconcile in their own tools. Pure CSV building
 import csv
 import io
 
+from digital_twin import cash_direction
+
 
 def _num(v, d=0.0):
     try:
@@ -18,22 +20,23 @@ def _num(v, d=0.0):
         return d
 
 
-# Cash direction per type, mirroring the twin fold — for the ledger's Debit/Credit.
-_INFLOW = {"Sale", "CustomerPayment"}
-_OUTFLOW = {"Purchase", "Expense", "Salary", "SupplierPayment", "TaxPayment",
-            "AssetPurchase", "InventoryReceipt"}
-
-
 def _direction(event_type: str, payload: dict) -> str:
-    """Which way the money went. Loans and refunds go BOTH ways, decided by
-    payload.direction exactly as digital_twin.project folds them: every loan
-    repayment and every refund to a customer was exported as money IN."""
-    d = str((payload or {}).get("direction") or "").lower()
-    if event_type == "Loan":
-        return "out" if d == "repayment" else "in"
-    if event_type == "Refund":
-        return "in" if d == "from_supplier" else "out"
-    return "in" if event_type in _INFLOW else "out" if event_type in _OUTFLOW else ""
+    """Which way the money went, from the twin fold's own cash rule
+    (digital_twin.cash_direction).
+
+    A sale on credit moved no cash: it is money the customer owes, and it
+    becomes money in when the customer pays (a CustomerPayment row). Exported
+    as "in" as well, the ledger showed every credit sale's cash twice. It now
+    reads "receivable"; a credit purchase reads "payable"."""
+    direction = cash_direction(event_type, payload)
+    if direction:
+        return direction
+    on_credit = str((payload or {}).get("payment_method", "")).lower() == "credit"
+    if on_credit and event_type == "Sale":
+        return "receivable"
+    if on_credit and event_type in ("Purchase", "InventoryReceipt"):
+        return "payable"
+    return ""
 
 
 def _cell(value) -> str:

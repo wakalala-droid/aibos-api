@@ -38,3 +38,18 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} exports tests passed ===")
+
+
+def test_a_credit_sale_is_a_receivable_not_money_in():
+    evs = [
+        {"id": "s", "status": "confirmed", "event_type": "Sale", "occurred_at": "2026-09-01T09:00:00+00:00",
+         "payload": {"amount": 2000, "customer": "Guest", "payment_method": "credit"}},
+        {"id": "p", "status": "confirmed", "event_type": "CustomerPayment", "occurred_at": "2026-09-03T09:00:00+00:00",
+         "payload": {"amount": 2000, "customer": "Guest"}},
+        {"id": "b", "status": "confirmed", "event_type": "Purchase", "occurred_at": "2026-09-02T09:00:00+00:00",
+         "payload": {"amount": 500, "supplier": "Zamsugar", "payment_method": "credit"}},
+    ]
+    lines = exports.events_csv(evs).strip().splitlines()
+    assert lines[1].startswith("2026-09-03,CustomerPayment,confirmed,2000.00,in,")
+    assert lines[2].startswith("2026-09-02,Purchase,confirmed,500.00,payable,")
+    assert lines[3].startswith("2026-09-01,Sale,confirmed,2000.00,receivable,")

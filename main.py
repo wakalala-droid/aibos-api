@@ -47,6 +47,7 @@ import parties as parties_api
 import customer_intel
 import invoices as invoices_api
 import cfo_tools
+import chat_history
 import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
@@ -128,7 +129,11 @@ app.add_middleware(
     allow_origins=_origins,
     allow_credentials=False,          # auth is a Bearer token, never a cookie
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    # X-Business-Id / X-Acting-As: which books a request is about. The chat
+    # streams straight from the browser to here (the website's own relay cuts
+    # any request off at 60 seconds), and without these two on the list the
+    # browser refused to send the request at all.
+    allow_headers=["Authorization", "Content-Type", "X-Business-Id", "X-Acting-As"],
 )
 
 
@@ -1752,20 +1757,44 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
 # result, and an unbounded history ran up the provider bill. Only the owner's
 # own words and the replies they were given come through, and not too many.
 _CHAT_ROLES = ("user", "assistant")
-_CHAT_MAX_TURNS = 20
+_CHAT_MAX_TURNS = 30
 _CHAT_MAX_CHARS = 8000
+# How long the lookups may run before the model is asked to answer with what
+# it has. Well inside every limit between the owner and this server, so an
+# answer always arrives instead of a timeout.
+_CHAT_BUDGET_SECONDS = float(os.environ.get("CHAT_TIME_BUDGET_SECONDS", "35"))
+# A comment line sent while the model is thinking or a lookup is running, so
+# nothing between the browser and here mistakes a quiet answer for a dead one.
+_CHAT_HEARTBEAT_SECONDS = 8.0
 
 
 def _clean_history(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    out = []
+    """The conversation as the model is sent it: turns that alternate, starting
+    with the owner.
+
+    The browser now sends the whole recent conversation (the chat's memory),
+    and a real conversation does not always alternate: a question whose answer
+    failed is followed by the owner asking again, and a long-press explanation
+    is an answer nobody asked in words. Some providers refuse two turns from
+    the same side in a row, or a conversation that opens with the assistant, so
+    back-to-back turns are joined and a leading answer is dropped.
+    """
+    out: List[Dict[str, str]] = []
     for m in messages or []:
         if not isinstance(m, dict) or m.get("role") not in _CHAT_ROLES:
             continue
         content = m.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
-        out.append({"role": m["role"], "content": content[:_CHAT_MAX_CHARS]})
-    return out[-_CHAT_MAX_TURNS:]
+        if out and out[-1]["role"] == m["role"]:
+            # Keep the most recent words when a joined turn runs long.
+            out[-1]["content"] = (out[-1]["content"] + "\n\n" + content)[-_CHAT_MAX_CHARS:]
+        else:
+            out.append({"role": m["role"], "content": content[:_CHAT_MAX_CHARS]})
+    out = out[-_CHAT_MAX_TURNS:]
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out
 
 
 def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str] = None,
@@ -1909,6 +1938,46 @@ def _safe_error(exc: Exception, limit: int = 240) -> str:
     return text
 
 
+def _with_heartbeat(frames, every: float = _CHAT_HEARTBEAT_SECONDS):
+    """Relay SSE frames, with an opening frame at once and a comment line
+    whenever nothing has been sent for `every` seconds.
+
+    A question that needs lookups can be quiet for twenty seconds while the
+    model thinks and the records are read. Browsers and the hosts in between
+    treat a long silent response as a dead one; a comment line (": ...") is
+    ignored by the reader and keeps the line visibly alive. The frames are
+    produced on a worker thread so the silence can be measured at all.
+    """
+    import queue
+    import threading
+
+    q: "queue.Queue" = queue.Queue()
+    done = object()
+
+    def pump():
+        try:
+            for frame in frames:
+                q.put(frame)
+        except BaseException as exc:  # noqa: BLE001 — handed to the reader below
+            q.put(("__error__", exc))
+        finally:
+            q.put(done)
+
+    threading.Thread(target=pump, name="chat-stream", daemon=True).start()
+    yield f"data: {json.dumps({'status': 'thinking'})}\n\n"
+    while True:
+        try:
+            item = q.get(timeout=every)
+        except queue.Empty:
+            yield ": still working\n\n"
+            continue
+        if item is done:
+            return
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+            raise item[1]
+        yield item
+
+
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30, 60)),
                 x_business_id: Optional[str] = Header(default=None),
@@ -1924,6 +1993,7 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
     prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)   # raises 402/500 before any stream
     db = prep["db"]
     taster_note = prep["taster_note"]
+    deadline = time.monotonic() + _CHAT_BUDGET_SECONDS
 
     def events():
         try:
@@ -1933,6 +2003,7 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                     [{"role": "system", "content": prep["tool_system"]}, *prep["chat_messages"]],
                     db, prep["tenant"],
                     business_id=prep["business_id"], allowed=prep["allowed_tools"],
+                    deadline=deadline,
                 ):
                     if kind == "token":
                         yield f"data: {json.dumps({'t': data})}\n\n"
@@ -1945,10 +2016,11 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                 return
 
             # No persistence configured → single-shot, still streamed.
-            stream = prep["client"].chat.completions.create(
+            stream = llm.chat_create(
+                prep["client"],
                 model=llm.chat_model(),
                 messages=[{"role": "system", "content": prep["system_prompt"]}, *prep["chat_messages"]],
-                max_tokens=1024, temperature=0.7, stream=True,
+                max_tokens=1024, temperature=0.7, stream=True, **llm.reasoning_kwargs(),
             )
             for chunk in stream:
                 choices = getattr(chunk, "choices", None) or []
@@ -1968,12 +2040,12 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
             if llm.is_quota_error(exc):
                 # retry:false — the browser's buffered fallback would only spend
                 # another request against the same spent quota.
-                yield f"data: {json.dumps({'error': llm.QUOTA_MESSAGE, 'retry': False})}\n\n"
+                yield f"data: {json.dumps({'error': llm.quota_message(exc), 'retry': False})}\n\n"
             else:
                 detail = 'The answer stopped early. ' + _safe_error(exc)
                 yield f"data: {json.dumps({'error': detail})}\n\n"
 
-    return StreamingResponse(events(), media_type="text/event-stream", headers={
+    return StreamingResponse(_with_heartbeat(events()), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",          # tell any proxy not to buffer us
         "Connection": "keep-alive",
@@ -2013,6 +2085,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
                     [{"role": "system", "content": prep["tool_system"]}, *chat_messages],
                     db, prep["tenant"],
                     business_id=prep["business_id"], allowed=prep["allowed_tools"],
+                    deadline=time.monotonic() + _CHAT_BUDGET_SECONDS,
                 )
                 if (out.get("reply") or "").strip():
                     reply = out["reply"] + (taster_note or "")
@@ -2026,7 +2099,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
                 logger.warning("chat tool-loop returned empty reply — using single-shot fallback")
             except Exception as exc:  # noqa: BLE001
                 if llm.is_quota_error(exc):
-                    raise HTTPException(status_code=503, detail=llm.QUOTA_MESSAGE)
+                    raise HTTPException(status_code=503, detail=llm.quota_message(exc))
                 logger.warning("chat tool-loop failed (%s) — using single-shot fallback", exc)
 
         completion = llm.chat_create(
@@ -2038,6 +2111,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
             max_tokens=1024,
             temperature=0.7,
             stream=False,
+            **llm.reasoning_kwargs(),
         )
 
         response_text = (completion.choices[0].message.content or "") + (taster_note or "")
@@ -2053,7 +2127,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
         raise
     except Exception as exc:
         if llm.is_quota_error(exc):
-            raise HTTPException(status_code=503, detail=llm.QUOTA_MESSAGE)
+            raise HTTPException(status_code=503, detail=llm.quota_message(exc))
         logger.error("Chat error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(
             status_code=500,
@@ -2081,7 +2155,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 33
+EXPECTS_MIGRATION = 34
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -4628,9 +4702,17 @@ def hospitality_get_booking(booking_id: str, ctx: membership.Context = Depends(m
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
-        return {"ok": True, "booking": hospitality_api.get_booking(db, ctx.tenant, booking_id)}
+        booking = hospitality_api.get_booking(db, ctx.tenant, booking_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    # With the guest, as the list returns it. The bookings list opens a stay
+    # through here, and without the join the panel showed no name, phone or
+    # email for a booking whose guest was on file.
+    try:
+        booking = hospitality_api.attach_guests(db, ctx.tenant, [booking])[0]
+    except Exception as e:  # noqa: BLE001 — the booking itself still opens
+        log.warning("[hospitality] guest join failed for booking %s: %s", booking_id, e)
+    return {"ok": True, "booking": booking}
 
 
 @app.patch("/hospitality/bookings/{booking_id}")
@@ -5139,6 +5221,32 @@ def public_stay_booking_request(site_token: str, request: Request,
 # ── Notifications ───────────────────────────────────────────────────────────
 # The durable half of "tell me whenever a booking is made". A row here does not
 # depend on a mail key being set, which is why the promise rests on it.
+
+# ── The AI chat's memory (migration 0034) ─────────────────────────────────────
+# Each person's conversation, per business, so the chat shows it again on any
+# device and the AI answers "and last month?" in the context of what came
+# before. Scoped by who is typing (ctx.actor) and the business they are in.
+
+class ChatHistoryAppend(BaseModel):
+    messages: List[Dict[str, Any]] = []
+
+
+@app.get("/chat/history")
+def chat_history_load(limit: int = Query(80),
+                      ctx: membership.Context = Depends(membership.require_context)):
+    return chat_history.load(_require_db(), ctx.actor, ctx.business_id, limit)
+
+
+@app.post("/chat/history")
+def chat_history_append(body: ChatHistoryAppend,
+                        ctx: membership.Context = Depends(membership.require_context)):
+    return chat_history.append(_require_db(), ctx.actor, ctx.business_id, body.messages)
+
+
+@app.delete("/chat/history")
+def chat_history_clear(ctx: membership.Context = Depends(membership.require_context)):
+    return chat_history.clear(_require_db(), ctx.actor, ctx.business_id)
+
 
 @app.get("/notifications")
 def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),

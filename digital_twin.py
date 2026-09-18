@@ -52,6 +52,33 @@ EVENT_TYPES = (
 )
 
 
+def cash_direction(event_type: str, payload: dict | None) -> str:
+    """Which way CASH moved for one event: "in", "out", or "" for none.
+
+    The cash column of the fold table above, as one function, so every report
+    that talks about "money in" agrees with the cash figure. Two of them kept
+    their own lists and counted every Sale as money in. Since bookings post as
+    credit sales that are paid later, a K2,000 stay then showed as K4,000 of
+    money in: once when booked, again when the guest paid.
+    """
+    p = payload or {}
+    on_credit = str(p.get("payment_method", "")).lower() == "credit"
+    direction = str(p.get("direction") or "").lower()
+    if event_type == "Sale":
+        return "" if on_credit else "in"
+    if event_type == "CustomerPayment":
+        return "in"
+    if event_type in ("Purchase", "InventoryReceipt"):
+        return "" if on_credit else "out"
+    if event_type in ("SupplierPayment", "Expense", "Salary", "TaxPayment", "AssetPurchase"):
+        return "out"
+    if event_type == "Loan":
+        return "out" if direction == "repayment" else "in"
+    if event_type == "Refund":
+        return "in" if direction == "from_supplier" else "out"
+    return ""
+
+
 def _num(v, default=0.0) -> float:
     # A NaN or infinity already in the log counts as nothing: one of them used
     # to turn every figure it touched into NaN (see nervous_system._non_finite).

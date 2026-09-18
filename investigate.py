@@ -18,13 +18,16 @@ them. Offline-tested in test_investigate.py.
 import logging
 from collections import defaultdict
 
+from digital_twin import cash_direction
+
 log = logging.getLogger("aibos.investigate")
 
-# Money direction per event type, mirroring the twin fold (digital_twin.py):
-# inflows count toward money-in, outflows toward money-out.
-_IN_TYPES = ("Sale", "CustomerPayment")
-_OUT_TYPES = ("Purchase", "Expense", "Salary", "SupplierPayment", "TaxPayment",
-              "InventoryReceipt", "AssetPurchase")
+# Money in and money out are CASH, decided per event by the twin fold itself
+# (digital_twin.cash_direction). This file kept its own list that counted every
+# Sale as money in, so a sale on credit (every booking, since bookings wait for
+# the guest to pay) was counted when made AND again when paid: a K2,000 stay
+# read as K4,000 in "why did this month change". A credit sale is income, not
+# money in; the payment is the money in.
 
 MIN_MONTHS = 4          # honest floor: a z-score over 3 points is noise
 Z_THRESHOLD = 2.0
@@ -58,12 +61,10 @@ def monthly_flows(events: list) -> dict:
         m = _month(ev)
         if m == "unknown":
             continue
-        amt = _num((ev.get("payload") or {}).get("amount"))
-        et = ev.get("event_type")
-        if et in _IN_TYPES:
-            out[m]["in"] += amt
-        elif et in _OUT_TYPES:
-            out[m]["out"] += amt
+        payload = ev.get("payload") or {}
+        direction = cash_direction(ev.get("event_type"), payload)
+        if direction:
+            out[m][direction] += _num(payload.get("amount"))
     return dict(out)
 
 
@@ -120,8 +121,8 @@ def investigate_month(events: list, month: str, baseline_months: int = 3) -> dic
             if ev.get("status") != "confirmed" or _month(ev) not in target_months:
                 continue
             et = ev.get("event_type")
-            direction = "in" if et in _IN_TYPES else "out" if et in _OUT_TYPES else None
-            if direction is None:
+            direction = cash_direction(et, ev.get("payload") or {})
+            if not direction:
                 continue
             g = groups[(direction, _bucket_label(ev), et)]
             g["amount"] += _num((ev.get("payload") or {}).get("amount"))
