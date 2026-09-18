@@ -1988,12 +1988,25 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
     same citations as /chat — which stays as the non-streaming fallback for any
     client that can't stream.
 
-    Frames: {"tool": name} · {"t": "…"} · {"done": true, "tools_used": [...]}
+    Frames: {"tool": name} · {"t": "…"} · {"done": true, "tools_used": [...], "ms": {...}}
+
+    `ms` on the last frame says where the time went (setup, first word,
+    whole answer), so a slow answer can be diagnosed from the browser.
     """
+    started = time.monotonic()
     prep = _prepare_chat(req, user_id, x_business_id, x_acting_as)   # raises 402/500 before any stream
+    prepared = time.monotonic()
     db = prep["db"]
     taster_note = prep["taster_note"]
     deadline = time.monotonic() + _CHAT_BUDGET_SECONDS
+    timing: Dict[str, float] = {}
+
+    def _ms() -> Dict[str, int]:
+        now = time.monotonic()
+        first = timing.get("first_word")
+        return {"setup": int((prepared - started) * 1000),
+                "first_word": int((first - started) * 1000) if first else None,
+                "total": int((now - started) * 1000)}
 
     def events():
         try:
@@ -2006,13 +2019,14 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                     deadline=deadline,
                 ):
                     if kind == "token":
+                        timing.setdefault("first_word", time.monotonic())
                         yield f"data: {json.dumps({'t': data})}\n\n"
                     elif kind == "tool":
                         yield f"data: {json.dumps({'tool': data})}\n\n"
                     elif kind == "done":
                         if taster_note:
                             yield f"data: {json.dumps({'t': taster_note})}\n\n"
-                        yield f"data: {json.dumps({'done': True, **data})}\n\n"
+                        yield f"data: {json.dumps({'done': True, **data, 'ms': _ms()})}\n\n"
                 return
 
             # No persistence configured → single-shot, still streamed.
@@ -2279,6 +2293,21 @@ def health_setup():
     missing = [f["key"] for f in features if not f["live"]]
     return {"ok": True, "features": features, "missing": missing,
             "all_live": not missing}
+
+
+@app.get("/health/stream")
+def health_stream():
+    """Four numbered ticks, 1.5 seconds apart, as Server-Sent Events.
+
+    No data and no login: it proves whether a streamed answer reaches the
+    browser piece by piece, or whether something between here and there holds
+    the pieces back until the end. The AI chat depends on the first."""
+    def ticks():
+        for i in range(4):
+            yield f"data: {json.dumps({'n': i, 'at': round(time.time(), 2)})}\n\n"
+            time.sleep(1.5)
+    return StreamingResponse(ticks(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
 @app.get("/health/ai")
