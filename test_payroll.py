@@ -133,3 +133,73 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("all payroll tests passed")
+
+
+# ── Deleting a run made by mistake ──────────────────────────────────────────
+
+class _Rows:
+    """A tiny in-memory table store: select/update/delete with eq + limit."""
+    def __init__(self, tables):
+        self.tables = tables
+
+    def table(self, name):
+        return _Query(self, name)
+
+
+class _Query:
+    def __init__(self, db, name):
+        self.db, self.name, self.op, self.data, self.filters = db, name, "select", None, []
+
+    def select(self, *_): self.op = "select"; return self
+    def update(self, data): self.op, self.data = "update", data; return self
+    def delete(self): self.op = "delete"; return self
+    def eq(self, k, v): self.filters.append((k, v)); return self
+    def order(self, *a, **k): return self
+    def limit(self, n): return self
+
+    def execute(self):
+        from types import SimpleNamespace as NS
+        rows = self.db.tables.setdefault(self.name, [])
+        hit = [r for r in rows if all(r.get(k) == v for k, v in self.filters)]
+        if self.op == "update":
+            for r in hit:
+                r.update(self.data)
+        elif self.op == "delete":
+            self.db.tables[self.name] = [r for r in rows if r not in hit]
+        return NS(data=[dict(r) for r in hit])
+
+
+def test_deleting_a_run_undoes_its_books_and_frees_the_month(monkeypatch):
+    import nervous_system
+    voided = []
+    monkeypatch.setattr(nervous_system, "void",
+                        lambda db, uid, eid, reason=None, **k: voided.append((eid, reason)))
+    db = _Rows({
+        "payroll_runs": [{"id": "r1", "user_id": "u1", "period": "2025-12", "totals": {
+            "remittances": [{"event_id": "tax-pending"}, {"event_id": "tax-paid"}]}}],
+        "payslips": [
+            {"id": "p1", "run_id": "r1", "user_id": "u1", "employee_id": "e1",
+             "employee_name": "Grace", "linked_event_id": "wage-1", "loan_deduction": 200},
+            {"id": "p2", "run_id": "r1", "user_id": "u1", "employee_id": "e2",
+             "employee_name": "Mumba", "linked_event_id": None, "loan_deduction": 0},
+        ],
+        "employees": [{"id": "e1", "user_id": "u1", "loan_balance": 100}],
+        "business_events": [
+            {"id": "tax-pending", "user_id": "u1", "status": "pending"},
+            {"id": "tax-paid", "user_id": "u1", "status": "confirmed"},
+        ],
+    })
+    out = payroll.delete_run(db, "u1", "r1")
+    assert out["wages_voided"] == 1 and out["tax_drafts_voided"] == 1
+    assert out["tax_payments_kept"] == 1              # money that really left stays
+    assert out["loans_restored"] == 1 and db.tables["employees"][0]["loan_balance"] == 300
+    assert [e for e, _ in voided] == ["wage-1", "tax-pending"]
+    assert db.tables["payslips"] == [] and db.tables["payroll_runs"] == []
+
+
+def test_someone_elses_run_cannot_be_deleted():
+    import pytest
+    db = _Rows({"payroll_runs": [{"id": "r1", "user_id": "owner", "period": "2026-01"}]})
+    with pytest.raises(ValueError):
+        payroll.delete_run(db, "intruder", "r1")
+    assert db.tables["payroll_runs"]

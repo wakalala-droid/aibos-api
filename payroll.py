@@ -580,6 +580,72 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     return run
 
 
+def delete_run(db, user_id: str, run_id: str) -> dict:
+    """Undo a payroll run made by mistake, books included.
+
+    A run can only be made once per month, so a run for the wrong month, or a
+    test, sat in the list for good with its wages in the books. Deleting it:
+
+      - voids each wage it posted (voided, never erased: the audit trail keeps
+        them, and the cash figure goes back up)
+      - voids the tax payments it drafted that are still waiting to be paid; a
+        tax payment already marked paid is real money that left, so it stays
+        and is reported back
+      - gives back any staff loan instalment it took
+      - removes its payslips and the run itself, so that month can be run again
+    """
+    import nervous_system as nervous
+    run = get_run(db, user_id, run_id)                      # ValueError when not theirs
+    period = run.get("period")
+    reason = f"Payroll run for {period} deleted"
+    out = {"period": period, "wages_voided": 0, "tax_drafts_voided": 0,
+           "tax_payments_kept": 0, "loans_restored": 0}
+
+    for slip in run.get("payslips") or []:
+        eid = slip.get("linked_event_id")
+        if eid:
+            try:
+                nervous.void(db, user_id, eid, reason=reason)
+                out["wages_voided"] += 1
+            except Exception as exc:  # noqa: BLE001 — an already-removed wage must not block the rest
+                log.warning("[payroll] could not void wage %s: %s", eid, exc)
+        loan = _num(slip.get("loan_deduction"))
+        if loan > 0 and slip.get("employee_id"):
+            try:
+                res = (db.table("employees").select("loan_balance")
+                       .eq("id", slip["employee_id"]).eq("user_id", user_id).limit(1).execute())
+                rows = getattr(res, "data", None) or []
+                if rows:
+                    restored = round(_num(rows[0].get("loan_balance")) + loan, 2)
+                    (db.table("employees").update({"loan_balance": restored})
+                     .eq("id", slip["employee_id"]).eq("user_id", user_id).execute())
+                    out["loans_restored"] += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[payroll] could not restore loan for %s: %s", slip.get("employee_id"), exc)
+
+    for draft in (run.get("totals") or {}).get("remittances") or []:
+        eid = draft.get("event_id") if isinstance(draft, dict) else None
+        if not eid:
+            continue
+        try:
+            res = (db.table("business_events").select("id,status")
+                   .eq("id", eid).eq("user_id", user_id).limit(1).execute())
+            rows = getattr(res, "data", None) or []
+            if not rows or rows[0].get("status") == "void":
+                continue
+            if rows[0].get("status") == "confirmed":
+                out["tax_payments_kept"] += 1
+                continue
+            nervous.void(db, user_id, eid, reason=reason)
+            out["tax_drafts_voided"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[payroll] could not void tax draft %s: %s", eid, exc)
+
+    db.table("payslips").delete().eq("run_id", run_id).eq("user_id", user_id).execute()
+    db.table("payroll_runs").delete().eq("id", run_id).eq("user_id", user_id).execute()
+    return out
+
+
 def _totals(slips: list) -> dict:
     keys = ("gross", "napsa_employee", "napsa_employer", "nhima_employee",
             "paye", "loan_deduction", "net", "gratuity_accrued")

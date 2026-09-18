@@ -4391,6 +4391,18 @@ class PayrollRunRequest(BaseModel):
     preview: bool = False                   # compute-only, no persistence, no events
 
 
+@app.delete("/payroll/runs/{run_id}")
+def delete_payroll_run(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """Undo a run made by mistake: its wages voided in the books, its unpaid tax
+    drafts voided, loan instalments given back, the month free to run again.
+    Owner only, like running payroll."""
+    db = _require_db()
+    try:
+        return {"ok": True, **payroll_api.delete_run(db, ctx.tenant, run_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/payroll/run")
 def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(membership.require_owner)):
     """Compute a pay period. Preview is free (the on-screen table); committing —
