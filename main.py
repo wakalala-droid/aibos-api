@@ -2191,7 +2191,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 34
+EXPECTS_MIGRATION = 35
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -2941,6 +2941,15 @@ def payments_callback(network: str, body: Dict[str, Any],
         except Exception as e:  # noqa: BLE001 — a webhook must not 500 at the provider
             log.error("[payments] invoice callback failed (ref=%s): %s", reference, e)
             return {"ok": False, "detail": "settlement error"}
+        try:
+            res = (db.table("booking_payments").select("*")
+                   .eq("reference", reference).limit(1).execute())
+            rows = getattr(res, "data", None) or []
+            if rows:
+                status = _settle_booking_payment(db, rows[0], resolved) if resolved else rows[0]["status"]
+                return {"ok": True, "status": status}
+        except Exception as e:  # noqa: BLE001 — pre-0035, or a settlement fault
+            log.info("[payments] stay callback lookup (ref=%s): %s", reference, e)
 
     return {"ok": False, "detail": "unknown reference"}
 
@@ -4317,6 +4326,172 @@ def public_pay_status(token: str, reference: str, request: Request):
     return {"ok": True, "reference": reference, "status": status}
 
 
+# ── Payment links for stays (upgrade 3, migration 0035) ───────────────────────
+# The same shape as invoice payment links above: a token in a link the guest
+# opens, a mobile money prompt, persisted collections settled exactly once. A
+# payment that arrives goes through hospitality.record_link_payment, which is
+# update_booking, so the books take it exactly as they take the owner's own
+# "Deposit paid" and "Paid in full".
+
+class StayPayLinkRequest(BaseModel):
+    amount: Optional[float] = None     # None: everything still owed; a number: a deposit
+
+
+@app.post("/hospitality/bookings/{booking_id}/pay-link")
+def hospitality_booking_pay_link(booking_id: str, body: StayPayLinkRequest = Body(default=None),
+                                 ctx: membership.Context = Depends(membership.require_write)):
+    """Make the payment link a guest opens to pay for their stay."""
+    _require_hospitality(ctx.tenant)
+    db = _require_db()
+    try:
+        out = hospitality_api.ensure_pay_link(db, ctx.tenant, booking_id,
+                                              (body.amount if body else None))
+    except hospitality_api.StayLinksNotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "url": f"{PUBLIC_APP_URL.rstrip('/')}/pay/stay/{out['token']}",
+            "owed": out["owed"], "requested": out["requested"]}
+
+
+def _stay_or_404(db, token: str) -> Dict[str, Any]:
+    try:
+        booking = hospitality_api.get_by_pay_token(db, token)
+    except hospitality_api.StayLinksNotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not booking:
+        raise HTTPException(status_code=404, detail="This payment link is not valid.")
+    return booking
+
+
+def _unit_name(db, user_id: str, unit_id: Optional[str]) -> Optional[str]:
+    if not unit_id:
+        return None
+    try:
+        res = (db.table("units").select("unit_name").eq("id", unit_id)
+               .eq("user_id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        return rows[0].get("unit_name") if rows else None
+    except Exception:  # noqa: BLE001 — a nameless unit still takes the payment
+        return None
+
+
+@app.get("/pay/stay/{token}")
+def public_stay(token: str, request: Request):
+    """What the guest sees: whose place, which dates, what is due."""
+    _throttle_public(request, "pay_view", 240, 60, token=token, token_limit=120)
+    db = _require_db()
+    booking = _stay_or_404(db, token)
+    try:
+        booking = hospitality_api.attach_guests(db, booking["user_id"], [booking])[0]
+    except Exception:  # noqa: BLE001
+        pass
+    name, logo = _business_brand_for(db, booking["user_id"])
+    return {"ok": True,
+            "stay": hospitality_api.public_stay_view(
+                booking, _unit_name(db, booking["user_id"], booking.get("unit_id")), name, logo),
+            "networks": payments.configured_networks()}
+
+
+@app.post("/pay/stay/{token}/initiate")
+def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
+    """Ask the guest's phone for the amount the link is due."""
+    _throttle_public(request, "pay_initiate", 60, 60, token=token, token_limit=5)
+    db = _require_db()
+    booking = _stay_or_404(db, token)
+    network = (body.network or "").lower()
+    if network not in ("mtn", "airtel"):
+        raise HTTPException(status_code=400, detail="Choose MTN or Airtel.")
+    if not (body.payer_phone or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the phone number to charge.")
+    # The amount is the booking's, read here. Nothing the guest sends sets it.
+    amount = hospitality_api.amount_due(booking)
+    if amount <= 0.005:
+        raise HTTPException(status_code=409, detail="Nothing is owed on this stay. Thank you!")
+    currency = booking.get("currency") or "ZMW"
+    reference = str(uuid.uuid4())
+    note = f"Stay {str(booking.get('check_in'))[:10]}" + (f" ref {booking['reference']}" if booking.get("reference") else "")
+    state = payments.initiate(network, reference, amount, currency, body.payer_phone, note)
+    if state == "unconfigured":
+        raise HTTPException(status_code=503,
+                            detail="Paying by mobile money isn't switched on yet. Please pay the property directly.")
+    if state == "failed":
+        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
+    db.table("booking_payments").insert({
+        "booking_id": booking["id"], "user_id": booking["user_id"], "reference": reference,
+        "network": network, "payer_phone": body.payer_phone.strip(),
+        "amount": amount, "currency": currency, "status": state,
+    }).execute()
+    return {"ok": True, "reference": reference, "status": state, "amount": amount, "currency": currency}
+
+
+def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
+    """Apply a resolved status once; on success the booking records the money.
+    `settled` is claimed with a conditional write first, so a status check and
+    the provider's confirmation cannot both record it."""
+    if new_status not in ("successful", "failed") or new_status == row.get("status"):
+        return row.get("status", "pending")
+    db.table("booking_payments").update({"status": new_status}).eq("id", row["id"]).execute()
+    row["status"] = new_status
+    if new_status != "successful" or row.get("settled"):
+        return new_status
+    claimed = (db.table("booking_payments").update({"settled": True})
+               .eq("id", row["id"]).eq("settled", False).execute())
+    if not (getattr(claimed, "data", None) or []):
+        return new_status
+    row["settled"] = True
+    money = billing_api.money(float(row.get("amount") or 0))
+    try:
+        saved = hospitality_api.record_link_payment(db, row["user_id"], row["booking_id"],
+                                                    float(row.get("amount") or 0))
+        notify.record_notification(
+            db, row["user_id"], "booking_paid_by_link",
+            f"A guest paid {money} for their stay",
+            f"{str(saved.get('check_in'))[:10]} to {str(saved.get('check_out'))[:10]}: "
+            f"{'paid in full' if saved.get('payment_status') == 'paid' else 'deposit received'} "
+            f"by {row['network'].upper()} mobile money, reference {row['reference']}. "
+            "It is in your books.",
+            link=f"/dashboard/hospitality?booking={row['booking_id']}",
+            meta={"booking_id": f"pay-{row['reference']}"})
+    except ValueError as e:
+        # Cancelled while the guest was approving. Their money arrived anyway,
+        # so the owner must hear about it: it is owed back or to be recorded.
+        log.warning("[pay] stay payment %s arrived but booking %s: %s",
+                    row["reference"], row["booking_id"], e)
+        try:
+            notify.record_notification(
+                db, row["user_id"], "booking_payment_unmatched",
+                f"A guest paid {money} for a stay that is no longer booked",
+                f"{row['network'].upper()} mobile money reference {row['reference']}. The stay "
+                f"changed ({e}) while they were paying, so this money is not in your books. "
+                "Record it or refund it.",
+                link=f"/dashboard/hospitality?booking={row['booking_id']}",
+                meta={"booking_id": f"pay-{row['reference']}"})
+        except Exception:  # noqa: BLE001 — telling the owner must never fail the payer
+            pass
+    return new_status
+
+
+@app.get("/pay/stay/{token}/status/{reference}")
+def public_stay_status(token: str, reference: str, request: Request):
+    """Poll a stay collection while the guest approves the prompt."""
+    _throttle_public(request, "pay_status", 600, 60, token=token, token_limit=200)
+    db = _require_db()
+    booking = _stay_or_404(db, token)
+    res = (db.table("booking_payments").select("*").eq("reference", reference)
+           .eq("booking_id", booking["id"]).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Unknown payment reference")
+    row = rows[0]
+    status = row["status"]
+    if status == "pending":
+        created = entitlements._parse_ts(row.get("created_at"))
+        status = _settle_booking_payment(
+            db, row, payments.status(row["network"], reference, created.timestamp() if created else None))
+    return {"ok": True, "reference": reference, "status": status}
+
+
 # ── Anomaly auto-investigation (audit #13) ────────────────────────────────────
 # Deterministic "what changed" over the caller's own events. Ungated like the
 # rest of the Engine-1 sub-features' free preview (see entitlements.py note).
@@ -5115,7 +5290,7 @@ def sweep_pending_payments(db) -> dict:
         return {"ok": True, "skipped": "mobile money is not switched on"}
     from datetime import datetime, timedelta, timezone
     since = (datetime.now(timezone.utc) - timedelta(hours=PAYMENTS_SWEEP_HOURS)).isoformat()
-    out = {"ok": True, "subscriptions": 0, "invoices": 0, "errors": 0}
+    out = {"ok": True, "subscriptions": 0, "invoices": 0, "stays": 0, "errors": 0}
 
     try:
         subs = (db.table("subscription_payments").select("*").eq("status", "pending")
@@ -5147,6 +5322,21 @@ def sweep_pending_payments(db) -> dict:
                 log.warning("[pay] sweep of %s failed: %s", row.get("reference"), e)
     except Exception as e:  # noqa: BLE001 — pre-0025: no table to sweep
         log.info("[pay] invoice sweep skipped: %s", e)
+
+    try:
+        stays = (db.table("booking_payments").select("*").eq("status", "pending")
+                 .gte("created_at", since).limit(200).execute())
+        for row in getattr(stays, "data", None) or []:
+            try:
+                created = entitlements._parse_ts(row.get("created_at"))
+                new = payments.status(row["network"], row["reference"], created.timestamp() if created else None)
+                if _settle_booking_payment(db, row, new) != "pending":
+                    out["stays"] += 1
+            except Exception as e:  # noqa: BLE001
+                out["errors"] += 1
+                log.warning("[pay] sweep of stay payment %s failed: %s", row.get("reference"), e)
+    except Exception as e:  # noqa: BLE001 — pre-0035: no table to sweep
+        log.info("[pay] stay sweep skipped: %s", e)
     return out
 
 

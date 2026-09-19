@@ -2431,3 +2431,127 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         "check_in": check_in.isoformat(),
         "check_out": check_out.isoformat(),
     }
+
+
+# ── Payment links for stays (migration 0035) ─────────────────────────────────
+# The owner makes a link for a confirmed stay, for everything still owed or a
+# deposit; the guest pays it by mobile money from their phone. A payment that
+# arrives goes through update_booking like the owner's own "Deposit paid" and
+# "Paid in full" buttons, so sync_booking_payment posts it to the books once.
+
+class StayLinksNotSetUp(ValueError):
+    """Migration 0035 is not on this database yet."""
+
+
+def _no_stay_link_schema(exc: Exception) -> bool:
+    from db import missing_schema
+    return missing_schema(exc, "pay_token") or missing_schema(exc, "pay_request") \
+        or missing_schema(exc, "booking_payments")
+
+
+_SETUP_NOTE = ("Payment links for stays need migration 0035. Run "
+               "supabase/migrations/0035_booking_payment_links.sql in the Supabase SQL editor.")
+
+
+def owed_on(booking: dict) -> float:
+    """What the guest still owes on a stay that counts as income."""
+    if not _counts_as_income(booking):
+        return 0.0
+    return round(max(0.0, _num(booking.get("total_amount"), 0.0) - _paid_target(booking)), 2)
+
+
+def amount_due(booking: dict) -> float:
+    """What the link asks for now: its requested amount, never more than is owed."""
+    owed = owed_on(booking)
+    asked = _num(booking.get("pay_request"), 0.0)
+    return round(min(asked, owed), 2) if asked > 0 else owed
+
+
+def ensure_pay_link(db, user_id: str, booking_id: str, amount=None) -> dict:
+    """Make (or re-aim) the payment link for a stay. `amount` None or 0 asks for
+    everything still owed; a number asks for that much (a deposit)."""
+    booking = get_booking(db, user_id, booking_id)
+    if not _counts_as_income(booking):
+        raise ValueError("Only a confirmed stay with an amount can take a payment. Confirm it first.")
+    owed = owed_on(booking)
+    if owed <= 0.005:
+        raise ValueError("Nothing is owed on this stay: it is paid in full.")
+    request = None
+    if amount not in (None, "", 0, "0"):
+        request = round(_num(amount, -1.0), 2)
+        if request <= 0 or request > owed + 0.005:
+            raise ValueError(f"Ask for an amount between 1 and {owed:,.2f}, what is still owed.")
+    token = booking.get("pay_token") or secrets.token_urlsafe(32)
+    try:
+        (db.table("bookings").update({"pay_token": token, "pay_request": request})
+         .eq("id", booking_id).eq("user_id", user_id).execute())
+    except Exception as exc:  # noqa: BLE001
+        if _no_stay_link_schema(exc):
+            raise StayLinksNotSetUp(_SETUP_NOTE) from exc
+        raise
+    return {"token": token, "owed": owed, "requested": request if request is not None else owed}
+
+
+def get_by_pay_token(db, token: str) -> dict | None:
+    if not token or len(token) < 20:
+        return None
+    try:
+        res = db.table("bookings").select("*").eq("pay_token", token).limit(1).execute()
+    except Exception as exc:  # noqa: BLE001
+        if _no_stay_link_schema(exc):
+            raise StayLinksNotSetUp(_SETUP_NOTE) from exc
+        raise
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
+def public_stay_view(booking: dict, unit_name: str | None, business: str | None,
+                     logo: str | None) -> dict:
+    """What a guest sees on the payment page. Whitelisted: the first name only,
+    so a forwarded link does not hand a stranger the guest's full name."""
+    full = str(((booking.get("guest") or {}).get("full_name")) or booking.get("guest_name") or "").strip()
+    try:
+        nights = (date.fromisoformat(str(booking.get("check_out"))[:10])
+                  - date.fromisoformat(str(booking.get("check_in"))[:10])).days
+    except ValueError:
+        nights = None
+    owed = owed_on(booking)
+    return {
+        "business_name": business,
+        "business_logo_url": logo,
+        "unit": unit_name,
+        "reference": booking.get("reference"),
+        "guest_first_name": full.split()[0] if full else None,
+        "check_in": str(booking.get("check_in") or "")[:10],
+        "check_out": str(booking.get("check_out") or "")[:10],
+        "nights": nights,
+        "currency": booking.get("currency") or "ZMW",
+        "total": round(_num(booking.get("total_amount"), 0.0), 2),
+        "paid": round(_paid_target(booking), 2),
+        "owed": owed,
+        "amount_due": amount_due(booking),
+        "is_deposit": 0 < amount_due(booking) < owed - 0.005,
+        "payable": owed > 0.005,
+        "paid_in_full": _counts_as_income(booking) and owed <= 0.005,
+    }
+
+
+def record_link_payment(db, user_id: str, booking_id: str, amount: float) -> dict:
+    """A guest's link payment arrived: the booking says so, and the books follow
+    through update_booking. Raises ValueError when the stay no longer takes
+    money (cancelled meanwhile), so the caller can tell the owner."""
+    booking = get_booking(db, user_id, booking_id)
+    if not _counts_as_income(booking):
+        raise ValueError(f"the stay is {booking.get('status')}")
+    total = _num(booking.get("total_amount"), 0.0)
+    paid = round(_paid_target(booking) + _num(amount, 0.0), 2)
+    patch = ({"payment_status": "paid"} if paid >= total - 0.005
+             else {"payment_status": "partial", "deposit_amount": paid})
+    saved = update_booking(db, user_id, booking_id, patch)
+    # The link has done its job for this amount; the next one asks for the rest.
+    try:
+        (db.table("bookings").update({"pay_request": None})
+         .eq("id", booking_id).eq("user_id", user_id).execute())
+    except Exception:  # noqa: BLE001
+        pass
+    return saved
