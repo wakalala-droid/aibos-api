@@ -17,10 +17,20 @@
 # the API, so the API is what wakes up. Set the repository variable HEALTH_URL
 # if you would rather hit Render directly.
 #
-# WHY EACH RUN PINGS TWICE. GitHub does not promise to run a schedule on time
-# and will delay one under load. A single ping every 10 minutes leaves only 5
-# minutes of slack against the 15 minute sleep. Two pings 5 minutes apart make
-# the real gap about 5 minutes, so a late run still lands in time.
+# WHY EACH RUN STAYS UP FOR ALMOST SIX HOURS. The schedule says every 10
+# minutes, but GitHub runs free schedules when it has room: on 18 and 19
+# September 2026 it ran this every two to four hours (20:04, 22:33, 00:37,
+# 05:05). A run that pinged twice and stopped left the API asleep for hours at
+# a time, and whoever opened AIBOS first waited a minute or more; a chat
+# question asked then ran into the website's 60 second limit. So each run now
+# pings every 4 minutes for up to 5 hours 50 minutes. The next scheduled run
+# queues behind it (the concurrency group below) and takes over when it ends,
+# so even at GitHub's slowest the pings never stop. Public repositories do not
+# pay for Actions minutes.
+#
+# A dedicated pinger is still more dependable than this. A free cron-job.org
+# or UptimeRobot check on https://aibos-api-37v9.onrender.com/health every 5
+# minutes does the same job without depending on GitHub's timing.
 #
 # ONE THING TO KNOW. GitHub switches off scheduled workflows in a repository
 # that has had no commits for 60 days. It emails first. If the API starts
@@ -41,9 +51,9 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
     steps:
-      - name: Ping, wait five minutes, ping again
+      - name: Ping every 4 minutes for almost six hours
         env:
           HEALTH_URL: ${{ vars.HEALTH_URL || 'https://aibos.vercel.app/api/proxy/health' }}
         run: |
@@ -55,14 +65,16 @@ jobs:
             [ "$code" = "200" ]
           }
 
-          first=0; ping || first=1
-          sleep 300
-          second=0; ping || second=1
-
           # One failed ping is a cold start that timed out, which is exactly the
-          # thing this job exists to prevent happening to a person. Two in a row
-          # means the API is actually down, and that is worth a red tick.
-          if [ "$first" = "1" ] && [ "$second" = "1" ]; then
-            echo "::error::The API did not answer either ping. Check Render."
-            exit 1
-          fi
+          # thing this job exists to prevent happening to a person. Three in a
+          # row means the API is actually down, and that is worth a red tick.
+          end=$(( $(date +%s) + 350 * 60 ))
+          fails=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if ping; then fails=0; else fails=$((fails + 1)); fi
+            if [ "$fails" -ge 3 ]; then
+              echo "::error::The API did not answer three pings in a row. Check Render."
+              exit 1
+            fi
+            sleep 240
+          done
