@@ -156,3 +156,92 @@ def test_the_request_goes_to_the_phone_they_paid_with_once_a_day():
         assert len(sent) == 1                                    # still waiting on the first
     finally:
         main.get_db, payments.provider_configured, payments.initiate = real
+
+
+# ── Plan & billing page and receipts (upgrades 1 and 2) ─────────────────────
+
+from datetime import datetime as _dt, timezone as _tz
+
+_PRICES = {"pro": {"monthly": 500, "annual": 5000}, "growth": {"monthly": 1499, "annual": 14990}}
+
+
+def test_a_paid_up_plan_says_when_it_renews_and_for_how_much():
+    now = _dt(2026, 9, 19, 10, 0, tzinfo=_tz.utc)
+    st = billing.plan_status({"tier": "growth", "tier_source": "payment",
+                              "paid_until": "2026-10-07T00:00:00+00:00"}, _PRICES, "monthly", now)
+    assert st["state"] == "active" and st["price"] == 1499
+    assert "7 October 2026" in st["sentence"] and "7th of each month" in st["sentence"]
+    assert "K1,499" in st["sentence"] and st["pay_link"] == "/checkout?plan=growth&billing=monthly"
+    assert st["days_left"] == 18
+
+
+def test_the_grace_week_and_the_end_are_said_plainly():
+    until = "2026-10-07T00:00:00+00:00"
+    grace = billing.plan_status({"tier": "growth", "tier_source": "payment", "paid_until": until},
+                                _PRICES, "monthly", _dt(2026, 10, 10, tzinfo=_tz.utc))
+    assert grace["state"] == "grace" and "keeps working until" in grace["sentence"]
+    ended = billing.plan_status({"tier": "growth", "tier_source": "payment", "paid_until": until},
+                                _PRICES, "monthly", _dt(2026, 10, 20, tzinfo=_tz.utc))
+    assert ended["state"] == "expired" and "on Free for now" in ended["sentence"]
+
+
+def test_a_plan_set_up_by_aibos_and_the_free_plan():
+    inc = billing.plan_status({"tier": "growth", "tier_source": "admin_demo"}, _PRICES, "monthly")
+    assert inc["state"] == "included" and inc["renews_on"] is None
+    free = billing.plan_status({"tier": "free"}, _PRICES, "monthly")
+    assert free["state"] == "free" and free["pay_link"] == "/pricing"
+
+
+def test_the_history_has_both_ways_of_paying_newest_first():
+    subs = [{"reference": "r1", "network": "mtn", "plan": "growth", "billing": "monthly",
+             "amount": 1499, "payer_phone": "+260 97 123 4567", "status": "successful",
+             "created_at": "2026-09-08T10:00:00+00:00"},
+            {"reference": "r2", "network": "airtel", "plan": "growth", "billing": "monthly",
+             "amount": 1499, "status": "failed", "created_at": "2026-09-09T10:00:00+00:00"}]
+    audits = [{"id": 7, "created_at": "2026-09-10T10:00:00+00:00",
+               "detail": {"tier": "growth", "source": "payment", "billing": "monthly",
+                          "paid_until": "2026-11-07T00:00:00+00:00"}},
+              {"id": 8, "created_at": "2026-09-11T10:00:00+00:00",     # put on billing: no money
+               "detail": {"tier": "growth", "source": "payment", "schedule": "join_date"}},
+              {"id": 9, "created_at": "2026-09-12T10:00:00+00:00",     # a demo grant: no money
+               "detail": {"tier": "growth", "source": "admin_demo"}}]
+    h = billing.payment_history(subs, audits, _PRICES)
+    assert [p["id"] for p in h] == ["a-7", "m-r2", "m-r1"]
+    assert h[0]["amount"] == 1499 and h[0]["receipt"] is True
+    assert h[1]["receipt"] is False                     # failed: no receipt
+    assert h[2]["phone_tail"] == "4567" and h[2]["method"] == "MTN Mobile Money"
+
+
+def test_a_simulated_payment_never_gets_a_receipt():
+    subs = [{"reference": "s", "network": "mtn", "plan": "pro", "amount": 500,
+             "status": "successful", "created_at": "2026-09-08T10:00:00+00:00"}]
+    h = billing.payment_history(subs, [], _PRICES, simulated=lambda net: True)
+    assert h[0]["receipt"] is False
+
+
+def test_the_receipt_names_the_plan_amount_and_who_paid():
+    pay = {"id": "m-abcd1234-ef", "date": "2026-09-08T10:00:00+00:00", "plan_name": "Growth",
+           "billing": "monthly", "amount": 1499.0, "currency": "ZMW",
+           "method": "MTN Mobile Money", "phone_tail": "4567"}
+    text = billing.receipt_text(pay, "Dunslim Apartments", "owner@example.com")
+    assert billing.receipt_number(pay) == "AIBOS-MABCD1234"
+    for part in ("Receipt AIBOS-MABCD1234", "Dunslim Apartments", "K1,499", "Growth plan, 1 month",
+                 "phone ending 4567", "8 September 2026"):
+        assert part in text
+    assert "—" not in text
+
+
+def test_staff_are_told_the_owner_manages_the_plan(monkeypatch):
+    import auth
+    import entitlements
+    import main
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(auth, "verify_token", lambda token: "staff-1")
+    monkeypatch.setattr(entitlements, "paying_account", lambda uid, acting=None: "owner-1")
+    res = TestClient(main.app).get("/me/billing", headers={"Authorization": "Bearer t"})
+    body = res.json()
+    assert res.status_code == 200 and body["own_plan"] is False
+    assert "payments" not in body and "price" not in body
+    # And a receipt of someone else's is not theirs to fetch.
+    paths = {r.path for r in main.app.routes}
+    assert "/me/billing/receipts/{payment_id}.pdf" in paths

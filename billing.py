@@ -250,3 +250,140 @@ def run_renewals(db, prices: dict, request_payment=None, send_email=None,
         return out
     finally:
         _RUN_LOCK.release()
+
+
+# ── What the customer sees (Plan & billing page, receipts) ───────────────────
+# Only the admin could see a customer's plan end date and payments. The owner
+# found out their plan was ending from a reminder, and had nowhere to look up
+# what they had paid, or to get a receipt for their tax records.
+
+NETWORK_NAMES = {"mtn": "MTN Mobile Money", "airtel": "Airtel Money"}
+
+
+def _long_day(dt: datetime) -> str:
+    local = dt.astimezone(LUSAKA)
+    return f"{local.strftime('%A')} {local.day} {local.strftime('%B %Y')}"
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None = None) -> dict:
+    """The owner's plan in plain words. Pure.
+
+    state: free | included (set up by AIBOS, no end date) | active | grace |
+    expired. `sentence` is what the page shows first."""
+    now = now or datetime.now(timezone.utc)
+    plan = str(profile.get("tier") or "free")
+    name = PLAN_NAMES.get(plan, "Free")
+    price = (prices.get(plan) or {}).get(billing)
+    until = _parse(profile.get("paid_until")) if profile.get("tier_source") == "payment" else None
+    period = "year" if billing == "annual" else "month"
+    out = {"plan": plan, "plan_name": name, "billing": billing, "price": price,
+           "paid_until": until.isoformat() if until else None, "renews_on": None,
+           "switches_off_on": None, "days_left": None,
+           "pay_link": f"/checkout?plan={plan}&billing={billing}" if plan in prices else "/pricing"}
+
+    if plan not in prices:
+        return {**out, "state": "free", "plan_name": "Free",
+                "sentence": "You are on the Free plan. Upgrade any time to switch on more of AIBOS."}
+    if until is None:
+        return {**out, "state": "included",
+                "sentence": f"Your {name} plan was set up for you by AIBOS and has no end date."}
+
+    off = until + timedelta(days=GRACE_DAYS)
+    out.update(renews_on=until.isoformat(), switches_off_on=off.isoformat())
+    if now <= until:
+        days = (until.astimezone(LUSAKA).date() - now.astimezone(LUSAKA).date()).days
+        cadence = (f"on the {_ordinal(until.astimezone(LUSAKA).day)} of each month"
+                   if billing != "annual" else f"every year on {_day(until)}")
+        return {**out, "state": "active", "days_left": days,
+                "sentence": f"Your {name} plan is paid up to {_long_day(until)}. It renews {cadence} "
+                            f"for {money(price)}. Paying early loses no days: the next {period} "
+                            f"still starts on {_day(until)}."}
+    if now <= off:
+        return {**out, "state": "grace",
+                "sentence": f"Your {name} plan was due on {_day(until)}. Everything keeps working "
+                            f"until {_long_day(off)}. Pay {money(price)} before then to keep it on."}
+    return {**out, "state": "expired",
+            "sentence": f"Your {name} plan ended on {_day(off)}, so the account is on Free for now. "
+                        f"Pay {money(price)} to switch everything back on. Your records are all there."}
+
+
+def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=None) -> list:
+    """Every plan payment, newest first, from both ways of paying. Pure.
+
+    sub_rows: subscription_payments (mobile money checkouts).
+    audit_rows: admin_audit set_tier rows; those with source 'payment' are money
+    paid to AIBOS by hand and recorded by an admin (their amount is the price of
+    the plan they bought; putting an account on billing records no money).
+    simulated(network) -> bool: True when a payment on that network could only
+    have been simulated. Those never get a receipt: a receipt is a record that
+    money moved."""
+    out = []
+    for r in sub_rows or []:
+        status = r.get("status") or "pending"
+        network = r.get("network") or ""
+        phone = "".join(ch for ch in str(r.get("payer_phone") or "") if ch.isdigit())
+        out.append({
+            "id": f"m-{r.get('reference')}",
+            "date": r.get("created_at"),
+            "plan": r.get("plan"), "plan_name": PLAN_NAMES.get(r.get("plan"), r.get("plan")),
+            "billing": r.get("billing") or "monthly",
+            "amount": float(r.get("amount") or 0), "currency": r.get("currency") or "ZMW",
+            "method": NETWORK_NAMES.get(network, network or "Mobile money"),
+            "phone_tail": phone[-4:] or None,
+            "status": status,
+            "receipt": status == "successful" and not (simulated and simulated(network)),
+        })
+    for a in audit_rows or []:
+        d = a.get("detail") or {}
+        if d.get("source") != "payment" or d.get("schedule") == "join_date":
+            continue
+        plan, billing = d.get("tier"), d.get("billing") or "monthly"
+        amount = (prices.get(plan) or {}).get(billing)
+        if amount is None:
+            continue
+        out.append({
+            "id": f"a-{a.get('id')}",
+            "date": a.get("created_at"),
+            "plan": plan, "plan_name": PLAN_NAMES.get(plan, plan),
+            "billing": billing, "amount": float(amount), "currency": "ZMW",
+            "method": "Paid to AIBOS directly", "phone_tail": None,
+            "status": "successful", "paid_until": d.get("paid_until"),
+            "receipt": True,
+        })
+    out.sort(key=lambda p: str(p.get("date") or ""), reverse=True)
+    return out
+
+
+def receipt_number(payment: dict) -> str:
+    raw = "".join(ch for ch in str(payment.get("id") or "") if ch.isalnum()).upper()
+    return f"AIBOS-{raw[:1]}{raw[1:9]}"
+
+
+def receipt_text(payment: dict, business: str | None, email: str | None) -> str:
+    """A plan payment receipt, as text (the PDF is rendered from it)."""
+    when = _parse(payment.get("date"))
+    period = "12 months" if payment.get("billing") == "annual" else "1 month"
+    lines = [
+        f"*Receipt {receipt_number(payment)}*",
+        "",
+        f"Date paid: {_long_day(when) if when else '-'}",
+        f"Paid by: {business or 'AIBOS customer'}" + (f" ({email})" if email else ""),
+        "",
+        f"*AIBOS {payment.get('plan_name')} plan, {period}*",
+        f"Amount paid: {money(float(payment.get('amount') or 0))} ({payment.get('currency') or 'ZMW'})",
+        f"Paid by: {payment.get('method')}"
+        + (f", phone ending {payment['phone_tail']}" if payment.get("phone_tail") else ""),
+    ]
+    until = _parse(payment.get("paid_until"))
+    if until:
+        lines.append(f"Plan paid up to: {_long_day(until)}")
+    lines += [
+        "",
+        "Received with thanks by AIBOS, ai-bos.website.",
+        "Keep this receipt for your business records.",
+    ]
+    return "\n".join(lines)

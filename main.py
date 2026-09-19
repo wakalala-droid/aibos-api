@@ -2487,6 +2487,118 @@ def _tool_round_trip_probe(client, model: str) -> dict:
     return out
 
 
+# ── Plan & billing for the customer (upgrades 1 and 2) ────────────────────────
+# Only the admin could see when a customer's plan ends and what they had paid.
+# The owner learned their plan was ending from a reminder, and had no way to
+# look up a payment or get a receipt for their tax records.
+
+def _simulated(network: str) -> bool:
+    """Could a payment on this network only have been a simulation?"""
+    return payments.SIMULATION_ENABLED and not payments.provider_configured(network)
+
+
+def _billing_view(user_id: str) -> Dict[str, Any]:
+    """The owner's plan, status sentence and every plan payment."""
+    db = _require_db()
+    try:
+        res = (db.table("profiles")
+               .select("tier,tier_source,paid_until,business_name,email,contact_email")
+               .eq("id", user_id).limit(1).execute())
+    except Exception as e:  # noqa: BLE001 — pre-0033: no paid_until yet
+        if not entitlements._missing_column(e):
+            raise
+        res = (db.table("profiles").select("tier,tier_source,business_name,email")
+               .eq("id", user_id).limit(1).execute())
+    profile = (getattr(res, "data", None) or [{}])[0]
+    billing = billing_api._billing_of(db, user_id)
+    status = billing_api.plan_status(profile, PLAN_PRICES, billing)
+
+    sub_rows, audit_rows = [], []
+    try:
+        r = (db.table("subscription_payments")
+             .select("reference,network,plan,billing,amount,currency,payer_phone,status,created_at")
+             .eq("user_id", user_id).order("created_at", desc=True).limit(60).execute())
+        sub_rows = getattr(r, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — pre-0033
+        log.info("[billing] no checkout history for %s: %s", user_id, e)
+    try:
+        r = (db.table("admin_audit").select("id,detail,created_at")
+             .eq("target_user_id", user_id).eq("action", "set_tier")
+             .order("created_at", desc=True).limit(60).execute())
+        audit_rows = getattr(r, "data", None) or []
+    except Exception as e:  # noqa: BLE001
+        log.info("[billing] no recorded payments for %s: %s", user_id, e)
+    history = billing_api.payment_history(sub_rows, audit_rows, PLAN_PRICES, _simulated)
+    return {"profile": profile, "status": status, "payments": history}
+
+
+@app.get("/me/billing")
+def my_billing(user_id: str = Depends(require_user),
+               x_acting_as: Optional[str] = Header(default=None)):
+    """The owner's plan, when it renews, what it costs and every payment.
+
+    Staff working in someone else's business get own_plan false and nothing
+    else: the plan and its payments belong to the owner."""
+    account = entitlements.paying_account(user_id, x_acting_as)
+    if account != user_id:
+        return {"ok": True, "own_plan": False,
+                "note": "The owner of this business manages its plan and payments."}
+    view = _billing_view(user_id)
+    return {"ok": True, "own_plan": True, **view["status"], "payments": view["payments"],
+            "collections_live": any(payments.configured_networks().values())}
+
+
+@app.get("/me/billing/receipts/{payment_id}.pdf")
+def my_receipt(payment_id: str, user_id: str = Depends(require_user)):
+    """A receipt for one plan payment the caller made. Only successful payments
+    that really moved money get one."""
+    view = _billing_view(user_id)
+    pay = next((p for p in view["payments"] if p["id"] == payment_id), None)
+    if pay is None or not pay.get("receipt"):
+        raise HTTPException(status_code=404, detail="There is no receipt for that payment.")
+    prof = view["profile"]
+    text = billing_api.receipt_text(pay, prof.get("business_name"),
+                                    prof.get("contact_email") or prof.get("email"))
+    name = billing_api.receipt_number(pay)
+    if pdfdoc.available():
+        return Response(content=pdfdoc.render("AIBOS receipt", text), media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename={name}.pdf"})
+    return Response(content=text, media_type="text/plain",
+                    headers={"Content-Disposition": f"attachment; filename={name}.txt"})
+
+
+def _send_plan_receipt(rec: Dict[str, Any]) -> None:
+    """After a plan payment goes through: a receipt by email and a note in the
+    bell. Best-effort; the plan is already granted either way."""
+    user_id = rec.get("user_id")
+    db = get_db()
+    if not user_id or db is None or _simulated(rec.get("network") or ""):
+        return
+    try:
+        view = _billing_view(user_id)
+        pay = next((p for p in view["payments"] if p["id"] == f"m-{rec.get('reference')}"), None)
+        if pay is None:
+            return
+        status, prof = view["status"], view["profile"]
+        until = billing_api._parse(status.get("paid_until"))
+        title = f"Payment received: {billing_api.money(pay['amount'])} for {pay['plan_name']}"
+        body = (f"Thank you. Your {pay['plan_name']} plan is paid up to "
+                f"{billing_api._long_day(until) if until else 'the end of this period'}. "
+                f"Your receipt number is {billing_api.receipt_number(pay)}; you can download it "
+                "any time from Plan & billing.")
+        notify.record_notification(db, user_id, "plan_payment_received", title, body,
+                                   "/dashboard/billing", {"payment": pay["id"]})
+        to = (prof.get("contact_email") or prof.get("email") or "").strip()
+        if to:
+            text = billing_api.receipt_text(pay, prof.get("business_name"), to)
+            url = f"{PUBLIC_APP_URL.rstrip('/')}/dashboard/billing"
+            notify.send_email(to, title, body + "\n\n" + text.replace("*", ""),
+                              notify.aibos_email_html(body + "\n\n" + text.replace("*", ""),
+                                                      ("See your plan and receipts", url)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("[billing] receipt for %s not sent: %s", rec.get("reference"), e)
+
+
 @app.get("/me/entitlements")
 def my_entitlements(user_id: str = Depends(require_user),
                     x_acting_as: Optional[str] = Header(default=None)):
@@ -2688,7 +2800,8 @@ def _settle(rec: Dict[str, Any], new_status: str) -> None:
             rec["granted"] = True          # someone else already granted it
             return
     rec["granted"] = True
-    _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly")
+    if _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly"):
+        _send_plan_receipt(rec)
 
 
 @app.get("/payments/config")
