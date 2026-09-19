@@ -43,7 +43,11 @@ import notify
 log = logging.getLogger("aibos.guest_mail")
 
 RESEND_URL = "https://api.resend.com/emails"
-KINDS = ("received", "confirmed", "declined")
+KINDS = ("received", "confirmed", "declined", "reminder")
+
+# The payment reminder goes this many days before arrival, once, to a guest who
+# still owes on a confirmed stay (upgrade 6).
+REMINDER_DAYS_BEFORE = 3
 
 # What the provider last told us about each sending domain. In memory on purpose:
 # it is a hint for the settings screen, never the thing a send depends on.
@@ -321,6 +325,34 @@ def compose(kind: str, prop: dict, unit: dict, b: dict) -> tuple[str, str, str]:
         text, page = _render(s, greeting, paragraphs, rows, after)
         return subject, text, page
 
+    if kind == "reminder":
+        # A sample booking has no status, so nothing reads as owed on it: show
+        # its total instead. Real reminders only go when something is owed.
+        owed = hospitality.owed_on(b) or float(b.get("total_amount") or 0)
+        currency = b.get("currency") or unit.get("currency")
+        subject = f"A reminder about your stay at {name}{ref_part}"
+        paragraphs = [
+            f"We look forward to welcoming you to {where} on {_day(b.get('check_in'))}.",
+            f"{_price(owed, currency)} is still to pay for your stay.",
+        ]
+        url = b.get("_pay_url")
+        if url:
+            block = ("Pay from your phone", f"Open this link to pay by MTN or Airtel mobile money:\n{url}")
+        elif s["payment_instructions"]:
+            block = ("How to pay", s["payment_instructions"])
+        else:
+            block = None
+        after = []
+        if not block:
+            after.append("To arrange payment, reply to this email"
+                         + (f" or call us on {s['phone']}." if s["phone"] else "."))
+        after += ["If you have already paid, thank you. Please ignore this reminder.",
+                  _contact_line(s) if block else ""]
+        after = [p for p in after if p]
+        text, page = _render(s, greeting, paragraphs, _details(prop, unit, b, "total_amount"),
+                             after, block)
+        return subject, text, page
+
     raise ValueError(f"Unknown guest email: {kind}")
 
 
@@ -450,6 +482,59 @@ def deliver(db, owner: str, booking: dict, kind: str) -> dict:
     except Exception as e:  # noqa: BLE001
         log.warning("[guest_mail] %s email for %s failed: %s", kind, booking.get("id"), e)
         return {"sent": False, "note": "The email to the guest could not be sent."}
+
+
+def send_due_reminders(db, now: datetime | None = None, public_url: str = "") -> dict:
+    """Remind every guest who still owes on a confirmed stay that starts within
+    REMINDER_DAYS_BEFORE days (upgrade 6). Every business, once per booking
+    (the stamp on guest_emails), only where the property sends guest emails.
+    The email carries the stay's payment link when links are set up
+    (migration 0035), else the property's payment instructions. Runs hourly
+    from the API's background loop; never raises."""
+    out = {"checked": 0, "sent": 0, "skipped": 0, "errors": 0}
+    if db is None:
+        return out
+    now = now or datetime.now(timezone.utc)
+    today = (now + timedelta(hours=2)).date()                       # Lusaka
+    until = today + timedelta(days=REMINDER_DAYS_BEFORE)
+    try:
+        res = (db.table("bookings").select("*").eq("status", "confirmed")
+               .in_("payment_status", ["unpaid", "partial"])
+               .gt("check_in", today.isoformat()).lt("check_in", (until + timedelta(days=1)).isoformat())
+               .limit(500).execute())
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001
+        log.info("[guest_mail] reminder check skipped: %s", e)
+        return out
+    for b in rows:
+        out["checked"] += 1
+        if (b.get("guest_emails") or {}).get("reminder") or hospitality.owed_on(b) <= 0.005:
+            out["skipped"] += 1
+            continue
+        owner = b.get("user_id")
+        try:
+            try:
+                link = hospitality.ensure_pay_link(db, owner, b["id"])
+                if public_url:
+                    b["_pay_url"] = f"{public_url.rstrip('/')}/pay/stay/{link['token']}"
+            except Exception:  # noqa: BLE001 — no links yet (0035): instructions instead
+                pass
+            result = deliver(db, owner, b, "reminder")
+            if result.get("sent"):
+                out["sent"] += 1
+                notify.record_notification(
+                    db, owner, "guest_payment_reminder",
+                    f"Reminded {_first_name(b) or 'a guest'} about {_price(hospitality.owed_on(b), b.get('currency'))} still owed",
+                    f"Arriving {_day(b.get('check_in'))}. The email went to the guest in your "
+                    "property's name" + (" with a link to pay by mobile money." if b.get("_pay_url") else "."),
+                    link=f"/dashboard/hospitality?booking={b['id']}",
+                    meta={"booking_id": f"reminder-{b['id']}"})
+            else:
+                out["skipped"] += 1
+        except Exception as e:  # noqa: BLE001 — one booking must not stop the rest
+            out["errors"] += 1
+            log.warning("[guest_mail] reminder for %s failed: %s", b.get("id"), e)
+    return out
 
 
 def send_samples(db, owner: str, actor: str, property_id: str) -> dict:

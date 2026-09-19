@@ -5475,6 +5475,14 @@ def _start_payments_sweeper() -> None:
                         log.info("[payroll] payday: %s", wages)
                 except Exception as e:  # noqa: BLE001
                     log.warning("[payroll] payday run crashed: %s", e)
+                # Guests who still owe and arrive within 3 days get a reminder.
+                try:
+                    import guest_mail
+                    sent = guest_mail.send_due_reminders(get_db(), public_url=PUBLIC_APP_URL)
+                    if sent.get("sent") or sent.get("errors"):
+                        log.info("[guest_mail] reminders: %s", sent)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[guest_mail] reminder run crashed: %s", e)
 
     threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
 

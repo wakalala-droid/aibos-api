@@ -412,3 +412,44 @@ if __name__ == "__main__":
             mp.undo()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} guest-email tests passed ===")
+
+
+# ── Payment reminders before arrival (upgrade 6) ───────────────────────────
+
+def test_a_guest_who_still_owes_is_reminded_once_with_the_link(monkeypatch):
+    from datetime import date, datetime, timedelta, timezone
+    out = _Outbox()
+    _wire(monkeypatch, out)
+    db = _db()
+    arrive = (date.today() + timedelta(days=2)).isoformat()
+    leave = (date.today() + timedelta(days=4)).isoformat()
+    _row(db, status="confirmed", check_in=arrive, check_out=leave, total_amount=4000,
+         payment_status="partial", deposit_amount=1000, user_id=OWNER)
+    monkeypatch.setattr(hospitality, "ensure_pay_link",
+                        lambda db_, owner, bid, amount=None: {"token": "tok" * 12, "owed": 3000, "requested": 3000})
+    notes = []
+    monkeypatch.setattr(guest_mail.notify, "record_notification", lambda *a, **k: notes.append(a) or True)
+
+    first = guest_mail.send_due_reminders(db, public_url="https://ai-bos.website")
+    assert first["sent"] == 1
+    text = out.sent[0]["text"]
+    assert "K3,000 is still to pay" in text and "/pay/stay/" + "tok" * 12 in text
+    assert out.sent[0]["subject"].startswith("A reminder about your stay at Dunslim Apartments")
+    assert len(notes) == 1                                          # the owner hears it went
+
+    again = guest_mail.send_due_reminders(db, public_url="https://ai-bos.website")
+    assert again["sent"] == 0 and len(out.sent) == 1                # never twice
+
+
+def test_no_reminder_for_a_paid_stay_or_one_far_away(monkeypatch):
+    from datetime import date, timedelta
+    out = _Outbox()
+    _wire(monkeypatch, out)
+    db = _db()
+    soon = (date.today() + timedelta(days=2)).isoformat()
+    later = (date.today() + timedelta(days=20)).isoformat()
+    _row(db, status="confirmed", check_in=soon, check_out=later, total_amount=4000,
+         payment_status="paid", user_id=OWNER)
+    db.rows["bookings"].append({**db.rows["bookings"][0], "id": "b2", "check_in": later,
+                                "payment_status": "unpaid"})
+    assert guest_mail.send_due_reminders(db)["sent"] == 0 and not out.sent
