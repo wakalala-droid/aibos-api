@@ -33,7 +33,7 @@ import billing as billing_api
 
 # ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
 # Isolated modules; the existing file-analysis endpoints above are untouched.
-from db import get_db, supabase_enabled, db_health, schema_health
+from db import get_db, supabase_enabled, db_health, schema_health, missing_schema
 from auth import require_user
 import entitlements
 import nervous_system as nervous
@@ -48,6 +48,7 @@ import customer_intel
 import invoices as invoices_api
 import cfo_tools
 import chat_history
+import webpush
 import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
@@ -2191,7 +2192,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 35
+EXPECTS_MIGRATION = 36
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -5711,6 +5712,61 @@ def chat_history_append(body: ChatHistoryAppend,
 @app.delete("/chat/history")
 def chat_history_clear(ctx: membership.Context = Depends(membership.require_context)):
     return chat_history.clear(_require_db(), ctx.actor, ctx.business_id)
+
+
+# ── Notifications on the phone (upgrade 10, migration 0036) ──────────────────
+# Everything that lands in the bell also reaches the owner's phone, if they
+# turned it on in that browser. The signing key needs no setup (see webpush).
+
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: Dict[str, str] = {}
+
+
+@app.get("/push/key")
+def push_key():
+    """The key a browser needs to sign up for notifications, and whether this
+    deployment can send them at all."""
+    return {"ok": True, "configured": webpush.configured(), "key": webpush.public_key()}
+
+
+@app.post("/push/subscribe")
+def push_subscribe(body: PushSubscription, request: Request,
+                   ctx: membership.Context = Depends(membership.require_context)):
+    """Remember this browser so notifications can reach it."""
+    try:
+        return webpush.subscribe(_require_db(), ctx.actor, body.endpoint,
+                                 body.keys.get("p256dh", ""), body.keys.get("auth", ""),
+                                 request.headers.get("user-agent", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001 — pre-0036
+        if missing_schema(e):
+            raise HTTPException(status_code=503, detail=(
+                "Notifications on the phone need migration 0036. Run "
+                "supabase/migrations/0036_push_subscriptions.sql in the Supabase SQL editor."))
+        raise
+
+
+@app.delete("/push/subscribe")
+def push_unsubscribe(body: PushSubscription,
+                     ctx: membership.Context = Depends(membership.require_context)):
+    """Stop notifications reaching this browser."""
+    try:
+        return webpush.unsubscribe(_require_db(), ctx.actor, body.endpoint)
+    except Exception as e:  # noqa: BLE001
+        if missing_schema(e):
+            return {"ok": True}
+        raise
+
+
+@app.post("/push/test")
+def push_test(ctx: membership.Context = Depends(membership.require_context)):
+    """Send a notification to this person's own devices, so they can see it work."""
+    out = webpush.send_to_user(_require_db(), ctx.actor, "Notifications are on",
+                               "This is how a booking or a payment will reach you.",
+                               "/dashboard", wait=True)
+    return {"ok": True, **out}
 
 
 @app.get("/notifications")

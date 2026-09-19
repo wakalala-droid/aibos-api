@@ -390,6 +390,13 @@ def record_notification(db, user_id: str, kind: str, title: str,
             "user_id": user_id, "kind": kind, "title": title,
             "body": body or None, "link": link or None, "meta": meta or {},
         }).execute()
+        # The same alert on their phone, if they turned it on in a browser
+        # (upgrade 10). On a thread: a slow push must not hold up a booking.
+        try:
+            import webpush
+            webpush.send_to_user(db, user_id, title, body, link)
+        except Exception as pe:  # noqa: BLE001 — never costs the bell
+            log.info("[notify] push skipped: %s", pe)
         return True
     except Exception as e:  # noqa: BLE001
         text = str(e).lower()
