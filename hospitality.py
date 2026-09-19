@@ -148,6 +148,8 @@ BOOKING_EDITABLE = (
     "quoted_total",
     # When the answer was given, and why.
     "confirmed_at", "declined_at", "cancelled_at", "decline_reason",
+    # Money the owner kept when the stay was called off (migration 0035).
+    "kept_amount",
 )
 
 BOOKING_SOURCES = ("direct", "website", "ota", "phone", "walk_in")
@@ -734,7 +736,7 @@ def _clean_booking(data: dict, partial: bool = False) -> dict:
             raise ValueError("guests_count must be at least 1.")
         out["guests_count"] = gc
 
-    for key in ("total_amount", "deposit_amount"):
+    for key in ("total_amount", "deposit_amount", "kept_amount"):
         if key in out and out[key] is not None:
             val = _num(out[key], None)
             if val is None or val < 0:
@@ -908,16 +910,37 @@ def _customer_name(db, user_id: str | None, booking: dict) -> str:
     return f"Booking {ref}" if ref else f"Booking {str(booking.get('check_in') or '')[:10]}".strip()
 
 
+# A stay called off with money kept (upgrade 5): a non-refundable deposit is
+# the owner's income. Cancelling used to void the stay's income AND every
+# payment on it, so a K500 deposit the owner kept vanished from their cash.
+CALLED_OFF = ("cancelled", "no_show")
+
+
+def _kept(booking: dict) -> float:
+    if booking.get("status") not in CALLED_OFF or booking.get("payment_status") == "refunded":
+        return 0.0
+    return round(max(0.0, _num(booking.get("kept_amount"), 0.0)), 2)
+
+
 def _counts_as_income(booking: dict) -> bool:
-    return (booking.get("status") in STAY_STATUSES
-            and _num(booking.get("total_amount"), 0.0) > 0
-            and booking.get("payment_status") != "refunded")
+    return ((booking.get("status") in STAY_STATUSES
+             and _num(booking.get("total_amount"), 0.0) > 0
+             and booking.get("payment_status") != "refunded")
+            or _kept(booking) > 0)
+
+
+def _income_amount(booking: dict) -> float:
+    """What the stay earns: the stay's price, or what was kept when it was called off."""
+    kept = _kept(booking)
+    return kept if kept > 0 else round(_num(booking.get("total_amount"), 0.0), 2)
 
 
 def _paid_target(booking: dict) -> float:
     """How much of the stay the booking says the guest has paid."""
     if not _counts_as_income(booking):
         return 0.0
+    if _kept(booking) > 0:
+        return _kept(booking)
     total = _num(booking.get("total_amount"), 0.0)
     status = booking.get("payment_status") or "unpaid"
     if status == "paid":
@@ -1325,7 +1348,7 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
     # stay as it is: unwound when the stay stops counting, reposted when what it
     # says changes.
     was_live = current.get("linked_event_id")
-    amount = _num(saved.get("total_amount"), 0.0)
+    amount = _income_amount({**saved, "status": new_status})
     counts = _counts_as_income({**saved, "status": new_status})
     def _same(k):
         a, b = current.get(k), saved.get(k)
@@ -1333,7 +1356,8 @@ def update_booking(db, user_id: str, booking_id: str, patch: dict) -> dict:
             return abs(_num(a, 0.0) - _num(b, 0.0)) < 0.005
         return str(a or "")[:10 if k in ("check_in", "check_out") else None] ==             str(b or "")[:10 if k in ("check_in", "check_out") else None]
     changed = any(k in clean and not _same(k)
-                  for k in ("total_amount", "currency", "unit_id", "check_in", "check_out", "guest_id"))
+                  for k in ("total_amount", "currency", "unit_id", "check_in", "check_out", "guest_id")) \
+        or abs(_income_amount(current) - amount) > 0.005
     if was_live and (not counts or changed):
         refunded = saved.get("payment_status") == "refunded" and new_status in STAY_STATUSES
         _void_event(db, user_id, was_live,
@@ -1415,16 +1439,34 @@ def decline_booking(db, user_id: str, booking_id: str, reason: str | None = None
     })
 
 
-def cancel_booking(db, user_id: str, booking_id: str) -> dict:
+def cancel_booking(db, user_id: str, booking_id: str, refund: bool = False) -> dict:
     """Call off a stay that was agreed. Frees the dates and unwinds the linked
     Sale so cancelled revenue leaves the P&L.
 
+    Money already paid is either KEPT (the default: a non-refundable deposit
+    stays as income and in cash, as a Sale of the kept amount) or refunded
+    (refund=True: it leaves the books). It used to vanish either way.
+
     Distinct from decline_booking, which turns down a request that was never
     agreed to in the first place."""
-    return update_booking(db, user_id, booking_id, {
-        "status": "cancelled",
-        "cancelled_at": _now_iso(),
-    })
+    current = get_booking(db, user_id, booking_id)
+    paid = _paid_target(current)
+    patch = {"status": "cancelled", "cancelled_at": _now_iso()}
+    if paid > 0.005:
+        if refund:
+            patch["payment_status"] = "refunded"
+        else:
+            patch["kept_amount"] = paid
+    try:
+        return update_booking(db, user_id, booking_id, patch)
+    except Exception as exc:  # noqa: BLE001
+        from db import missing_schema
+        if "kept_amount" in patch and missing_schema(exc, "kept_amount"):
+            raise ValueError(
+                "Keeping the money paid on a cancelled stay needs migration 0035. Run "
+                "supabase/migrations/0035_booking_payment_links.sql in Supabase, or cancel "
+                "with a refund.") from exc
+        raise
 
 
 def availability(db, user_id: str, unit_id: str, frm: str | None = None,
@@ -2457,7 +2499,7 @@ def owed_on(booking: dict) -> float:
     """What the guest still owes on a stay that counts as income."""
     if not _counts_as_income(booking):
         return 0.0
-    return round(max(0.0, _num(booking.get("total_amount"), 0.0) - _paid_target(booking)), 2)
+    return round(max(0.0, _income_amount(booking) - _paid_target(booking)), 2)
 
 
 def amount_due(booking: dict) -> float:

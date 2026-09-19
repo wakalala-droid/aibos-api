@@ -230,13 +230,30 @@ def test_cancelling_refunding_or_deleting_a_paid_stay_clears_it_from_the_books()
         unit = _unit(db)
         b = _stay(db, unit, payment_status="paid")
         if finish == "cancel":
-            hospitality.cancel_booking(db, "u1", b["id"])
+            # Cancelled AND refunded. Cancelling without a refund keeps the
+            # money as income (upgrade 5): see the test below.
+            hospitality.cancel_booking(db, "u1", b["id"], refund=True)
         elif finish == "refund":
             hospitality.update_booking(db, "u1", b["id"], {"payment_status": "refunded"})
         else:
             hospitality.delete_unit(db, "u1", unit["id"])
         assert _books(db) == (0, 0, 0), finish
         assert not _live_payments(db), finish
+
+
+def test_a_cancelled_stay_keeps_the_money_the_owner_kept():
+    """A non-refundable deposit is income. Cancelling used to void the stay AND
+    every payment on it, so money the owner kept vanished from their cash."""
+    db = _fresh()
+    businesses.ensure_default_business(db, "u1")
+    unit = _unit(db)
+    b = _stay(db, unit, payment_status="partial", deposit_amount=500)
+    before = _books(db)
+    saved = hospitality.cancel_booking(db, "u1", b["id"])
+    assert saved["kept_amount"] == 500
+    revenue, cash, owed = _books(db)
+    assert (revenue, cash, owed) == (500, 500, 0), (before, _books(db))
+    assert round(sum(e["payload"]["amount"] for e in _live_payments(db)), 2) == 500
 
 
 def test_old_stays_move_to_money_owed_and_finished_ones_leave_the_bank_alone():

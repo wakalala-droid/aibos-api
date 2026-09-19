@@ -207,3 +207,30 @@ def test_the_cash_split_adds_up_to_the_cash_figure():
     assert split == {"cash": 200.0, "mobile_money": 2000.0, "bank": 100.0, "unsaid": -100.0,
                      "opening": 50.0, "total": 2250.0}
     assert split["total"] == round(twin.project(events, opening_cash=50)["cash"], 2)
+
+
+# ── A deposit kept on a cancelled stay stays income (upgrade 5) ──────────────
+
+def test_a_kept_deposit_is_income_and_paid():
+    kept = _stay(status="cancelled", payment_status="partial", deposit_amount=500, kept_amount=500)
+    assert hospitality._counts_as_income(kept) is True
+    assert hospitality._income_amount(kept) == 500 and hospitality._paid_target(kept) == 500
+    assert hospitality.owed_on(kept) == 0
+    refunded = {**kept, "payment_status": "refunded"}
+    assert hospitality._counts_as_income(refunded) is False
+    plain = _stay(status="cancelled", payment_status="partial", deposit_amount=500)   # never kept
+    assert hospitality._counts_as_income(plain) is False
+
+
+def test_cancelling_keeps_what_was_paid_unless_told_to_refund(monkeypatch):
+    seen = []
+    monkeypatch.setattr(hospitality, "get_booking",
+                        lambda db, uid, bid: _stay(payment_status="partial", deposit_amount=500))
+    monkeypatch.setattr(hospitality, "update_booking", lambda db, uid, bid, patch: seen.append(patch) or patch)
+    hospitality.cancel_booking(NS(), "u1", "b1")
+    assert seen[-1]["status"] == "cancelled" and seen[-1]["kept_amount"] == 500
+    hospitality.cancel_booking(NS(), "u1", "b1", refund=True)
+    assert seen[-1]["payment_status"] == "refunded" and "kept_amount" not in seen[-1]
+    monkeypatch.setattr(hospitality, "get_booking", lambda db, uid, bid: _stay())      # nothing paid
+    hospitality.cancel_booking(NS(), "u1", "b1")
+    assert "kept_amount" not in seen[-1] and "payment_status" not in seen[-1]

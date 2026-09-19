@@ -5164,12 +5164,18 @@ def hospitality_decline_booking(booking_id: str, body: Dict[str, Any] = Body(def
     return {"ok": True, "booking": booking, "guest_email": guest_email}
 
 
+class CancelStayRequest(BaseModel):
+    refund: bool = False       # False keeps what was paid as income (upgrade 5)
+
+
 @app.post("/hospitality/bookings/{booking_id}/cancel")
-def hospitality_cancel_booking(booking_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def hospitality_cancel_booking(booking_id: str, body: CancelStayRequest = Body(default=None),
+                               ctx: membership.Context = Depends(membership.require_write)):
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
-        return {"ok": True, "booking": hospitality_api.cancel_booking(db, ctx.tenant, booking_id)}
+        return {"ok": True, "booking": hospitality_api.cancel_booking(
+            db, ctx.tenant, booking_id, refund=bool(body and body.refund))}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
