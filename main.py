@@ -5727,6 +5727,27 @@ def post_simulate(req: SimulateRequest, ctx: membership.Context = Depends(member
     return simulation.simulate(state, scenario)
 
 
+# ── Tidy up test and mistaken entries (upgrade 16) ────────────────────────────
+
+class TidyRequest(BaseModel):
+    kinds: List[str] = []
+
+
+@app.get("/cleanup")
+def cleanup_candidates(ctx: membership.Context = Depends(membership.require_owner)):
+    """What can be tidied away: K0 records, invoices and bookings whose money is
+    all undone, payroll runs with no wage standing. Owner only."""
+    import cleanup
+    return {"ok": True, **cleanup.find(_require_db(), ctx.tenant, ctx.business_id)}
+
+
+@app.post("/cleanup")
+def cleanup_apply(body: TidyRequest, ctx: membership.Context = Depends(membership.require_owner)):
+    """Clear the kinds the owner picked. Nothing that still carries money goes."""
+    import cleanup
+    return {"ok": True, "done": cleanup.tidy(_require_db(), ctx.tenant, ctx.business_id, body.kinds)}
+
+
 @app.get("/twin/cash-by-method")
 def twin_cash_by_method(ctx: membership.Context = Depends(membership.require_context)):
     """The cash figure split into cash, mobile money and bank (upgrade 9), from
