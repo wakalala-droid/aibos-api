@@ -245,3 +245,29 @@ def test_staff_are_told_the_owner_manages_the_plan(monkeypatch):
     # And a receipt of someone else's is not theirs to fetch.
     paths = {r.path for r in main.app.routes}
     assert "/me/billing/receipts/{payment_id}.pdf" in paths
+
+
+# ── The hourly jobs in one place, callable from outside (upgrade 15) ─────────
+
+def test_every_hourly_job_runs_and_one_crash_does_not_stop_the_rest(monkeypatch):
+    import main
+    import guest_mail
+    ran = []
+    monkeypatch.setattr(main, "run_plan_renewals", lambda: ran.append("renewals") or {"sent": 0})
+    monkeypatch.setattr(main.payroll_api, "confirm_due_wages", lambda db: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(guest_mail, "send_due_reminders", lambda db, public_url="": ran.append("reminders") or {"sent": 0})
+    monkeypatch.setattr(main, "sweep_pending_payments", lambda db: ran.append("payments") or {"ok": True})
+    out = main.run_hourly_jobs()
+    assert ran == ["renewals", "reminders", "payments"]
+    assert "error" in out["payday_wages"] and main.HOURLY["last_run"]
+
+
+def test_the_hourly_address_needs_the_cron_secret(monkeypatch):
+    import main
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    monkeypatch.setattr(main, "run_hourly_jobs", lambda: {"ok": True, "ran": True})
+    client = TestClient(main.app)
+    assert client.post("/cron/hourly").status_code == 403
+    assert client.post("/cron/hourly", headers={"X-Cron-Secret": "wrong"}).status_code == 403
+    assert client.post("/cron/hourly", headers={"X-Cron-Secret": "s3cret"}).json()["ran"] is True

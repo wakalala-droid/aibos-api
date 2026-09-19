@@ -2262,6 +2262,8 @@ def health():
         "migrations_applied": _schema["applied"],
         "migrations_missing": _schema["missing"],
         "schema_note": _schema["note"],
+        # When renewals, payday wages and guest reminders last ran (upgrade 15).
+        "hourly_jobs_last_run": HOURLY.get("last_run"),
     }
 
 
@@ -5436,6 +5438,53 @@ def payments_renewals(x_cron_secret: Optional[str] = Header(default=None)):
     return run_plan_renewals()
 
 
+# ── The hourly jobs, in one place (upgrade 15) ────────────────────────────────
+# Plan renewals, wages on payday, payment reminders to guests. They ran only
+# inside the API's own background loop, so on Render's free plan, which puts
+# the API to sleep, they ran only while someone happened to be using AIBOS.
+# Now the same work is one function the loop calls hourly AND an address an
+# outside timer can call (the daily Vercel cron, the keep-awake job with the
+# CRON_SECRET, or any free cron service). Each job is safe to run again: a
+# reminder is sent once per period, a wage is posted once, a guest is
+# reminded once.
+
+HOURLY: Dict[str, Any] = {"last_run": None, "last_result": None}
+_HOURLY_LOCK = __import__("threading").Lock()
+
+
+def run_hourly_jobs() -> Dict[str, Any]:
+    if not _HOURLY_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": "already running"}
+    try:
+        from datetime import datetime, timezone
+        out: Dict[str, Any] = {}
+        db = get_db()
+        for name, job in (
+            ("renewals", run_plan_renewals),
+            ("payday_wages", lambda: payroll_api.confirm_due_wages(db)),
+            ("guest_reminders", lambda: __import__("guest_mail").send_due_reminders(db, public_url=PUBLIC_APP_URL)),
+            ("payments", lambda: sweep_pending_payments(db)),
+        ):
+            try:
+                out[name] = job()
+            except Exception as e:  # noqa: BLE001 — one job must not stop the rest
+                log.warning("[hourly] %s crashed: %s", name, e)
+                out[name] = {"error": str(e)[:200]}
+        HOURLY["last_run"] = datetime.now(timezone.utc).isoformat()
+        HOURLY["last_result"] = out
+        return {"ok": True, **out}
+    finally:
+        _HOURLY_LOCK.release()
+
+
+@app.post("/cron/hourly")
+def cron_hourly(x_cron_secret: Optional[str] = Header(default=None)):
+    """Run the hourly jobs now. Cron-only (CRON_SECRET), like sync-all."""
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    return run_hourly_jobs()
+
+
 @app.post("/payments/sweep")
 def payments_sweep(x_cron_secret: Optional[str] = Header(default=None)):
     """Settle pending mobile money payments now. Cron-only, like sync-all."""
@@ -5460,29 +5509,15 @@ def _start_payments_sweeper() -> None:
                     log.info("[payments] sweep: %s", result)
             except Exception as e:  # noqa: BLE001 — the loop must outlive any one failure
                 log.warning("[payments] sweep crashed: %s", e)
-            # Renewals by the hour: each reminder is sent once per period, so
-            # running often costs nothing and a restart never skips a day.
+            # Renewals, payday wages and guest reminders by the hour (see
+            # run_hourly_jobs); each is sent or posted once, so running often
+            # costs nothing and a restart never skips a day.
             if time.time() - last_renewals >= 3600:
                 last_renewals = time.time()
                 try:
-                    run_plan_renewals()
+                    run_hourly_jobs()
                 except Exception as e:  # noqa: BLE001
-                    log.warning("[billing] renewal run crashed: %s", e)
-                # Wages from a payroll run made before payday, posted on the day.
-                try:
-                    wages = payroll_api.confirm_due_wages(get_db())
-                    if wages.get("posted") or wages.get("errors"):
-                        log.info("[payroll] payday: %s", wages)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("[payroll] payday run crashed: %s", e)
-                # Guests who still owe and arrive within 3 days get a reminder.
-                try:
-                    import guest_mail
-                    sent = guest_mail.send_due_reminders(get_db(), public_url=PUBLIC_APP_URL)
-                    if sent.get("sent") or sent.get("errors"):
-                        log.info("[guest_mail] reminders: %s", sent)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("[guest_mail] reminder run crashed: %s", e)
+                    log.warning("[hourly] run crashed: %s", e)
 
     threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
 

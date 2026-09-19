@@ -56,6 +56,8 @@ jobs:
       - name: Ping every 4 minutes for almost six hours
         env:
           HEALTH_URL: ${{ vars.HEALTH_URL || 'https://aibos.vercel.app/api/proxy/health' }}
+          API_URL: ${{ vars.API_URL || 'https://aibos-api-37v9.onrender.com' }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           ping() {
             # --max-time 90 because a cold start really does take that long.
@@ -68,10 +70,20 @@ jobs:
           # One failed ping is a cold start that timed out, which is exactly the
           # thing this job exists to prevent happening to a person. Three in a
           # row means the API is actually down, and that is worth a red tick.
+          # With the CRON_SECRET repository secret set, the run also starts the
+          # API's hourly jobs (plan renewals, wages on payday, guest payment
+          # reminders) once an hour, so they happen even on a quiet day.
+          hourly() {
+            [ -n "$CRON_SECRET" ] || return 0
+            curl -s -o /dev/null -w "$(date -u '+%H:%M:%S') hourly jobs -> %{http_code}\n" --max-time 120 \
+              -X POST -H "X-Cron-Secret: $CRON_SECRET" "$API_URL/cron/hourly" || true
+          }
           end=$(( $(date +%s) + 350 * 60 ))
           fails=0
+          last_hourly=0
           while [ "$(date +%s)" -lt "$end" ]; do
             if ping; then fails=0; else fails=$((fails + 1)); fi
+            if [ $(( $(date +%s) - last_hourly )) -ge 3600 ]; then hourly; last_hourly=$(date +%s); fi
             if [ "$fails" -ge 3 ]; then
               echo "::error::The API did not answer three pings in a row. Check Render."
               exit 1
