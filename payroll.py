@@ -448,8 +448,9 @@ def post_missing_salaries(db, user_id: str) -> dict:
                         "napsa": _num(s.get("napsa_employee")), "nhima": _num(s.get("nhima_employee")),
                         "loan_deduction": _num(s.get("loan_deduction")),
                         "note": "Salary from a payroll run that had not reached the books, posted by repair.",
+                        **({"scheduled_payday": True} if _is_future(pay_iso) else {}),
                     },
-                    source="manual", status="confirmed",
+                    source="manual", status="pending" if _is_future(pay_iso) else "confirmed",
                     occurred_at=f"{pay_iso}T00:00:00+00:00",
                 ))
                 event_id = (ev or {}).get("id")
@@ -503,6 +504,11 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     # below as separate remittance entries, so nothing is counted twice. Gross and
     # the full breakdown ride along in the payload for transparency.
     import nervous_system as nervous
+    # PAYDAY STILL AHEAD: the wages wait for it. A run made on the 18th for a
+    # payday on the 28th used to take the wages out of "money right now" at
+    # once, ten days before they left the bank. They are recorded as pending,
+    # like the tax payments below, and confirm_due_wages posts them on the day.
+    scheduled = _is_future(pay_iso)
     persisted = []
     for emp, slip in zip(emps, slips):
         event_id = None
@@ -520,8 +526,11 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
                     "gross": slip["gross"], "net": slip["net"], "paye": slip["paye"],
                     "napsa": slip["napsa_employee"], "nhima": slip["nhima_employee"],
                     "loan_deduction": slip["loan_deduction"],
+                    **({"scheduled_payday": True,
+                        "note": f"Wages for {period}, to be paid on {pay_iso}. Posted to your "
+                                "books by themselves on payday."} if scheduled else {}),
                 },
-                source="manual", status="confirmed",
+                source="manual", status="pending" if scheduled else "confirmed",
                 occurred_at=f"{pay_iso}T00:00:00+00:00",
             ))
             event_id = ev.get("id")
@@ -643,6 +652,49 @@ def delete_run(db, user_id: str, run_id: str) -> dict:
 
     db.table("payslips").delete().eq("run_id", run_id).eq("user_id", user_id).execute()
     db.table("payroll_runs").delete().eq("id", run_id).eq("user_id", user_id).execute()
+    return out
+
+
+def _is_future(day_iso: str) -> bool:
+    """Is this date after today in Lusaka?"""
+    from datetime import datetime, timedelta, timezone
+    today = (datetime.now(timezone.utc) + timedelta(hours=2)).date()     # CAT, no DST
+    d = parse_date(day_iso)
+    return bool(d and d > today)
+
+
+def confirm_due_wages(db) -> dict:
+    """Post the wages whose payday has come (every business). Runs hourly.
+
+    Payroll run before payday records the wages as pending with
+    payload.scheduled_payday; on the day they are confirmed, which moves them
+    into the books and out of cash. Only those: a wage someone left pending
+    by hand is theirs to confirm."""
+    import nervous_system as nervous
+    from datetime import datetime, timedelta, timezone
+    out = {"posted": 0, "errors": 0}
+    if db is None:
+        return out
+    # Midnight tonight in Lusaka, as UTC: everything dated today or earlier.
+    now_cat = datetime.now(timezone.utc) + timedelta(hours=2)
+    cutoff = (now_cat.replace(hour=0, minute=0, second=0, microsecond=0)
+              + timedelta(days=1) - timedelta(hours=2)).isoformat()
+    try:
+        res = (db.table("business_events").select("id,user_id,occurred_at,payload")
+               .eq("event_type", "Salary").eq("status", "pending")
+               .eq("payload->>scheduled_payday", "true")
+               .lt("occurred_at", cutoff).limit(500).execute())
+        rows = getattr(res, "data", None) or []
+    except Exception as exc:  # noqa: BLE001
+        log.info("[payroll] payday check skipped: %s", exc)
+        return out
+    for row in rows:
+        try:
+            nervous.confirm(db, row["user_id"], row["id"])
+            out["posted"] += 1
+        except Exception as exc:  # noqa: BLE001 — one must not stop the rest
+            out["errors"] += 1
+            log.warning("[payroll] could not post wage %s on payday: %s", row.get("id"), exc)
     return out
 
 

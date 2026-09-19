@@ -203,3 +203,36 @@ def test_someone_elses_run_cannot_be_deleted():
     with pytest.raises(ValueError):
         payroll.delete_run(db, "intruder", "r1")
     assert db.tables["payroll_runs"]
+
+
+# ── Payday still ahead: the wages wait for it ────────────────────────────────
+
+def test_a_payday_in_the_future_is_recognised():
+    from datetime import date, timedelta
+    assert payroll._is_future((date.today() + timedelta(days=10)).isoformat())
+    assert not payroll._is_future((date.today() - timedelta(days=1)).isoformat())
+
+
+def test_wages_are_posted_on_payday(monkeypatch):
+    import nervous_system
+    posted = []
+    monkeypatch.setattr(nervous_system, "confirm", lambda db, uid, eid: posted.append((uid, eid)))
+
+    class _Q:
+        def __init__(self): self.filters = []
+        def select(self, *_): return self
+        def eq(self, k, v): self.filters.append(("eq", k, v)); return self
+        def lt(self, k, v): self.filters.append(("lt", k, v)); return self
+        def limit(self, n): return self
+        def execute(self):
+            from types import SimpleNamespace as NS
+            return NS(data=[{"id": "w1", "user_id": "u1"}, {"id": "w2", "user_id": "u2"}])
+
+    q = _Q()
+    out = payroll.confirm_due_wages(type("DB", (), {"table": lambda self, n: q})())
+    assert out == {"posted": 2, "errors": 0}
+    assert posted == [("u1", "w1"), ("u2", "w2")]
+    # Only wages a payroll run scheduled, and only pending ones whose day has come.
+    assert ("eq", "payload->>scheduled_payday", "true") in q.filters
+    assert ("eq", "status", "pending") in q.filters and ("eq", "event_type", "Salary") in q.filters
+    assert any(f[0] == "lt" and f[1] == "occurred_at" for f in q.filters)

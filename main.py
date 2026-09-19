@@ -1847,6 +1847,16 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
         currency_line,
         "You are expert in Zambian business, economics, and SME finance.",
         "Be direct, insightful, and action-oriented. No fluff.",
+        # The house style every AIBOS screen follows, so the AI's own words
+        # read like the rest of the product: plain words for an owner, not an
+        # accountant, and two punctuation rules the owner holds absolutely.
+        "Write in plain, simple words a busy shop owner reads at a glance. Say "
+        "months as words ('September 2026'), never as codes like 2026-09. Never "
+        "use the long dash (—) or a spaced en dash (–); use a full stop, comma or "
+        "colon instead. Never put a comma before the word 'and'.",
+        "You can see the conversation so far. Use it: when the owner says 'and "
+        "July?' or 'what about him?', answer in the context of what came before "
+        "instead of asking them to repeat themselves.",
         "NEVER fabricate a time range or data span. Describe the data only by the "
         "period/granularity actually given in the context. POS/operations data is "
         "point-in-time sales for its stated period — never call it 'months' or imply "
@@ -5110,6 +5120,13 @@ def _start_payments_sweeper() -> None:
                     run_plan_renewals()
                 except Exception as e:  # noqa: BLE001
                     log.warning("[billing] renewal run crashed: %s", e)
+                # Wages from a payroll run made before payday, posted on the day.
+                try:
+                    wages = payroll_api.confirm_due_wages(get_db())
+                    if wages.get("posted") or wages.get("errors"):
+                        log.info("[payroll] payday: %s", wages)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[payroll] payday run crashed: %s", e)
 
     threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
 
