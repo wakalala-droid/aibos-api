@@ -2555,3 +2555,90 @@ def record_link_payment(db, user_id: str, booking_id: str, amount: float) -> dic
     except Exception:  # noqa: BLE001
         pass
     return saved
+
+
+# ── Instalments: each payment on a stay with its own date and method ─────────
+# (upgrades 4 and 9). A stay could hold one deposit and then "the rest", every
+# payment took the one method the guest mentioned when booking, and nothing
+# listed what had come in when. Each payment is now its own CustomerPayment in
+# the books, with its date and method, and the booking's paid status follows
+# the total. Posted first and the booking updated after, so sync_booking_payment
+# finds the books already matching and posts nothing twice.
+
+PAYMENT_METHODS = ("cash", "mobile_money", "card", "bank")
+
+
+def list_booking_payments(db, user_id: str, booking_id: str) -> list:
+    get_booking(db, user_id, booking_id)                 # theirs, or ValueError
+    rows = _booking_payments(db, user_id, booking_id)
+    out = [{
+        "id": r.get("id"),
+        "date": str(r.get("occurred_at") or "")[:10],
+        "amount": round(_num((r.get("payload") or {}).get("amount"), 0.0), 2),
+        "method": (r.get("payload") or {}).get("payment_method") or "cash",
+    } for r in rows]
+    out.sort(key=lambda p: (p["date"], p["id"] or ""))
+    return out
+
+
+def _paid_patch(total: float, paid: float) -> dict:
+    if paid <= 0.005:
+        return {"payment_status": "unpaid", "deposit_amount": None}
+    if paid >= total - 0.005:
+        return {"payment_status": "paid"}
+    return {"payment_status": "partial", "deposit_amount": round(paid, 2)}
+
+
+def add_booking_payment(db, user_id: str, booking_id: str, amount, paid_on=None,
+                        method: str = "cash") -> dict:
+    booking = get_booking(db, user_id, booking_id)
+    if not _counts_as_income(booking):
+        raise ValueError("Only a confirmed stay with an amount can take a payment. Confirm it first.")
+    owed = owed_on(booking)
+    value = round(_num(amount, -1.0), 2)
+    if value <= 0:
+        raise ValueError("Enter how much the guest paid.")
+    if value > owed + 0.005:
+        raise ValueError(f"That is more than the {owed:,.2f} still owed on this stay.")
+    method = str(method or "cash").strip().lower()
+    if method not in PAYMENT_METHODS:
+        raise ValueError("Choose cash, mobile money, card or bank.")
+    day = None
+    if paid_on:
+        try:
+            d = date.fromisoformat(str(paid_on)[:10])
+        except ValueError:
+            raise ValueError("That date is not a real date.") from None
+        if d > datetime.now(timezone.utc).date():
+            raise ValueError("A payment cannot be dated in the future.")
+        day = f"{d.isoformat()}T12:00:00+00:00"
+
+    # Bring the books in line first (a Sale that still went to cash moves to
+    # money owed), then post this payment as its own event.
+    sync_booking_payment(db, user_id, booking)
+    sale_payload = {}
+    if booking.get("linked_event_id"):
+        res = (db.table("business_events").select("payload").eq("id", booking["linked_event_id"])
+               .eq("user_id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        sale_payload = (rows[0].get("payload") or {}) if rows else {}
+    payload = {**_payment_payload(booking, sale_payload, value), "payment_method": method}
+    if not _post_event(db, user_id, "CustomerPayment", payload,
+                       note=f"Guest payment for booking {booking.get('check_in')}→{booking.get('check_out')}",
+                       occurred_at=day):
+        raise ValueError("The payment could not be saved to your books. Try again in a moment.")
+    total = _num(booking.get("total_amount"), 0.0)
+    saved = update_booking(db, user_id, booking_id, _paid_patch(total, _paid_target(booking) + value))
+    return {"booking": saved, "payments": list_booking_payments(db, user_id, booking_id)}
+
+
+def remove_booking_payment(db, user_id: str, booking_id: str, event_id: str) -> dict:
+    booking = get_booking(db, user_id, booking_id)
+    pay = next((p for p in list_booking_payments(db, user_id, booking_id) if p["id"] == event_id), None)
+    if pay is None:
+        raise ValueError("That payment is not on this booking.")
+    _void_event(db, user_id, event_id, "Payment removed from the booking")
+    total = _num(booking.get("total_amount"), 0.0)
+    left = max(0.0, _paid_target(booking) - pay["amount"])
+    saved = update_booking(db, user_id, booking_id, _paid_patch(total, left))
+    return {"booking": saved, "payments": list_booking_payments(db, user_id, booking_id)}

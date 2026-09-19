@@ -79,6 +79,50 @@ def cash_direction(event_type: str, payload: dict | None) -> str:
     return ""
 
 
+# Where the cash is (upgrade 9). The fold keeps one cash pool; this splits it by
+# how each payment was made, so an owner can see the cash drawer, the mobile
+# money wallet and the bank apart. Card payments settle into the bank.
+_METHOD_BUCKET = {
+    "cash": "cash",
+    "mobile_money": "mobile_money", "momo": "mobile_money", "mobile money": "mobile_money",
+    "mtn": "mobile_money", "airtel": "mobile_money",
+    "bank": "bank", "card": "bank", "transfer": "bank", "eft": "bank", "cheque": "bank",
+}
+
+
+def method_bucket(method) -> str:
+    """cash | mobile_money | bank | unsaid, from a payload's payment_method."""
+    return _METHOD_BUCKET.get(str(method or "").strip().lower().replace("-", "_"), "unsaid")
+
+
+def cash_by_method(events: list, opening_cash: float = 0.0) -> dict:
+    """The cash figure split by where the money sits. Pure.
+
+    Every confirmed event that moves cash (cash_direction) lands in the bucket
+    of its payment_method; a Transfer moves money between buckets (payload
+    from / to). A record that does not say how it was paid is counted as
+    "unsaid" rather than guessed. The buckets plus the opening balance add up
+    to exactly the twin's cash."""
+    out = {"cash": 0.0, "mobile_money": 0.0, "bank": 0.0, "unsaid": 0.0}
+    for ev in events or []:
+        if ev.get("status") not in (None, "confirmed"):
+            continue
+        p = ev.get("payload") or {}
+        amount = _num(p.get("amount"))
+        if ev.get("event_type") == "Transfer":
+            src, dst = method_bucket(p.get("from")), method_bucket(p.get("to"))
+            out[src] -= amount
+            out[dst] += amount
+            continue
+        direction = cash_direction(ev.get("event_type"), p)
+        if direction:
+            out[method_bucket(p.get("payment_method"))] += amount if direction == "in" else -amount
+    result = {k: round(v, 2) for k, v in out.items()}
+    result["opening"] = round(_num(opening_cash), 2)
+    result["total"] = round(sum(out.values()) + _num(opening_cash), 2)
+    return result
+
+
 def _num(v, default=0.0) -> float:
     # A NaN or infinity already in the log counts as nothing: one of them used
     # to turn every figure it touched into NaN (see nervous_system._non_finite).

@@ -135,3 +135,75 @@ def test_the_routes_exist():
     for p, m in (("/hospitality/bookings/{booking_id}/pay-link", "POST"), ("/pay/stay/{token}", "GET"),
                  ("/pay/stay/{token}/initiate", "POST"), ("/pay/stay/{token}/status/{reference}", "GET")):
         assert (p, m) in paths
+
+
+# ── Instalments with their own date and method (upgrades 4 and 9) ────────────
+
+def _patch_booking(monkeypatch, start):
+    state = {"b": dict(start), "posted": [], "voided": [], "patches": []}
+    monkeypatch.setattr(hospitality, "get_booking", lambda db, uid, bid: dict(state["b"]))
+    monkeypatch.setattr(hospitality, "sync_booking_payment", lambda *a, **k: None)
+
+    def post(db, uid, et, payload, note, occurred_at=None):
+        eid = f"e{len(state['posted']) + 1}"
+        state["posted"].append({"id": eid, "payload": payload, "occurred_at": occurred_at or "2026-09-19"})
+        return eid
+
+    def update(db, uid, bid, patch):
+        state["patches"].append(dict(patch))
+        state["b"] = {**state["b"], **patch}
+        return state["b"]
+
+    monkeypatch.setattr(hospitality, "_post_event", post)
+    monkeypatch.setattr(hospitality, "update_booking", update)
+    monkeypatch.setattr(hospitality, "_void_event", lambda db, uid, eid, r: state["voided"].append(eid))
+    monkeypatch.setattr(hospitality, "_booking_payments", lambda db, uid, bid: [
+        {**e, "status": "confirmed"} for e in state["posted"] if e["id"] not in state["voided"]])
+    return state
+
+
+def test_three_instalments_each_keep_their_day_and_method(monkeypatch):
+    st = _patch_booking(monkeypatch, _stay(linked_event_id=None))
+    db = NS(table=lambda n: None)
+    hospitality.add_booking_payment(db, "u1", "b1", 500, "2026-09-01", "cash")
+    assert st["patches"][-1] == {"payment_status": "partial", "deposit_amount": 500}
+    hospitality.add_booking_payment(db, "u1", "b1", 700, "2026-09-05", "mobile_money")
+    out = hospitality.add_booking_payment(db, "u1", "b1", 800, "2026-09-09", "bank")
+    assert st["patches"][-1] == {"payment_status": "paid"}
+    assert [p["method"] for p in out["payments"]] == ["cash", "mobile_money", "bank"]
+    assert [p["date"] for p in out["payments"]] == ["2026-09-01", "2026-09-05", "2026-09-09"]
+
+
+def test_an_instalment_cannot_overpay_be_in_the_future_or_use_an_unknown_method(monkeypatch):
+    _patch_booking(monkeypatch, _stay(payment_status="partial", deposit_amount=1500))
+    db = NS(table=lambda n: None)
+    for bad in ((600, None, "cash"), (100, "2999-01-01", "cash"), (100, None, "cheque-book")):
+        with pytest.raises(ValueError):
+            hospitality.add_booking_payment(db, "u1", "b1", *bad)
+
+
+def test_removing_an_instalment_puts_the_owed_amount_back(monkeypatch):
+    st = _patch_booking(monkeypatch, _stay(linked_event_id=None))
+    db = NS(table=lambda n: None)
+    hospitality.add_booking_payment(db, "u1", "b1", 2000, None, "cash")
+    assert st["b"]["payment_status"] == "paid"
+    hospitality.remove_booking_payment(db, "u1", "b1", "e1")
+    assert st["voided"] == ["e1"] and st["patches"][-1]["payment_status"] == "unpaid"
+
+
+def test_the_cash_split_adds_up_to_the_cash_figure():
+    import digital_twin as twin
+    ev = lambda et, amt, **p: {"event_type": et, "status": "confirmed", "occurred_at": "2026-09-01",
+                               "payload": {"amount": amt, **p}}
+    events = [
+        ev("Sale", 1000, payment_method="cash"),
+        ev("Sale", 2000, payment_method="credit"),                      # owed, not cash
+        ev("CustomerPayment", 2000, payment_method="mobile_money"),
+        ev("Salary", 700, payment_method="bank"),
+        ev("Expense", 100),                                             # how it was paid: not said
+        ev("Transfer", 800, **{"from": "cash", "to": "bank"}),          # cash taken to the bank
+    ]
+    split = twin.cash_by_method(events, opening_cash=50)
+    assert split == {"cash": 200.0, "mobile_money": 2000.0, "bank": 100.0, "unsaid": -100.0,
+                     "opening": 50.0, "total": 2250.0}
+    assert split["total"] == round(twin.project(events, opening_cash=50)["cash"], 2)

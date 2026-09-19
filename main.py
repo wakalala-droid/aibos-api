@@ -4354,6 +4354,45 @@ def hospitality_booking_pay_link(booking_id: str, body: StayPayLinkRequest = Bod
             "owed": out["owed"], "requested": out["requested"]}
 
 
+class StayPaymentIn(BaseModel):
+    amount: float
+    paid_on: Optional[str] = None          # YYYY-MM-DD; today when left out
+    method: str = "cash"                   # cash | mobile_money | card | bank
+
+
+@app.get("/hospitality/bookings/{booking_id}/payments")
+def hospitality_booking_payments(booking_id: str, ctx: membership.Context = Depends(membership.require_context)):
+    """Every payment on a stay, each with its date and method (upgrades 4 and 9)."""
+    _require_hospitality(ctx.tenant)
+    try:
+        return {"ok": True, "payments": hospitality_api.list_booking_payments(_require_db(), ctx.tenant, booking_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/hospitality/bookings/{booking_id}/payments")
+def hospitality_add_booking_payment(booking_id: str, body: StayPaymentIn,
+                                    ctx: membership.Context = Depends(membership.require_write)):
+    """Record one payment a guest made: amount, day and how they paid."""
+    _require_hospitality(ctx.tenant)
+    try:
+        return {"ok": True, **hospitality_api.add_booking_payment(
+            _require_db(), ctx.tenant, booking_id, body.amount, body.paid_on, body.method)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/hospitality/bookings/{booking_id}/payments/{event_id}")
+def hospitality_remove_booking_payment(booking_id: str, event_id: str,
+                                       ctx: membership.Context = Depends(membership.require_write)):
+    """Take a payment recorded by mistake off a stay (voided in the books, not erased)."""
+    _require_hospitality(ctx.tenant)
+    try:
+        return {"ok": True, **hospitality_api.remove_booking_payment(_require_db(), ctx.tenant, booking_id, event_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 def _stay_or_404(db, token: str) -> Dict[str, Any]:
     try:
         booking = hospitality_api.get_by_pay_token(db, token)
@@ -5672,6 +5711,18 @@ def post_simulate(req: SimulateRequest, ctx: membership.Context = Depends(member
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     scenario = {k: v for k, v in req.dict().items() if v is not None}
     return simulation.simulate(state, scenario)
+
+
+@app.get("/twin/cash-by-method")
+def twin_cash_by_method(ctx: membership.Context = Depends(membership.require_context)):
+    """The cash figure split into cash, mobile money and bank (upgrade 9), from
+    how each confirmed record says it was paid. Adds up to the twin's cash."""
+    db = _require_db()
+    state = twin.get_state(db, ctx.tenant, ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=100000,
+                                 business_id=twin._books_for(db, ctx.tenant, ctx.business_id))
+    split = twin.cash_by_method(events, state.get("opening_cash") or 0.0)
+    return {"ok": True, **split, "cash": round(float(state.get("cash") or 0.0), 2)}
 
 
 @app.get("/twin/financials")
