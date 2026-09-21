@@ -306,6 +306,31 @@ def test_devices_are_named_in_plain_words():
     assert webpush.describe(edge) == "Edge on a Windows computer"
     assert webpush.describe(mac) == "Safari on a Mac"
     assert webpush.describe("") == "A browser"
+    assert webpush.describe("undici") == "A browser"          # the website's relay, not a browser
+
+
+def test_a_device_saved_without_its_browser_is_named_by_its_push_service():
+    rows = [
+        {"id": "a", "user_agent": "node", "created_at": "2026-09-20T00:28:00+00:00",
+         "endpoint": "https://wns2-par02p.notify.windows.com/w/?token=secret"},
+        {"id": "b", "user_agent": None, "created_at": "2026-09-19T00:00:00+00:00",
+         "endpoint": "https://web.push.apple.com/QGx"},
+        {"id": "c", "user_agent": "Mozilla/5.0 (Linux; Android 14) Chrome/128.0 Mobile Safari/537.36",
+         "created_at": "2026-09-18T00:00:00+00:00", "endpoint": "https://fcm.googleapis.com/fcm/send/x"},
+    ]
+
+    class _Q:
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def order(self, *_, **__): return self
+        def execute(self): return NS(data=rows)
+
+    out = webpush.devices(NS(table=lambda n: _Q()), "owner")
+    assert [d["device"] for d in out] == ["Edge on a Windows computer", "Safari on an iPhone or Mac",
+                                          "Chrome on an Android phone"]
+    assert all("endpoint" not in d for d in out)               # the address is never handed out
+    assert webpush.describe_service("https://fcm.googleapis.com/fcm/send/x") == "Chrome on a phone or computer"
+    assert webpush.describe_service("") == "A browser"
 
 
 # ── Who the platform's emails come from ──────────────────────────────────────

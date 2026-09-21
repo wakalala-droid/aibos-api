@@ -218,9 +218,31 @@ def describe(agent: str | None) -> str:
     return device or browser or "A browser"
 
 
+def describe_service(endpoint: str | None) -> str:
+    """What the push service alone says about a device. Used when the saved
+    user agent says nothing: the website's relay used to pass on its own
+    instead of the browser's, so early sign-ups were all "a browser"."""
+    host = urlparse(str(endpoint or "")).netloc.lower()
+    if host.endswith("notify.windows.com"):
+        return "Edge on a Windows computer"
+    if host.endswith("push.apple.com"):
+        return "Safari on an iPhone or Mac"
+    if host.endswith("mozilla.com"):
+        return "Firefox"
+    if host.endswith("googleapis.com"):
+        return "Chrome on a phone or computer"
+    return "A browser"
+
+
 def devices(db, user_id: str) -> list[dict]:
-    """The browsers this person turned notifications on in, newest first."""
-    res = (db.table(TABLE).select("id,user_agent,created_at").eq("user_id", user_id)
+    """The browsers this person turned notifications on in, newest first. The
+    delivery address is read only to name the device and is never returned."""
+    res = (db.table(TABLE).select("id,user_agent,endpoint,created_at").eq("user_id", user_id)
            .order("created_at", desc=True).execute())
-    return [{"id": r.get("id"), "device": describe(r.get("user_agent")), "since": r.get("created_at")}
-            for r in (getattr(res, "data", None) or [])]
+    out = []
+    for r in getattr(res, "data", None) or []:
+        name = describe(r.get("user_agent"))
+        if name == "A browser":
+            name = describe_service(r.get("endpoint"))
+        out.append({"id": r.get("id"), "device": name, "since": r.get("created_at")})
+    return out
