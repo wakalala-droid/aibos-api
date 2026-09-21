@@ -29,6 +29,7 @@ from engine3 import run_engine3
 from intelligence import run_cross_engine
 from extensions import generate_proposals  # SAFEGUARD Layer 2 (isolated from core)
 import payments
+import paddle
 import billing as billing_api
 
 # ─── Evolution spine (additive — Directive Initiatives 5, 11, 12) ──────────────
@@ -2193,7 +2194,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 36
+EXPECTS_MIGRATION = 37
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -2312,9 +2313,14 @@ def health_setup():
          "needs": ["CRON_SECRET"],
          "without_it": "The nightly iCal sync with Booking.com and Airbnb cannot "
                        "be triggered, so OTA calendars drift."},
-        {"key": "card_and_mobile_money", "live": any(payments.configured_networks().values()),
+        {"key": "mobile_money", "live": any(payments.configured_networks().values()),
          "needs": ["MTN_MOMO_SUBSCRIPTION_KEY", "AIRTEL_CLIENT_ID"],
          "without_it": "Checkout runs in simulation. No real money moves."},
+        {"key": "card_payments", "live": paddle.status()["ready"],
+         "needs": ["PADDLE_API_KEY"],
+         "environment": paddle.environment(),
+         "detail": paddle.status()["note"],
+         "without_it": "Nobody can pay for a plan by card. Only mobile money is offered."},
         {"key": "faster_auth", "live": on("SUPABASE_JWT_SECRET"),
          "needs": ["SUPABASE_JWT_SECRET"],
          "without_it": "Every request verifies the login against Supabase over "
@@ -2497,7 +2503,10 @@ def _tool_round_trip_probe(client, model: str) -> dict:
 # look up a payment or get a receipt for their tax records.
 
 def _simulated(network: str) -> bool:
-    """Could a payment on this network only have been a simulation?"""
+    """Could a payment on this network only have been a simulation? A card
+    payment never is: it reached us signed by Paddle."""
+    if network == "paddle":
+        return False
     return payments.SIMULATION_ENABLED and not payments.provider_configured(network)
 
 
@@ -2515,7 +2524,8 @@ def _billing_view(user_id: str) -> Dict[str, Any]:
                .eq("id", user_id).limit(1).execute())
     profile = (getattr(res, "data", None) or [{}])[0]
     billing = billing_api._billing_of(db, user_id)
-    status = billing_api.plan_status(profile, PLAN_PRICES, billing)
+    card = billing_api.card_plan_of(db, user_id, paddle.environment())
+    status = billing_api.plan_status(profile, PLAN_PRICES, billing, card=card)
 
     sub_rows, audit_rows = [], []
     try:
@@ -2533,7 +2543,7 @@ def _billing_view(user_id: str) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         log.info("[billing] no recorded payments for %s: %s", user_id, e)
     history = billing_api.payment_history(sub_rows, audit_rows, PLAN_PRICES, _simulated)
-    return {"profile": profile, "status": status, "payments": history}
+    return {"profile": profile, "status": status, "payments": history, "card": card}
 
 
 @app.get("/me/billing")
@@ -2548,8 +2558,31 @@ def my_billing(user_id: str = Depends(require_user),
         return {"ok": True, "own_plan": False,
                 "note": "The owner of this business manages its plan and payments."}
     view = _billing_view(user_id)
+    card = view["card"] or {}
     return {"ok": True, "own_plan": True, **view["status"], "payments": view["payments"],
-            "collections_live": any(payments.configured_networks().values())}
+            "collections_live": any(payments.configured_networks().values()),
+            "card_payments": paddle.status()["ready"],
+            # Whether Paddle's own page (change card, invoices) can be opened.
+            "card_manageable": bool(card.get("customer_id")) and paddle.configured()}
+
+
+@app.get("/me/billing/invoices/{payment_id}")
+def my_card_invoice(payment_id: str, user_id: str = Depends(require_user)):
+    """Where to download Paddle's invoice for one card payment. Paddle sold the
+    plan (Merchant of Record), so its invoice is the receipt that counts."""
+    view = _billing_view(user_id)
+    pay = next((p for p in view["payments"] if p["id"] == payment_id), None)
+    if pay is None or not pay.get("invoice") or not payment_id.startswith("c-"):
+        raise HTTPException(status_code=404, detail="There is no invoice for that payment.")
+    try:
+        url = paddle.invoice_url(payment_id[2:])
+    except paddle.PaddleError as e:
+        log.warning("[paddle] invoice for %s: %s", payment_id, e)
+        raise HTTPException(status_code=502, detail="Paddle could not hand over that invoice just "
+                                                    "now. Please try again in a minute.")
+    if not url:
+        raise HTTPException(status_code=404, detail="Paddle has no invoice for that payment yet.")
+    return {"ok": True, "url": url}
 
 
 @app.get("/me/billing/receipts/{payment_id}.pdf")
@@ -2578,14 +2611,27 @@ def _send_plan_receipt(rec: Dict[str, Any]) -> None:
     db = get_db()
     if not user_id or db is None or _simulated(rec.get("network") or ""):
         return
+    by_card = rec.get("network") == "paddle"
     try:
         view = _billing_view(user_id)
-        pay = next((p for p in view["payments"] if p["id"] == f"m-{rec.get('reference')}"), None)
+        pid = f"{'c' if by_card else 'm'}-{rec.get('reference')}"
+        pay = next((p for p in view["payments"] if p["id"] == pid), None)
         if pay is None:
             return
         status, prof = view["status"], view["profile"]
         until = billing_api._parse(status.get("paid_until"))
-        title = f"Payment received: {billing_api.money(pay['amount'])} for {pay['plan_name']}"
+        title = (f"Payment received: {billing_api.money(pay['amount'], pay.get('currency'))} "
+                 f"for {pay['plan_name']}")
+        if by_card:
+            # Paddle sold it, so Paddle has already emailed the receipt and the
+            # invoice. A note in the bell is enough from us.
+            body = (f"Thank you. Your {pay['plan_name']} plan is paid up to "
+                    f"{billing_api._long_day(until) if until else 'the end of this period'} and "
+                    "renews by itself on your card. Paddle has emailed you the receipt. The "
+                    "invoice is on Plan & billing too.")
+            notify.record_notification(db, user_id, "plan_payment_received", title, body,
+                                       "/dashboard/billing", {"payment": pay["id"]})
+            return
         body = (f"Thank you. Your {pay['plan_name']} plan is paid up to "
                 f"{billing_api._long_day(until) if until else 'the end of this period'}. "
                 f"Your receipt number is {billing_api.receipt_number(pay)}; you can download it "
@@ -2691,11 +2737,17 @@ def paid_period_end(now, current_until, current_tier: Optional[str], plan: str, 
     return billing_api.add_period(now, billing)
 
 
-def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly") -> bool:
+def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly",
+                until_override=None) -> bool:
     """Server-authoritative tier grant. Writes profiles via the service-role
     client (the ONLY path allowed to set a tier — the client can't, see the
     profiles guard trigger). Best-effort: never breaks the payment response.
-    Returns whether the grant was written."""
+    Returns whether the grant was written.
+
+    `until_override` is the end of the period a card payment covered, as Paddle
+    billed it. Paddle's calendar decides when a card is next charged, so ours
+    must not invent a different end date. Days already paid by mobile money
+    beyond it are kept."""
     if not user_id:
         return False
     # Only known paid plans may be granted; anything unrecognised falls back to
@@ -2722,9 +2774,13 @@ def _grant_tier(user_id: Optional[str], plan: str, billing: str = "monthly") -> 
         # grant's leftover date must not decide when a real payment ends.
         until = (entitlements._parse_ts(row.get("paid_until"))
                  if row.get("paid_until") and row.get("tier_source") == "payment" else None)
-        patch["paid_until"] = paid_period_end(
-            now, until, row.get("tier"), tier, billing,
-            billing_api.anchor_for(until, entitlements._parse_ts(row.get("created_at")))).isoformat()
+        if until_override is not None:
+            end = until_override if until is None or row.get("tier") != tier else max(until, until_override)
+            patch["paid_until"] = end.isoformat()
+        else:
+            patch["paid_until"] = paid_period_end(
+                now, until, row.get("tier"), tier, billing,
+                billing_api.anchor_for(until, entitlements._parse_ts(row.get("created_at")))).isoformat()
     except Exception as e:  # noqa: BLE001 — pre-0033: grant without a period
         log.info("[payments] no paid_until for %s (%s)", user_id, e)
     try:
@@ -2804,7 +2860,8 @@ def _settle(rec: Dict[str, Any], new_status: str) -> None:
             rec["granted"] = True          # someone else already granted it
             return
     rec["granted"] = True
-    if _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly"):
+    if _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly",
+                   rec.get("period_end")):
         _send_plan_receipt(rec)
 
 
@@ -2956,6 +3013,513 @@ def payments_callback(network: str, body: Dict[str, Any],
             log.info("[payments] stay callback lookup (ref=%s): %s", reference, e)
 
     return {"ok": False, "detail": "unknown reference"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAYMENTS — Cards, through Paddle (paddle.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Paddle is the Merchant of Record: it sells the plan in its own name, charges
+# the card every period until the customer cancels, and tells us about every
+# payment on the webhook below. A PAYMENT is the only thing that grants or
+# extends a plan here. The subscription events keep our copy of the card plan
+# (renews on, cancelled, card declined) in step with Paddle, and move the
+# account between plans when the customer changes plan.
+
+def _paddle_testers() -> set:
+    raw = os.environ.get("PADDLE_TESTERS") or os.environ.get("ADMIN_EMAILS") or "vwanheda@gmail.com"
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _paddle_may_grant(db, user_id: str) -> bool:
+    """Sandbox payments are made with test cards anyone can type. While the
+    server holds a sandbox key, only the people testing it (PADDLE_TESTERS,
+    proven by Google like the admin) get a plan from one."""
+    if paddle.environment() != "sandbox":
+        return True
+    return bool(membership.verified_emails(db, user_id) & _paddle_testers())
+
+
+def _card_row(db, subscription_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not subscription_id:
+        return None
+    try:
+        res = (db.table("card_subscriptions").select("*")
+               .eq("subscription_id", subscription_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+    except Exception as e:  # noqa: BLE001 — pre-0037
+        log.info("[paddle] card subscription lookup skipped: %s", e)
+        return None
+
+
+def _card_owner(db, subscription_id: Optional[str] = None,
+                customer_id: Optional[str] = None) -> Optional[str]:
+    """Whose account a Paddle subscription or customer belongs to, from the
+    copy we keep. Used when an event carries no user id of its own."""
+    row = _card_row(db, subscription_id)
+    if row and row.get("user_id"):
+        return row["user_id"]
+    if customer_id:
+        try:
+            res = (db.table("card_subscriptions").select("user_id")
+                   .eq("customer_id", customer_id).order("updated_at", desc=True).limit(1).execute())
+            rows = getattr(res, "data", None) or []
+            if rows:
+                return rows[0]["user_id"]
+        except Exception as e:  # noqa: BLE001 — pre-0037
+            log.info("[paddle] customer lookup skipped: %s", e)
+    return None
+
+
+def _iso(dt) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _save_card_subscription(db, fact: Dict[str, Any], user_id: str) -> str:
+    """Keep our copy of a card subscription in step with Paddle: 'saved',
+    'stale' (older than the copy we hold, since Paddle does not promise to
+    deliver events in order) or 'failed' (pre-0037)."""
+    held = _card_row(db, fact.get("subscription_id"))
+    held_at = entitlements._parse_ts(held.get("event_at")) if held and held.get("event_at") else None
+    if held_at and fact.get("event_at") and fact["event_at"] < held_at:
+        return "stale"
+    row: Dict[str, Any] = {
+        "subscription_id": fact["subscription_id"],
+        "user_id": user_id,
+        "environment": paddle.environment() or "live",
+        "event_at": _iso(fact.get("event_at")),
+        "period_end": _iso(fact.get("period_end")),
+        "next_billed_at": _iso(fact.get("next_billed_at")),
+        "cancel_at": _iso(fact.get("cancel_at")),
+        "canceled_at": _iso(fact.get("canceled_at")),
+    }
+    for k in ("customer_id", "status", "plan", "billing", "price_id", "amount", "currency"):
+        if fact.get(k) is not None:
+            row[k] = fact[k]
+    try:
+        db.table("card_subscriptions").upsert(row, on_conflict="subscription_id").execute()
+        return "saved"
+    except Exception as e:  # noqa: BLE001 — pre-0037: the plan itself still follows
+        log.warning("[paddle] card subscription %s not saved (run migration 0037): %s",
+                    fact.get("subscription_id"), e)
+        return "failed"
+
+
+def _note_card_payment(db, fact: Dict[str, Any], user_id: str) -> None:
+    """A payment names its subscription and customer. Keep them, so the owner
+    can manage the card at once even before the subscription's own event lands."""
+    if not fact.get("subscription_id"):
+        return
+    held = _card_row(db, fact["subscription_id"])
+    row: Dict[str, Any] = {"subscription_id": fact["subscription_id"], "user_id": user_id,
+                           "environment": paddle.environment() or "live"}
+    if fact.get("customer_id"):
+        row["customer_id"] = fact["customer_id"]
+    if held is None:
+        row.update(status="active", plan=fact.get("plan"), billing=fact.get("billing"),
+                   currency=fact.get("currency"), period_end=_iso(fact.get("period_end")),
+                   next_billed_at=_iso(fact.get("period_end")))
+        price = paddle.price_for(fact.get("plan") or "", fact.get("billing") or "")
+        if price:
+            row["amount"] = price["amount"]
+    try:
+        db.table("card_subscriptions").upsert(row, on_conflict="subscription_id").execute()
+    except Exception as e:  # noqa: BLE001 — pre-0037
+        log.info("[paddle] card payment not noted on the subscription: %s", e)
+
+
+def _profile_plan(db, user_id: str) -> Dict[str, Any]:
+    res = (db.table("profiles").select("tier,tier_source,paid_until")
+           .eq("id", user_id).limit(1).execute())
+    return (getattr(res, "data", None) or [{}])[0]
+
+
+def _follow_card_plan(db, user_id: str, plan: str) -> None:
+    """The customer changed plan on their card subscription (Pro to Growth, or
+    back): the account moves with it. Only an account paid up right now; a
+    FIRST payment is granted by the payment itself, never by a subscription
+    merely existing."""
+    from datetime import datetime, timezone
+    if plan not in PLAN_PRICES:
+        return
+    row = _profile_plan(db, user_id)
+    until = entitlements._parse_ts(row.get("paid_until")) if row.get("paid_until") else None
+    if (row.get("tier_source") != "payment" or until is None
+            or until < datetime.now(timezone.utc) or row.get("tier") == plan):
+        return
+    db.table("profiles").update({"tier": plan, "subscription_tier": plan}).eq("id", user_id).execute()
+    entitlements.invalidate(user_id)
+    log.info("[paddle] %s moved to %s with their card plan", user_id, plan)
+
+
+def _end_card_plan(db, user_id: str, fact: Dict[str, Any]) -> None:
+    """A card plan cancelled before the end of what was paid (a refund, a
+    cancellation on the spot, or Paddle giving up on a declined card) ends now.
+    One cancelled at the end of its period needs nothing: the paid days run out
+    by themselves. Never lengthens a plan."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    canceled = fact.get("canceled_at") or now
+    end = fact.get("period_end")
+    if end is None or canceled >= end - timedelta(hours=1):
+        return
+    row = _profile_plan(db, user_id)
+    if row.get("tier_source") != "payment" or row.get("tier") != fact.get("plan"):
+        return
+    until = entitlements._parse_ts(row.get("paid_until")) if row.get("paid_until") else None
+    # The plan reads Free once the week of grace after paid_until has passed,
+    # so ending it at `canceled` means paid_until a week before.
+    stop = canceled - timedelta(days=entitlements.GRACE_DAYS)
+    if until is not None and until <= stop:
+        return
+    db.table("profiles").update({"paid_until": stop.isoformat()}).eq("id", user_id).execute()
+    entitlements.invalidate(user_id)
+    log.info("[paddle] card plan of %s ended early on %s", user_id, canceled.isoformat())
+
+
+def _paddle_payment(db, data: Dict[str, Any]) -> Dict[str, Any]:
+    fact = paddle.transaction_fact(data, paddle.by_product())
+    if fact["origin"] == "subscription_payment_method_change":
+        return {"ok": True, "ignored": "a card change, not a payment"}
+    if fact["subscription_id"] and fact["origin"] == "subscription_update":
+        # A plan change was charged: what the subscription holds NOW is the
+        # plan paid for, whatever lines the prorated bill carries.
+        try:
+            sub = paddle.get_subscription(fact["subscription_id"])
+            hit = paddle.plan_of_items(sub.get("items"), paddle.by_product())
+            if hit:
+                fact["plan"], fact["billing"] = hit
+        except paddle.PaddleError as e:
+            log.warning("[paddle] could not read subscription %s: %s", fact["subscription_id"], e)
+    user_id = fact["user_id"] or _card_owner(db, fact["subscription_id"], fact["customer_id"])
+    if not fact["transaction_id"] or not user_id or not fact["plan"]:
+        paddle.note_unmatched("payment", fact["transaction_id"],
+                              f"account={user_id or 'unknown'} plan={fact['plan'] or 'unknown'}")
+        return {"ok": True, "ignored": "unmatched"}
+    if not _paddle_may_grant(db, user_id):
+        log.warning("[paddle] sandbox payment %s by %s not granted: not a tester",
+                    fact["transaction_id"], user_id)
+        return {"ok": True, "ignored": "a test payment by someone who is not testing"}
+
+    reference = fact["transaction_id"]
+    rec = _load_subscription_payment(reference)
+    if rec is not None and rec.get("status") == "refunded":
+        return {"ok": True, "ignored": "a payment that was refunded"}
+    if rec is None:
+        rec = {"reference": reference, "network": "paddle", "plan": fact["plan"],
+               "billing": fact["billing"], "amount": fact["amount"], "currency": fact["currency"],
+               "user_id": user_id, "status": "pending", "granted": False, "created_at": time.time()}
+        PAYMENTS[reference] = rec
+        try:
+            db.table("subscription_payments").insert({
+                "reference": reference, "user_id": user_id, "network": "paddle",
+                "plan": fact["plan"], "billing": fact["billing"], "amount": fact["amount"],
+                "currency": fact["currency"], "status": "pending", "granted": False,
+            }).execute()
+        except Exception as e:  # noqa: BLE001 — a repeat delivery racing us, or pre-0033
+            log.info("[paddle] payment %s not inserted: %s", reference, e)
+            held = _load_subscription_payment(reference)
+            rec = held or rec
+    rec["period_end"] = fact["period_end"]
+    _settle(rec, "successful")
+    _note_card_payment(db, fact, user_id)
+    return {"ok": True, "granted": bool(rec.get("granted"))}
+
+
+def _paddle_subscription(db, data: Dict[str, Any], occurred_at) -> Dict[str, Any]:
+    fact = paddle.subscription_fact(data, occurred_at, paddle.by_product())
+    if not fact["subscription_id"]:
+        return {"ok": True, "ignored": "no subscription id"}
+    user_id = fact["user_id"] or _card_owner(db, fact["subscription_id"], fact["customer_id"])
+    if not user_id:
+        paddle.note_unmatched("subscription", fact["subscription_id"], "no account")
+        return {"ok": True, "ignored": "unmatched"}
+    if not _paddle_may_grant(db, user_id):
+        return {"ok": True, "ignored": "a test subscription by someone who is not testing"}
+    if _save_card_subscription(db, fact, user_id) == "stale":
+        return {"ok": True, "ignored": "older than what we hold"}
+    if fact["status"] == "active" and fact["plan"]:
+        _follow_card_plan(db, user_id, fact["plan"])
+    elif fact["status"] == "canceled":
+        _end_card_plan(db, user_id, fact)
+    entitlements.invalidate(user_id)
+    return {"ok": True, "status": fact["status"]}
+
+
+def _paddle_adjustment(db, data: Dict[str, Any]) -> Dict[str, Any]:
+    """A refund or a chargeback. Once Paddle has approved a FULL one, the
+    customer has that payment back: it reads Refunded on Plan & billing, and
+    when it paid for the period running now the card plan stops at once. The
+    Refund Policy promises exactly that: a refunded plan ends when the refund
+    is made and does not renew again. Partial refunds change nothing."""
+    from datetime import datetime, timezone
+    fact = paddle.adjustment_fact(data)
+    if (fact["action"] not in ("refund", "chargeback") or fact["status"] != "approved"
+            or not fact["full"] or not fact["transaction_id"]):
+        return {"ok": True, "ignored": f"{fact['action']} {fact['status']}"}
+    txn = fact["transaction_id"]
+    rec = _load_subscription_payment(txn)
+    user_id = (rec or {}).get("user_id") or _card_owner(db, fact["subscription_id"], fact["customer_id"])
+    if not user_id:
+        paddle.note_unmatched("refund", txn, "no account")
+        return {"ok": True, "ignored": "unmatched"}
+    if rec is not None:
+        rec["status"] = "refunded"
+    try:
+        db.table("subscription_payments").update({"status": "refunded"}).eq("reference", txn).execute()
+    except Exception as e:  # noqa: BLE001 — pre-0037 the status cannot say "refunded" yet
+        log.warning("[paddle] payment %s not marked refunded (run migration 0037): %s", txn, e)
+
+    # Only the payment for the period running now ends the plan. Refunding an
+    # older month (a mistake put right) leaves the current one alone.
+    latest = None
+    try:
+        res = (db.table("subscription_payments").select("reference")
+               .eq("user_id", user_id).eq("network", "paddle")
+               .order("created_at", desc=True).limit(1).execute())
+        latest = ((getattr(res, "data", None) or [{}])[0]).get("reference")
+    except Exception as e:  # noqa: BLE001
+        log.info("[paddle] latest card payment of %s unknown: %s", user_id, e)
+    card = _card_row(db, fact["subscription_id"])
+    ended = False
+    if latest == txn and card:
+        now = datetime.now(timezone.utc)
+        sub_fact = None
+        if card.get("status") in paddle.LIVE_STATUSES:
+            try:
+                sub_fact = paddle.subscription_fact(paddle.cancel_now(card["subscription_id"]), None,
+                                                    paddle.by_product())
+                _save_card_subscription(db, sub_fact, user_id)
+            except paddle.PaddleError as e:
+                log.warning("[paddle] could not stop %s after a refund: %s", card["subscription_id"], e)
+        # The period the refunded payment covered, as we held it: a subscription
+        # cancelled on the spot no longer has a current period to report.
+        paid_to = entitlements._parse_ts(card["period_end"]) if card.get("period_end") else None
+        _end_card_plan(db, user_id, {
+            "canceled_at": now,
+            "period_end": paid_to or (sub_fact or {}).get("period_end"),
+            "plan": card.get("plan"),
+        })
+        ended = True
+    entitlements.invalidate(user_id)
+    try:
+        amount = billing_api.money(float((rec or {}).get("amount") or 0), (rec or {}).get("currency") or "USD")
+        what = "Chargeback" if fact["action"] == "chargeback" else "Refund made"
+        notify.record_notification(
+            db, user_id, "plan_payment_refunded", f"{what}: {amount}",
+            (f"Paddle has sent back your card payment of {amount}. " if fact["action"] == "refund"
+             else f"Your card payment of {amount} was reversed by your bank. ")
+            + ("The card plan has stopped and the account is on Free. Your records all stay."
+               if ended else "Your current plan is not affected."),
+            "/dashboard/billing", {"payment": f"c-{txn}"})
+    except Exception as e:  # noqa: BLE001 — the refund stands either way
+        log.info("[paddle] refund note for %s not recorded: %s", user_id, e)
+    return {"ok": True, "refunded": txn, "plan_ended": ended}
+
+
+def _on_paddle_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(event.get("event_type") or "")
+    data = event.get("data") or {}
+    db = get_db()
+    if db is None:
+        # Paddle retries a failed delivery for days: better than a lost payment.
+        raise HTTPException(status_code=503, detail="Persistence is not configured")
+    paddle.ensure_setup()       # so a price made in the dashboard is recognised
+    try:
+        if kind == "transaction.completed":
+            return _paddle_payment(db, data)
+        if kind.startswith("subscription."):
+            return _paddle_subscription(db, data, event.get("occurred_at"))
+        if kind.startswith("adjustment."):
+            return _paddle_adjustment(db, data)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — say so, and let Paddle try again
+        log.error("[paddle] %s %s failed: %s", kind, data.get("id"), e)
+        raise HTTPException(status_code=500, detail="The event could not be processed; Paddle will retry.")
+    return {"ok": True, "ignored": kind}
+
+
+@app.post("/payments/paddle/webhook")
+async def paddle_webhook(request: Request):
+    """Paddle tells us about card payments and card plans here. Every request
+    must be signed with the webhook's secret: unsigned, anyone could post
+    "paid" and take a plan."""
+    from starlette.concurrency import run_in_threadpool
+
+    raw = await request.body()
+    header = request.headers.get("paddle-signature")
+    secret = await run_in_threadpool(paddle.webhook_secret)
+    if not secret:
+        raise HTTPException(status_code=503, detail="Card payments are not set up on this server.")
+    ok = paddle.verify_signature(raw, header, secret)
+    if not ok and header:
+        # The secret may have been rotated in the Paddle dashboard since we read it.
+        fresh = await run_in_threadpool(paddle.webhook_secret, True)
+        ok = bool(fresh) and fresh != secret and paddle.verify_signature(raw, header, fresh)
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid Paddle signature")
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="The body is not JSON")
+    return await run_in_threadpool(_on_paddle_event, event)
+
+
+@app.get("/payments/paddle/config")
+def paddle_config():
+    """What the website needs to offer card payments. Public: the checkout
+    token is public by design and the prices are on the pricing page."""
+    st = paddle.status()
+    if not st["configured"]:
+        return {"enabled": False, "environment": None, "prices": {}, "testers_only": False}
+    if not st["ready"]:
+        st = paddle.ensure_setup()
+    ready = bool(st["ready"])
+    return {"enabled": ready, "environment": st["environment"],
+            "client_token": paddle.client_token() if ready else None,
+            "prices": paddle.card_prices() if ready else {},
+            "testers_only": st["environment"] == "sandbox"}
+
+
+class CardPlanRequest(BaseModel):
+    plan: str
+    billing: str = "monthly"
+    confirm: bool = False
+
+
+def _card_plan_choice(body: CardPlanRequest) -> tuple:
+    plan = (body.plan or "").lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="plan must be 'pro', 'proplus' or 'growth'")
+    return plan, ("annual" if body.billing == "annual" else "monthly")
+
+
+def _live_card_plan(db, user_id: str) -> Optional[Dict[str, Any]]:
+    card = billing_api.card_plan_of(db, user_id, paddle.environment())
+    return card if card and card.get("status") in paddle.LIVE_STATUSES else None
+
+
+@app.post("/payments/paddle/checkout")
+def paddle_checkout(body: CardPlanRequest, user_id: str = Depends(require_user)):
+    """Start a card checkout for the caller's own account. The transaction is
+    made here, so the price and the account it pays for are the server's to
+    decide; the browser only opens it."""
+    plan, billing = _card_plan_choice(body)
+    st = paddle.ensure_setup()
+    if not st["ready"]:
+        raise HTTPException(status_code=503, detail="Card payments are not switched on yet. "
+                                                    "Please pay with mobile money for now.")
+    db = _require_db()
+    if not _paddle_may_grant(db, user_id):
+        raise HTTPException(status_code=403, detail="Card payments are still being tested and are "
+                                                    "not open yet. Please pay with mobile money.")
+    card = _live_card_plan(db, user_id)
+    if card:
+        raise HTTPException(status_code=409, detail="You already pay for AIBOS by card. Change your "
+                                                    "plan from Plan & billing instead.")
+    prof = (db.table("profiles").select("email,contact_email").eq("id", user_id)
+            .limit(1).execute())
+    row = (getattr(prof, "data", None) or [{}])[0]
+    held = billing_api.card_plan_of(db, user_id, paddle.environment()) or {}
+    customer_id = held.get("customer_id") or paddle.find_or_create_customer(
+        row.get("contact_email") or row.get("email") or "", user_id)
+    try:
+        out = paddle.create_checkout(user_id, plan, billing, customer_id)
+    except paddle.PaddleError as e:
+        log.warning("[paddle] checkout for %s failed: %s", user_id, e)
+        raise HTTPException(status_code=502, detail="Paddle could not start the card checkout just "
+                                                    "now. Please try again in a minute.")
+    return {"ok": True, **out, "plan": plan, "billing": billing,
+            "client_token": paddle.client_token(), "environment": paddle.environment()}
+
+
+@app.post("/payments/paddle/change")
+def paddle_change(body: CardPlanRequest, user_id: str = Depends(require_user)):
+    """Move a card plan to another plan or period. Without `confirm` it only
+    says what it would cost now; with it, Paddle charges the difference (or
+    keeps the unused part as credit) and the account moves at once."""
+    plan, billing = _card_plan_choice(body)
+    db = _require_db()
+    card = _live_card_plan(db, user_id)
+    if not card or card.get("status") not in ("active", "trialing"):
+        raise HTTPException(status_code=404, detail="There is no card plan on this account to change.")
+    if card.get("plan") == plan and card.get("billing") == billing:
+        raise HTTPException(status_code=400, detail="That is already your plan.")
+    try:
+        result = paddle.change_plan(card["subscription_id"], plan, billing, preview=not body.confirm)
+    except paddle.PaddleError as e:
+        log.warning("[paddle] plan change for %s failed: %s", user_id, e)
+        declined = "declin" in str(e).lower() or "payment" in str(e.code or "")
+        raise HTTPException(status_code=402 if declined else 502, detail=(
+            "Your card was declined, so the plan was not changed. Update your card and try again."
+            if declined else "Paddle could not change the plan just now. Nothing was changed. "
+                             "Please try again in a minute."))
+    if not body.confirm:
+        return {"ok": True, "preview": paddle.change_summary(result)}
+    fact = paddle.subscription_fact(result, None, paddle.by_product())
+    _save_card_subscription(db, fact, user_id)
+    if fact["status"] == "active" and fact["plan"]:
+        _follow_card_plan(db, user_id, fact["plan"])
+    entitlements.invalidate(user_id)
+    return {"ok": True, "plan": fact["plan"], "billing": fact["billing"]}
+
+
+@app.post("/payments/paddle/cancel")
+def paddle_cancel(user_id: str = Depends(require_user)):
+    """Stop the card plan renewing. It stays on until the end of what is paid."""
+    db = _require_db()
+    card = _live_card_plan(db, user_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="There is no card plan on this account.")
+    if card.get("cancel_at"):
+        return {"ok": True, "ends_on": card["cancel_at"]}
+    try:
+        result = paddle.cancel_at_period_end(card["subscription_id"])
+    except paddle.PaddleError as e:
+        log.warning("[paddle] cancel for %s failed: %s", user_id, e)
+        raise HTTPException(status_code=502, detail="Paddle could not cancel the renewal just now. "
+                                                    "Nothing was changed. Please try again in a minute.")
+    fact = paddle.subscription_fact(result, None, paddle.by_product())
+    _save_card_subscription(db, fact, user_id)
+    return {"ok": True, "ends_on": _iso(fact["cancel_at"])}
+
+
+@app.post("/payments/paddle/keep")
+def paddle_keep(user_id: str = Depends(require_user)):
+    """Undo a cancelled renewal before it takes effect."""
+    db = _require_db()
+    card = _live_card_plan(db, user_id)
+    if not card or not card.get("cancel_at"):
+        raise HTTPException(status_code=404, detail="There is no cancelled card plan to keep.")
+    try:
+        result = paddle.keep_subscription(card["subscription_id"])
+    except paddle.PaddleError as e:
+        log.warning("[paddle] keep for %s failed: %s", user_id, e)
+        raise HTTPException(status_code=502, detail="Paddle could not keep the plan just now. "
+                                                    "Please try again in a minute.")
+    fact = paddle.subscription_fact(result, None, paddle.by_product())
+    _save_card_subscription(db, fact, user_id)
+    return {"ok": True, "renews_on": _iso(fact["next_billed_at"])}
+
+
+@app.post("/payments/paddle/portal")
+def paddle_portal(user_id: str = Depends(require_user)):
+    """A link into Paddle's own page for this customer: change the card, see
+    every invoice. The link is short-lived, so it is made fresh each time."""
+    db = _require_db()
+    card = billing_api.card_plan_of(db, user_id, paddle.environment())
+    if not card or not card.get("customer_id"):
+        raise HTTPException(status_code=404, detail="There is no card on this account.")
+    try:
+        url = paddle.portal_url(card["customer_id"], [card.get("subscription_id")])
+    except paddle.PaddleError as e:
+        log.warning("[paddle] portal for %s failed: %s", user_id, e)
+        url = None
+    if not url:
+        raise HTTPException(status_code=502, detail="Paddle could not open your card page just now. "
+                                                    "Please try again in a minute.")
+    return {"ok": True, "url": url}
 
 
 # ── Morning Brief delivery (notify.py — ready-for-keys like payments) ────────
@@ -5428,7 +5992,8 @@ def run_plan_renewals() -> dict:
         return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url)))
 
     return billing_api.run_renewals(db, PLAN_PRICES, request_payment=_renewal_request,
-                                    send_email=_email, record=notify.record_notification)
+                                    send_email=_email, record=notify.record_notification,
+                                    card_environment=paddle.environment())
 
 
 @app.post("/payments/renewals")
@@ -5496,6 +6061,13 @@ def payments_sweep(x_cron_secret: Optional[str] = Header(default=None)):
     if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
         raise HTTPException(status_code=403, detail="Invalid cron secret")
     return sweep_pending_payments(get_db())
+
+
+@app.on_event("startup")
+def _start_paddle_setup() -> None:
+    """Make sure Paddle has the plans, the webhook and the checkout token before
+    the first customer asks (paddle.ensure_setup). Never blocks the boot."""
+    paddle.start_setup_in_background()
 
 
 @app.on_event("startup")

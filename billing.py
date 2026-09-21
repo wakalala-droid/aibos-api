@@ -119,9 +119,17 @@ def _day(dt: datetime) -> str:
     return f"{local.day} {local.strftime('%B')}"
 
 
-def money(amount: float) -> str:
+def money(amount: float, currency: str | None = "ZMW") -> str:
+    """K500, K1,234.50, $25, $29.99. Card plans are paid in US dollars (Paddle
+    cannot charge in Kwacha), so an amount is only a number with its currency."""
     whole = abs(amount - round(amount)) < 0.005
-    return f"K{amount:,.0f}" if whole else f"K{amount:,.2f}"
+    figure = f"{amount:,.0f}" if whole else f"{amount:,.2f}"
+    cur = (currency or "ZMW").upper()
+    if cur == "ZMW":
+        return f"K{figure}"
+    if cur == "USD":
+        return f"${figure}"
+    return f"{figure} {cur}"
 
 
 # ── What it says ─────────────────────────────────────────────────────────────
@@ -156,6 +164,49 @@ def _already_sent(db, user_id: str, kind: str, period: str) -> bool:
     return bool(getattr(res, "data", None))
 
 
+CARD_LIVE_STATUSES = ("active", "trialing", "past_due", "paused")   # = paddle.LIVE_STATUSES
+
+
+def card_renews_itself(db, user_ids: list, environment: str | None = None) -> set:
+    """The accounts among these whose plan is a card subscription that is still
+    going (Paddle renews it). Empty before migration 0037.
+
+    `environment` ('live' or 'sandbox') leaves out test subscriptions once the
+    server has moved to the live account, and the other way round."""
+    ids = [u for u in user_ids if u]
+    if not ids:
+        return set()
+    try:
+        q = (db.table("card_subscriptions").select("user_id,status")
+             .in_("user_id", ids).in_("status", list(CARD_LIVE_STATUSES)))
+        if environment:
+            q = q.eq("environment", environment)
+        res = q.execute()
+        return {r["user_id"] for r in (getattr(res, "data", None) or []) if r.get("user_id")}
+    except Exception as e:  # noqa: BLE001 — pre-0037: nobody pays by card yet
+        log.info("[billing] card subscriptions not readable: %s", e)
+        return set()
+
+
+def card_plan_of(db, user_id: str, environment: str | None = None) -> dict | None:
+    """The account's card subscription: the live one if there is one, else the
+    most recent. None when they have never paid by card (or pre-0037)."""
+    try:
+        q = (db.table("card_subscriptions")
+             .select("subscription_id,customer_id,status,plan,billing,amount,currency,"
+                     "period_end,next_billed_at,cancel_at,canceled_at,environment,updated_at")
+             .eq("user_id", user_id))
+        if environment:
+            q = q.eq("environment", environment)
+        res = q.order("updated_at", desc=True).limit(10).execute()
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — pre-0037
+        log.info("[billing] no card plan for %s: %s", user_id, e)
+        return None
+    live = [r for r in rows if r.get("status") in CARD_LIVE_STATUSES]
+    return (live or rows or [None])[0]
+
+
 def _billing_of(db, user_id: str) -> str:
     """Monthly unless the last payment for this account was for a year."""
     try:
@@ -180,7 +231,8 @@ def _billing_of(db, user_id: str) -> str:
 
 
 def run_renewals(db, prices: dict, request_payment=None, send_email=None,
-                 record=None, now: datetime | None = None) -> dict:
+                 record=None, now: datetime | None = None,
+                 card_environment: str | None = None) -> dict:
     """Send whatever renewal reminders are due. Safe to call as often as liked.
 
     request_payment(user_id, plan, billing) -> phone tail or None: asks the
@@ -206,10 +258,13 @@ def run_renewals(db, prices: dict, request_payment=None, send_email=None,
             log.info("[billing] renewal check skipped: %s", e)
             return {**out, "skipped": "paid periods are not set up"}
 
+        # A card plan renews by itself: Paddle charges the card and emails the
+        # customer. Telling them to pay as well invites a second payment.
+        by_card = card_renews_itself(db, [p.get("id") for p in rows], card_environment)
         for p in rows:
             plan = p.get("tier")
             until = _parse(p.get("paid_until"))
-            if plan not in prices or until is None:
+            if plan not in prices or until is None or p.get("id") in by_card:
                 continue
             out["checked"] += 1
             stage = due_stage(until, now)
@@ -257,7 +312,7 @@ def run_renewals(db, prices: dict, request_payment=None, send_email=None,
 # found out their plan was ending from a reminder, and had nowhere to look up
 # what they had paid, or to get a receipt for their tax records.
 
-NETWORK_NAMES = {"mtn": "MTN Mobile Money", "airtel": "Airtel Money"}
+NETWORK_NAMES = {"mtn": "MTN Mobile Money", "airtel": "Airtel Money", "paddle": "Card, through Paddle"}
 
 
 def _long_day(dt: datetime) -> str:
@@ -269,25 +324,76 @@ def _ordinal(n: int) -> str:
     return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
-def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None = None) -> dict:
+def card_status(card: dict | None, plan: str, until: datetime | None,
+                now: datetime) -> dict | None:
+    """The plan in plain words when a card subscription is paying for it, or
+    None when it is not. Pure. Paddle renews the card, so these sentences never
+    ask the owner to pay: they say when the card is charged, or what went wrong."""
+    if not card or card.get("status") not in CARD_LIVE_STATUSES or card.get("plan") != plan:
+        return None
+    name = PLAN_NAMES.get(plan, plan)
+    amount = card.get("amount")
+    currency = card.get("currency") or "USD"
+    price = money(float(amount), currency) if amount is not None else "the plan's price"
+    period = "year" if card.get("billing") == "annual" else "month"
+    renews = _parse(card.get("next_billed_at")) or _parse(card.get("period_end")) or until
+    cancel_at = _parse(card.get("cancel_at"))
+    off = until + timedelta(days=GRACE_DAYS) if until else None
+    info = {"status": card.get("status"), "plan": plan, "billing": card.get("billing") or "monthly",
+            "amount": float(amount) if amount is not None else None, "currency": currency,
+            "renews_on": renews.isoformat() if renews and not cancel_at else None,
+            "cancel_at": cancel_at.isoformat() if cancel_at else None}
+    base = {"card": info, "price": info["amount"], "currency": currency,
+            "renews_on": info["renews_on"],
+            "switches_off_on": (cancel_at or off).isoformat() if (cancel_at or off) else None,
+            "days_left": (((cancel_at or renews).astimezone(LUSAKA).date()
+                           - now.astimezone(LUSAKA).date()).days if (cancel_at or renews) else None)}
+    status = card.get("status")
+    if status == "past_due":
+        return {**base, "state": "grace",
+                "sentence": f"Your card payment of {price} for {name} did not go through. Paddle tries "
+                            f"the card again over the next few days. Update your card to keep {name} on"
+                            + (f". Everything keeps working until {_long_day(off)}." if off else ".")}
+    if status == "paused":
+        return {**base, "state": "grace",
+                "sentence": f"Your {name} card plan is paused, so the card is not being charged."
+                            + (f" Everything keeps working until {_long_day(off)}." if off and off > now else "")}
+    if cancel_at:
+        return {**base, "state": "active",
+                "sentence": f"Your {name} plan is paid up to {_long_day(cancel_at)} and then ends: "
+                            f"you cancelled the card renewal. Changed your mind? Keep it and your card "
+                            f"is charged {price} on {_day(cancel_at)} as before."}
+    return {**base, "state": "active",
+            "sentence": (f"Your {name} plan renews by itself on {_long_day(renews)}. Your card is "
+                         f"charged {price} each {period} and Paddle emails the receipt. You can cancel "
+                         f"the renewal here at any time." if renews else
+                         f"Your {name} plan renews by itself each {period} for {price} on your card.")}
+
+
+def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None = None,
+                card: dict | None = None) -> dict:
     """The owner's plan in plain words. Pure.
 
     state: free | included (set up by AIBOS, no end date) | active | grace |
-    expired. `sentence` is what the page shows first."""
+    expired. `sentence` is what the page shows first. `card` is the account's
+    card subscription (card_plan_of), when there is one."""
     now = now or datetime.now(timezone.utc)
     plan = str(profile.get("tier") or "free")
     name = PLAN_NAMES.get(plan, "Free")
     price = (prices.get(plan) or {}).get(billing)
     until = _parse(profile.get("paid_until")) if profile.get("tier_source") == "payment" else None
     period = "year" if billing == "annual" else "month"
-    out = {"plan": plan, "plan_name": name, "billing": billing, "price": price,
+    out = {"plan": plan, "plan_name": name, "billing": billing, "price": price, "currency": "ZMW",
            "paid_until": until.isoformat() if until else None, "renews_on": None,
-           "switches_off_on": None, "days_left": None,
+           "switches_off_on": None, "days_left": None, "card": None,
            "pay_link": f"/checkout?plan={plan}&billing={billing}" if plan in prices else "/pricing"}
 
     if plan not in prices:
         return {**out, "state": "free", "plan_name": "Free",
                 "sentence": "You are on the Free plan. Upgrade any time to switch on more of AIBOS."}
+    by_card = card_status(card, plan, until, now)
+    if by_card:
+        return {**out, **by_card}
     if until is None:
         return {**out, "state": "included",
                 "sentence": f"Your {name} plan was set up for you by AIBOS and has no end date."}
@@ -326,16 +432,21 @@ def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=No
         status = r.get("status") or "pending"
         network = r.get("network") or ""
         phone = "".join(ch for ch in str(r.get("payer_phone") or "") if ch.isdigit())
+        # Paddle sold a card plan in its own name (Merchant of Record), so its
+        # invoice is the receipt that counts. AIBOS does not print a second one.
+        by_card = network == "paddle"
         out.append({
-            "id": f"m-{r.get('reference')}",
+            "id": f"{'c' if by_card else 'm'}-{r.get('reference')}",
             "date": r.get("created_at"),
             "plan": r.get("plan"), "plan_name": PLAN_NAMES.get(r.get("plan"), r.get("plan")),
             "billing": r.get("billing") or "monthly",
             "amount": float(r.get("amount") or 0), "currency": r.get("currency") or "ZMW",
             "method": NETWORK_NAMES.get(network, network or "Mobile money"),
-            "phone_tail": phone[-4:] or None,
+            "phone_tail": None if by_card else (phone[-4:] or None),
             "status": status,
-            "receipt": status == "successful" and not (simulated and simulated(network)),
+            "receipt": (not by_card and status == "successful"
+                        and not (simulated and simulated(network))),
+            "invoice": by_card and status in ("successful", "refunded"),
         })
     for a in audit_rows or []:
         d = a.get("detail") or {}
@@ -352,7 +463,7 @@ def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=No
             "billing": billing, "amount": float(amount), "currency": "ZMW",
             "method": "Paid to AIBOS directly", "phone_tail": None,
             "status": "successful", "paid_until": d.get("paid_until"),
-            "receipt": True,
+            "receipt": True, "invoice": False,
         })
     out.sort(key=lambda p: str(p.get("date") or ""), reverse=True)
     return out
@@ -374,7 +485,7 @@ def receipt_text(payment: dict, business: str | None, email: str | None) -> str:
         f"Paid by: {business or 'AIBOS customer'}" + (f" ({email})" if email else ""),
         "",
         f"*AIBOS {payment.get('plan_name')} plan, {period}*",
-        f"Amount paid: {money(float(payment.get('amount') or 0))} ({payment.get('currency') or 'ZMW'})",
+        f"Amount paid: {money(float(payment.get('amount') or 0), payment.get('currency'))} ({payment.get('currency') or 'ZMW'})",
         f"Paid by: {payment.get('method')}"
         + (f", phone ending {payment['phone_tail']}" if payment.get("phone_tail") else ""),
     ]

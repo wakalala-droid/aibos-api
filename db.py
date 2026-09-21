@@ -284,6 +284,7 @@ _SCHEMA_PROBES = (
     (34, "chat_messages", "client_id"),
     (35, "booking_payments", "settled"),
     (36, "push_subscriptions", "endpoint"),
+    (37, "card_subscriptions", "subscription_id"),
 )
 
 _schema_cache: tuple[dict, float] | None = None
