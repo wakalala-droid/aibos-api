@@ -145,9 +145,11 @@ def _send_one(sub: dict, message: dict, subject: str) -> int:
 
 
 def send_to_user(db, user_id: str, title: str, body: str = "", link: str = "",
-                 wait: bool = False) -> dict:
+                 wait: bool = False, extra: dict | None = None) -> dict:
     """Notify every browser this person turned notifications on in. Runs on a
-    thread unless `wait`; dead subscriptions (404/410) are removed."""
+    thread unless `wait`; dead subscriptions (404/410) are removed. `extra`
+    rides along to the service worker: `tag` keeps one notification from
+    replacing another, `sticky` keeps it on screen until it is dealt with."""
     if db is None or not user_id or not configured():
         return {"sent": 0, "skipped": True}
 
@@ -158,8 +160,9 @@ def send_to_user(db, user_id: str, title: str, body: str = "", link: str = "",
         except Exception as e:  # noqa: BLE001 — pre-0036: nobody has signed up yet
             log.info("[webpush] no subscriptions table: %s", e)
             return out
-        subject = "mailto:" + (os.environ.get("PUSH_CONTACT_EMAIL") or "bookings@ai-bos.website")
-        message = {"title": title[:120], "body": (body or "")[:300], "link": link or "/dashboard"}
+        subject = "mailto:" + (os.environ.get("PUSH_CONTACT_EMAIL") or "hello@ai-bos.website")
+        message = {"title": title[:120], "body": (body or "")[:300], "link": link or "/dashboard",
+                   **(extra or {})}
         for sub in rows:
             try:
                 code = _send_one(sub, message, subject)
@@ -194,3 +197,30 @@ def subscribe(db, user_id: str, endpoint: str, p256dh: str, auth: str, agent: st
 def unsubscribe(db, user_id: str, endpoint: str) -> dict:
     db.table(TABLE).delete().eq("endpoint", endpoint).eq("user_id", user_id).execute()
     return {"ok": True}
+
+
+def describe(agent: str | None) -> str:
+    """'Chrome on an Android phone' from a browser's user agent, so an owner can
+    tell whether their phone is one of the devices that will buzz."""
+    a = (agent or "").lower()
+    device = ("iPhone" if "iphone" in a else "iPad" if "ipad" in a
+              else "Android phone" if "android" in a
+              else "Windows computer" if "windows" in a
+              else "Mac" if "macintosh" in a or "mac os" in a
+              else "Linux computer" if "linux" in a else "")
+    browser = ("Edge" if "edg/" in a or "edga/" in a or "edgios/" in a
+               else "Samsung Internet" if "samsungbrowser" in a
+               else "Firefox" if "firefox" in a or "fxios" in a
+               else "Chrome" if "chrome" in a or "crios" in a
+               else "Safari" if "safari" in a else "")
+    if device and browser:
+        return f"{browser} on {'an' if device[0].lower() in 'aeiou' else 'a'} {device}"
+    return device or browser or "A browser"
+
+
+def devices(db, user_id: str) -> list[dict]:
+    """The browsers this person turned notifications on in, newest first."""
+    res = (db.table(TABLE).select("id,user_agent,created_at").eq("user_id", user_id)
+           .order("created_at", desc=True).execute())
+    return [{"id": r.get("id"), "device": describe(r.get("user_agent")), "since": r.get("created_at")}
+            for r in (getattr(res, "data", None) or [])]

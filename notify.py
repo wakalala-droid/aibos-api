@@ -16,13 +16,15 @@ Channels:
     after the user last messaged the number. Both modes are implemented.
 
 Env:
-  RESEND_API_KEY      — Resend API key
-  BRIEF_FROM_EMAIL    — verified sender, e.g. "AIBOS <brief@yourdomain>"
-                        (defaults to Resend's test sender for first smoke test)
-  WHATSAPP_TOKEN      — Meta Cloud API access token
-  WHATSAPP_PHONE_ID   — sending phone-number id
-  WHATSAPP_TEMPLATE   — approved template name (optional; see note above)
-  CRON_SECRET         — shared secret the cron caller must present
+  RESEND_API_KEY      Resend API key
+  BRIEF_FROM_EMAIL    an address on the domain verified with Resend. Only its
+                      DOMAIN is used: AI-BOS writes as hello@ that domain (see
+                      sender()). Unset: Resend's test sender, for a first test.
+  APP_FROM_EMAIL      optional: the exact "Name <address>" to send as instead
+  WHATSAPP_TOKEN      Meta Cloud API access token
+  WHATSAPP_PHONE_ID   sending phone-number id
+  WHATSAPP_TEMPLATE   approved template name (optional; see note above)
+  CRON_SECRET         shared secret the cron caller must present
 """
 
 import os
@@ -235,6 +237,24 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
 
 # ── Senders ───────────────────────────────────────────────────────────────────
 
+def sender() -> str:
+    """Who AI-BOS's own emails are from: "AI-BOS <hello@ai-bos.website>".
+
+    BRIEF_FROM_EMAIL on the API is bookings@, set up for booking alerts. It was
+    the From line on everything: the Morning Brief, renewals, receipts. A
+    customer reading their brief saw it come from "bookings". Only that
+    variable's DOMAIN is used now (Resend verifies the domain, so any address on
+    it sends). APP_FROM_EMAIL can still name an exact sender.
+    """
+    explicit = (os.environ.get("APP_FROM_EMAIL") or "").strip()
+    if explicit:
+        return explicit
+    from email.utils import parseaddr
+    _name, addr = parseaddr(os.environ.get("BRIEF_FROM_EMAIL") or "")
+    domain = addr.rsplit("@", 1)[-1].strip().lower() if "@" in addr else ""
+    return f"AI-BOS <hello@{domain}>" if domain else "AI-BOS <onboarding@resend.dev>"
+
+
 def send_email(to: str, subject: str, body: str, html: str | None = None) -> bool:
     """Send as AI-BOS. Every email in the platform's own name wears its logo:
     pass `html` to shape it, or get the plain body wrapped in the logo."""
@@ -246,7 +266,7 @@ def send_email(to: str, subject: str, body: str, html: str | None = None) -> boo
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {os.environ['RESEND_API_KEY']}"},
         json={
-            "from": os.environ.get("BRIEF_FROM_EMAIL", "AIBOS <onboarding@resend.dev>"),
+            "from": sender(),
             "to": [to],
             "subject": subject,
             "text": body,

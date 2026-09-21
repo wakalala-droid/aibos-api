@@ -16,6 +16,9 @@ stay queryable rows, each with its own linked_event_id.
 CRUD is tenant-scoped on user_id; the backend writes via service role (auth.py
 verifies the caller). Pure helpers (validate_recurrence/next_occurrence/
 expand_occurrences) are dependency-free and unit-testable offline.
+
+Reminders are delivered by schedule_reminders.py: remind_minutes_before unset
+means at the time, REMIND_OFF means none.
 """
 
 import calendar
@@ -35,6 +38,11 @@ EDITABLE = ("kind", "title", "notes", "location", "with_whom", "amount",
 # Expansion guard rails: a rule never yields more than a year ahead or 120 hits.
 MAX_HORIZON_DAYS = 366
 MAX_OCCURRENCES = 120
+
+# remind_minutes_before: unset = at the time, REMIND_OFF = no reminder. At
+# most a week ahead (the reminder job reads that far forward).
+REMIND_OFF = -1
+MAX_REMIND_MINUTES = 7 * 24 * 60
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────────
@@ -177,9 +185,11 @@ def _clean(data: dict, partial: bool = False) -> dict:
 
     if "remind_minutes_before" in out and out["remind_minutes_before"] is not None:
         try:
-            out["remind_minutes_before"] = max(0, int(out["remind_minutes_before"]))
+            minutes = int(out["remind_minutes_before"])
         except (TypeError, ValueError):
             raise ValueError("remind_minutes_before must be a whole number of minutes.")
+        out["remind_minutes_before"] = (REMIND_OFF if minutes < 0
+                                        else min(minutes, MAX_REMIND_MINUTES))
 
     if "all_day" in out:
         out["all_day"] = bool(out["all_day"])

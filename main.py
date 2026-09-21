@@ -65,6 +65,7 @@ import rate_limit
 import exports as exports_api
 import pdfdoc
 import schedule_items as schedule_api
+import schedule_reminders
 import payroll as payroll_api
 import hospitality as hospitality_api
 import guest_mail
@@ -5465,6 +5466,9 @@ def run_hourly_jobs() -> Dict[str, Any]:
             ("payday_wages", lambda: payroll_api.confirm_due_wages(db)),
             ("guest_reminders", lambda: __import__("guest_mail").send_due_reminders(db, public_url=PUBLIC_APP_URL)),
             ("payments", lambda: sweep_pending_payments(db)),
+            # Normally sent on the minute by their own loop; this catches any
+            # the API missed while it slept.
+            ("schedule_reminders", lambda: schedule_reminders.send_due(db)),
         ):
             try:
                 out[name] = job()
@@ -5521,6 +5525,13 @@ def _start_payments_sweeper() -> None:
                     log.warning("[hourly] run crashed: %s", e)
 
     threading.Thread(target=loop, name="payments-sweeper", daemon=True).start()
+
+
+@app.on_event("startup")
+def _start_schedule_reminders() -> None:
+    """Schedule reminders go out on the minute they are due: the bell, the
+    owner's phone and computer, email when no device got it."""
+    schedule_reminders.start(get_db)
 
 
 @app.post("/hospitality/sync-all")
@@ -5757,6 +5768,18 @@ def push_unsubscribe(body: PushSubscription,
     except Exception as e:  # noqa: BLE001
         if missing_schema(e):
             return {"ok": True}
+        raise
+
+
+@app.get("/push/devices")
+def push_devices(ctx: membership.Context = Depends(membership.require_context)):
+    """Which phones and computers this person turned notifications on in, in
+    plain words, so the Schedule can say where a reminder will arrive."""
+    try:
+        return {"ok": True, "devices": webpush.devices(_require_db(), ctx.actor)}
+    except Exception as e:  # noqa: BLE001: pre-0036, nobody has signed up yet
+        if missing_schema(e):
+            return {"ok": True, "devices": []}
         raise
 
 
