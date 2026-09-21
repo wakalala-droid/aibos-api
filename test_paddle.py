@@ -209,7 +209,7 @@ def fake_paddle(monkeypatch):
     saved = dict(paddle._STATE)
     paddle._STATE.update(checked_at=0.0, ready=False, catalog={}, by_price={}, by_product={},
                          webhook_secret=None, webhook_id=None, webhook_url=None,
-                         client_token=None, notes=[], error=None)
+                         client_token=None, notes=[], error=None, blocked=None)
     yield fake
     paddle._STATE.clear()
     paddle._STATE.update(saved)
@@ -554,3 +554,25 @@ def test_refunding_last_month_leaves_this_month_alone(api, monkeypatch):
     r = _post(client, "adjustment.updated", _refund(transaction_id="txn_1"))
     assert r.json()["plan_ended"] is False
     assert db.rows["profiles"][0]["paid_until"] == END2
+
+
+def test_a_missing_payment_link_hides_cards_and_says_how_to_fix_it(fake_paddle, monkeypatch):
+    paddle.ensure_setup()
+    assert paddle.status()["ready"]
+
+    def refuse(method, path, body=None, params=None, timeout=20.0):
+        if (method, path) == ("POST", "/transactions"):
+            raise paddle.PaddleError("A Default Payment Link has not yet been defined", 400,
+                                     "transaction_default_checkout_url_not_set")
+        return fake_paddle.api(method, path, body, params, timeout)
+
+    monkeypatch.setattr(paddle, "api", refuse)
+    with pytest.raises(paddle.PaddleError):
+        paddle.create_checkout("u1", "pro", "monthly", None)
+    st = paddle.status()
+    assert not st["ready"] and "default payment link" in st["note"].lower()
+    # Once Paddle takes a checkout again, cards come back at once.
+    monkeypatch.setattr(paddle, "api", lambda m, p, body=None, params=None, timeout=20.0: (
+        {"data": {"id": "txn_ok"}} if (m, p) == ("POST", "/transactions") else fake_paddle.api(m, p, body, params, timeout)))
+    assert paddle.create_checkout("u1", "pro", "monthly", None)["transaction_id"] == "txn_ok"
+    assert paddle.status()["ready"]

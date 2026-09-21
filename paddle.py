@@ -357,8 +357,17 @@ def _list(path: str, params: dict | None = None, pages: int = 10) -> list:
 
 # ── Making sure Paddle has what AIBOS needs ─────────────────────────────────
 
+# Paddle will not open any checkout until its dashboard has a default payment
+# link (Checkout settings), and on a live account until that domain is
+# approved. Neither can be read through the API, so the first refused
+# checkout says so: cards are then hidden for a while (a customer is never
+# offered a button that cannot work) and /health/setup names the fix.
+BLOCK_FOR = 15 * 60
+LINK_FIX = ("Set the default payment link in Paddle (Checkout, Checkout settings) to "
+            "https://ai-bos.website/pricing. A live account also needs that domain approved.")
+
 _STATE: dict = {
-    "checked_at": 0.0, "ready": False, "environment": None,
+    "checked_at": 0.0, "ready": False, "environment": None, "blocked": None,
     "catalog": {}, "by_price": {}, "by_product": {},
     "webhook_secret": None, "webhook_id": None, "webhook_url": None,
     "client_token": None, "notes": [], "error": None,
@@ -541,15 +550,34 @@ def ensure_setup(force: bool = False) -> dict:
         return status()
 
 
+def _blocked() -> dict | None:
+    held = _STATE.get("blocked")
+    return held if held and time.time() - held["at"] < BLOCK_FOR else None
+
+
+def is_payment_link_problem(e: "PaddleError") -> bool:
+    text = f"{e.code or ''} {e}".lower()
+    return ("checkout_url" in text or "payment link" in text or "checkout url" in text
+            or "domain" in text and "approv" in text)
+
+
+def checkout_refused(e: "PaddleError") -> None:
+    """Paddle refused to make a checkout because of its own settings."""
+    _STATE["blocked"] = {"at": time.time(), "reason": f"{LINK_FIX} (Paddle said: {e})"}
+    log.error("[paddle] checkout refused, cards hidden for %s minutes: %s", BLOCK_FOR // 60, e)
+
+
 def status() -> dict:
     """What /health/setup and the checkout need to know. Never raises."""
     if not configured():
         return {"configured": False, "ready": False, "environment": None,
                 "note": "PADDLE_API_KEY is not set on the server."}
-    note = _STATE["error"] or ("Card payments are ready." if _STATE["ready"] else
-                               " ".join(_STATE["notes"]) or "Setting up Paddle.")
+    blocked = _blocked()
+    ready = bool(_STATE["ready"]) and not blocked
+    note = (blocked["reason"] if blocked else _STATE["error"]) or (
+        "Card payments are ready." if ready else " ".join(_STATE["notes"]) or "Setting up Paddle.")
     return {
-        "configured": True, "ready": bool(_STATE["ready"]), "environment": environment(),
+        "configured": True, "ready": ready, "environment": environment(),
         "plans": {plan: {b: {"amount": v["amount"], "currency": v["currency"]} for b, v in by.items()}
                   for plan, by in (_STATE["catalog"] or {}).items()},
         "webhook_url": _STATE["webhook_url"],
@@ -663,7 +691,13 @@ def create_checkout(user_id: str, plan: str, billing: str, customer_id: str | No
     }
     if customer_id:
         body["customer_id"] = customer_id
-    data = api("POST", "/transactions", body)["data"]
+    try:
+        data = api("POST", "/transactions", body)["data"]
+    except PaddleError as e:
+        if is_payment_link_problem(e):
+            checkout_refused(e)
+        raise
+    _STATE["blocked"] = None
     return {"transaction_id": data["id"], "amount": price["amount"], "currency": price["currency"]}
 
 

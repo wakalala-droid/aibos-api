@@ -3428,6 +3428,9 @@ def paddle_checkout(body: CardPlanRequest, user_id: str = Depends(require_user))
         out = paddle.create_checkout(user_id, plan, billing, customer_id)
     except paddle.PaddleError as e:
         log.warning("[paddle] checkout for %s failed: %s", user_id, e)
+        if not paddle.status()["ready"]:
+            raise HTTPException(status_code=503, detail="Card payments are not available right now. "
+                                                        "Please pay with mobile money.")
         raise HTTPException(status_code=502, detail="Paddle could not start the card checkout just "
                                                     "now. Please try again in a minute.")
     return {"ok": True, **out, "plan": plan, "billing": billing,
