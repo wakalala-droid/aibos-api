@@ -6408,11 +6408,24 @@ def push_devices(ctx: membership.Context = Depends(membership.require_context)):
 
 @app.post("/push/test")
 def push_test(ctx: membership.Context = Depends(membership.require_context)):
-    """Send a notification to this person's own devices, so they can see it work."""
-    out = webpush.send_to_user(_require_db(), ctx.actor, "Notifications are on",
-                               "This is how a booking or a payment will reach you.",
-                               "/dashboard", wait=True)
-    return {"ok": True, **out}
+    """Send a notification to this person's own devices, so they can see it work.
+
+    It carries their own numbers and what is next on the schedule
+    (notify.snapshot), so the first notification an owner sees is worth having.
+    Cash and sales only for an owner or accountant: a phone can show them on
+    its lock screen. A placeholder only when there is nothing real to say."""
+    db = _require_db()
+    snap = None
+    try:
+        snap = notify.snapshot(db, ctx.tenant, ctx.business_id,
+                               with_money=ctx.role in ("owner", "accountant"))
+    except Exception as e:  # noqa: BLE001: the test must still arrive
+        log.warning("[push] snapshot for %s failed: %s", ctx.tenant, e)
+    title, body = snap or ("Notifications are on",
+                           "This is how a booking or a payment will reach you.")
+    out = webpush.send_to_user(db, ctx.actor, title, body, "/dashboard", wait=True,
+                               extra={"tag": "aibos-snapshot"})
+    return {"ok": True, "title": title, "body": body, **out}
 
 
 @app.get("/notifications")

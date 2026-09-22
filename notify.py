@@ -108,14 +108,16 @@ def _day_start(days_back: int = 0) -> datetime:
     return start_lusaka - timedelta(hours=LUSAKA_UTC_OFFSET)
 
 
-def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str] | None:
+def compose_brief(db, user_id: str, business_name: str | None,
+                  business_id: str | None = None) -> tuple[str, str] | None:
     """
     Build (subject, plain-text body) for one user. Returns None when there's
     nothing real to say (no recorded activity) — we never send an empty brief.
+    `business_id` picks the books; unset means the owner's default.
     """
     # The owner's default business: one brief per owner, about the books they
     # open first. (Reading with no business picked whichever row came back.)
-    business_id = twin_mod._books_for(db, user_id, None)
+    business_id = twin_mod._books_for(db, user_id, business_id)
     state = twin_mod.get_state(db, user_id, business_id)
     if not state or int(state.get("event_count") or 0) == 0:
         return None
@@ -233,6 +235,107 @@ def compose_brief(db, user_id: str, business_name: str | None) -> tuple[str, str
     subject = f"Your Morning Brief{name} · {day}"
     body = "\n\n".join(lines) + "\n\nAny questions? Open AI-BOS and just ask."
     return subject, body
+
+
+# ── The phone snapshot ────────────────────────────────────────────────────────
+# Your numbers and what is next on the schedule, short enough for a phone
+# notification. The test notification carries it, so the first thing an owner
+# sees on their phone is their own business rather than a placeholder.
+
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS_SHORT = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+SNAPSHOT_MAX_BODY = 300              # what webpush.send_to_user keeps
+SNAPSHOT_SCHEDULE_ITEMS = 3
+
+
+def _plain_money(n: float, sym: str) -> str:
+    """K1,240 for a whole amount, K1,240.50 when there are ngwee."""
+    return f"{sym}{n:,.0f}" if n == int(n) else f"{sym}{n:,.2f}"
+
+
+def schedule_lines(db, user_id: str, business_id: str | None, now: datetime | None = None,
+                   days: int = 7, limit: int = SNAPSHOT_SCHEDULE_ITEMS, sym: str = "K") -> list[str]:
+    """What is overdue or coming up in the next `days`, one short line each,
+    on the owner's own clock: "Tomorrow 12:50: Supplier meeting"."""
+    import schedule_items
+    now = now or datetime.now(timezone.utc)
+    local = timezone(timedelta(hours=LUSAKA_UTC_OFFSET))
+    try:
+        rows = schedule_items.list_items(db, user_id, horizon_days=days, business_id=business_id)
+    except Exception as e:  # noqa: BLE001: no schedule table yet, or a bad minute
+        log.info("[notify] schedule read failed for %s: %s", user_id, e)
+        return []
+    upcoming = []
+    for r in rows:
+        if r.get("status") != "scheduled":
+            continue
+        occ = next((t for t in (schedule_items.parse_ts(o) for o in r.get("next_occurrences") or []) if t), None)
+        if occ is not None and occ <= now + timedelta(days=days):
+            upcoming.append((occ, r))
+    upcoming.sort(key=lambda x: x[0])
+    if not upcoming:
+        return [f"Nothing on your schedule for the next {days} days."]
+
+    today = now.astimezone(local).date()
+    out = []
+    for occ, r in upcoming[:limit]:
+        when = occ.astimezone(local)
+        clock = "" if r.get("all_day") else f" {when:%H:%M}"
+        day = f"{_WEEKDAYS[when.weekday()]} {when.day} {_MONTHS_SHORT[when.month - 1]}"
+        name = " ".join(str(r.get("title") or "").split()) or "Something"
+        try:
+            if float(r.get("amount") or 0) > 0:
+                name += f", {_plain_money(float(r['amount']), sym)}"
+        except (TypeError, ValueError):
+            pass
+        if occ < now and not (r.get("all_day") and when.date() == today):
+            out.append(f"Overdue: {name} ({day}{clock})")
+        elif when.date() == today:
+            out.append(f"Today{clock}: {name}")
+        elif when.date() == today + timedelta(days=1):
+            out.append(f"Tomorrow{clock}: {name}")
+        else:
+            out.append(f"{day}{clock}: {name}")
+    if len(upcoming) > limit:
+        more = len(upcoming) - limit
+        out.append(f"{more} more in the next {days} days.")
+    return out
+
+
+def snapshot(db, user_id: str, business_id: str | None = None, with_money: bool = True,
+             now: datetime | None = None) -> tuple[str, str] | None:
+    """(title, body) for a phone notification, or None when there is nothing
+    real to say. The money lines are the Morning Brief's own (the same honest
+    arithmetic, nothing invented); `with_money` False leaves them out for a
+    staff member, whose phone may show them on a lock screen."""
+    title, owed, sales, other, sym = None, [], [], [], "K"
+    try:
+        books = twin_mod._books_for(db, user_id, business_id)
+        sym = _sym((twin_mod.get_state(db, user_id, books) or {}).get("currency", "ZMW"))
+    except Exception:  # noqa: BLE001: the symbol is a nicety
+        pass
+    if with_money:
+        brief = compose_brief(db, user_id, None, business_id)
+        if brief:
+            parts = [p.strip() for p in brief[1].split("\n\n") if p.strip()]
+            parts = [p for p in parts if not p.startswith("Any questions?")]
+            if parts:
+                cash, _, rest = parts[0].partition(". ")
+                title = cash.rstrip(".")
+                if rest:
+                    owed.append(rest)
+                for p in parts[1:]:
+                    (sales if p.startswith(("Today so far", "Yesterday", "No sales")) else other).append(p)
+    lines = owed + sales + schedule_lines(db, user_id, business_id, now, sym=sym) + other
+    if not title and not lines:
+        return None
+    body = ""
+    for line in lines:
+        nxt = f"{body}\n{line}" if body else line
+        if len(nxt) > SNAPSHOT_MAX_BODY:
+            break
+        body = nxt
+    return (title or "Your schedule"), body
 
 
 # ── Senders ───────────────────────────────────────────────────────────────────
