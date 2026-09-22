@@ -2319,7 +2319,8 @@ def health_setup():
         {"key": "card_payments", "live": paddle.status()["ready"],
          "needs": ["PADDLE_API_KEY"],
          "environment": paddle.environment(),
-         "detail": paddle.status()["note"],
+         "open_to_customers": _cards_open_to_all(),
+         "detail": _card_setup_note(),
          "without_it": "Nobody can pay for a plan by card. Only mobile money is offered."},
         {"key": "faster_auth", "live": on("SUPABASE_JWT_SECRET"),
          "needs": ["SUPABASE_JWT_SECRET"],
@@ -2561,7 +2562,7 @@ def my_billing(user_id: str = Depends(require_user),
     card = view["card"] or {}
     return {"ok": True, "own_plan": True, **view["status"], "payments": view["payments"],
             "collections_live": any(payments.configured_networks().values()),
-            "card_payments": paddle.status()["ready"],
+            "card_payments": paddle.status()["ready"] and _cards_open_to_all(),
             # Whether Paddle's own page (change card, invoices) can be opened.
             "card_manageable": bool(card.get("customer_id")) and paddle.configured()}
 
@@ -3366,20 +3367,67 @@ async def paddle_webhook(request: Request):
     return await run_in_threadpool(_on_paddle_event, event)
 
 
+# Going live is the owner's own first card payment (Paddle's "Test and go
+# live"). Until Paddle has approved the account it refuses every checkout, and
+# nothing in its API says whether it has. So on a live key the card option is
+# shown to admins only, until a real card payment has gone through: the owner
+# buys a plan by card (and refunds it if they like) and from then on every
+# customer sees it. PADDLE_OPEN=1 opens it without that. A sandbox key never
+# opens to customers: test cards work for anyone.
+_CARDS_OPEN: Dict[str, Any] = {"open": False, "checked": 0.0}
+
+
+def _cards_open_to_all() -> bool:
+    if paddle.environment() != "live":
+        return False
+    if os.environ.get("PADDLE_OPEN", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    if _CARDS_OPEN["open"] or time.time() - _CARDS_OPEN["checked"] < 60:
+        return _CARDS_OPEN["open"]
+    _CARDS_OPEN["checked"] = time.time()
+    db = get_db()
+    if db is None:
+        return False
+    try:
+        res = (db.table("card_subscriptions").select("subscription_id")
+               .eq("environment", "live").limit(1).execute())
+        _CARDS_OPEN["open"] = bool(getattr(res, "data", None))
+    except Exception as e:  # noqa: BLE001 — pre-0037: nobody has paid by card
+        log.info("[paddle] could not tell whether cards are open: %s", e)
+    return _CARDS_OPEN["open"]
+
+
+def _card_setup_note() -> str:
+    st = paddle.status()
+    if st["ready"] and st["environment"] == "live" and not _cards_open_to_all():
+        return ("Ready, and shown to admins only. Buy a plan by card yourself (refund it after "
+                "if you like): once that payment goes through, every customer sees the card "
+                "option. Or set PADDLE_OPEN=1.")
+    if st["ready"] and st["environment"] == "sandbox":
+        return "Sandbox (test) key: the card option is shown to admins only."
+    return st["note"]
+
+
 @app.get("/payments/paddle/config")
 def paddle_config():
     """What the website needs to offer card payments. Public: the checkout
-    token is public by design and the prices are on the pricing page."""
+    token is public by design and the prices are on the pricing page.
+    testers_only: only admins are shown the card option (a sandbox key, or a
+    live one before its first real payment); stage says which."""
     st = paddle.status()
     if not st["configured"]:
-        return {"enabled": False, "environment": None, "prices": {}, "testers_only": False}
+        return {"enabled": False, "environment": None, "prices": {}, "testers_only": False,
+                "stage": "off"}
     if not st["ready"]:
         st = paddle.ensure_setup()
     ready = bool(st["ready"])
+    open_to_all = ready and _cards_open_to_all()
     return {"enabled": ready, "environment": st["environment"],
             "client_token": paddle.client_token() if ready else None,
             "prices": paddle.card_prices() if ready else {},
-            "testers_only": st["environment"] == "sandbox"}
+            "testers_only": not open_to_all,
+            "stage": ("open" if open_to_all else "sandbox" if st["environment"] == "sandbox"
+                      else "admins_until_first_payment" if ready else "setting_up")}
 
 
 class CardPlanRequest(BaseModel):

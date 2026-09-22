@@ -494,6 +494,46 @@ def test_renewal_reminders_skip_a_card_plan():
     assert out["sent"] == 1
 
 
+def test_a_live_key_shows_cards_to_admins_only_until_the_first_real_payment(api, monkeypatch):
+    client, db = api
+    main._CARDS_OPEN.update(open=False, checked=0.0)
+    monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
+                                                   "environment": "live", "note": "ok"})
+    monkeypatch.setattr(paddle, "client_token", lambda: "live_tok")
+    monkeypatch.setattr(paddle, "card_prices", lambda: {"pro": {"monthly": {"amount": 25.0, "currency": "USD"}}})
+    cfg = client.get("/payments/paddle/config").json()
+    assert cfg["enabled"] and cfg["testers_only"] and cfg["stage"] == "admins_until_first_payment"
+    # The owner's own test purchase opens cards to everyone.
+    main._CARDS_OPEN.update(checked=0.0)
+    _post(client, "transaction.completed", _transaction())
+    cfg = client.get("/payments/paddle/config").json()
+    assert not cfg["testers_only"] and cfg["stage"] == "open"
+    main._CARDS_OPEN.update(open=False, checked=0.0)
+
+
+def test_paddle_open_skips_the_test_purchase(api, monkeypatch):
+    client, db = api
+    main._CARDS_OPEN.update(open=False, checked=0.0)
+    monkeypatch.setenv("PADDLE_OPEN", "1")
+    monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
+                                                   "environment": "live", "note": "ok"})
+    monkeypatch.setattr(paddle, "client_token", lambda: "live_tok")
+    monkeypatch.setattr(paddle, "card_prices", lambda: {})
+    assert client.get("/payments/paddle/config").json()["stage"] == "open"
+
+
+def test_a_sandbox_key_never_opens_to_customers(api, monkeypatch):
+    client, db = api
+    monkeypatch.setenv("PADDLE_API_KEY", "pdl_sdbx_apikey_test")
+    monkeypatch.setenv("PADDLE_OPEN", "1")
+    monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
+                                                   "environment": "sandbox", "note": "ok"})
+    monkeypatch.setattr(paddle, "client_token", lambda: "test_tok")
+    monkeypatch.setattr(paddle, "card_prices", lambda: {})
+    cfg = client.get("/payments/paddle/config").json()
+    assert cfg["testers_only"] and cfg["stage"] == "sandbox"
+
+
 def test_the_card_routes_are_wired():
     paths = {r.path for r in main.app.routes}
     for p in ("/payments/paddle/webhook", "/payments/paddle/config", "/payments/paddle/checkout",
