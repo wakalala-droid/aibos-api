@@ -422,6 +422,83 @@ def send_whatsapp(to_number: str, body: str) -> bool:
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
+def _slug(text: str, fallback: str = "announcement") -> str:
+    out = "".join(ch if ch.isalnum() else "-" for ch in str(text or "").lower())
+    return "-".join(p for p in out.split("-") if p)[:60] or fallback
+
+
+def broadcast(db, title: str, body: str = "", link: str = "/dashboard", key: str = "",
+              dry_run: bool = False, budget_seconds: float = 25.0) -> dict:
+    """One message to everyone: a row in every account's bell and a
+    notification on every device that has them on.
+
+    ONCE, WHATEVER HAPPENS. `key` (or the title) stamps each row, and migration
+    0030's unique index refuses a second copy, so a retry after a timeout tells
+    nobody twice.
+
+    THE BELL IS THE PROMISE, the phone is extra reach: the rows are written
+    first and for everyone, then devices are pushed within a time budget, since
+    a send is one request per device. Whoever is not reached in time still has
+    the message waiting in the app, and the count says so.
+
+    `dry_run` answers "who would get this" and sends nothing.
+    """
+    title = " ".join(str(title or "").split())
+    if not title:
+        raise ValueError("An announcement needs something to say.")
+    body = str(body or "").strip()
+    key = _slug(key or title)
+    stamp = f"announce:{key}"
+
+    people = [r["id"] for r in (getattr(db.table("profiles").select("id").limit(5000).execute(),
+                                        "data", None) or []) if r.get("id")]
+    try:
+        devices = {r["user_id"] for r in
+                   (getattr(db.table("push_subscriptions").select("user_id").limit(5000).execute(),
+                            "data", None) or []) if r.get("user_id")}
+    except Exception as e:  # noqa: BLE001: pre-0036, nobody has signed up yet
+        log.info("[notify] no devices to announce to: %s", e)
+        devices = set()
+
+    out = {"key": key, "people": len(people), "with_devices": len(devices & set(people)),
+           "told": 0, "already": 0, "pushed": 0, "not_pushed": 0, "errors": 0}
+    if dry_run:
+        return {**out, "dry_run": True}
+
+    import time
+    import webpush
+    deadline = time.time() + budget_seconds
+    for uid in people:
+        try:
+            db.table("notifications").insert({
+                "user_id": uid, "kind": "announcement", "title": title,
+                "body": body or None, "link": link or "/dashboard", "meta": {"booking_id": stamp},
+            }).execute()
+            out["told"] += 1
+        except Exception as e:  # noqa: BLE001
+            text = str(e).lower()
+            if "duplicate" in text or "23505" in text:
+                out["already"] += 1
+                continue
+            out["errors"] += 1
+            log.warning("[notify] announcement for %s failed: %s", uid, e)
+            continue
+        if uid not in devices:
+            continue
+        if time.time() > deadline:
+            out["not_pushed"] += 1          # the bell has it; the phone missed this run
+            continue
+        try:
+            res = webpush.send_to_user(db, uid, title, body, link or "/dashboard", wait=True,
+                                       extra={"tag": f"announce-{key}"})
+            out["pushed"] += int(res.get("sent") or 0)
+        except Exception as e:  # noqa: BLE001: the bell already has it
+            out["errors"] += 1
+            log.warning("[notify] announcement push for %s failed: %s", uid, e)
+    log.info("[notify] announcement %s: %s", key, out)
+    return out
+
+
 def push_brief(db, user_id: str) -> int:
     """The morning brief as a phone notification, for an owner who has
     notifications on. Returns how many devices it reached. Never raises: the

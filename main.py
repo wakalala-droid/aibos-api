@@ -6428,6 +6428,35 @@ def push_test(ctx: membership.Context = Depends(membership.require_context)):
     return {"ok": True, "title": title, "body": body, **out}
 
 
+class Announcement(BaseModel):
+    title: str
+    body: str = ""
+    link: str = "/dashboard"
+    # Names the announcement so nobody is told the same thing twice, even if
+    # the send is retried. Defaults to the title.
+    key: str = ""
+    dry_run: bool = False
+
+
+@app.post("/admin/announce")
+def admin_announce(req: Announcement, user_id: str = Depends(require_user)):
+    """Tell every AI-BOS account something once: a row in their bell and a
+    notification on every device that has them on.
+
+    Only an AI-BOS administrator, which means an allowlisted address that
+    Google has proven the account owns (membership.is_admin), never an email
+    string on a row anyone could edit. `dry_run` answers who would get it.
+    """
+    db = _require_db()
+    if not membership.is_admin(db, user_id):
+        raise HTTPException(status_code=403, detail="Only an AI-BOS administrator can send this.")
+    try:
+        return {"ok": True, **notify.broadcast(db, req.title, req.body, req.link,
+                                               req.key, dry_run=req.dry_run)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/notifications")
 def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),
                              ctx: membership.Context = Depends(membership.require_context)):

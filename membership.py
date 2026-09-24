@@ -279,6 +279,26 @@ def verified_emails(db, caller_uid: str) -> set:
     return out
 
 
+def admin_emails() -> list:
+    """The AI-BOS administrator allowlist, with the same default as the
+    website's lib/admin.ts."""
+    import os
+    raw = os.environ.get("ADMIN_EMAILS") or "vwanheda@gmail.com"
+    return [e.strip().lower() for e in raw.split(",") if e.strip()]
+
+
+def is_admin(db, caller_uid: str) -> bool:
+    """An allowlisted address that GOOGLE has proven this account owns.
+
+    The same rule as the website (isAdminUser), for the same reason: an email
+    string proves nothing on its own, because profiles.email is editable by the
+    person it belongs to and email sign-ups are auto-confirmed. Fails closed.
+    """
+    if not caller_uid or db is None:
+        return False
+    return bool(verified_emails(db, caller_uid) & set(admin_emails()))
+
+
 def accept_pending(db, caller_uid: str, email) -> int:
     """On login, bind any pending invites for these PROVEN addresses (see
     verified_emails) to this user id and activate them. Returns how many
