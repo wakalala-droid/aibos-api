@@ -422,6 +422,23 @@ def send_whatsapp(to_number: str, body: str) -> bool:
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
+def push_brief(db, user_id: str) -> int:
+    """The morning brief as a phone notification, for an owner who has
+    notifications on. Returns how many devices it reached. Never raises: the
+    email is the promise, this is extra reach."""
+    try:
+        import webpush
+        snap = snapshot(db, user_id)
+        if not snap:
+            return 0
+        res = webpush.send_to_user(db, user_id, snap[0], snap[1], "/dashboard",
+                                   wait=True, extra={"tag": "aibos-brief"})
+        return int(res.get("sent") or 0)
+    except Exception as e:  # noqa: BLE001: nothing here may cost the brief
+        log.warning("[notify] brief push for %s failed: %s", user_id, e)
+        return 0
+
+
 def dispatch_briefs(db) -> dict:
     """
     Send the morning brief to every opted-in, entitled user. Tier checks are
@@ -436,7 +453,7 @@ def dispatch_briefs(db) -> dict:
         .limit(2000)
         .execute()
     )
-    sent_email = sent_wa = skipped = errors = 0
+    sent_email = sent_wa = sent_push = skipped = errors = 0
 
     for p in res.data or []:
         uid = p["id"]
@@ -455,6 +472,11 @@ def dispatch_briefs(db) -> dict:
                 if send_email(to, subject, body,
                               aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"))):
                     sent_email += 1
+            # The same morning, on the phone. One preference, both channels: an
+            # owner who asked for the brief gets it wherever they turned
+            # notifications on, without a second switch to find.
+            if p.get("brief_email_enabled") and can_access(tier, "scheduled_brief"):
+                sent_push += push_brief(db, uid)
             if p.get("whatsapp_number") and can_access(tier, "morning_brief"):
                 if send_whatsapp(str(p["whatsapp_number"]), f"{subject}\n\n{body}"):
                     sent_wa += 1
@@ -466,6 +488,7 @@ def dispatch_briefs(db) -> dict:
         "ok": True,
         "email_sent": sent_email,
         "whatsapp_sent": sent_wa,
+        "push_sent": sent_push,
         "skipped_no_data": skipped,
         "errors": errors,
         "email_channel": "live" if email_enabled() else "not configured",

@@ -112,6 +112,57 @@ def test_house_style_no_long_dashes(brief):
     assert "—" not in title + body and "–" not in title + body
 
 
+class _Profiles:
+    """Just enough of the profiles read dispatch_briefs makes."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def table(self, name):
+        assert name == "profiles"
+        return self
+
+    def select(self, *_): return self
+    def or_(self, *_): return self
+    def limit(self, *_): return self
+
+    def execute(self):
+        return type("R", (), {"data": self.rows})()
+
+
+def test_the_morning_brief_also_goes_to_the_phone(monkeypatch):
+    pushed = []
+    monkeypatch.setattr(notify, "compose_brief", lambda db, uid, name, business_id=None: ("Subject", BRIEF_BODY))
+    monkeypatch.setattr(notify, "snapshot", lambda db, uid, *a, **k: ("Cash: K11,630.50", "No sales yet."))
+    monkeypatch.setattr(notify, "send_email", lambda *a, **k: True)
+    monkeypatch.setattr(notify, "user_tier", lambda uid: "growth")
+    monkeypatch.setattr(notify, "can_access", lambda tier, feature: True)
+    import webpush
+    monkeypatch.setattr(webpush, "send_to_user",
+                        lambda db, uid, title, body, link, wait=False, extra=None:
+                        (pushed.append((uid, title, body, link, extra)), {"sent": 2})[1])
+
+    db = _Profiles([{"id": "owner", "email": "owner@shop.co.zm", "business_name": "Shop",
+                     "brief_email_enabled": True},
+                    {"id": "quiet", "email": "q@x.co", "business_name": "Q",
+                     "brief_email_enabled": False, "whatsapp_number": "+2609"}])
+    out = notify.dispatch_briefs(db)
+    assert out["email_sent"] == 1 and out["push_sent"] == 2
+    assert [p[0] for p in pushed] == ["owner"]           # never the one who did not ask
+    assert pushed[0][1] == "Cash: K11,630.50" and pushed[0][3] == "/dashboard"
+    assert pushed[0][4] == {"tag": "aibos-brief"}
+
+
+def test_a_brief_push_that_fails_never_costs_the_email(monkeypatch):
+    monkeypatch.setattr(notify, "snapshot", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no db")))
+    assert notify.push_brief(None, "owner") == 0
+
+
+def test_nothing_to_say_means_no_morning_notification(monkeypatch):
+    monkeypatch.setattr(notify, "snapshot", lambda *a, **k: None)
+    assert notify.push_brief(None, "owner") == 0
+
+
 def test_the_test_notification_sends_the_snapshot():
     src = (Path(__file__).parent / "main.py").read_text(encoding="utf-8")
     route = src[src.index('@app.post("/push/test")'):]
