@@ -162,6 +162,7 @@ class _FakePaddle:
 
     def __init__(self):
         self.products, self.settings, self.tokens, self.calls = [], [], [], []
+        self.domains = [{"id": "chedom_1", "domain": "ai-bos.website", "status": "pending_review"}]
         self.n = 0
 
     def _id(self, prefix):
@@ -189,6 +190,8 @@ class _FakePaddle:
                      subscribed_events=[{"name": e} for e in body["subscribed_events"]])
             self.settings.append(s)
             return {"data": s}
+        if method == "GET" and path == "/checkout-domains":
+            return {"data": list(self.domains)}
         if method == "GET" and path == "/client-tokens":
             return {"data": self.tokens}
         if method == "POST" and path == "/client-tokens":
@@ -209,7 +212,7 @@ def fake_paddle(monkeypatch):
     saved = dict(paddle._STATE)
     paddle._STATE.update(checked_at=0.0, ready=False, catalog={}, by_price={}, by_product={},
                          webhook_secret=None, webhook_id=None, webhook_url=None,
-                         client_token=None, notes=[], error=None, blocked=None)
+                         client_token=None, notes=[], error=None, blocked=None, domain=None)
     yield fake
     paddle._STATE.clear()
     paddle._STATE.update(saved)
@@ -512,9 +515,84 @@ def test_renewal_reminders_skip_a_card_plan():
     assert out["sent"] == 1
 
 
-def test_a_live_key_shows_cards_to_admins_only_until_the_first_real_payment(api, monkeypatch):
+def test_paddle_says_whether_it_has_approved_the_website(fake_paddle, monkeypatch):
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://ai-bos.website")
+    waiting = paddle.domain_status(force=True)
+    assert waiting["readable"] and not waiting["approved"]
+    assert waiting["status"] == "pending_review"
+    assert "waiting for Paddle to review it" in waiting["note"]
+
+    fake_paddle.domains = [{"domain": "www.ai-bos.website", "status": "approved"}]
+    done = paddle.domain_status(force=True)
+    assert done["approved"] and "has approved ai-bos.website" in done["note"]
+
+    fake_paddle.domains = []
+    never = paddle.domain_status(force=True)
+    assert never["readable"] and not never["approved"] and never["status"] is None
+    assert "has not been sent to Paddle" in never["note"]
+
+    fake_paddle.domains = [{"domain": "ai-bos.website", "status": "action_required"}]
+    asked = paddle.domain_status(force=True)
+    assert "needs something from you" in asked["note"]
+
+
+def test_an_answer_about_the_website_is_kept_for_a_while(fake_paddle, monkeypatch):
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://ai-bos.website")
+    paddle.domain_status(force=True)
+    before = len([c for c in fake_paddle.calls if c[1] == "/checkout-domains"])
+    paddle.domain_status()
+    assert len([c for c in fake_paddle.calls if c[1] == "/checkout-domains"]) == before
+
+
+def test_a_key_that_cannot_read_the_website_is_not_the_same_as_unapproved(fake_paddle, monkeypatch):
+    def refuse(method, path, body=None, params=None, timeout=20.0):
+        if path == "/checkout-domains":
+            raise paddle.PaddleError("Forbidden", 403, "forbidden")
+        return fake_paddle.api(method, path, body, params, timeout)
+
+    monkeypatch.setattr(paddle, "api", refuse)
+    out = paddle.domain_status(force=True)
+    assert not out["readable"] and not out["approved"]
+    assert "checkout domain read permission" in out["note"]
+
+
+def test_the_site_domain_comes_from_the_app_address(monkeypatch):
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://www.example.com/")
+    assert paddle.site_domain() == "example.com"
+    monkeypatch.delenv("PUBLIC_APP_URL")
+    assert paddle.site_domain() == "ai-bos.website"
+
+
+def test_cards_open_by_themselves_once_paddle_approves_the_website(api, monkeypatch):
     client, db = api
     main._CARDS_OPEN.update(open=False, checked=0.0)
+    monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
+                                                   "environment": "live", "note": "ok"})
+    monkeypatch.setattr(paddle, "client_token", lambda: "live_tok")
+    monkeypatch.setattr(paddle, "card_prices", lambda: {})
+    waiting = {"readable": True, "approved": False, "status": "pending_review",
+               "domain": "ai-bos.website", "note": "ai-bos.website is waiting for Paddle to review it."}
+    monkeypatch.setattr(paddle, "domain_status", lambda force=False: waiting)
+    cfg = client.get("/payments/paddle/config").json()
+    assert cfg["testers_only"] and cfg["stage"] == "waiting_for_website_approval"
+    assert "waiting for Paddle" in main._card_setup_note()
+
+    approved = dict(waiting, approved=True, status="approved",
+                    note="Paddle has approved ai-bos.website.")
+    monkeypatch.setattr(paddle, "domain_status", lambda force=False: approved)
+    cfg = client.get("/payments/paddle/config").json()
+    assert not cfg["testers_only"] and cfg["stage"] == "open"
+    main._CARDS_OPEN.update(open=False, checked=0.0)
+
+
+def test_a_live_key_shows_cards_to_admins_only_until_the_first_real_payment(api, monkeypatch):
+    """With a key that cannot read the website's approval, the older signal
+    decides: a real card payment proves the checkout works."""
+    client, db = api
+    main._CARDS_OPEN.update(open=False, checked=0.0)
+    monkeypatch.setattr(paddle, "domain_status", lambda force=False: {
+        "readable": False, "approved": False, "status": None, "domain": "ai-bos.website",
+        "note": "Paddle would not say."})
     monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
                                                    "environment": "live", "note": "ok"})
     monkeypatch.setattr(paddle, "client_token", lambda: "live_tok")
@@ -532,6 +610,9 @@ def test_a_live_key_shows_cards_to_admins_only_until_the_first_real_payment(api,
 def test_paddle_open_skips_the_test_purchase(api, monkeypatch):
     client, db = api
     main._CARDS_OPEN.update(open=False, checked=0.0)
+    monkeypatch.setattr(paddle, "domain_status", lambda force=False: {
+        "readable": True, "approved": False, "status": "pending_review",
+        "domain": "ai-bos.website", "note": "waiting"})
     monkeypatch.setenv("PADDLE_OPEN", "1")
     monkeypatch.setattr(paddle, "status", lambda: {"configured": True, "ready": True,
                                                    "environment": "live", "note": "ok"})

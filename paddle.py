@@ -567,6 +567,74 @@ def checkout_refused(e: "PaddleError") -> None:
     log.error("[paddle] checkout refused, cards hidden for %s minutes: %s", BLOCK_FOR // 60, e)
 
 
+# Paddle refuses every checkout on a website it has not approved, and this is
+# the one place its API says whether it has. Read for ten minutes at a time:
+# the owner is usually waiting on it, so it must not be stale for long.
+CHECKOUT_DOMAIN_TTL = 600
+
+
+def site_domain() -> str:
+    """The website the card form opens on, without www."""
+    raw = (os.environ.get("PUBLIC_APP_URL") or "https://ai-bos.website").strip()
+    try:
+        host = urlparse(raw if "//" in raw else "https://" + raw).hostname or ""
+    except ValueError:
+        host = ""
+    host = (host or "ai-bos.website").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _domain_note(domain: str, status: str | None) -> str:
+    if status == "approved":
+        return f"Paddle has approved {domain}."
+    if status is None:
+        return (f"{domain} has not been sent to Paddle for approval yet. Add it in Paddle "
+                "under Checkout, then Website approval.")
+    words = {
+        "pending_review": f"{domain} is waiting for Paddle to review it.",
+        "in_review": f"Paddle is reviewing {domain} now.",
+        "action_required": f"Paddle needs something from you about {domain}. Open Paddle and "
+                           "read what it asks for.",
+        "rejected": f"Paddle rejected {domain}. Open Paddle to see why.",
+    }
+    return words.get(status, f"{domain} is '{status}' at Paddle.")
+
+
+def domain_status(force: bool = False) -> dict:
+    """Has Paddle approved the website the checkout opens on? Never raises.
+
+    `readable` false means Paddle would not say (an API key without the
+    checkout domain permission), which is NOT the same as unapproved."""
+    held = _STATE.get("domain")
+    if held and not force and time.time() - held["at"] < CHECKOUT_DOMAIN_TTL:
+        return held
+    want = site_domain()
+    if not configured():
+        return {"at": time.time(), "readable": False, "approved": False, "status": None,
+                "domain": want, "note": "PADDLE_API_KEY is not set on the server."}
+    try:
+        rows = _list("/checkout-domains", {})
+    except PaddleError as e:
+        out = {"at": time.time(), "readable": False, "approved": False, "status": None,
+               "domain": want,
+               "note": f"Paddle would not say whether {want} is approved ({e}). Give the API "
+                       "key the checkout domain read permission to see it here."}
+        _STATE["domain"] = out
+        return out
+    mine = None
+    for row in rows:
+        host = str(row.get("domain") or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        if host == want:
+            mine = row
+            break
+    status = (mine or {}).get("status")
+    out = {"at": time.time(), "readable": True, "approved": status == "approved",
+           "status": status, "domain": want, "note": _domain_note(want, status)}
+    _STATE["domain"] = out
+    return out
+
+
 def status() -> dict:
     """What /health/setup and the checkout need to know. Never raises."""
     if not configured():

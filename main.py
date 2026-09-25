@@ -2321,6 +2321,8 @@ def health_setup():
          "needs": ["PADDLE_API_KEY"],
          "environment": paddle.environment(),
          "open_to_customers": _cards_open_to_all(),
+         "website": paddle.domain_status()["domain"],
+         "website_approval": paddle.domain_status()["status"] or "not submitted",
          "detail": _card_setup_note(),
          "without_it": "Nobody can pay for a plan at all: plans are paid by card only."},
         {"key": "faster_auth", "live": on("SUPABASE_JWT_SECRET"),
@@ -3312,13 +3314,14 @@ async def paddle_webhook(request: Request):
     return await run_in_threadpool(_on_paddle_event, event)
 
 
-# Going live is the owner's own first card payment (Paddle's "Test and go
-# live"). Until Paddle has approved the account it refuses every checkout, and
-# nothing in its API says whether it has. So on a live key the card option is
-# shown to admins only, until a real card payment has gone through: the owner
-# buys a plan by card (and refunds it if they like) and from then on every
-# customer sees it. PADDLE_OPEN=1 opens it without that. A sandbox key never
-# opens to customers: test cards work for anyone.
+# Going live: Paddle refuses every checkout on a website it has not approved,
+# so until it has, the card option is shown to ADMINS ONLY and customers are
+# never handed a button that cannot work. Paddle's checkout-domains API says
+# whether the website is approved (paddle.domain_status), and the moment it is,
+# cards open to everyone by themselves. If the API key cannot read that, we
+# fall back to the older signal: a real card payment has gone through, so the
+# checkout plainly works. PADDLE_OPEN=1 opens it regardless. A sandbox key
+# never opens to customers: test cards work for anyone.
 _CARDS_OPEN: Dict[str, Any] = {"open": False, "checked": 0.0}
 
 
@@ -3327,6 +3330,9 @@ def _cards_open_to_all() -> bool:
         return False
     if os.environ.get("PADDLE_OPEN", "").strip().lower() in ("1", "true", "yes"):
         return True
+    domain = paddle.domain_status()
+    if domain["readable"]:
+        return bool(domain["approved"])
     if _CARDS_OPEN["open"] or time.time() - _CARDS_OPEN["checked"] < 60:
         return _CARDS_OPEN["open"]
     _CARDS_OPEN["checked"] = time.time()
@@ -3343,14 +3349,21 @@ def _cards_open_to_all() -> bool:
 
 
 def _card_setup_note() -> str:
+    """What is left to do, in one sentence, for /health/setup."""
     st = paddle.status()
-    if st["ready"] and st["environment"] == "live" and not _cards_open_to_all():
-        return ("Ready, and shown to admins only. Buy a plan by card yourself (refund it after "
-                "if you like): once that payment goes through, every customer sees the card "
-                "option. Or set PADDLE_OPEN=1.")
-    if st["ready"] and st["environment"] == "sandbox":
+    if not st["ready"]:
+        return st["note"]
+    if st["environment"] == "sandbox":
         return "Sandbox (test) key: the card option is shown to admins only."
-    return st["note"]
+    domain = paddle.domain_status()
+    if _cards_open_to_all():
+        return f"Ready, and every customer can pay by card. {domain['note']}".strip()
+    if domain["readable"]:
+        return (f"Ready on our side, shown to admins only. {domain['note']} Paddle refuses "
+                "every checkout until then, so customers are not offered cards yet.")
+    return ("Ready, and shown to admins only. Buy a plan by card yourself (refund it after "
+            "if you like): once that payment goes through, every customer sees the card "
+            "option. Or set PADDLE_OPEN=1.")
 
 
 @app.get("/payments/paddle/config")
@@ -3367,12 +3380,16 @@ def paddle_config():
         st = paddle.ensure_setup()
     ready = bool(st["ready"])
     open_to_all = ready and _cards_open_to_all()
+    domain = paddle.domain_status() if ready and st["environment"] == "live" else None
     return {"enabled": ready, "environment": st["environment"],
             "client_token": paddle.client_token() if ready else None,
             "prices": paddle.card_prices() if ready else {},
             "testers_only": not open_to_all,
-            "stage": ("open" if open_to_all else "sandbox" if st["environment"] == "sandbox"
-                      else "admins_until_first_payment" if ready else "setting_up")}
+            "stage": ("open" if open_to_all
+                      else "setting_up" if not ready
+                      else "sandbox" if st["environment"] == "sandbox"
+                      else "waiting_for_website_approval" if domain and domain["readable"]
+                      else "admins_until_first_payment")}
 
 
 class CardPlanRequest(BaseModel):
