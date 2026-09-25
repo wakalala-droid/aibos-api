@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 import billing
 import main
 import notify
-import payments
 from test_books_integrity import _fresh
 
 UTC = timezone.utc
@@ -61,41 +60,49 @@ def _db(**profile):
     return db
 
 
-def _run(db, now, request=None):
+def _run(db, now):
     emails = []
     out = billing.run_renewals(
-        db, PRICES, request_payment=request,
+        db, PRICES,
         send_email=lambda to, subject, body, button: emails.append((to, subject, body, button)) or True,
         record=notify.record_notification, now=now)
     return out, emails
 
 
-def test_a_renewal_is_asked_for_once_per_stage():
+def test_a_fixed_period_plan_is_asked_to_set_up_card_payment_once_per_stage():
+    # Plans are paid by card and renew automatically (25 September 2026). A
+    # plan paid for a period before that is asked, in dollars, to move to a card.
     db = _db()
-    asked = []
-    request = lambda user, plan, period: asked.append((user, plan, period)) or "4567"
+    out, emails = _run(db, datetime(2026, 10, 4, 7, 0, tzinfo=UTC))
+    assert out["sent"] == 1
+    assert emails[0][1] == "Your Growth plan is paid up to 7 October"
+    assert "$79" in emails[0][2] and "renews automatically" in emails[0][2]
+    assert "K1,499" not in emails[0][2]
+    assert emails[0][3] == ("Set up card payment", "/checkout?plan=growth&billing=monthly")
+    assert _run(db, datetime(2026, 10, 4, 18, 0, tzinfo=UTC))[0]["sent"] == 0
 
-    out, emails = _run(db, datetime(2026, 10, 4, 7, 0, tzinfo=UTC), request)
-    assert out["sent"] == 1 and not asked                       # a heads-up asks for nothing yet
-    assert emails[0][1] == "Your Growth plan renews on 7 October"
-    assert "K1,499" in emails[0][2]
-    assert emails[0][3] == ("Pay K1,499", "/checkout?plan=growth&billing=monthly")
-    assert _run(db, datetime(2026, 10, 4, 18, 0, tzinfo=UTC), request)[0]["sent"] == 0
+    out, emails = _run(db, datetime(2026, 10, 7, 6, 0, tzinfo=UTC))
+    assert out["sent"] == 1 and emails[0][1] == "Your Growth plan is due today"
+    assert "Set up card payment" in emails[0][2] and "14 October" in emails[0][2]
 
-    out, emails = _run(db, datetime(2026, 10, 7, 6, 0, tzinfo=UTC), request)
-    assert out["sent"] == 1 and asked == [("u1", "growth", "monthly")]
-    assert "phone ending 4567" in emails[0][2]
-
-    out, emails = _run(db, datetime(2026, 10, 11, 6, 0, tzinfo=UTC), request)
+    out, emails = _run(db, datetime(2026, 10, 11, 6, 0, tzinfo=UTC))
     assert emails[0][1] == "Growth switches off on 14 October"
     kinds = [n["kind"] for n in db.rows["notifications"]]
     assert kinds == ["plan_renews_soon", "plan_renews_today", "plan_renewal_last_call"]
 
 
-def test_without_a_phone_request_the_reminder_still_says_how_to_pay():
-    out, emails = _run(_db(), datetime(2026, 10, 7, 6, 0, tzinfo=UTC), lambda *_: None)
-    assert out["sent"] == 1 and out["requested"] == 0
-    assert "Pay K1,499" in emails[0][2] and "14 October" in emails[0][2]
+def test_no_reminder_asks_for_a_mobile_money_payment():
+    for day in (4, 7, 11):
+        _, emails = _run(_db(), datetime(2026, 10, day, 7, 0, tzinfo=UTC))
+        text = " ".join(emails[0][1:3]).lower()
+        assert "mobile money" not in text and "your pin" not in text and "phone" not in text
+
+
+def test_the_mobile_money_plan_checkout_is_gone():
+    from fastapi.testclient import TestClient
+    res = TestClient(main.app).post("/payments/initiate", json={"network": "mtn", "plan": "pro"})
+    assert res.status_code == 410 and "card" in res.json()["detail"]
+    assert not hasattr(main, "_renewal_request") and not hasattr(main, "_begin_subscription_payment")
 
 
 def test_a_renewed_plan_or_a_free_grant_gets_no_reminder():
@@ -111,7 +118,7 @@ def test_an_annual_plan_is_reminded_at_the_annual_price():
         {"reference": "r1", "user_id": "u1", "billing": "annual", "status": "successful",
          "created_at": "2025-10-07T10:00:00+00:00"})
     _, emails = _run(db, datetime(2026, 10, 4, 7, 0, tzinfo=UTC))
-    assert "K14,990" in emails[0][2] and "another year" in emails[0][2]
+    assert "$790" in emails[0][2] and "each year" in emails[0][2]
 
 
 def test_a_reminder_that_cannot_be_recorded_is_not_sent():
@@ -122,56 +129,21 @@ def test_a_reminder_that_cannot_be_recorded_is_not_sent():
     assert out["errors"] == 1 and not emails
 
 
-# ── The payment request ──────────────────────────────────────────────────────
-
-def test_no_request_goes_out_while_mobile_money_is_off():
-    db = _fresh()
-    db.rows.setdefault("subscription_payments", []).append(
-        {"reference": "r1", "user_id": "u1", "network": "mtn", "payer_phone": "0971234567",
-         "status": "successful", "created_at": "2026-09-07T10:00:00+00:00"})
-    real = main.get_db
-    main.get_db = lambda: db
-    try:
-        assert main._renewal_request("u1", "growth", "monthly") is None
-    finally:
-        main.get_db = real
-
-
-def test_the_request_goes_to_the_phone_they_paid_with_once_a_day():
-    db = _fresh()
-    db.rows.setdefault("subscription_payments", []).append(
-        {"reference": "r1", "user_id": "u1", "network": "mtn", "payer_phone": "0971234567",
-         "status": "successful", "created_at": "2026-09-07T10:00:00+00:00"})
-    sent = []
-    real = (main.get_db, payments.provider_configured, payments.initiate)
-    main.get_db = lambda: db
-    payments.provider_configured = lambda network: True
-    payments.initiate = lambda network, ref, amount, cur, phone, note: sent.append((network, amount, phone)) or "pending"
-    try:
-        assert main._renewal_request("u1", "growth", "monthly") == "4567"
-        assert sent == [("mtn", 1499, "0971234567")]
-        for row in db.rows["subscription_payments"]:
-            row.setdefault("created_at", datetime.now(UTC).isoformat())
-        assert main._renewal_request("u1", "growth", "monthly") == "4567"
-        assert len(sent) == 1                                    # still waiting on the first
-    finally:
-        main.get_db, payments.provider_configured, payments.initiate = real
-
-
 # ── Plan & billing page and receipts (upgrades 1 and 2) ─────────────────────
 
 from datetime import datetime as _dt, timezone as _tz
 
-_PRICES = {"pro": {"monthly": 500, "annual": 5000}, "growth": {"monthly": 1499, "annual": 14990}}
+_PRICES = {"pro": {"monthly": 25, "annual": 250}, "growth": {"monthly": 79, "annual": 790}}
 
 
-def test_a_paid_up_plan_says_when_it_renews_and_for_how_much():
+def test_a_fixed_period_plan_says_when_it_ends_and_how_to_keep_it_renewing():
     now = _dt(2026, 9, 19, 10, 0, tzinfo=_tz.utc)
     st = billing.plan_status({"tier": "growth", "tier_source": "payment",
                               "paid_until": "2026-10-07T00:00:00+00:00"}, _PRICES, "monthly", now)
-    assert st["state"] == "active" and st["price"] == 1499
-    assert "7 October 2026" in st["sentence"] and "7th of each month" in st["sentence"]
-    assert "K1,499" in st["sentence"] and st["pay_link"] == "/checkout?plan=growth&billing=monthly"
+    assert st["state"] == "active" and st["price"] == 79 and st["currency"] == "USD"
+    assert "7 October 2026" in st["sentence"] and "set up card payment" in st["sentence"]
+    assert "$79" in st["sentence"] and "renews automatically" in st["sentence"]
+    assert st["pay_link"] == "/checkout?plan=growth&billing=monthly"
     assert st["days_left"] == 18
 
 
@@ -207,9 +179,20 @@ def test_the_history_has_both_ways_of_paying_newest_first():
                "detail": {"tier": "growth", "source": "admin_demo"}}]
     h = billing.payment_history(subs, audits, _PRICES)
     assert [p["id"] for p in h] == ["a-7", "m-r2", "m-r1"]
-    assert h[0]["amount"] == 1499 and h[0]["receipt"] is True
+    # Recorded by hand before the switch to dollars: it was paid in Kwacha, at
+    # the price of the time, whatever the price list says today.
+    assert h[0]["amount"] == 1499 and h[0]["currency"] == "ZMW" and h[0]["receipt"] is True
     assert h[1]["receipt"] is False                     # failed: no receipt
     assert h[2]["phone_tail"] == "4567" and h[2]["method"] == "MTN Mobile Money"
+    assert h[2]["currency"] == "ZMW"                    # an old mobile money payment stays in Kwacha
+
+
+def test_a_payment_recorded_with_its_amount_shows_that_amount():
+    audits = [{"id": 3, "created_at": "2026-09-26T10:00:00+00:00",
+               "detail": {"tier": "pro", "source": "payment", "billing": "monthly",
+                          "amount": 25, "currency": "USD"}}]
+    h = billing.payment_history([], audits, _PRICES)
+    assert h[0]["amount"] == 25 and h[0]["currency"] == "USD"
 
 
 def test_a_simulated_payment_never_gets_a_receipt():

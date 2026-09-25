@@ -2315,13 +2315,14 @@ def health_setup():
                        "be triggered, so OTA calendars drift."},
         {"key": "mobile_money", "live": any(payments.configured_networks().values()),
          "needs": ["MTN_MOMO_SUBSCRIPTION_KEY", "AIRTEL_CLIENT_ID"],
-         "without_it": "Checkout runs in simulation. No real money moves."},
+         "without_it": "Invoice and booking payment links run in simulation. No real money "
+                       "moves. (Plans are paid by card only, so this does not affect them.)"},
         {"key": "card_payments", "live": paddle.status()["ready"],
          "needs": ["PADDLE_API_KEY"],
          "environment": paddle.environment(),
          "open_to_customers": _cards_open_to_all(),
          "detail": _card_setup_note(),
-         "without_it": "Nobody can pay for a plan by card. Only mobile money is offered."},
+         "without_it": "Nobody can pay for a plan at all: plans are paid by card only."},
         {"key": "faster_auth", "live": on("SUPABASE_JWT_SECRET"),
          "needs": ["SUPABASE_JWT_SECRET"],
          "without_it": "Every request verifies the login against Supabase over "
@@ -2561,7 +2562,6 @@ def my_billing(user_id: str = Depends(require_user),
     view = _billing_view(user_id)
     card = view["card"] or {}
     return {"ok": True, "own_plan": True, **view["status"], "payments": view["payments"],
-            "collections_live": any(payments.configured_networks().values()),
             "card_payments": paddle.status()["ready"] and _cards_open_to_all(),
             # Whether Paddle's own page (change card, invoices) can be opened.
             "card_manageable": bool(card.get("customer_id")) and paddle.configured()}
@@ -2628,7 +2628,7 @@ def _send_plan_receipt(rec: Dict[str, Any]) -> None:
             # invoice. A note in the bell is enough from us.
             body = (f"Thank you. Your {pay['plan_name']} plan is paid up to "
                     f"{billing_api._long_day(until) if until else 'the end of this period'} and "
-                    "renews by itself on your card. Paddle has emailed you the receipt. The "
+                    "renews automatically on your card. Paddle has emailed you the receipt. The "
                     "invoice is on Plan & billing too.")
             notify.record_notification(db, user_id, "plan_payment_received", title, body,
                                        "/dashboard/billing", {"payment": pay["id"]})
@@ -2670,11 +2670,24 @@ def my_entitlements(user_id: str = Depends(require_user),
     account = entitlements.paying_account(user_id, x_acting_as)
     detail = entitlements.tier_detail(account)
     tier = detail["tier"]
+    # A card plan that is still going and not cancelled renews by itself, so
+    # the app must not warn that it is "ending" before each renewal (every
+    # plan is paid by card since 25 September 2026).
+    renews = False
+    if detail.get("paid_until"):
+        try:
+            db = get_db()
+            card = billing_api.card_plan_of(db, account, paddle.environment()) if db is not None else None
+            renews = bool(card and card.get("status") in billing_api.CARD_LIVE_STATUSES
+                          and not card.get("cancel_at") and card.get("plan") == tier)
+        except Exception as e:  # noqa: BLE001 — the plan answer matters more than this flag
+            log.info("[entitlements] card plan not read for %s: %s", account, e)
     return {
         "ok": True,
         "tier": tier,
         "own_plan": account == user_id,
         "paid_until": detail.get("paid_until"),
+        "renews_automatically": renews,
         "expired": detail.get("reason") == "expired",
         "paid_tier": detail.get("paid_tier"),
         "reason": detail.get("reason", "ok"),
@@ -2685,23 +2698,20 @@ def my_entitlements(user_id: str = Depends(require_user),
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAYMENTS — Mobile Money (MTN MoMo + Airtel Money), ready-for-keys
+# PAYMENTS — plans by card (Paddle, further down); mobile money (MTN MoMo +
+# Airtel Money) now only for invoice and booking payment links
 # ══════════════════════════════════════════════════════════════════════════════
 
-# In-memory record of collection requests, keyed by reference.
-# Production should persist these (Supabase) and reconcile via the callback.
+# Cache of mobile money plan payments made before the switch to cards, keyed by
+# reference (subscription_payments is the record).
 PAYMENTS: Dict[str, Dict[str, Any]] = {}
-MAX_PAYMENTS = int(os.environ.get("MAX_PAYMENTS", "5000"))
 
-# ZMW prices per plan — must match lib/tiers.ts on the frontend.
-PLAN_PRICES = {
-    "pro":     {"monthly": 500,  "annual": 5000},
-    "proplus": {"monthly": 750,  "annual": 7500},
-    "growth":  {"monthly": 1499, "annual": 14990},
-}
-
-# Human plan names for payment notes/messages ("proplus" is internal only).
-PLAN_LABEL = {"pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
+# The price of every plan, in US dollars. Since 25 September 2026 plans are
+# paid by card only (Paddle, which cannot charge in Kwacha) and renew
+# automatically, so there is one price list: the card one. Must match
+# tier_contract.json and lib/tiers.ts. The owner can still change a price in
+# the Paddle dashboard; checkout charges whatever Paddle has on sale.
+PLAN_PRICES = {plan: dict(p) for plan, p in paddle.CARD_PRICES_USD.items()}
 
 # Shared secret a provider must present on the webhook. Without it the callback
 # is REJECTED — otherwise anyone could POST "successful" and grant themselves a
@@ -2872,86 +2882,21 @@ def payments_config():
     return {"networks": payments.configured_networks(), "mode": "live" if any(payments.configured_networks().values()) else "simulation"}
 
 
-class PaymentInitiateRequest(BaseModel):
-    network: str                      # "mtn" | "airtel"
-    plan: str                         # "pro" | "proplus" | "growth"
-    billing: str = "monthly"          # "monthly" | "annual"
-    payer_phone: str
-    currency: str = "ZMW"
-
-
 @app.post("/payments/initiate")
-def payments_initiate(body: PaymentInitiateRequest, user_id: str = Depends(require_user)):
-    # The account to upgrade is ALWAYS the authenticated caller — never a
-    # user_id from the request body (which any client could forge).
-    network = (body.network or "").lower()
-    if network not in ("mtn", "airtel"):
-        raise HTTPException(status_code=400, detail="network must be 'mtn' or 'airtel'")
-
-    plan = (body.plan or "").lower()
-    if plan not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="plan must be 'pro', 'proplus' or 'growth'")
-
-    billing = body.billing if body.billing in ("monthly", "annual") else "monthly"
-
-    if not (body.payer_phone or "").strip():
-        raise HTTPException(status_code=400, detail="payer_phone is required")
-
-    return _begin_subscription_payment(user_id, network, plan, billing, body.payer_phone, body.currency)
+def payments_initiate():
+    """Retired 25 September 2026: plans are no longer bought by mobile money.
+    Every plan is paid by card and renews automatically (/payments/paddle/*).
+    Kept as an address so an old page left open gets a plain answer, not a 404.
+    Mobile money still collects invoice and booking payment links; those have
+    their own addresses."""
+    raise HTTPException(status_code=410, detail="AIBOS plans are paid by card now and renew "
+                                                "automatically. Choose your plan again on the "
+                                                "pricing page to pay by card.")
 
 
-def _begin_subscription_payment(user_id: str, network: str, plan: str, billing: str,
-                                payer_phone: str, currency: str = "ZMW") -> dict:
-    """Ask the payer's phone for a plan's price and remember that we asked.
-    Shared by the checkout and by the renewal run, so a renewal settles, grants
-    and extends exactly as a checkout does."""
-    amount = PLAN_PRICES[plan][billing]
-    reference = str(uuid.uuid4())
-    note = f"AIBOS {PLAN_LABEL.get(plan, plan.capitalize())} ({billing})"
-    state = payments.initiate(network, reference, amount, currency, payer_phone, note)
-
-    # Bound the store so a flood of initiations can't exhaust memory.
-    while len(PAYMENTS) >= MAX_PAYMENTS:
-        PAYMENTS.pop(next(iter(PAYMENTS)), None)
-
-    PAYMENTS[reference] = {
-        "reference": reference,
-        "network": network,
-        "plan": plan,
-        "billing": billing,
-        "amount": amount,
-        "currency": currency,
-        "user_id": user_id,           # from the verified JWT, not the body
-        "status": state,
-        "granted": False,
-        "created_at": time.time(),
-    }
-
-    if state == "unconfigured":
-        PAYMENTS.pop(reference, None)
-        raise HTTPException(
-            status_code=503,
-            detail="Mobile money isn’t enabled on this server yet. Pay manually to the number shown, or contact support.",
-        )
-    if state == "failed":
-        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
-
-    db = get_db()
-    if db is not None:
-        try:
-            db.table("subscription_payments").insert({
-                "reference": reference, "user_id": user_id, "network": network,
-                "plan": plan, "billing": billing, "amount": amount,
-                "currency": currency, "status": state, "granted": False,
-                "payer_phone": payer_phone.strip()[:32],
-            }).execute()
-        except Exception as e:  # noqa: BLE001 — pre-0033: memory only, as before
-            log.warning("[payments] checkout %s kept in memory only (run migration 0033): %s",
-                        reference, e)
-
-    return {"reference": reference, "status": state, "amount": amount, "network": network, "plan": plan}
-
-
+# The status poll and the provider callback below stay: they settle any mobile
+# money plan payment started before the switch, and the callback is shared with
+# invoice and booking payment links.
 @app.get("/payments/status/{reference}")
 def payments_status(reference: str, user_id: str = Depends(require_user)):
     rec = _load_subscription_payment(reference)
@@ -5098,7 +5043,8 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
     if not (getattr(claimed, "data", None) or []):
         return new_status
     row["settled"] = True
-    money = billing_api.money(float(row.get("amount") or 0))
+    # A stay is paid by mobile money, in Kwacha (plans are the ones in dollars).
+    money = billing_api.money(float(row.get("amount") or 0), row.get("currency") or "ZMW")
     try:
         saved = hospitality_api.record_link_payment(db, row["user_id"], row["booking_id"],
                                                     float(row.get("amount") or 0))
@@ -6004,37 +5950,11 @@ def sweep_pending_payments(db) -> dict:
     return out
 
 
-def _renewal_request(user_id: str, plan: str, billing: str) -> Optional[str]:
-    """Send a renewal's payment request to the phone this account last paid
-    with. Returns the last digits of that phone when a request went out.
-
-    Nothing is sent while the network's collections are off, to an account
-    that has never paid by phone, or when a request already went out in the
-    last day (the customer is still looking at the first one)."""
-    db = get_db()
-    if db is None:
-        return None
-    from datetime import datetime, timedelta, timezone
-    res = (db.table("subscription_payments").select("network,payer_phone,status,created_at")
-           .eq("user_id", user_id).order("created_at", desc=True).limit(20).execute())
-    rows = getattr(res, "data", None) or []
-    since = (datetime.now(timezone.utc) - timedelta(hours=20)).isoformat()
-    last = next((r for r in rows if r.get("status") == "successful" and r.get("payer_phone")), None)
-    if not last or not payments.provider_configured(last.get("network") or ""):
-        return None
-    phone = str(last["payer_phone"])
-    tail = re.sub(r"\D", "", phone)[-4:]
-    if any(r.get("status") == "pending" and str(r.get("created_at") or "") >= since for r in rows):
-        return tail
-    try:
-        _begin_subscription_payment(user_id, last["network"], plan, billing, phone)
-    except HTTPException as e:
-        log.warning("[billing] renewal request for %s not sent: %s", user_id, e.detail)
-        return None
-    return tail
-
-
 def run_plan_renewals() -> dict:
+    """Remind the owners whose plan was paid for a fixed period (by mobile
+    money before the switch to cards, or by hand) to set up card payment, so
+    it renews automatically from then on. A card plan renews by itself and is
+    never reminded."""
     db = get_db()
 
     def _email(to, subject, body, button):
@@ -6042,14 +5962,14 @@ def run_plan_renewals() -> dict:
         url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
         return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url)))
 
-    return billing_api.run_renewals(db, PLAN_PRICES, request_payment=_renewal_request,
-                                    send_email=_email, record=notify.record_notification,
+    return billing_api.run_renewals(db, PLAN_PRICES, send_email=_email,
+                                    record=notify.record_notification,
                                     card_environment=paddle.environment())
 
 
 @app.post("/payments/renewals")
 def payments_renewals(x_cron_secret: Optional[str] = Header(default=None)):
-    """Send the plan renewal reminders and payment requests that are due.
+    """Send the plan renewal reminders that are due.
     Cron-only; the API also runs it every hour by itself."""
     if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
         raise HTTPException(status_code=403, detail="Invalid cron secret")

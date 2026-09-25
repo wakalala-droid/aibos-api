@@ -433,11 +433,11 @@ CARD = {"status": "active", "plan": "pro", "billing": "monthly", "amount": 25, "
         "next_billed_at": "2026-10-21T10:00:00+00:00", "cancel_at": None}
 
 
-def test_a_card_plan_says_it_renews_by_itself_and_never_asks_to_pay():
+def test_a_card_plan_says_it_renews_automatically_and_never_asks_to_pay():
     st = billing.plan_status(PAID, main.PLAN_PRICES, "monthly", NOW, card=CARD)
     assert st["state"] == "active" and st["price"] == 25 and st["currency"] == "USD"
-    assert "renews by itself on Wednesday 21 October 2026" in st["sentence"]
-    assert "$25" in st["sentence"] and "K500" not in st["sentence"]
+    assert "renews automatically on Wednesday 21 October 2026" in st["sentence"]
+    assert "$25" in st["sentence"] and "K" not in st["sentence"].replace("Keep", "")
     assert st["card"]["renews_on"].startswith("2026-10-21")
 
 
@@ -453,9 +453,9 @@ def test_a_declined_card_says_so():
     assert st["state"] == "grace" and "did not go through" in st["sentence"]
 
 
-def test_without_a_card_plan_nothing_changes():
+def test_without_a_card_plan_it_asks_for_a_card():
     st = billing.plan_status(PAID, main.PLAN_PRICES, "monthly", NOW)
-    assert st["card"] is None and "K500" in st["sentence"]
+    assert st["card"] is None and "$25" in st["sentence"] and "set up card payment" in st["sentence"]
     ended = billing.plan_status(PAID, main.PLAN_PRICES, "monthly", NOW, card=dict(CARD, status="canceled"))
     assert ended["card"] is None
 
@@ -470,8 +470,26 @@ def test_a_card_payment_is_listed_with_paddles_invoice_not_an_aibos_receipt():
 
 def test_money_carries_its_currency():
     assert billing.money(25, "USD") == "$25"
-    assert billing.money(1499) == "K1,499"
+    assert billing.money(25) == "$25"                     # plans are in dollars
+    assert billing.money(1499, "ZMW") == "K1,499"          # an old mobile money payment
     assert billing.money(29.5, "EUR") == "29.50 EUR"
+
+
+def test_a_card_plan_that_renews_is_not_shown_as_ending(api, monkeypatch):
+    # Every plan renews automatically by card (25 September 2026). The app's
+    # "your plan ends soon" strip must not appear before each renewal.
+    _client, db = api
+    monkeypatch.setattr(main.entitlements, "paying_account", lambda uid, acting=None: uid)
+    monkeypatch.setattr(main.entitlements, "tier_detail",
+                        lambda uid: {"tier": "pro", "reason": "ok", "paid_until": "2026-10-21T10:00:00+00:00"})
+    db.rows["card_subscriptions"] = [{"subscription_id": "sub_1", "user_id": "u1", "status": "active",
+                                      "plan": "pro", "billing": "monthly", "cancel_at": None,
+                                      "environment": "live", "updated_at": "2026-09-21T10:00:00+00:00"}]
+    assert main.my_entitlements(user_id="u1", x_acting_as=None)["renews_automatically"] is True
+    db.rows["card_subscriptions"][0]["cancel_at"] = "2026-10-21T10:00:00+00:00"      # cancelled: it ends
+    assert main.my_entitlements(user_id="u1", x_acting_as=None)["renews_automatically"] is False
+    db.rows["card_subscriptions"] = []                                                # paid for a period
+    assert main.my_entitlements(user_id="u1", x_acting_as=None)["renews_automatically"] is False
 
 
 def test_renewal_reminders_skip_a_card_plan():

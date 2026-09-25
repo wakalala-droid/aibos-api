@@ -23,7 +23,11 @@
     "features that are reserved and not yet written. can_access() / canAccess()",
     "deny them to every tier, including Growth, so no gate can ever hand a",
     "customer a feature with no implementation behind it. Shipping one = remove",
-    "it from this list, from entitlements._UNBUILT and from tiers.ts UNBUILT."
+    "it from this list, from entitlements._UNBUILT and from tiers.ts UNBUILT.",
+    "",
+    "'prices' are in US dollars (since 25 September 2026 every plan is paid by",
+    "card through Paddle and renews automatically). They equal paddle.py",
+    "CARD_PRICES_USD, main.py PLAN_PRICES and lib/tiers.ts priceMonthly/Annual."
   ],
 
   "access": {
@@ -94,8 +98,8 @@
   },
 
   "prices": {
-    "pro": { "monthly": 500, "annual": 5000 },
-    "proplus": { "monthly": 750, "annual": 7500 },
-    "growth": { "monthly": 1499, "annual": 14990 }
+    "pro": { "monthly": 25, "annual": 250 },
+    "proplus": { "monthly": 39, "annual": 390 },
+    "growth": { "monthly": 79, "annual": 790 }
   }
 }
