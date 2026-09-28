@@ -25,6 +25,7 @@ from typing import Callable
 
 import pandas as pd
 
+import sheetscan
 import nervous_system as nervous
 from nervous_system import EventIn
 
@@ -367,3 +368,110 @@ def rows_to_events(rows: list[dict], mapping: dict, defaults: dict | None = None
             errors.append({"row": i, "error": f"{type(e).__name__}: {e}"})
 
     return events, errors
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Content-aware mapping — read the column, not just its name
+# ══════════════════════════════════════════════════════════════════════════════
+# excel_suggest_mapping() above reads headers. That is not enough on a real
+# workbook: a column headed "2026-07-31" holds the date, "Details" holds the
+# name, and "Column2" holds nothing at all. Every one of those is invisible to a
+# header match, so a sheet whose headers are dates or blanks mapped to nothing
+# and imported as nothing. Here the values themselves decide, and the header is
+# only the tie-breaker.
+
+_INDEXY = ("no", "no.", "s/n", "sn", "#", "item no", "line", "row", "id", "index", "count")
+
+
+def _profile(rows: list, column: str) -> dict:
+    """What kind of thing actually sits in this column."""
+    vals = [r.get(column) for r in (rows or [])[:400]]
+    vals = [v for v in vals if v is not None and str(v).strip() != ""]
+    if not vals:
+        return {"n": 0, "date": 0.0, "num": 0.0, "text": 0.0, "distinct": 0, "sequential": False}
+    dates = sum(1 for v in vals if sheetscan.is_date_like(v))
+    nums = sum(1 for v in vals if sheetscan.is_number(v))
+    texts = len(vals) - nums - sum(1 for v in vals if sheetscan.is_date_like(v) and not sheetscan.is_number(v))
+    numbers = [sheetscan.to_number(v) for v in vals if sheetscan.is_number(v)]
+    numbers = [n for n in numbers if n is not None]
+    # 1, 2, 3, 4 … is a line number, never a money figure.
+    sequential = (len(numbers) >= 4
+                  and all(float(n).is_integer() for n in numbers[:20])
+                  and sorted(numbers)[:20] == list(range(int(min(numbers)),
+                                                        int(min(numbers)) + len(numbers[:20]))))
+    return {
+        "n": len(vals),
+        "date": dates / len(vals),
+        "num": nums / len(vals),
+        "text": max(texts, 0) / len(vals),
+        "distinct": len({str(v) for v in vals}),
+        "sequential": sequential,
+        "spread": (max(numbers) - min(numbers)) if numbers else 0.0,
+    }
+
+
+def suggest_mapping(columns: list, rows: list | None = None) -> dict:
+    """Best-guess column→field mapping, using the header AND what is in the column.
+
+    Headers win where they are meaningful; where they are not (a date as a
+    header, "Column2", a blank), the values decide. One column is never given
+    two jobs."""
+    columns = [str(c) for c in columns if not str(c).startswith("_")]
+    mapping = {k: v for k, v in excel_suggest_mapping(columns).items() if v in columns}
+    if not rows:
+        return mapping
+    prof = {c: _profile(rows, c) for c in columns}
+
+    # A header match that the column itself contradicts is wrong. "Paid To" won
+    # the amount column because the word "paid" is an amount hint, so every
+    # amount in the import was a person's name and not one row could be booked.
+    # The values get the final say on the two fields where being wrong is fatal.
+    if mapping.get("amount") and prof[mapping["amount"]]["num"] < 0.5:
+        mapping.pop("amount")
+    if mapping.get("date") and prof[mapping["date"]]["date"] < 0.5:
+        mapping.pop("date")
+    used = set(mapping.values())
+
+    def take(field: str, col: str) -> None:
+        mapping[field] = col
+        used.add(col)
+
+    # A column literally called Date/Amount is what an unpivoted matrix produces.
+    for field, exact in (("date", "date"), ("amount", "amount")):
+        if field not in mapping:
+            hit = next((c for c in columns if c.lower() == exact and c not in used), None)
+            if hit:
+                take(field, hit)
+
+    if "date" not in mapping:
+        best = max((c for c in columns if c not in used and prof[c]["n"]),
+                   key=lambda c: (prof[c]["date"], -columns.index(c)), default=None)
+        if best and prof[best]["date"] >= 0.6:
+            take("date", best)
+
+    if "amount" not in mapping:
+        cands = [c for c in columns if c not in used
+                 and prof[c]["num"] >= 0.7 and not prof[c]["sequential"]
+                 and not any(h in _norm(c) for h in _INDEXY)
+                 and prof[c]["date"] < 0.3]
+        # The widest-ranging money column, not simply the leftmost number.
+        best = max(cands, key=lambda c: (prof[c]["spread"], prof[c]["n"]), default=None)
+        if best:
+            take("amount", best)
+
+    for field in ("counterparty", "description"):
+        if field in mapping:
+            continue
+        cands = [c for c in columns if c not in used
+                 and prof[c]["text"] >= 0.6 and prof[c]["distinct"] > 1]
+        best = max(cands, key=lambda c: (prof[c]["distinct"], -columns.index(c)), default=None)
+        if best:
+            take(field, best)
+
+    if "quantity" not in mapping:
+        hit = next((c for c in columns if c not in used
+                    and any(h in _norm(c) for h in ("qty", "quantity", "units", "pieces", "pcs"))), None)
+        if hit:
+            take("quantity", hit)
+
+    return mapping
