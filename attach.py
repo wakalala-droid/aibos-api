@@ -316,6 +316,15 @@ def _first_text(row: dict, columns: list) -> str:
 # Resolving a row against the business
 # ══════════════════════════════════════════════════════════════════════════════
 
+def is_banking(text: str) -> bool:
+    """The line describes money moved between the business's own pockets.
+
+    Asked on its own for the money-OUT side, because classify_direction() reads
+    the SALE first — one line often describes both legs ("sale 15,000, sent to
+    access"), and on the way out it is the banking that is happening."""
+    return bool(_longest_phrase(_norm(text), BANKING_WORDS))
+
+
 def classify_direction(text: str) -> dict:
     """For a figure in the money-IN column: earned, put in, or moved."""
     t = _norm(text)
@@ -422,7 +431,7 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             },
         }
 
-    if direction == "out" and _longest_phrase(_norm(text), BANKING_WORDS):
+    if direction == "out" and is_banking(text):
         return {
             "event_type": "Transfer",
             "payload_extra": {"from": "cash", "to": "bank"},

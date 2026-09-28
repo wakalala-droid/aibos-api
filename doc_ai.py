@@ -152,13 +152,19 @@ def _sanitise(plan: dict, scanned: dict) -> list:
     all: nothing the model says can put AI-BOS somewhere the file does not go."""
     by_id = {t["id"]: t for t in scanned.get("tables", [])}
     from_ai = {}
-    for item in (plan or {}).get("tables", []) or []:
+    items = (plan or {}).get("tables")
+    if not isinstance(items, list):
+        items = []                       # the model answered with some other shape
+    for item in items:
+        if not isinstance(item, dict):
+            continue                     # a number or a string where a table should be
         tid = item.get("id")
-        table = by_id.get(tid)
+        table = by_id.get(tid) if isinstance(tid, str) else None
         if not table:
             continue
         cols = set(table.get("columns", []))
-        mapping = {k: v for k, v in (item.get("mapping") or {}).items()
+        raw_map = item.get("mapping")
+        mapping = {k: v for k, v in (raw_map if isinstance(raw_map, dict) else {}).items()
                    if isinstance(v, str) and v in cols
                    and k in ("date", "amount", "description", "counterparty", "category", "quantity")}
         etype = item.get("event_type")
@@ -199,7 +205,9 @@ def _parse_json(text: str) -> dict:
     s = (text or "").strip()
     if s.startswith("```"):
         s = s.split("```")[1] if "```" in s[3:] else s[3:]
-        s = s.split("\n", 1)[1] if s.lower().startswith("json") else s
+        if s.lower().startswith("json"):
+            parts = s.split("\n", 1)
+            s = parts[1] if len(parts) > 1 else ""
     start, end = s.find("{"), s.rfind("}")
     if start < 0 or end <= start:
         return {}
@@ -213,7 +221,20 @@ def plan(scanned: dict, filename: str = "", use_ai: bool = True) -> dict:
     """What every table in this file is, and how to map it.
 
     Falls back to the rules on every failure path, so the caller never has to
-    handle "the AI was not available" as a special case."""
+    handle "the AI was not available" as a special case. The belt-and-braces
+    wrapper is deliberate: a broken prompt template once made this raise before
+    a request was even sent, and the whole import screen answered 500 for every
+    file. Reading a file must not depend on the AI being well."""
+    try:
+        return _plan(scanned, filename, use_ai)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("doc_ai: planning failed (%s); using the rules", exc)
+        out = plan_locally(scanned)
+        out["reason"] = "The AI could not read the file this time, so AIBOS used its own rules."
+        return out
+
+
+def _plan(scanned: dict, filename: str = "", use_ai: bool = True) -> dict:
     if not use_ai or not llm.configured():
         return plan_locally(scanned)
 
@@ -221,11 +242,14 @@ def plan(scanned: dict, filename: str = "", use_ai: bool = True) -> dict:
     if client is None:
         return plan_locally(scanned)
 
-    prompt = PLAN_PROMPT.format(
-        types=", ".join(ingestion.EVENT_TYPES),
-        filename=(filename or "a spreadsheet")[:120],
-        digest=build_digest(scanned),
-    )
+    # Plain replacement, never str.format: the template shows the model the JSON
+    # to answer in, so it is full of literal braces, and format() reads those as
+    # fields and raises KeyError before a request is ever sent. It also keeps a
+    # spreadsheet cell containing a brace from being read as a format field.
+    prompt = (PLAN_PROMPT
+              .replace("{types}", ", ".join(ingestion.EVENT_TYPES))
+              .replace("{filename}", (filename or "a spreadsheet")[:120])
+              .replace("{digest}", build_digest(scanned)))
     try:
         resp = client.chat.completions.create(
             model=llm.chat_model(),
@@ -237,7 +261,7 @@ def plan(scanned: dict, filename: str = "", use_ai: bool = True) -> dict:
     except Exception as exc:  # noqa: BLE001
         if llm.is_reasoning_rejection(exc):
             llm.note_reasoning_rejected()
-            return plan(scanned, filename, use_ai=True)
+            return _plan(scanned, filename, use_ai=True)
         log.info("doc_ai: model could not plan the file (%s); using the rules", exc)
         out = plan_locally(scanned)
         out["reason"] = llm.quota_message(exc) if _is_quota(exc) else \

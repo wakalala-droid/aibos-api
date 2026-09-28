@@ -444,6 +444,86 @@ def _load_sheet(content: bytes, filename: str, sheet_name: Optional[str] = None)
 # FILE TYPE DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _ledger_to_monthly(content: bytes, filename: str):
+    """A file of individual transactions → the month/revenue/costs an engine needs.
+
+    The engines were written for a monthly summary, and most small businesses
+    keep a ledger instead: one row per payment, money in one column and money
+    out in another. Every figure the engine wants is in there; it just has to be
+    added up. Returns None when the file is not a ledger, so the normal path is
+    unchanged for the summaries that already worked.
+
+    Transfers between the owner's own accounts, and money put IN to be spent,
+    are in neither total: banking your own takings is not a second sale, and a
+    director's float is not income."""
+    try:
+        scanned = sheetscan.scan(content, filename)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("ledger rollup: could not read %s (%s)", filename, exc)
+        return None
+
+    months: dict = {}
+    counted = 0
+    for table in scanned.get("tables", []):
+        mapping = ingestion.suggest_mapping(table["columns"], table["rows"])
+        amt_col, date_col = mapping.get("amount"), mapping.get("date")
+        if not amt_col or not date_col:
+            continue
+        name_cols = [c for c in (mapping.get("description"), mapping.get("counterparty")) if c]
+        for row in table["rows"]:
+            if row.get("_is_total"):
+                continue
+            amount = sheetscan.to_number(row.get(amt_col))
+            when = ingestion._parse_date(row.get(date_col))
+            if not amount or not when:
+                continue
+            text = " ".join(str(row.get(c) or "") for c in name_cols).strip()
+            direction = row.get("Direction")
+            kind = attach.classify_direction(text)["kind"] if direction == "in" else None
+
+            if direction == "in":
+                if kind in ("banking", "funding"):
+                    continue                       # not earned
+                bucket = "revenue"
+            elif direction == "out":
+                # Asked directly, because one line often describes both legs
+                # ("sale 15,000, sent to access") and classify_direction reads
+                # the sale first. On the way OUT it is the banking happening.
+                if attach.is_banking(text):
+                    continue                       # moved, not spent
+                bucket = "costs"
+            else:
+                # No in/out columns: the wording decides.
+                bucket = "revenue" if attach.classify_direction(text)["kind"] == "sale" else "costs"
+
+            key = when[:7]
+            slot = months.setdefault(key, {"month": key, "revenue": 0.0, "costs": 0.0})
+            slot[bucket] += abs(amount)
+            counted += 1
+
+    if counted < 3 or not months:
+        return None
+    rows = [months[k] for k in sorted(months)]
+    logger.info("ledger rollup: %s rows over %s months from %s", counted, len(rows), filename)
+    return pd.DataFrame(rows)
+
+
+def _far_off_months(months: list) -> list:
+    """Months sitting years away from the rest — almost always a typed year.
+
+    Never dropped: it is the owner's money and only they know which year they
+    meant. Named, so they can see it and fix the sheet."""
+    if len(months) < 3:
+        return []
+    ordinals = sorted(int(m[:4]) * 12 + int(m[5:7]) for m in months)
+    middle = ordinals[len(ordinals) // 2]
+    out = []
+    for m in months:
+        if abs((int(m[:4]) * 12 + int(m[5:7])) - middle) > 18:      # more than 18 months adrift
+            out.append(m)
+    return sorted(out)
+
+
 def _detect_file_type(filename: str, df: pd.DataFrame) -> str:
     """Detect which engine should handle this file."""
     name_lower = filename.lower()
@@ -978,13 +1058,24 @@ def upload_file(
 
         # ── Resolve columns ───────────────────────────────────────────────────
         rev_col, cost_col, month_col = _resolve_columns(df)
-        if rev_col is None:
+
+        # A ledger of individual payments has every figure the engine needs, one
+        # row at a time. Add it up by month rather than telling the owner their
+        # own books are the wrong shape.
+        rolled_up = False
+        if rev_col is None or cost_col is None:
+            monthly_df = _ledger_to_monthly(content, filename)
+            if monthly_df is not None and not monthly_df.empty:
+                df = monthly_df
+                rev_col, cost_col, month_col = _resolve_columns(df)
+                rolled_up = True
+
+        if rev_col is None or cost_col is None:
             raise ValueError(
-                f"Cannot find revenue column. Columns found: {list(df.columns)}"
-            )
-        if cost_col is None:
-            raise ValueError(
-                f"Cannot find cost/expense column. Columns found: {list(df.columns)}"
+                "This file does not hold a monthly summary, and AIBOS could not find "
+                "dated payments in it to add up either. It needs either month, revenue "
+                "and cost columns, or a list of transactions with a date and an amount. "
+                f"Columns found: {list(df.columns)}"
             )
 
         # ── Detect engine ─────────────────────────────────────────────────────
@@ -1026,6 +1117,11 @@ def upload_file(
         return {
             "success": True,
             "engine": engine_type,
+            # True when AIBOS added a ledger up into months rather than reading a
+            # summary, so the screen can say where the figures came from.
+            "rolled_up_from_transactions": rolled_up,
+            "odd_dates": _far_off_months([str(r.get("month")) for r in monthly_rows
+                                          if r.get("month")]) if rolled_up else [],
             "cabinet_id": cab_id,
             "filename": filename,
             "sheets": all_sheets,

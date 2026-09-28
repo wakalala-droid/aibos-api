@@ -777,3 +777,181 @@ def test_an_itemised_purchase_list_keeps_its_quantities():
     assert mapping["amount"] == "TOTAL" and mapping["quantity"] == "QTY"
     # The date is written once at the top and belongs to every line under it.
     assert all(str(r["DATE"])[:10] == "2026-08-10" for r in t["rows"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The two things that still failed in production
+# ══════════════════════════════════════════════════════════════════════════════
+# Both were invisible locally: there is no AI key on this machine, and the
+# analysis screen was never pointed at a ledger.
+
+class _FakeMsg:
+    def __init__(self, c):
+        self.content = c
+
+
+class _FakeChoice:
+    def __init__(self, c):
+        self.message = _FakeMsg(c)
+
+
+class _FakeResp:
+    def __init__(self, c):
+        self.choices = [_FakeChoice(c)]
+
+
+class _FakeCompletions:
+    def __init__(self, c):
+        self._c = c
+
+    def create(self, **kw):
+        if isinstance(self._c, Exception):
+            raise self._c
+        return _FakeResp(self._c)
+
+
+class _FakeChat:
+    def __init__(self, c):
+        self.completions = _FakeCompletions(c)
+
+
+class _FakeClient:
+    def __init__(self, c):
+        self.chat = _FakeChat(c)
+
+
+@pytest.fixture
+def ai_on(monkeypatch):
+    """Pretend a provider is configured, and choose what it answers."""
+    import llm
+
+    def use(answer):
+        monkeypatch.setattr(llm, "configured", lambda: True)
+        monkeypatch.setattr(llm, "client", lambda: _FakeClient(answer))
+    return use
+
+
+def test_the_prompt_is_built_at_all(payments_book, ai_on):
+    """PLAN_PROMPT shows the model the JSON to answer in, so it is full of
+    literal braces. Built with str.format() those read as format fields and it
+    raised KeyError('"tables"') before a request was ever sent — so with a key
+    configured, EVERY upload answered 500. There is no key on a dev machine, so
+    nothing local ever took that branch."""
+    scanned = sheetscan.scan(payments_book, "book.xlsx")
+    ai_on('{"tables": []}')
+    plan = doc_ai.plan(scanned, "book.xlsx", use_ai=True)
+    assert len(plan["tables"]) == len(scanned["tables"])
+
+
+@pytest.mark.parametrize("answer", [
+    '{"tables": "oops"}',                     # not a list
+    '{"tables": [1, 2, 3]}',                  # not objects
+    '{"tables": {"a": 1}}',                   # an object, not a list
+    '{"tables": [{"id": null}]}',             # no usable id
+    '```json',                                # a fence and nothing else
+    '',                                       # an empty answer
+    None,                                     # no content at all
+    'I cannot help with that.',               # prose instead of JSON
+])
+def test_no_answer_from_the_model_can_break_an_import(payments_book, ai_on, answer):
+    """Reading a file must not depend on the AI being well."""
+    scanned = sheetscan.scan(payments_book, "book.xlsx")
+    ai_on(answer)
+    plan = doc_ai.plan(scanned, "book.xlsx", use_ai=True)
+    assert len(plan["tables"]) == len(scanned["tables"])
+    assert all(p.get("mapping") is not None for p in plan["tables"])
+
+
+def test_a_provider_that_explodes_falls_back_to_the_rules(payments_book, ai_on):
+    scanned = sheetscan.scan(payments_book, "book.xlsx")
+    ai_on(RuntimeError("provider down"))
+    plan = doc_ai.plan(scanned, "book.xlsx", use_ai=True)
+    assert plan["ai"] is False
+    assert any(p["import"] for p in plan["tables"])
+
+
+def test_a_cell_full_of_braces_cannot_break_the_prompt(ai_on):
+    """A spreadsheet is somebody else's file and a cell can hold anything,
+    including the braces that a format string reads as fields."""
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["Date", "Details", "Amount"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        for i, note in enumerate(["{amount}", "{{digest}}", "{types}"], start=2):
+            ws.cell(row=i, column=1, value=datetime(2026, 7, i))
+            ws.cell(row=i, column=2, value=note)
+            ws.cell(row=i, column=3, value=100 * i)
+    scanned = sheetscan.scan(_book(build), "braces.xlsx")
+    ai_on('{"tables": []}')
+    assert doc_ai.plan(scanned, "braces.xlsx", use_ai=True)["tables"]
+
+
+# ── "Upload & Analyse" on a ledger ───────────────────────────────────────────
+
+def test_a_ledger_is_added_up_into_months_for_the_engines(cashbook):
+    """The engines want month/revenue/costs; a guest house keeps one row per
+    payment. The screen said "Cannot find revenue column" — true, and useless,
+    because every figure it needed was in the file one row at a time."""
+    import main
+    df = main._ledger_to_monthly(cashbook, "EXPENSE REPORT.xlsx")
+    assert df is not None and not df.empty
+    assert list(df.columns) == ["month", "revenue", "costs"]
+    assert main._resolve_columns(df)[:2] == ("revenue", "costs")
+    july = df[df["month"] == "2026-07"].iloc[0]
+    # The wages and the levy went out; the director's float is not revenue.
+    assert july["costs"] > 0
+    assert july["revenue"] == 0
+
+
+def test_banking_your_own_takings_is_not_a_second_sale(cashbook):
+    """"Sale 15,000 in, 15,000 sent to access" is one sale and one transfer."""
+    import main
+    df = main._ledger_to_monthly(cashbook, "EXPENSE REPORT.xlsx")
+    august = df[df["month"] == "2026-08"].iloc[0]
+    assert august["revenue"] == 15000.0          # counted once, not twice
+    assert august["costs"] < 15000.0             # the banking is not a cost
+
+
+def test_a_monthly_summary_still_takes_the_normal_path():
+    """The rollup must not touch files that already worked."""
+    import main
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["Month", "Revenue", "Costs"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        for i, (m, r, c) in enumerate([("2026-01", 5000, 3000), ("2026-02", 6000, 3500)], start=2):
+            ws.cell(row=i, column=1, value=m)
+            ws.cell(row=i, column=2, value=r)
+            ws.cell(row=i, column=3, value=c)
+    import io as _io
+    import pandas as pd
+    df = pd.read_excel(_io.BytesIO(_book(build)))
+    assert main._resolve_columns(df)[:2] == ("Revenue", "Costs")
+
+
+def test_a_year_typed_wrong_is_named_not_swallowed():
+    """One line dated two years after the rest becomes a phantom month that
+    drags the forecast. It is the owner's money, so it is counted and named
+    rather than quietly dropped."""
+    import main
+    assert main._far_off_months(["2026-07", "2026-08", "2026-09", "2028-08"]) == ["2028-08"]
+    assert main._far_off_months(["2026-07", "2026-08", "2026-09"]) == []
+    assert main._far_off_months(["2026-07", "2026-08"]) == []      # too few to judge
+
+
+def test_the_upload_screen_accepts_a_real_cash_book(cashbook):
+    """End to end on the screen the owner actually uses."""
+    import main
+    from fastapi.testclient import TestClient
+    route = next(r for r in main.app.routes if getattr(r, "path", "") == "/upload")
+    dep = next(d.call for d in route.dependant.dependencies)
+    main.app.dependency_overrides[dep] = lambda: "u1"
+    try:
+        r = TestClient(main.app).post(
+            "/upload", files={"file": ("EXPENSE REPORT.xlsx", cashbook, "x")})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rolled_up_from_transactions"] is True
+        assert body["monthly"] and all("revenue" in m for m in body["monthly"])
+    finally:
+        main.app.dependency_overrides.clear()
