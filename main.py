@@ -40,6 +40,9 @@ import entitlements
 import nervous_system as nervous
 import digital_twin as twin
 import ingestion
+import sheetscan
+import attach
+import doc_ai
 import business_memory as memory
 import engine_interface as engines_api
 import simulation
@@ -387,6 +390,30 @@ def _find_best_sheet(xl_file: pd.ExcelFile) -> str:
     return best_sheet
 
 
+def _detect_header_row(xl, sheet: str) -> int:
+    """Which row of this sheet names the columns (0-based), for pandas `header=`.
+
+    pandas assumes row 1. Real books almost never are: a title sits on row 1, the
+    headers on row 3 or 4, sometimes with a blank row between them and the data.
+    Assuming row 1 is how a fifteen-sheet workbook came back as twenty-six
+    columns called "Unnamed: 0" … "Unnamed: 25", with no amount and no date, so
+    there was nothing to map and nothing to import."""
+    try:
+        head = xl.parse(sheet, header=None, nrows=80)
+        grid = [[None if (v != v) else v for v in row] for row in head.values.tolist()]
+        grid = sheetscan._trim(grid)
+        if not grid:
+            return 0
+        blocks = sheetscan._blocks(grid)
+        if not blocks:
+            return 0
+        a, b = blocks[0]
+        return sheetscan._pick_header(grid, a, b)
+    except Exception as exc:  # noqa: BLE001 — never fail an upload over this
+        logger.info("header detection fell back to row 1 on %s: %s", sheet, exc)
+        return 0
+
+
 def _load_sheet(content: bytes, filename: str, sheet_name: Optional[str] = None) -> tuple:
     """
     Load a specific sheet from an Excel file.
@@ -403,7 +430,7 @@ def _load_sheet(content: bytes, filename: str, sheet_name: Optional[str] = None)
     else:
         selected = _find_best_sheet(xl)
 
-    df = xl.parse(selected)
+    df = xl.parse(selected, header=_detect_header_row(xl, selected))
 
     # Drop rows/cols that are entirely NaN
     df.dropna(how="all", inplace=True)
@@ -3944,6 +3971,286 @@ def excel_commit_file(
 class QrRequest(BaseModel):
     payload: str
     currency: str = "ZMW"
+
+
+# ── Documents: read EVERY sheet, decide where each table belongs ──────────────
+# The old import read one sheet and assumed row 1 was the header. These two
+# routes replace that with: scan the whole file → say what each table is → ask
+# about what only the owner can know → import the lot in one go.
+
+PREVIEW_ROWS_PER_TABLE = 25        # what travels back to the screen
+MAX_QUESTIONS = 40
+
+
+def _business_context(db, ctx, default_type: str = "Expense") -> dict:
+    """Who and what this business already has on file, for matching rows against.
+
+    Read once per import rather than per row: a thousand-row sheet would
+    otherwise be a thousand round trips to the database."""
+    def safe(fn, *a, **kw):
+        try:
+            return fn(*a, **kw) or []
+        except Exception as exc:  # noqa: BLE001 — a missing table never fails an import
+            logger.info("import context: %s unavailable (%s)", getattr(fn, "__name__", fn), exc)
+            return []
+    return {
+        "employees": [{"id": e.get("id"), "name": e.get("name"), "status": e.get("status")}
+                      for e in safe(payroll_api.list_employees, db, ctx.tenant)],
+        "products": [{"id": p.get("id"), "name": p.get("name"), "sku": p.get("sku"),
+                      "category": p.get("category"), "supplier": p.get("supplier")}
+                     for p in safe(products_api.list_products, db, ctx.tenant,
+                                   business_id=ctx.business_id)],
+        "parties": [{"id": p.get("id"), "name": p.get("name"), "kind": p.get("kind")}
+                    for p in safe(parties_api.list_parties, db, ctx.tenant,
+                                  business_id=ctx.business_id)],
+        "default_type": default_type,
+    }
+
+
+def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
+    try:
+        scanned = sheetscan.scan(content, filename)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("document scan error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Could not read that file: {exc}")
+    if not scanned["tables"]:
+        raise HTTPException(status_code=400, detail=(
+            "AI-BOS opened the file but found no table of figures in it. "
+            "Check the sheet has column headings and rows underneath them."))
+    return scanned, doc_ai.plan(scanned, filename, use_ai=use_ai)
+
+
+def _text_columns(table: dict, mapping: dict) -> list:
+    """The columns whose words say what a row was for. On an unpivoted matrix the
+    member/worker name is a label column, which no header hint would ever find."""
+    cols = [c for c in (mapping.get("counterparty"), mapping.get("description")) if c]
+    for c in table.get("label_columns", []):
+        if c not in cols and not c.startswith("_"):
+            cols.append(c)
+    return cols
+
+
+@app.post("/documents/scan")
+def documents_scan(
+    file: UploadFile = File(...),
+    use_ai: bool = Query(True),
+    ctx: membership.Context = Depends(membership.require_write),
+):
+    """Read the WHOLE file: every sheet, every table on it, what each one is, and
+    what AI-BOS needs the owner to tell it before importing."""
+    db = _require_db()
+    content = file.file.read()
+    _enforce_upload_size(content)
+    filename = file.filename or "upload.xlsx"
+
+    scanned, plan = _scan_and_plan(content, filename, use_ai)
+    context = _business_context(db, ctx)
+    by_id = {p["id"]: p for p in plan["tables"]}
+
+    tables, questions = [], []
+    for t in scanned["tables"]:
+        p = by_id.get(t["id"], {})
+        mapping = p.get("mapping", {})
+        out = {
+            "id": t["id"], "sheet": t["sheet"], "title": t["title"],
+            "header_row": t["header_row"], "orientation": t["orientation"],
+            "columns": [c for c in t["columns"] if not c.startswith("_")],
+            "row_count": t["row_count"], "nonzero_rows": t["nonzero_rows"],
+            "total_rows": t["total_rows"], "notes": t["notes"],
+            "dropped_columns": t["dropped_columns"],
+            "what_it_is": p.get("what_it_is", ""), "import": p.get("import", False),
+            "reason": p.get("reason", ""), "event_type": p.get("event_type", "Expense"),
+            "mapping": mapping, "confidence": p.get("confidence", 0.5),
+            "rows": [{k: v for k, v in r.items() if not k.startswith("_")}
+                     for r in t["rows"][:PREVIEW_ROWS_PER_TABLE]],
+        }
+        if p.get("import") and mapping.get("amount"):
+            res = attach.resolve_table(t["rows"], mapping, context, _text_columns(t, mapping),
+                                       heading=f'{t["title"]} {t["sheet"]}')
+            out["counts"] = res["counts"]
+            for q in res["questions"]:
+                questions.append({**q, "table": t["id"], "sheet": t["sheet"]})
+        tables.append(out)
+
+    # One question per unknown thing across the whole file, biggest first: an
+    # owner should be asked about Chanda once, not once for each month she was paid.
+    merged: dict = {}
+    for q in questions:
+        key = f"{q['type']}::{attach._norm(q.get('name'))}"
+        slot = merged.setdefault(key, {**q, "key": key, "tables": [], "count": 0})
+        slot["count"] += q.get("count", 1)
+        if q["table"] not in slot["tables"]:
+            slot["tables"].append(q["table"])
+    questions = sorted(merged.values(), key=lambda q: -q["count"])[:MAX_QUESTIONS]
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "fingerprint": _import_fingerprint(content, None, ctx.business_id),
+        "sheets": scanned["sheets"],
+        "sheet_count": scanned["sheet_count"],
+        "table_count": scanned["table_count"],
+        "row_total": scanned["row_total"],
+        "nonzero_total": scanned["nonzero_total"],
+        "tables": tables,
+        "questions": questions,
+        "ai": plan.get("ai", False),
+        "ai_note": plan.get("reason", ""),
+        "known": {"employees": len(context["employees"]),
+                  "products": len(context["products"]),
+                  "parties": len(context["parties"])},
+        "event_types": list(nervous.EVENT_TYPES),
+    }
+
+
+@app.post("/documents/import")
+def documents_import(
+    file: UploadFile = File(...),
+    tables: str = Form("[]"),          # [{id, event_type?, mapping?}] — the owner's choices
+    answers: str = Form("{}"),         # {question key: {action, ...}}
+    currency: str = Form("ZMW"),
+    use_ai: bool = Form(True),
+    force: bool = Form(False),
+    ctx: membership.Context = Depends(membership.require_write),
+):
+    """Import every table the owner kept, each row filed against the worker,
+    product or expense category it actually belongs to."""
+    db = _require_db()
+    try:
+        chosen = json.loads(tables or "[]")
+        answers_d = json.loads(answers or "{}")
+        if not isinstance(chosen, list) or not isinstance(answers_d, dict):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="tables must be a JSON list and answers a JSON object.")
+
+    content = file.file.read()
+    _enforce_upload_size(content)
+    filename = file.filename or "upload.xlsx"
+
+    fingerprint = _import_fingerprint(content, None, ctx.business_id)
+    before = memory.recall(db, ctx.tenant, "excel_import", fingerprint)
+    if before and not force:
+        raise HTTPException(status_code=409, detail={
+            "code": "already_imported",
+            "message": "This file has already been imported into these books. "
+                       "Importing it again records every row a second time.",
+            "imported_at": before.get("at"), "saved_count": before.get("saved"),
+        })
+
+    scanned, plan = _scan_and_plan(content, filename, use_ai)
+    context = _business_context(db, ctx)
+    planned = {p["id"]: p for p in plan["tables"]}
+    picked = {c.get("id"): c for c in chosen if isinstance(c, dict) and c.get("id")}
+    if not picked:
+        picked = {p["id"]: {} for p in plan["tables"] if p.get("import")}
+    if not picked:
+        raise HTTPException(status_code=400, detail=(
+            "There was nothing to import: every table in this file is either empty "
+            "or holds totals worked out from another table."))
+
+    events, skipped, per_table, new_workers, new_products = [], [], [], set(), set()
+
+    for table in scanned["tables"]:
+        if table["id"] not in picked:
+            continue
+        choice = picked[table["id"]]
+        base = planned.get(table["id"], {})
+        mapping = choice.get("mapping") or base.get("mapping") or {}
+        etype = choice.get("event_type") or base.get("event_type") or "Expense"
+        if not mapping.get("amount"):
+            skipped.append({"table": table["id"], "why": "No column in this table holds a money figure."})
+            continue
+
+        ctx_for_table = {**context, "default_type": etype}
+        res = attach.resolve_table(table["rows"], mapping, ctx_for_table,
+                                   _text_columns(table, mapping),
+                                   heading=f'{table["title"]} {table["sheet"]}')
+        rows = attach.apply_answers(res["rows"], answers_d)
+
+        made = 0
+        for row in rows:
+            if row.get("_skip"):
+                continue
+            verdict = row.get("_resolved") or {}
+            ev = _row_to_event(row, mapping, verdict, currency, table)
+            if ev is None:
+                continue
+            try:
+                nervous.validate(ev)
+            except nervous.PipelineError as e:
+                skipped.append({"table": table["id"], "row": row.get("_row"), "why": str(e)})
+                continue
+            events.append(ev)
+            made += 1
+            extra = verdict.get("payload_extra") or {}
+            if verdict.get("kind") == "wages" and not extra.get("employee_id") and extra.get("employee"):
+                new_workers.add(extra["employee"])
+            if verdict.get("kind") == "stock" and not extra.get("product_id") and extra.get("items"):
+                new_products.add(str(extra["items"][0]))
+        per_table.append({"table": table["id"], "sheet": table["sheet"],
+                          "title": table["title"], "events": made,
+                          "event_type": etype, "counts": res["counts"]})
+
+    if not events:
+        raise HTTPException(status_code=400, detail=(
+            "Nothing in the tables you chose could be imported. "
+            + (skipped[0]["why"] if skipped else "Every row was blank, zero, or a total.")))
+
+    result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
+                                  actor_role=ctx.role, actor_id=ctx.actor)
+    result.pop("saved", None)
+    result["errors"] = (result.get("errors") or [])[:200]
+    result["error_count"] = len(result["errors"])
+
+    if result.get("saved_count"):
+        from datetime import datetime, timezone
+        memory.remember(db, ctx.tenant, "excel_import", fingerprint, {
+            "at": datetime.now(timezone.utc).isoformat(), "saved": result.get("saved_count"),
+            "file": filename[:120], "rows": len(events)})
+
+    return {
+        "ok": True, **result,
+        "tables": per_table,
+        "skipped": skipped[:100],
+        "event_count": len(events),
+        # Named so the owner can add them properly afterwards, rather than
+        # discovering later that a wage went in against nobody.
+        "workers_not_on_register": sorted(new_workers)[:50],
+        "products_not_on_list": sorted(new_products)[:50],
+    }
+
+
+def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table: dict):
+    """One resolved row → an event, carrying what it was attached to."""
+    amount = sheetscan.to_number(row.get(mapping.get("amount")))
+    if amount is None or amount == 0:
+        return None
+    payload = {"currency": currency, "amount": abs(amount)}
+    payload.update(verdict.get("payload_extra") or {})
+
+    desc = row.get(mapping.get("description")) if mapping.get("description") else None
+    cp = row.get(mapping.get("counterparty")) if mapping.get("counterparty") else None
+    note_parts = [str(x).strip() for x in (desc, cp) if x not in (None, "")]
+    label = " — ".join(note_parts)
+    payload["note"] = (label or f'{table["title"]} ({table["sheet"]})')[:300]
+
+    etype = verdict.get("event_type") or "Expense"
+    if cp not in (None, "") and not any(k in payload for k in ("customer", "supplier", "employee")):
+        payload[ingestion._COUNTERPARTY_KEY.get(etype, "counterparty")] = str(cp)[:120]
+    if etype == "Expense" and not payload.get("category"):
+        payload["category"] = "general"
+
+    occurred = ingestion._parse_date(row.get(mapping.get("date"))) if mapping.get("date") else None
+    return nervous.EventIn(
+        event_type=etype,
+        payload=payload,
+        source="excel",
+        occurred_at=occurred,
+        # What AI-BOS worked out, not what a person confirmed: below the
+        # auto-confirm line these stay pending until the owner looks at them.
+        confidence=min(float(verdict.get("confidence") or 0.5), 0.98),
+    )
 
 
 @app.post("/ingest/qr")
