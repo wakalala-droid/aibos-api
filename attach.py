@@ -406,7 +406,11 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
         if d["kind"] == "funding":
             return {
                 "event_type": "Loan",
-                "payload_extra": {"direction": "in", "category": "funding"},
+                # The spine's own words: a float put into the business is a
+                # loan RECEIVED. "in" was rejected by validation, so every one
+                # of these rows was thrown away with the reason buried in a
+                # skipped list the owner never opens.
+                "payload_extra": {"direction": "received", "category": "funding"},
                 "kind": "funding", "match": None, "confidence": 0.6,
                 "question": {
                     # Named by the phrase that identified it ("from mr mulima"),

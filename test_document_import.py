@@ -955,3 +955,277 @@ def test_the_upload_screen_accepts_a_real_cash_book(cashbook):
         assert body["monthly"] and all("revenue" in m for m in body["monthly"])
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Money: the figures themselves
+# ══════════════════════════════════════════════════════════════════════════════
+# These are the tests that matter most. A misread category is annoying; a
+# misread FIGURE is a client's books being wrong, and nobody forgives that.
+
+@pytest.mark.parametrize("written,value", [
+    # A thousands GROUP is always three digits. One comma and two digits is a
+    # decimal comma, which is how much of the world writes money. Read as a
+    # thousands separator, "k55,00" became K5,500 — a hundredfold error, caught
+    # only because the owner's balance column disagreed.
+    ("k55,00", 55.0),
+    ("55,5", 55.5),
+    ("1.234,56", 1234.56),          # European in full
+    ("k12,000", 12000.0),           # three digits: thousands
+    ("1,234,567", 1234567.0),
+    ("k5,650.77", 5650.77),         # a period is present, so the comma groups
+    ("12,000.50", 12000.5),
+    ("ZMK2,000", 2000.0),
+    ("K,4259.00", 4259.0),
+    ("(1,500)", -1500.0),           # accountants' brackets are negative
+    ("-258", -258.0),
+    ("k 1 500", None),              # a space is not a separator we invent
+])
+def test_money_is_read_as_written(written, value):
+    got = sheetscan.to_number(written)
+    if value is None:
+        assert got is None or got != got
+    else:
+        assert got == pytest.approx(value)
+
+
+def test_a_credit_never_becomes_a_charge():
+    """-258 in the money-OUT column is money coming back. Read through abs() it
+    became a K258 expense that never happened, and the books came out wrong by
+    TWICE the figure: once for the charge invented, once for the credit lost."""
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        rows = [(datetime(2026, 7, 1), "groceries", None, 6058, -258),
+                (datetime(2026, 7, 2), "correction", None, -258, 0)]
+        for i, r in enumerate(rows, start=2):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+    t = sheetscan.scan(_book(build), "c.xlsx")["tables"][0]
+    back = next(r for r in t["rows"] if r["_row"] == 3)
+    assert back["Direction"] == "in"        # it came BACK
+    assert back["Amount"] == 258.0
+    assert back["_reversal"] is True
+    # And the net position is right: 6058 out, 258 back.
+    net = sum(r["Amount"] if r["Direction"] == "in" else -r["Amount"] for r in t["rows"])
+    assert net == pytest.approx(-5800.0)
+
+
+def test_a_reversal_is_booked_as_a_refund_not_as_income():
+    """Money coming back is not money earned."""
+    import main
+    row = {"Amount": 258.0, "Direction": "in", "_reversal": True, "DATE": "2026-07-02"}
+    ev = main._row_to_event(row, {"amount": "Amount", "date": "DATE"},
+                            {"event_type": "Sale", "payload_extra": {}}, "ZMW",
+                            {"title": "t", "sheet": "s"})
+    assert ev.event_type == "Refund"
+    assert ev.payload["amount"] == 258.0
+
+
+def test_the_running_balance_is_checked_against_the_figures():
+    """A cash book proves itself: balance[n] = balance[n-1] + in - out. Where it
+    does not, a figure or the balance was typed wrong, and only the owner knows
+    which — so AIBOS points at the line and changes nothing."""
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        rows = [
+            (datetime(2026, 7, 1), "float", 1000, None, 1000),
+            (datetime(2026, 7, 2), "rent", None, 400, 600),        # adds up
+            (datetime(2026, 7, 3), "fuel", None, 100, 450),        # does NOT: 500 expected
+            (datetime(2026, 7, 4), "airtime", None, 50, 400),      # adds up from 450
+        ]
+        for i, r in enumerate(rows, start=2):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+    t = sheetscan.scan(_book(build), "b.xlsx")["tables"][0]
+    checks = t["balance_checks"]
+    assert len(checks) == 1
+    assert checks[0]["row"] == 4 and checks[0]["label"] == "fuel"
+    assert checks[0]["balance_says"] == 450.0
+    assert checks[0]["figures_say"] == 500.0
+    assert checks[0]["difference"] == -50.0
+    # Nothing was "corrected": the figures still read as written.
+    fuel = next(r for r in t["rows"] if r["_row"] == 4)
+    assert fuel["Amount"] == 100.0
+
+
+def test_a_rounding_cent_is_not_reported_as_an_error():
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        rows = [(datetime(2026, 7, 1), "float", 1000, None, 1000),
+                (datetime(2026, 7, 2), "rent", None, 400, 600.01)]
+        for i, r in enumerate(rows, start=2):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+    t = sheetscan.scan(_book(build), "b.xlsx")["tables"][0]
+    assert t["balance_checks"] == []
+
+
+def test_a_break_in_the_book_does_not_cascade_into_false_errors():
+    """A blank balance means a new section, not that every later row is wrong."""
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        rows = [(datetime(2026, 7, 1), "float", 1000, None, 1000),
+                (datetime(2026, 7, 2), "rent", None, 400, 600),
+                (datetime(2026, 7, 3), "note", None, None, None),      # the chain breaks
+                (datetime(2026, 7, 4), "new float", 500, None, 500),
+                (datetime(2026, 7, 5), "fuel", None, 100, 400)]
+        for i, r in enumerate(rows, start=2):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+    t = sheetscan.scan(_book(build), "b.xlsx")["tables"][0]
+    assert t["balance_checks"] == []
+
+
+def test_every_figure_in_a_cash_book_is_accounted_for(cashbook):
+    """The whole point, stated as arithmetic: what AIBOS reads must net to what
+    the sheet says, to the cent. Not a sample — every row."""
+    import openpyxl
+    import io as _io
+    ws = openpyxl.load_workbook(_io.BytesIO(cashbook), data_only=True).active
+    raw_in = raw_out = 0.0
+    for r in range(4, ws.max_row + 1):
+        i = sheetscan.to_number(ws.cell(row=r, column=4).value)
+        o = sheetscan.to_number(ws.cell(row=r, column=5).value)
+        if i:
+            raw_in += i
+        if o:
+            raw_out += o
+
+    t = sheetscan.scan(cashbook, "EXPENSE REPORT.xlsx")["tables"][0]
+    got_in = sum(r["Amount"] for r in t["rows"] if r["Direction"] == "in")
+    got_out = sum(r["Amount"] for r in t["rows"] if r["Direction"] == "out")
+    assert (got_in - got_out) == pytest.approx(raw_in - raw_out, abs=0.005)
+
+
+def test_no_row_with_money_on_it_is_silently_dropped(cashbook):
+    """Every cell holding a figure must appear as an entry. A dropped row is a
+    payment that never happened as far as the books are concerned."""
+    import openpyxl
+    import io as _io
+    ws = openpyxl.load_workbook(_io.BytesIO(cashbook), data_only=True).active
+    expected = set()
+    for r in range(4, ws.max_row + 1):
+        for col in (4, 5):
+            if sheetscan.to_number(ws.cell(row=r, column=col).value):
+                expected.add(r)
+    t = sheetscan.scan(cashbook, "EXPENSE REPORT.xlsx")["tables"][0]
+    got = {r["_row"] for r in t["rows"]}
+    assert expected - got == set(), f"rows with money that never arrived: {sorted(expected - got)}"
+
+
+def test_the_same_figure_is_never_counted_twice(cashbook):
+    """A merged continuation block must not re-read the rows above it."""
+    t = sheetscan.scan(cashbook, "EXPENSE REPORT.xlsx")["tables"][0]
+    seen = [(r["_row"], r["Direction"]) for r in t["rows"]]
+    assert len(seen) == len(set(seen)), "a row/direction pair appeared more than once"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The invariant: money that goes in must come out
+# ══════════════════════════════════════════════════════════════════════════════
+# Every event AIBOS builds is validated by the spine before it is saved, and a
+# rejected event is reported in a "skipped" list the owner has no reason to
+# open. Loan.direction was being set to "in" when the spine wants "received",
+# so eighteen rows — K90,818 of the director's floats — were thrown away while
+# the screen said the import had succeeded. Counts alone would never have shown
+# it. Only adding the money up did.
+
+def test_every_kwacha_in_the_file_reaches_the_books(cashbook):
+    """What the scanner reads and what the importer saves must be the same
+    total. A rejected event is money that vanished between the two."""
+    import main
+    import membership
+    from fastapi.testclient import TestClient
+
+    scanned = 0.0
+    for t in sheetscan.scan(cashbook, "EXPENSE REPORT.xlsx")["tables"]:
+        amount_col = ingestion.suggest_mapping(t["columns"], t["rows"]).get("amount")
+        if not amount_col:
+            continue
+        for r in t["rows"]:
+            if r.get("_is_total"):
+                continue
+            v = sheetscan.to_number(r.get(amount_col))
+            if v:
+                scanned += abs(v)
+
+    db = _books()
+    main.get_db = lambda: db
+    client = _client(db, "/documents/import")
+    try:
+        res = client.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
+                          data={"tables": "[]", "answers": "{}", "use_ai": "false"}).json()
+        booked = sum(abs((e["payload"] or {}).get("amount") or 0)
+                     for e in db.rows["business_events"])
+        assert res["error_count"] == 0, res.get("errors")
+        assert not res.get("skipped"), res["skipped"]
+        assert booked == pytest.approx(scanned, abs=0.01), (
+            f"{scanned - booked:,.2f} of money was read but never saved")
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("text,direction,event_type", [
+    ("from mr mulima", "in", "Loan"),          # a float put in
+    ("accomodation sale", "in", "Sale"),
+    ("deposited into access", "in", "Transfer"),
+    ("faith kasisi salary", "out", "Salary"),
+    ("tourism levy", "out", "TaxPayment"),
+    ("laundry", "out", "Expense"),
+])
+def test_everything_the_classifier_produces_is_a_valid_event(text, direction, event_type, context):
+    """Every shape AIBOS builds must pass the spine's own validation. A payload
+    the spine refuses is a row dropped after the owner was told it imported."""
+    import nervous_system as nervous
+    out = attach.resolve_row({}, text, 1000, context, None, direction)
+    assert out["event_type"] == event_type
+    payload = {"currency": "ZMW", "amount": 1000.0, **out["payload_extra"]}
+    payload.pop("quantity_assumed", None)
+    if out["event_type"] == "Expense":
+        payload.setdefault("category", "general")
+    nervous.validate(nervous.EventIn(event_type=out["event_type"], payload=payload,
+                                     source="excel"))
+
+
+def test_a_reversal_builds_a_refund_the_spine_accepts():
+    import main
+    import nervous_system as nervous
+    row = {"Amount": 258.0, "Direction": "in", "_reversal": True, "DATE": "2026-07-02"}
+    ev = main._row_to_event(row, {"amount": "Amount", "date": "DATE"},
+                            {"event_type": "Sale", "payload_extra": {}}, "ZMW",
+                            {"title": "t", "sheet": "s"})
+    assert ev.event_type == "Refund"
+    nervous.validate(ev)                       # would have raised before
+
+
+def test_the_importer_reports_anything_it_could_not_save(cashbook, monkeypatch):
+    """If a row ever is rejected, it must be named — never counted as imported."""
+    import main
+    import nervous_system as nervous
+    real = nervous.validate
+    calls = {"n": 0}
+
+    def reject_third(ev):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise nervous.PipelineError("deliberate test rejection")
+        return real(ev)
+
+    monkeypatch.setattr(nervous, "validate", reject_third)
+    db = _books()
+    main.get_db = lambda: db
+    client = _client(db, "/documents/import")
+    try:
+        res = client.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
+                          data={"tables": "[]", "answers": "{}", "use_ai": "false"}).json()
+        assert any("deliberate test rejection" in s["why"] for s in res["skipped"])
+    finally:
+        main.app.dependency_overrides.clear()

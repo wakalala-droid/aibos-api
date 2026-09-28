@@ -103,7 +103,7 @@ def _coerce_amount(v) -> float | None:
     if not m:
         return None
     try:
-        return abs(float(m.group(0).replace(",", "")))
+        return abs(float(sheetscan._decimal_point(m.group(0))))
     except ValueError:
         return None
 

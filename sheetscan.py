@@ -85,7 +85,7 @@ def is_number(v) -> bool:
         return v == v
     if isinstance(v, (datetime, date, time)):
         return False
-    s = str(v).strip().replace(",", "").replace("%", "")
+    s = _decimal_point(str(v).strip()).replace("%", "")
     s = re.sub(r"^[A-Za-z$£€]{0,3}\s*", "", s)   # K 1,500 / ZMW 1500 / $12
     s = re.sub(r"^\((.*)\)$", r"-\1", s)                   # (1,500) is negative
     try:
@@ -145,6 +145,34 @@ def col_letter(i: int) -> str:
     return s
 
 
+def _decimal_point(s: str) -> str:
+    """A written number with its separators resolved, whichever convention it uses.
+
+    A comma is not always a thousands separator. "k55,00" is fifty-five kwacha,
+    and stripping the comma made it five thousand five hundred — a hundredfold
+    error on a real client's books, caught only because the balance column
+    disagreed. A thousands GROUP is always three digits, so one comma followed
+    by one or two digits at the end is a decimal comma:
+
+        12,000      -> 12000      (thousands: three digits)
+        55,00       -> 55.00      (decimal comma: two digits)
+        5,650.77    -> 5650.77    (a period is present, so the comma groups)
+        1.234,56    -> 1234.56    (the comma is last, so it is the decimal)
+    """
+    has_comma, has_dot = "," in s, "." in s
+    if has_comma and has_dot:
+        # Whichever comes last is the decimal separator.
+        if s.rfind(",") > s.rfind("."):
+            return s.replace(".", "").replace(",", ".")
+        return s.replace(",", "")
+    if has_comma:
+        parts = s.split(",")
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 2:
+            return parts[0] + "." + parts[1]
+        return s.replace(",", "")
+    return s
+
+
 def to_number(v):
     """A cell as a number, reading the way money is actually written down:
     "K 1,500", "(1,500)" for negative, "12%"."""
@@ -154,7 +182,7 @@ def to_number(v):
         return float(v) if v == v else None
     if isinstance(v, (datetime, date, time)):
         return None
-    s = text_of(v).replace(",", "")
+    s = _decimal_point(text_of(v))
     neg = bool(re.match(r"^\(.*\)$", s))
     s = re.sub(r"^\((.*)\)$", r"\1", s)
     s = re.sub(r"^[A-Za-z$£€]{0,3}\s*", "", s).replace("%", "").strip()
@@ -538,6 +566,50 @@ def looks_like_header_row(row: list) -> bool:
         return False
     return st["labelish"] / st["filled"] >= 0.7 and st["numeric"] <= 1
 
+_BALANCE_TOLERANCE = 0.02          # a cent or two of rounding is not an error
+
+
+def check_running_balance(grid: list, names: list, data_rows: list, used: list,
+                          in_col: int, out_col: int) -> list:
+    """Rows where the owner's running balance disagrees with their own figures.
+
+    A cash book proves itself: balance[n] = balance[n-1] + in - out. Where that
+    fails, either a figure or the balance was typed wrong, and only the person
+    who was there knows which. AIBOS never silently "corrects" money — it points
+    at the line.
+
+    A blank balance means a new section started, so the chain restarts rather
+    than reporting every row after a gap."""
+    bal_col = next((c for c in used if is_balance_header(names[c])), None)
+    if bal_col is None:
+        return []
+    out, prev = [], None
+    for r in data_rows:
+        row = grid[r]
+        got = to_number(row[bal_col]) if bal_col < len(row) else None
+        if got is None:
+            prev = None                      # a break in the chain
+            continue
+        came_in = to_number(row[in_col]) if in_col < len(row) else None
+        went_out = to_number(row[out_col]) if out_col < len(row) else None
+        if prev is not None and (came_in or went_out):
+            expected = prev + (came_in or 0) - (went_out or 0)
+            if abs(expected - got) > _BALANCE_TOLERANCE:
+                # Name the line by what it was, not by the date it happened.
+                label = next((text_of(row[c]) for c in used
+                              if c < len(row) and not is_blank(row[c])
+                              and not is_number(row[c]) and not is_date_like(row[c])), "")
+                out.append({
+                    "row": r + 1,
+                    "label": label[:60],
+                    "balance_says": round(got, 2),
+                    "figures_say": round(expected, 2),
+                    "difference": round(got - expected, 2),
+                })
+        prev = got
+    return out
+
+
 def _split_in_out(grid: list, names: list, data_rows: list, used: list,
                   in_col: int, out_col: int, date_col: int | None, dates: dict) -> list:
     """One row per money figure, tagged with which way the money went.
@@ -558,8 +630,16 @@ def _split_in_out(grid: list, names: list, data_rows: list, used: list,
             n = to_number(v)
             if n is None or n == 0:
                 continue
-            out.append({**base, "Direction": direction, "Amount": abs(n),
-                        "_row": r + 1, "_is_total": is_total})
+            # A negative in the money-OUT column is money coming BACK: a refund,
+            # a reversal, a correction. Read through abs() it became a charge
+            # that never happened, and the books came out wrong by TWICE the
+            # figure — once for the charge invented, once for the credit lost.
+            side = direction
+            if n < 0:
+                side = "in" if direction == "out" else "out"
+            out.append({**base, "Direction": side, "Amount": abs(n),
+                        "_row": r + 1, "_is_total": is_total,
+                        "_reversal": n < 0})
     return out
 
 
@@ -673,6 +753,7 @@ def _build_table(sheet: str, grid: list, start: int, end: int, index: int,
         "last_data_row": data_rows[-1] + 1,
         "orientation": "matrix" if matrix else "rows",
         "dropped_columns": [],
+        "balance_checks": [],
         "notes": [],
     }
 
@@ -699,6 +780,14 @@ def _build_table(sheet: str, grid: list, start: int, end: int, index: int,
                 "Money is kept in two columns here (" + names[pair[0]] + " and "
                 + names[pair[1]] + "), so each figure is read as its own entry and "
                 "the running balance is left alone.")
+            # The book proves itself; say where it does not.
+            table["balance_checks"] = check_running_balance(
+                grid, names, data_rows, used, pair[0], pair[1])
+            if table["balance_checks"]:
+                table["notes"].append(
+                    f"{len(table['balance_checks'])} line(s) do not add up against the "
+                    "running balance in this sheet. Nothing has been changed — check "
+                    "them and see which figure is right.")
         else:
             rows = _flat_rows(grid, names, data_rows, used, date_col, dates)
         table["columns"] = table.get("columns") or [names[c] for c in used]
@@ -794,6 +883,8 @@ def scan(content: bytes, filename: str = "", sample_rows: int = 0) -> dict:
                     prev["nonzero_rows"] = sum(1 for r in prev["rows"] if _row_has_value(r))
                     prev["all_zero"] = prev["row_count"] > 0 and prev["nonzero_rows"] == 0
                     prev["last_data_row"] = t["last_data_row"]
+                    prev["balance_checks"] = (prev.get("balance_checks") or []) + \
+                        (t.get("balance_checks") or [])
                     continue
                 if not carry:
                     last = {"id": t["id"], "header_row": t["header_row"],

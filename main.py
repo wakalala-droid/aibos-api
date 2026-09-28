@@ -484,6 +484,13 @@ def _ledger_to_monthly(content: bytes, filename: str):
             if direction == "in":
                 if kind in ("banking", "funding"):
                     continue                       # not earned
+                # Money that came back out of the OUT column is a cost reversed,
+                # not income earned: it reduces what was spent.
+                if row.get("_reversal"):
+                    months.setdefault(when[:7], {"month": when[:7], "revenue": 0.0,
+                                                 "costs": 0.0})["costs"] -= abs(amount)
+                    counted += 1
+                    continue
                 bucket = "revenue"
             elif direction == "out":
                 # Asked directly, because one line often describes both legs
@@ -4262,6 +4269,9 @@ def documents_scan(
             "columns": [c for c in t["columns"] if not c.startswith("_")],
             "row_count": t["row_count"], "nonzero_rows": t["nonzero_rows"],
             "total_rows": t["total_rows"], "notes": t["notes"],
+            # Lines whose running balance disagrees with the figures on them.
+            # Reported, never corrected: only the owner knows which is right.
+            "balance_checks": (t.get("balance_checks") or [])[:50],
             "dropped_columns": t["dropped_columns"],
             "what_it_is": p.get("what_it_is", ""), "import": p.get("import", False),
             "reason": p.get("reason", ""), "event_type": p.get("event_type", "Expense"),
@@ -4437,6 +4447,19 @@ def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table:
     if amount is None or amount == 0:
         return None
     payload = {"currency": currency, "amount": abs(amount)}
+    # A figure that was negative in its column is money coming back. Booking it
+    # as an ordinary receipt would show it as income the business never earned.
+    if row.get("_reversal"):
+        # A credit in the money-out column is money coming back from whoever
+        # was paid; a negative receipt is money going back to a customer.
+        payload["direction"] = ("from_supplier" if row.get("Direction") == "in"
+                                else "to_customer")
+        payload["note_reversal"] = True
+        return nervous.EventIn(
+            event_type="Refund", payload=payload, source="excel",
+            occurred_at=ingestion._parse_date(row.get(mapping.get("date")))
+            if mapping.get("date") else None,
+            confidence=0.7)
     payload.update(verdict.get("payload_extra") or {})
 
     desc = row.get(mapping.get("description")) if mapping.get("description") else None
