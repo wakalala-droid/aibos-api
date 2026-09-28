@@ -473,6 +473,96 @@ def _period_run(header: list) -> tuple:
 # One table
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ── A cash book: one header up top, money in two columns, dates written once ──
+
+# Header names that mean "money came in" and "money went out". Matched whole,
+# not by substring: a column called "Invoice" must never read as "in".
+_MONEY_IN_HEADERS = (
+    "in", "money in", "cash in", "in s", "ins", "received", "receipts", "receipt",
+    "credit", "credits", "deposit", "deposits", "inflow", "inflows", "paid in",
+)
+_MONEY_OUT_HEADERS = (
+    "out", "money out", "cash out", "out s", "outs", "paid", "paid out", "payment",
+    "payments", "spent", "debit", "debits", "withdrawal", "withdrawals",
+    "outflow", "outflows", "expense", "expenses",
+)
+# A running balance is never the amount of a transaction.
+_BALANCE_HEADERS = ("balance", "bal", "running balance", "closing balance", "b/f", "c/f")
+
+
+def is_balance_header(name) -> bool:
+    return _norm(name) in _BALANCE_HEADERS
+
+
+def _money_pair(names: list, used: list) -> tuple | None:
+    """(in column, out column) when the table keeps money in two columns."""
+    ins = [c for c in used if _norm(names[c]) in _MONEY_IN_HEADERS]
+    outs = [c for c in used if _norm(names[c]) in _MONEY_OUT_HEADERS]
+    if len(ins) == 1 and len(outs) == 1:
+        return ins[0], outs[0]
+    return None
+
+
+def _date_column(grid: list, data_rows: list, used: list) -> int | None:
+    """The column holding the date, judged by what is in it."""
+    for c in used:
+        vals = [grid[r][c] for r in data_rows if c < len(grid[r]) and not is_blank(grid[r][c])]
+        if vals and sum(1 for v in vals if is_date_like(v)) >= max(1, len(vals) * 0.5):
+            return c
+    return None
+
+
+def _carried_dates(grid: list, data_rows: list, col: int) -> dict:
+    """{row: the date that row belongs to}, blanks inheriting the date above.
+
+    A ledger writes the date once and the next few lines belong to it. Read
+    literally, those lines have no date and land nowhere in the timeline."""
+    out, last = {}, None
+    for r in data_rows:
+        v = grid[r][col] if col < len(grid[r]) else None
+        if not is_blank(v) and is_date_like(v):
+            last = v
+        out[r] = last
+    return out
+
+
+def looks_like_header_row(row: list) -> bool:
+    """True when this row NAMES the columns, rather than being one of them.
+
+    A header is words. The moment a candidate carries a date or more than one
+    figure it is a line of the ledger, and promoting it to a header costs the
+    real column names and one row of real data."""
+    st = _row_stats(row)
+    if st["filled"] < 2 or st["dates"]:
+        return False
+    return st["labelish"] / st["filled"] >= 0.7 and st["numeric"] <= 1
+
+def _split_in_out(grid: list, names: list, data_rows: list, used: list,
+                  in_col: int, out_col: int, date_col: int | None, dates: dict) -> list:
+    """One row per money figure, tagged with which way the money went.
+
+    A cash-book line can be both ("sale 15,000 in, 15,000 banked out"), and both
+    are real, so it becomes two entries rather than one of them being dropped."""
+    out = []
+    for r in data_rows:
+        row = grid[r]
+        base = {names[c]: (row[c] if c < len(row) else None) for c in used}
+        if date_col is not None:
+            base[names[date_col]] = dates.get(r)
+        first_label = next((text_of(row[c]) for c in used
+                            if c < len(row) and not is_blank(row[c]) and not is_number(row[c])), "")
+        is_total = looks_like_total(first_label)
+        for col, direction in ((in_col, "in"), (out_col, "out")):
+            v = row[col] if col < len(row) else None
+            n = to_number(v)
+            if n is None or n == 0:
+                continue
+            out.append({**base, "Direction": direction, "Amount": abs(n),
+                        "_row": r + 1, "_is_total": is_total})
+    return out
+
+
 def _mostly_numeric(grid: list, data_rows: list, col: int) -> bool:
     vals = [grid[r][col] for r in data_rows if col < len(grid[r]) and not is_blank(grid[r][col])]
     if not vals:
@@ -527,11 +617,14 @@ def _unpivot(grid: list, header: list, names: list, data_rows: list,
     return out, columns, [names[c] for c in label_cols], dropped
 
 
-def _flat_rows(grid: list, names: list, data_rows: list, used: list) -> list:
+def _flat_rows(grid: list, names: list, data_rows: list, used: list,
+               date_col: int | None = None, dates: dict | None = None) -> list:
     out = []
     for r in data_rows:
         row = grid[r]
         rec = {names[c]: (row[c] if c < len(row) else None) for c in used}
+        if date_col is not None and dates:
+            rec[names[date_col]] = dates.get(r)
         first_label = next((text_of(row[c]) for c in used
                             if c < len(row) and not is_blank(row[c]) and not is_number(row[c])), "")
         rec["_row"] = r + 1
@@ -540,21 +633,35 @@ def _flat_rows(grid: list, names: list, data_rows: list, used: list) -> list:
     return out
 
 
-def _build_table(sheet: str, grid: list, start: int, end: int, index: int) -> dict | None:
-    header_row = _pick_header(grid, start, end)
-    header = grid[header_row]
-    data_rows = [r for r in range(header_row + 1, end + 1)
-                 if any(not is_blank(v) for v in grid[r])]
-    if not data_rows:
-        return None
+def _build_table(sheet: str, grid: list, start: int, end: int, index: int,
+                 inherit: dict | None = None) -> dict | None:
+    if inherit:
+        # A continuation of the table above: it has no header of its own,
+        # and its first line is data, not column names.
+        header_row = inherit["header_row"] - 1
+        header, names, used = inherit["header"], inherit["names"], inherit["used"]
+        data_rows = [r for r in range(start, end + 1)
+                     if any(not is_blank(v) for v in grid[r])]
+        if not data_rows:
+            return None
+        p0, p1 = (0, -1)
+        matrix = False
+    else:
+        header_row = _pick_header(grid, start, end)
+        header = grid[header_row]
+        data_rows = [r for r in range(header_row + 1, end + 1)
+                     if any(not is_blank(v) for v in grid[r])]
+        if not data_rows:
+            return None
 
-    used = _used_columns(grid, header, data_rows)
-    if not used:
-        return None
-    header = list(header[:used[-1] + 1]) + [None] * max(0, used[-1] + 1 - len(header))
-    names = _column_names(header)
-    p0, p1 = _period_run([header[c] if c in set(used) else None for c in range(len(header))])
-    matrix = p1 >= p0
+        used = _used_columns(grid, header, data_rows)
+        if not used:
+            return None
+        header = list(header[:used[-1] + 1]) + [None] * max(0, used[-1] + 1 - len(header))
+        names = _column_names(header)
+        p0, p1 = _period_run([header[c] if c in set(used) else None
+                              for c in range(len(header))])
+        matrix = p1 >= p0
 
     table = {
         "id": f"{sheet}!{header_row + 1}",
@@ -580,8 +687,21 @@ def _build_table(sheet: str, grid: list, start: int, end: int, index: int) -> di
                 "Columns worked out from the months (" + ", ".join(dropped[:4]) +
                 ") were left out, so a total is not imported on top of the months it adds up.")
     else:
-        rows = _flat_rows(grid, names, data_rows, used)
-        table["columns"] = [names[c] for c in used]
+        date_col = _date_column(grid, data_rows, used)
+        dates = _carried_dates(grid, data_rows, date_col) if date_col is not None else {}
+        pair = _money_pair(names, used)
+        if pair:
+            rows = _split_in_out(grid, names, data_rows, used,
+                                 pair[0], pair[1], date_col, dates)
+            table["columns"] = [names[c] for c in used] + ["Direction", "Amount"]
+            table["orientation"] = "cashbook"
+            table["notes"].append(
+                "Money is kept in two columns here (" + names[pair[0]] + " and "
+                + names[pair[1]] + "), so each figure is read as its own entry and "
+                "the running balance is left alone.")
+        else:
+            rows = _flat_rows(grid, names, data_rows, used, date_col, dates)
+        table["columns"] = table.get("columns") or [names[c] for c in used]
         table["label_columns"] = [names[c] for c in used
                                   if not _mostly_numeric(grid, data_rows, c)]
 
@@ -593,6 +713,8 @@ def _build_table(sheet: str, grid: list, start: int, end: int, index: int) -> di
     if table["all_zero"]:
         table["notes"].append(
             "Every figure in this table is blank or zero — it looks like an unused template.")
+    # Kept for a continuation block to inherit; stripped before the table travels.
+    table["_header"], table["_names"], table["_used"] = header, names, used
     return table
 
 
@@ -612,6 +734,19 @@ def _sheet_is_divider(grid: list, name: str) -> str | None:
     if len(cells) < 3:
         return "The sheet has almost nothing in it."
     return None
+
+
+
+def _shares_columns(grid: list, start: int, end: int, used: list) -> bool:
+    """True when this block sits in the same columns as the table above it."""
+    here = set()
+    for r in range(start, end + 1):
+        for c, v in enumerate(grid[r]):
+            if not is_blank(v):
+                here.add(c)
+    if not here:
+        return False
+    return len(here & set(used)) / len(here) >= 0.6
 
 
 def scan(content: bytes, filename: str = "", sample_rows: int = 0) -> dict:
@@ -634,14 +769,36 @@ def scan(content: bytes, filename: str = "", sample_rows: int = 0) -> dict:
             "tables": [],
         }
         if not skip:
+            last = None          # the last table on this sheet with a real header
             for i, (a, b) in enumerate(_blocks(grid)[:MAX_TABLES_PER_SHEET]):
+                # A section under a header that was written once, at the top of the
+                # sheet, and separated from the next by a blank line or a running
+                # total. Its first line is data; reading it as a header costs the
+                # real column names and a row of real figures.
+                carry = (last is not None
+                         and not looks_like_header_row(grid[_pick_header(grid, a, b)])
+                         and _shares_columns(grid, a, b, last["used"]))
                 try:
-                    t = _build_table(name, grid, a, b, i)
+                    t = _build_table(name, grid, a, b, i, last if carry else None)
                 except Exception as exc:  # noqa: BLE001 — one odd table never stops the rest
                     log.warning("sheetscan: %s rows %s-%s failed: %s", name, a, b, exc)
                     continue
                 if not t or not t["rows"]:
                     continue
+                if carry and tables and tables[-1]["id"] == last["id"]:
+                    # One ledger, not five: the sections belong together.
+                    prev = tables[-1]
+                    prev["rows"] = prev["rows"] + t["rows"]
+                    prev["row_count"] = len(prev["rows"])
+                    prev["total_rows"] = sum(1 for r in prev["rows"] if r.get("_is_total"))
+                    prev["nonzero_rows"] = sum(1 for r in prev["rows"] if _row_has_value(r))
+                    prev["all_zero"] = prev["row_count"] > 0 and prev["nonzero_rows"] == 0
+                    prev["last_data_row"] = t["last_data_row"]
+                    continue
+                if not carry:
+                    last = {"id": t["id"], "header_row": t["header_row"],
+                            "header": t["_header"], "names": t["_names"],
+                            "used": t["_used"]}
                 info["tables"].append(t["id"])
                 if sample_rows and len(t["rows"]) > sample_rows:
                     t = {**t, "rows": t["rows"][:sample_rows], "sampled": True}

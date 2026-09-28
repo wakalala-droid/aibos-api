@@ -55,30 +55,77 @@ WAGE_WORDS = (
     "guard pay", "cleaner pay",
 )
 
+# ── Money coming IN ───────────────────────────────────────────────────────────
+# A receipt is not a cost. Without this, every payment received was booked as an
+# expense, because the wording alone ("accomodation sale") says nothing about
+# which column the figure sat in.
+
+SALE_WORDS = (
+    "sale", "sales", "sold", "revenue", "takings", "income",
+    "accomodation", "accommodation", "booking", "bookings", "room", "rooms",
+    "stay", "nights", "night stay", "checkout", "guest payment",
+    "spa", "massage", "treatment", "conference", "venue hire", "hall hire",
+    "laundry sale", "restaurant", "bar sales", "tour",
+)
+# Money put IN to be spent, rather than earned: a director's float, petty cash.
+FUNDING_WORDS = (
+    "from mr", "from mrs", "from ms", "from miss", "from dr",
+    "petty cash", "float", "top up", "topup", "received from",
+    "capital", "injection", "funding", "advance from", "loan from",
+    "reimburse", "refund from",
+)
+# Cash moved between the business's own pockets: till to bank, bank to mobile
+# money. Real movement, but not a sale and not a cost.
+BANKING_WORDS = (
+    "deposited into", "deposit into", "deposited to", "sent to access",
+    "sent to bank", "sent to the bank", "added to bank", "bank deposit",
+    "banked", "transfer to bank", "moved to bank", "into access",
+)
+
 # Services and running costs, each with the words a person actually writes.
 SERVICE_CATEGORIES = (
-    ("laundry",        ("laundry", "washing", "dry clean", "drycleaning", "linen wash", "wash and iron", "ironing")),
-    ("cleaning",       ("cleaning", "cleaner", "janitor", "fumigation", "pest control", "sanitation", "refuse", "garbage")),
-    ("transport",      ("transport", "fuel", "petrol", "diesel", "taxi", "fare", "delivery", "courier",
-                        "mileage", "bus", "freight", "shipping", "toll", "parking")),
+    ("laundry",        ("laundry", "washing", "dry clean", "drycleaning", "linen wash",
+                    "wash and iron", "ironing", "linen", "duvet", "bedsheet", "bed sheet",
+                    "towel", "pillow case", "mattress cover", "matress cover", "fleece")),
+    ("housekeeping",   ("house keep", "housekeep", "groceries", "grocery", "consumables",
+                    "scrubber", "scrubbing", "bleach", "detergent", "dish liquid",
+                    "washing powder", "pine gel", "toilet cleaner", "tile cleaner",
+                    "shower shine", "liquid soap", "scoring powder", "spirit of salt",
+                    "diffuser", "linen mist", "air freshener", "mr min", "sta soft")),
+    ("cleaning",       ("cleaning", "cleaner", "janitor", "fumigation", "pest control",
+                    "sanitation", "refuse", "garbage", "toilet brush")),
+    ("transport",      ("transport", "fuel", "petrol", "diesel", "taxi", "fare", "delivery",
+                    "courier", "mileage", "bus", "freight", "shipping", "toll", "parking",
+                    "yango", "bolt", "uber", "ulendo", "cab", "trip to", "travel")),
     ("rent",           ("rent", "rental", "lease", "landlord")),
     ("utilities",      ("electricity", "zesco", "power", "water bill", "water utility", "lwsc", "utility",
                         "utilities", "gas bill", "sewerage")),
-    ("communication",  ("airtime", "talktime", "data bundle", "bundles", "internet", "wifi", "wi fi",
-                        "phone bill", "mtn", "airtel", "zamtel", "hosting", "domain")),
-    ("repairs",        ("repair", "maintenance", "service charge", "servicing", "spare part", "spares",
-                        "plumbing", "electrical work", "painting", "welding")),
+    ("communication",  ("airtime", "talktime", "data bundle", "bundles", "data sub", "internet",
+                    "wifi", "wi fi", "phone bill", "mtn", "airtel", "zamtel", "minutes",
+                    "all net", "all-net", "subcription", "subscription")),
+    ("website",        ("website", "web site", "web building", "web buiding", "hosting",
+                    "domain", "ssl", "web design", "web development", "app development")),
+    ("repairs",        ("repair", "maintenance", "service charge", "servicing", "spare part",
+                    "spares", "plumbing", "electrical work", "painting", "welding",
+                    "door handle", "lock", "locks", "adaptor", "adapter",
+                    "batteries", "battery", "fitting", "fittings", "hardware")),
     ("security",       ("security", "guard", "alarm", "cctv")),
-    ("marketing",      ("marketing", "advert", "advertising", "promotion", "branding", "flyer",
-                        "banner", "signage", "social media")),
-    ("bank charges",   ("bank charge", "bank fee", "ledger fee", "transaction fee", "mobile money charge",
-                        "withdrawal fee", "interest charge", "atm")),
+    ("marketing",      ("marketing", "advert", "advertising", "promotion", "branding", "brand",
+                    "brand guideline", "flyer", "flier", "banner", "signage", "sign age",
+                    "billboard", "bilboard", "photography", "photoshoot", "social media",
+                    "graphics", "logo", "poster")),
+    ("bank charges",   ("bank charge", "bank fee", "ledger fee", "transaction fee",
+                    "transaction charge", "transaction and withdraw", "mobile money charge",
+                    "withdrawal fee", "withdraw charge", "withdraw fee", "withdrawal charge",
+                    "electronic transaction", "interest charge", "atm", "charges")),
     ("professional",   ("accountant", "auditor", "lawyer", "legal fee", "consultant", "consultancy",
                         "professional fee", "audit fee")),
     ("insurance",      ("insurance", "premium", "cover note")),
     ("licences",       ("licence", "license", "permit", "levy", "council fee", "registration fee",
                         "pacra", "zra fee", "compliance fee")),
-    ("food",           ("catering", "refreshment", "lunch", "meals", "tea and coffee", "food for staff")),
+    ("food",           ("catering", "refreshment", "lunch", "meals", "tea and coffee",
+                    "food for staff", "mineral water", "bottled water", "nescafe", "coffee",
+                    "milo", "cremora", "freshpak", "quick brew", "sugar", "tea bags")),
     ("packaging",      ("packaging", "carrier bag", "cartons", "wrapping", "labels", "bottles", "crates")),
     ("stationery",     ("stationery", "printing", "photocopy", "toner", "paper ream", "pens", "files")),
     ("rates",          ("rates", "property tax", "ground rent")),
@@ -96,6 +143,11 @@ STOCK_WORDS = (
 # Taxes and statutory payments, which are their own event type.
 TAX_WORDS = (
     ("vat", "VAT"), ("paye", "PAYE"), ("napsa", "NAPSA"), ("nhima", "NHIMA"),
+    ("tourism levy", "Tourism Levy"), ("skills levy", "Skills Levy"),
+    ("skills development", "Skills Development Levy"),
+    ("turn over tax", "Turnover Tax"), ("tot", "Turnover Tax"),
+    ("npsa", "NAPSA"), ("local levy", "Local Levy"), ("council levy", "Council Levy"),
+    ("statutory", "Statutory"),
     ("turnover tax", "Turnover Tax"), ("withholding", "Withholding Tax"),
     ("income tax", "Income Tax"), ("zra", "ZRA"), ("tax", "Tax"),
 )
@@ -158,20 +210,58 @@ def best_match(name: str, candidates: list, key: str = "name") -> tuple:
 # Reading one line of a sheet
 # ══════════════════════════════════════════════════════════════════════════════
 
+def has_phrase(text_norm: str, phrase: str) -> bool:
+    """Whole-word match that forgives a plural, never a substring.
+
+    Plain `in` matching quietly ruined lines: "pens" matched inside "expense",
+    so "carry over expense" was filed as stationery, and "tot" matched inside
+    "total", so every TOTAL row read as a turnover-tax payment. _norm() has
+    already lowercased the text and turned punctuation into spaces, so padding
+    both sides with a space makes `in` mean what a person means by "the line
+    mentions pens" — and it stays faster than a regex over every phrase.
+
+    Whole words alone were too strict for how people write: the list says
+    "flier" and the sheet says "fliers", the list says "lock" and the sheet says
+    "locks". A trailing s or es is matched either way round, which is as much
+    grammar as an expense line ever needs."""
+    padded = f" {text_norm} "
+    base = phrase[:-2] if phrase.endswith("es") else (phrase[:-1] if phrase.endswith("s") else phrase)
+    for form in (phrase, base, base + "s", base + "es"):
+        if f" {form} " in padded:
+            return True
+    return False
+
+
+def _longest_phrase(text_norm: str, words) -> str | None:
+    """The most specific phrase from `words` the line mentions, if any."""
+    best = None
+    for w in words:
+        if has_phrase(text_norm, w) and (best is None or len(w) > len(best)):
+            best = w
+    return best
+
+
 def classify_text(text: str) -> dict:
     """What a line's own wording says it is. Pure, no database, no AI."""
     t = _norm(text)
     if not t:
         return {"kind": "unknown", "detail": None}
-    if any(w in t for w in WAGE_WORDS):
+    if _longest_phrase(t, WAGE_WORDS):
         return {"kind": "wages", "detail": None}
     for code, label in TAX_WORDS:
-        if code in t:
+        if has_phrase(t, code):
             return {"kind": "tax", "detail": label}
+    # Several categories can fit one line ("transaction fee airtel charges" is
+    # both). The most specific wording wins, so a bank charge is not filed as a
+    # phone bill because the word "airtel" happened to appear in the comment.
+    best_cat, best_len = None, 0
     for cat, words in SERVICE_CATEGORIES:
-        if any(w in t for w in words):
-            return {"kind": "service", "detail": cat}
-    if any(w in t for w in STOCK_WORDS):
+        p = _longest_phrase(t, words)
+        if p and len(p) > best_len:
+            best_cat, best_len = cat, len(p)
+    if best_cat:
+        return {"kind": "service", "detail": best_cat}
+    if _longest_phrase(t, STOCK_WORDS):
         return {"kind": "stock", "detail": None}
     return {"kind": "unknown", "detail": None}
 
@@ -226,7 +316,42 @@ def _first_text(row: dict, columns: list) -> str:
 # Resolving a row against the business
 # ══════════════════════════════════════════════════════════════════════════════
 
-def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None = None) -> dict:
+def classify_direction(text: str) -> dict:
+    """For a figure in the money-IN column: earned, put in, or moved."""
+    t = _norm(text)
+    # Earned first. One line often describes BOTH legs of a movement — "sale
+    # 15,000, sent to access" is a sale that was then banked — and the comment
+    # describes the leg that went out. On the money-IN side the sale is the
+    # truth; the banking words belong to the matching OUT figure.
+    if _longest_phrase(t, SALE_WORDS):
+        return {"kind": "sale", "detail": None}
+    hit = _longest_phrase(t, FUNDING_WORDS)
+    if hit:
+        return {"kind": "funding", "detail": hit}
+    if _longest_phrase(t, BANKING_WORDS):
+        return {"kind": "banking", "detail": None}
+    return {"kind": "unknown", "detail": None}
+
+
+def payer_of(text: str) -> str:
+    """Who the money came from, out of "from mr mulima given to ms faith".
+
+    Used to NAME the question, so seventeen floats from the same person are one
+    question rather than seventeen. Plain string work rather than a regex: the
+    title plus one name is all the grouping needs."""
+    t = _norm(text)
+    if "from" not in t.split():
+        return ""
+    after = t.split("from", 1)[1].split()
+    if not after:
+        return ""
+    if after[0] in ("mr", "mrs", "ms", "miss", "dr") and len(after) > 1:
+        return f"{after[0]} {after[1]}"
+    return " ".join(after[:2])
+
+
+def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None = None,
+                direction: str | None = None, name_text: str | None = None) -> dict:
     """One row → what it is, who/what it concerns, and what is still unknown.
 
     Returns {event_type, payload_extra, kind, match, confidence, question}.
@@ -251,10 +376,77 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
         verdict = dict(hint)
         kind = verdict["kind"]
 
+    # ── Which way the money went ─────────────────────────────────────────────
+    # On a cash book the wording says what a line was FOR; only the column it
+    # sits in says whether the money came in or went out. A receipt read as an
+    # expense turns a good month into a terrible one.
+    if direction == "in":
+        d = classify_direction(text)
+        if d["kind"] == "banking":
+            return {
+                "event_type": "Transfer",
+                "payload_extra": {"from": "cash", "to": "bank"},
+                "kind": "banking", "match": "moved between your own accounts",
+                "confidence": 0.8, "question": None,
+            }
+        if d["kind"] == "sale":
+            return {
+                "event_type": "Sale", "payload_extra": {},
+                "kind": "sale", "match": None, "confidence": 0.82, "question": None,
+            }
+        if d["kind"] == "funding":
+            return {
+                "event_type": "Loan",
+                "payload_extra": {"direction": "in", "category": "funding"},
+                "kind": "funding", "match": None, "confidence": 0.6,
+                "question": {
+                    # Named by the phrase that identified it ("from mr mulima"),
+                    # not the whole line, so seventeen floats from the same
+                    # person are ONE question rather than seventeen.
+                    "type": "money_in_kind", "name": payer_of(text) or d.get("detail") or text[:40],
+                    "ask": "Money came in here. Was this money the business EARNED, "
+                           "or money put in to spend?",
+                    "options": ["It was a sale", "Money put in (a float or loan)",
+                                "Moved between my own accounts"],
+                },
+            }
+        # Money in, and the wording gives nothing away.
+        return {
+            "event_type": "Sale", "payload_extra": {},
+            "kind": "sale", "match": None, "confidence": 0.45,
+            "question": {
+                "type": "money_in_kind", "name": text[:80],
+                "ask": "Money came in here, but AIBOS cannot tell what for.",
+                "options": ["It was a sale", "Money put in (a float or loan)",
+                            "Moved between my own accounts"],
+            },
+        }
+
+    if direction == "out" and _longest_phrase(_norm(text), BANKING_WORDS):
+        return {
+            "event_type": "Transfer",
+            "payload_extra": {"from": "cash", "to": "bank"},
+            "kind": "banking", "match": "moved between your own accounts",
+            "confidence": 0.8, "question": None,
+        }
+
     # ── Wages ────────────────────────────────────────────────────────────────
     # A worker's name on its own is enough: on a payment sheet, a line that just
     # says "Mary Banda  4500" is her wages even though no word says "salary".
-    emp, emp_score = best_match(text, employees)
+    # Who a line is ABOUT is scored on each name column SEPARATELY, and the best
+    # score wins. Joined together first, "elizabeth" arrived as "july salary
+    # elizabeth" and scored 0.49 against "Elizabeth Mulenga" — so a worker
+    # already on the register was asked about as though she were a stranger.
+    # Which column holds the name differs by sheet, and trying each is cheaper
+    # than guessing right.
+    cands = [c for c in (name_text if isinstance(name_text, (list, tuple)) else [name_text])
+             if c not in (None, "")] or [text]
+    who = cands[0]
+    emp, emp_score = None, 0.0
+    for cand in cands:
+        e, sc = best_match(cand, employees)
+        if sc > emp_score:
+            emp, emp_score, who = e, sc, cand
     if kind == "wages" or (emp_score >= NAME_MATCH and amount):
         if emp and emp_score >= NAME_MATCH:
             return {
@@ -266,19 +458,21 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
                 "question": None,
             }
         # Wages, but to nobody on the register. Never book it silently.
-        who = _likely_person_name(text) or text[:60]
+        named = (_likely_person_name(who) or _likely_person_name(text)
+                 or next((c for c in cands if c and not classify_text(c)["kind"] == "wages"), "")
+                 or str(who))[:60]
         return {
             "event_type": "Salary",
-            "payload_extra": {"category": "salaries", "employee": who or None},
+            "payload_extra": {"category": "salaries", "employee": named or None},
             "kind": "wages", "match": None,
             "confidence": round(max(emp_score, 0.4), 3),
             "question": {
                 "type": "unknown_worker",
-                "name": who,
+                "name": named,
                 "closest": (emp or {}).get("name"),
                 "closest_score": emp_score,
-                "ask": (f"This looks like a payment to {who}, who is not on your worker list."
-                        if who else "This looks like a payment to a worker who is not on your list."),
+                "ask": (f"This looks like a payment to {named}, who is not on your worker list."
+                        if named else "This looks like a payment to a worker who is not on your list."),
                 "options": ["Add them as a worker", "Point it at an existing worker",
                             "Record it as an ordinary expense"],
             },
@@ -293,9 +487,13 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
         }
 
     # ── Stock ────────────────────────────────────────────────────────────────
-    prod, prod_score = best_match(text, products)
+    prod, prod_score, prod_from = None, 0.0, cands[0]
+    for cand in cands:
+        pr, sc = best_match(cand, products)
+        if sc > prod_score:
+            prod, prod_score, prod_from = pr, sc, cand
     if prod and prod_score >= NAME_MATCH:
-        qty = find_quantity(row, text, prod.get("name"))
+        qty = find_quantity(row, f"{prod_from} {text}", prod.get("name"))
         return {
             "event_type": "InventoryReceipt",
             "payload_extra": {
@@ -399,6 +597,8 @@ def resolve_table(rows: list, mapping: dict, context: dict,
     cp_col = mapping.get("counterparty")
     amt_col = mapping.get("amount")
     cols = text_columns or [c for c in (cp_col, desc_col) if c]
+    # The column that names the person or the thing, used for matching only.
+    name_cols = [c for c in (cp_col, desc_col) if c] or cols[:1]
 
     for i, row in enumerate(rows or []):
         if row.get("_is_total"):
@@ -406,7 +606,8 @@ def resolve_table(rows: list, mapping: dict, context: dict,
             continue
         text = _first_text(row, cols) or _first_text(row, [c for c in (row or {}) if not c.startswith("_")])
         amount = row.get(amt_col) if amt_col else None
-        verdict = resolve_row(row, text, amount, context, hint)
+        verdict = resolve_row(row, text, amount, context, hint, row.get("Direction"),
+                              [_first_text(row, [c]) for c in name_cols])
         counts[verdict["kind"]] = counts.get(verdict["kind"], 0) + 1
 
         q = verdict.pop("question", None)

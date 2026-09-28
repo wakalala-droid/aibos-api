@@ -4007,6 +4007,70 @@ def _business_context(db, ctx, default_type: str = "Expense") -> dict:
     }
 
 
+def _record_from_answers(db, ctx, answers: dict) -> dict:
+    """Actually put the new workers and products on file, before matching begins.
+
+    The owner answering "yes, that was Chanda's wages" has told AI-BOS something
+    it did not know. Labelling this one import with her name and then forgetting
+    her means being asked the same question on the next file, and the file after
+    that, and a wage that hangs off nobody. Recording her means the payment
+    attaches to a real worker, her PAYE and NAPSA are worked out from here on,
+    and every later import matches her without being asked again.
+
+    Never fails the import: if a record cannot be created the answer still
+    labels the rows, which is what it did before."""
+    made: dict = {"employees": [], "products": []}
+    if not answers:
+        return made
+
+    def existing(fn, *a, **kw) -> dict:
+        try:
+            return {attach._norm(r.get("name")): r for r in (fn(*a, **kw) or [])}
+        except Exception as exc:  # noqa: BLE001
+            logger.info("import: could not read existing records (%s)", exc)
+            return {}
+
+    emps = existing(payroll_api.list_employees, db, ctx.tenant)
+    prods = existing(products_api.list_products, db, ctx.tenant, business_id=ctx.business_id)
+
+    for ans in answers.values():
+        if not isinstance(ans, dict):
+            continue
+        action = ans.get("action")
+
+        if action == "add_worker" and ans.get("employee_name") and not ans.get("employee_id"):
+            name = str(ans["employee_name"]).strip()[:120]
+            key = attach._norm(name)
+            if key in emps:                       # already on the register under that name
+                ans["employee_id"] = emps[key].get("id")
+                continue
+            try:
+                row = payroll_api.create_employee(db, ctx.tenant, {"name": name, "status": "active"})
+                ans["employee_id"] = row.get("id")
+                emps[key] = row
+                made["employees"].append(name)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("import: could not add worker %r (%s)", name, exc)
+
+        elif action == "add_product" and ans.get("product_name") and not ans.get("product_id"):
+            name = str(ans["product_name"]).strip()[:120]
+            key = attach._norm(name)
+            if key in prods:
+                ans["product_id"] = prods[key].get("id")
+                continue
+            try:
+                row = products_api.create_product(
+                    db, ctx.tenant, {"name": name, "category": ans.get("category") or "stock"},
+                    business_id=ctx.business_id)
+                ans["product_id"] = row.get("id")
+                prods[key] = row
+                made["products"].append(name)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("import: could not add product %r (%s)", name, exc)
+
+    return made
+
+
 def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
     try:
         scanned = sheetscan.scan(content, filename)
@@ -4020,14 +4084,59 @@ def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
     return scanned, doc_ai.plan(scanned, filename, use_ai=use_ai)
 
 
+# Columns that never say what a line was FOR. A cash book keeps the date, the
+# payment channel and a running balance beside the description, and sweeping
+# them into the text turned "franscis" into "june salary franscis 2026-07-11
+# AIRTEL MONEY" — which matched no worker on the register and asked the owner a
+# question with a date in the middle of the person's name.
+_NOT_DESCRIPTIVE = ("date", "day", "via", "channel", "method", "balance", "bal",
+                    "direction", "amount", "in", "out", "qty", "quantity", "unit",
+                    "unit p", "no", "ref", "total", "rate", "price")
+
+
+def _heading(table: dict, mapping: dict) -> str:
+    """What the table as a whole is about, for lines that do not say.
+
+    A table with a quantity AND a unit price is an itemised purchase list, whatever
+    its title says — that is what those two columns together mean. Without this,
+    "boom cream 750ml" and "vatra 330ml" were things AIBOS could not place,
+    rather than obviously stock that was bought."""
+    parts = [str(table.get("title") or ""), str(table.get("sheet") or "")]
+    cols = " ".join(_norm_col(c) for c in table.get("columns", []))
+    has_qty = bool(mapping.get("quantity")) or " qty" in f" {cols}" or "quantity" in cols
+    has_price = any(w in cols for w in ("unit p", "unit price", "unitprice", "rate"))
+    if has_qty and has_price:
+        parts.append("stock purchase of goods")
+    return " ".join(p for p in parts if p)
+
+
 def _text_columns(table: dict, mapping: dict) -> list:
-    """The columns whose words say what a row was for. On an unpivoted matrix the
-    member/worker name is a label column, which no header hint would ever find."""
+    """The columns whose words say what a row was for.
+
+    The mapped description and counterparty lead, because they are what the
+    owner pointed at. On an unpivoted matrix the member's name is a label
+    column, which no header hint would ever find, so those come next — minus
+    the ones that carry a date, a channel or a figure rather than a meaning."""
     cols = [c for c in (mapping.get("counterparty"), mapping.get("description")) if c]
     for c in table.get("label_columns", []):
-        if c not in cols and not c.startswith("_"):
+        if c in cols or c.startswith("_") or _norm_col(c) in _NOT_DESCRIPTIVE:
+            continue
+        # A column of dates describes when, never what.
+        vals = [r.get(c) for r in (table.get("rows") or [])[:40]]
+        vals = [v for v in vals if v not in (None, "")]
+        if vals and sum(1 for v in vals if sheetscan.is_date_like(v)) > len(vals) * 0.5:
+            continue
+        cols.append(c)
+    # A comment column is worth reading even when it was not the mapped one:
+    # on a cash book the name is in DESCRIPTION and the word "salary" only there.
+    for c in table.get("columns", []):
+        if c not in cols and _norm_col(c).startswith("comment"):
             cols.append(c)
-    return cols
+    return cols[:4]
+
+
+def _norm_col(name: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", str(name).lower()).strip()
 
 
 @app.post("/documents/scan")
@@ -4066,7 +4175,7 @@ def documents_scan(
         }
         if p.get("import") and mapping.get("amount"):
             res = attach.resolve_table(t["rows"], mapping, context, _text_columns(t, mapping),
-                                       heading=f'{t["title"]} {t["sheet"]}')
+                                       heading=_heading(t, mapping))
             out["counts"] = res["counts"]
             for q in res["questions"]:
                 questions.append({**q, "table": t["id"], "sheet": t["sheet"]})
@@ -4139,6 +4248,9 @@ def documents_import(
         })
 
     scanned, plan = _scan_and_plan(content, filename, use_ai)
+    # Put any new workers and products on file FIRST, so every row that
+    # mentions them matches a real record instead of only carrying a name.
+    recorded = _record_from_answers(db, ctx, answers_d)
     context = _business_context(db, ctx)
     planned = {p["id"]: p for p in plan["tables"]}
     picked = {c.get("id"): c for c in chosen if isinstance(c, dict) and c.get("id")}
@@ -4165,7 +4277,7 @@ def documents_import(
         ctx_for_table = {**context, "default_type": etype}
         res = attach.resolve_table(table["rows"], mapping, ctx_for_table,
                                    _text_columns(table, mapping),
-                                   heading=f'{table["title"]} {table["sheet"]}')
+                                   heading=_heading(table, mapping))
         rows = attach.apply_answers(res["rows"], answers_d)
 
         made = 0
@@ -4218,6 +4330,8 @@ def documents_import(
         # discovering later that a wage went in against nobody.
         "workers_not_on_register": sorted(new_workers)[:50],
         "products_not_on_list": sorted(new_products)[:50],
+        # What the owner's answers put on file for good.
+        "recorded": recorded,
     }
 
 

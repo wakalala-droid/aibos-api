@@ -499,7 +499,12 @@ def test_the_import_route_files_rows_against_workers_products_and_categories(pay
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["saved_count"] > 0
-        assert body["workers_not_on_register"] == ["Chanda Mulenga"]
+        # The owner said who she was, so she is now ON the register, not merely
+        # named in a warning. That is the whole point of being asked.
+        assert body["recorded"]["employees"] == ["Chanda Mulenga"]
+        assert body["workers_not_on_register"] == []
+        chanda = next(e for e in db.rows["employees"] if e["name"] == "Chanda Mulenga")
+        assert chanda["status"] == "active"
 
         saved = list(db.rows["business_events"])
         kinds = {e["event_type"] for e in saved}
@@ -566,3 +571,209 @@ def test_an_all_zero_workbook_is_refused_with_a_plain_reason():
     finally:
         main.get_db = real
         main.app.dependency_overrides.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A real cash book (a guest house's expense report, September 2026)
+# ══════════════════════════════════════════════════════════════════════════════
+# A blank template exercises READING a file. A real one exercises UNDERSTANDING
+# it, and this one found four defects a template never could.
+
+@pytest.fixture
+def cashbook() -> bytes:
+    """The shape a guest house actually keeps: one header at the top, money in
+    two columns, sections divided by running-balance lines, and the date written
+    once for all the lines under it."""
+    def build(wb):
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws["D1"] = "DUNSLIM APARTMENTS EXPENSE"
+        for j, h in enumerate(["DATE", "DESCRIPTION", "", "IN", "OUT", "BALANCE", "", "VIA", "", "COMMENT"]):
+            ws.cell(row=3, column=1 + j, value=h or None)
+        rows = [
+            (datetime(2026, 7, 10), "from mr mulima", None, "k12,000", None, "k12,000", None, "AIRTEL MONEY", None, "from mr mulima"),
+            (datetime(2026, 7, 11), "faith kasisi", None, None, 2182.58, "k9,817.42", None, "cash", None, "june salary"),
+            (datetime(2026, 7, 11), "grace zulu", None, None, 2313.10, "k7,504.32", None, "cash", None, "june salary"),
+            (datetime(2026, 7, 11), "chanda mulenga", None, None, "k5,650.77", "k1853.55", None, "AIRTEL MONEY", None, "june salary"),
+            (datetime(2026, 7, 11), "napsa", None, None, "k827.65", "k1,025.9", None, "AIRTEL MONEY", None, "sent to ms bev"),
+            (datetime(2026, 7, 11), "tourism levy", None, None, "k75", "k575.9", None, "AIRTEL MONEY", None, "sent to ms bev"),
+            (datetime(2026, 7, 13), "laundry balance", None, None, "k1,730", "k477.29", None, "AIRTEL MONEY", None, "laundry agent"),
+            (None, "transaction charges", None, None, "k95", "k382.29", None, "AIRTEL MONEY", None, "airtel charges"),
+        ]
+        for i, r in enumerate(rows, start=4):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+        # A running-balance line, a blank row, then the ledger CONTINUES with no
+        # header of its own.
+        ws.cell(row=13, column=5, value="BALANCE K382.29")
+        rows2 = [
+            (datetime(2026, 8, 9), "accomodation sale", None, 15000, 15000, 0, None, "bank", None, "sent to access"),
+            (None, "yango to the bank", None, None, "k80", "k302", None, "cash", None, "transport"),
+            (None, "fliers", None, None, "k1,800", "k-1498", None, "airtel money", None, None),
+        ]
+        for i, r in enumerate(rows2, start=16):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=1 + j, value=v)
+    return _book(build)
+
+
+@pytest.fixture
+def cashbook_context() -> dict:
+    return {"employees": [{"id": "w1", "name": "Faith Kasisi"},
+                          {"id": "w2", "name": "Grace Zulu"}],
+            "products": [], "parties": [], "default_type": "Expense"}
+
+
+def _cash_table(cashbook):
+    scanned = sheetscan.scan(cashbook, "EXPENSE REPORT.xlsx")
+    return scanned, scanned["tables"][0]
+
+
+def _cash_resolved(cashbook, ctx):
+    _, t = _cash_table(cashbook)
+    mapping = ingestion.suggest_mapping(t["columns"], t["rows"])
+    return t, attach.resolve_table(t["rows"], mapping, ctx,
+                                   ["DESCRIPTION", "COMMENT"], heading="expense report")
+
+
+def test_a_running_balance_is_never_read_as_the_amount(cashbook):
+    """BALANCE was chosen as the amount column, so a line that spent K2,182.58
+    was imported as K9,817.42 — the balance after it. Wrong money, in silence."""
+    _, t = _cash_table(cashbook)
+    mapping = ingestion.suggest_mapping(t["columns"], t["rows"])
+    assert mapping["amount"] == "Amount"
+    assert mapping["amount"] != "BALANCE"
+
+
+def test_money_in_two_columns_is_all_read(cashbook):
+    """One import maps one amount column, so with IN and OUT either every
+    receipt or every payment was lost."""
+    _, t = _cash_table(cashbook)
+    assert t["orientation"] == "cashbook"
+    assert {"Direction", "Amount"} <= set(t["columns"])
+    assert {r["Direction"] for r in t["rows"]} == {"in", "out"}
+    came_in = next(r for r in t["rows"] if r["Direction"] == "in")
+    assert came_in["Amount"] == 12000.0
+
+
+def test_a_line_that_is_both_in_and_out_becomes_both(cashbook):
+    """"Accommodation sale 15,000 in, 15,000 banked out" is two real movements."""
+    _, t = _cash_table(cashbook)
+    sale = [r for r in t["rows"] if "accomodation" in str(r.get("DESCRIPTION", "")).lower()]
+    assert sorted(r["Direction"] for r in sale) == ["in", "out"]
+    assert all(r["Amount"] == 15000.0 for r in sale)
+
+
+def test_the_ledger_continues_without_reinventing_a_header(cashbook):
+    """A section under a header written once at the top was split into its own
+    table, and its first DATA row promoted to be the header — a payment to
+    faith kasisi became a column name."""
+    scanned, t = _cash_table(cashbook)
+    assert scanned["table_count"] == 1                 # one ledger, not two
+    assert t["header_row"] == 3
+    assert "DESCRIPTION" in t["columns"] and "OUT" in t["columns"]
+    assert not any("faith" in c.lower() for c in t["columns"])
+    assert any("fliers" in str(r.get("DESCRIPTION", "")) for r in t["rows"])
+
+
+def test_a_date_written_once_carries_down_the_lines_under_it(cashbook):
+    """A ledger dates a day once. Read literally, the lines under it have no
+    date at all and land nowhere in the timeline."""
+    _, t = _cash_table(cashbook)
+    charges = next(r for r in t["rows"] if "transaction charges" in str(r.get("DESCRIPTION", "")))
+    assert str(charges["DATE"])[:10] == "2026-07-13"
+    yango = next(r for r in t["rows"] if "yango" in str(r.get("DESCRIPTION", "")))
+    assert str(yango["DATE"])[:10] == "2026-08-09"
+
+
+def test_the_whole_cashbook_files_itself_correctly(cashbook, cashbook_context):
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    got = {}
+    for r in res["rows"]:
+        if r.get("_skip"):
+            continue
+        v = r["_resolved"]
+        got[str(r.get("DESCRIPTION"))] = (
+            v["event_type"],
+            v["payload_extra"].get("category") or v["payload_extra"].get("tax_type"))
+    assert got["faith kasisi"] == ("Salary", "salaries")
+    assert got["napsa"] == ("TaxPayment", "NAPSA")
+    assert got["tourism levy"] == ("TaxPayment", "Tourism Levy")
+    assert got["laundry balance"] == ("Expense", "laundry")
+    assert got["transaction charges"] == ("Expense", "bank charges")
+    assert got["yango to the bank"] == ("Expense", "transport")
+    assert got["fliers"] == ("Expense", "marketing")
+
+
+def test_money_received_is_never_booked_as_a_cost(cashbook, cashbook_context):
+    """The wording says what a line was FOR; only the column says which way the
+    money went. A receipt read as an expense turns a good month into a bad one."""
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    ins = [r for r in res["rows"] if r.get("Direction") == "in" and not r.get("_skip")]
+    assert ins and all(r["_resolved"]["event_type"] != "Expense" for r in ins)
+    float_in = next(r for r in ins if "mulima" in str(r.get("DESCRIPTION", "")))
+    assert float_in["_resolved"]["event_type"] == "Loan"          # money put in
+    assert float_in["_question"] == "money_in_kind"               # and it asks
+    sale = next(r for r in ins if "accomodation" in str(r.get("DESCRIPTION", "")))
+    assert sale["_resolved"]["event_type"] == "Sale"
+
+
+def test_a_worker_paid_on_the_ledger_is_matched_or_asked_about(cashbook, cashbook_context):
+    """The name is in DESCRIPTION and the word "salary" only in COMMENT, so
+    neither column alone identifies a wage."""
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    faith = next(r for r in res["rows"] if str(r.get("DESCRIPTION")) == "faith kasisi")
+    assert faith["_resolved"]["payload_extra"]["employee_id"] == "w1"
+    q = next(q for q in res["questions"] if q["type"] == "unknown_worker")
+    assert "chanda" in q["name"].lower()
+
+
+# ── Whole-word matching: the bug class that silently misfiled lines ──────────
+
+@pytest.mark.parametrize("text,not_category", [
+    ("carry over expense from 01", "stationery"),   # "pens" inside "expense"
+    ("TOTAL", "Turnover Tax"),                      # "tot" inside "total"
+])
+def test_a_word_inside_another_word_is_not_a_match(text, not_category, context):
+    out = attach.resolve_row({}, text, 100, context, None, "out")
+    got = out["payload_extra"].get("category") or out["payload_extra"].get("tax_type")
+    assert got != not_category
+    assert out["kind"] == "unknown"
+
+
+def test_the_most_specific_wording_wins(context):
+    """"transaction fee airtel charges" is a bank charge, not a phone bill,
+    even though the comment happens to name the network."""
+    out = attach.resolve_row({}, "transaction fee airtel charges", 100, context, None, "out")
+    assert out["payload_extra"]["category"] == "bank charges"
+
+
+@pytest.mark.parametrize("text,category", [
+    ("fliers", "marketing"),          # the list says "flier"
+    ("lock batteries", "repairs"),    # the list says "lock"
+    ("towels", "laundry"),            # the list says "towel"
+])
+def test_a_plural_still_matches(text, category, context):
+    out = attach.resolve_row({}, text, 100, context, None, "out")
+    assert out["payload_extra"]["category"] == category
+
+
+def test_an_itemised_purchase_list_keeps_its_quantities():
+    """The housekeeping sheet lists what was actually bought, with counts, off
+    to the right of an otherwise empty sheet."""
+    def build(wb):
+        ws = wb.active
+        for j, h in enumerate(["DATE", "DESCRIPTION", "QTY", "UNIT.P", "TOTAL"]):
+            ws.cell(row=20, column=15 + j, value=h)
+        items = [(datetime(2026, 8, 10), "star scrubber", 1, 30, 30),
+                 (None, "toilet cleaner 500mls", 2, 25, 50),
+                 (None, "towels", 16, 60, 960),
+                 (None, "bedsheets", 4, 70, 280)]
+        for i, r in enumerate(items, start=21):
+            for j, v in enumerate(r):
+                ws.cell(row=i, column=15 + j, value=v)
+    t = sheetscan.scan(_book(build), "house.xlsx")["tables"][0]
+    mapping = ingestion.suggest_mapping(t["columns"], t["rows"])
+    assert mapping["amount"] == "TOTAL" and mapping["quantity"] == "QTY"
+    # The date is written once at the top and belongs to every line under it.
+    assert all(str(r["DATE"])[:10] == "2026-08-10" for r in t["rows"])
