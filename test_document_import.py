@@ -1399,3 +1399,126 @@ def test_the_analyse_screen_reads_the_whole_workbook(multi_sheet_book):
         assert len(body["by_sheet"]) == 3
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Questions a person can actually answer
+# ══════════════════════════════════════════════════════════════════════════════
+# "Money came in here, but AIBOS cannot tell what for. (2 lines, sheet Sheet1)"
+# names no figure, no day, and none of the words from the owner's own book. The
+# only ways through it are to guess or to skip, and guessing is how a wrong
+# figure gets into real books.
+
+def test_a_question_carries_the_lines_it_is_about(cashbook, cashbook_context):
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    q = next(q for q in res["questions"] if q["type"] == "money_in_kind")
+    assert q["lines"], "a question with no evidence cannot be answered"
+    line = q["lines"][0]
+    assert line["row"] and line["date"] and line["amount"]
+    assert line["description"]
+    assert q["total"] > 0
+
+
+def test_a_question_says_what_it_is_and_why_it_matters(cashbook, cashbook_context):
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    for q in res["questions"]:
+        assert q.get("title"), f"{q['type']} has no heading"
+        assert q.get("why"), f"{q['type']} does not say why it matters"
+        assert "cannot tell what for" not in q["ask"].lower()
+
+
+def test_a_weak_suggestion_is_not_offered_at_all(cashbook):
+    """Proposing "Wakalala" as the nearest thing to "loveness chanda" helps
+    nobody decide anything, and a wrong suggestion in a money tool costs trust
+    that is hard to win back."""
+    ctx = {"employees": [{"id": "x", "name": "Wakalala"}],
+           "products": [], "parties": [], "default_type": "Expense"}
+    _, res = _cash_resolved(cashbook, ctx)
+    for q in res["questions"]:
+        assert not q.get("closest"), f"offered {q['closest']!r} for {q['name']!r}"
+
+
+def test_a_close_suggestion_is_still_offered(context):
+    """The guard must not throw away a suggestion that genuinely helps."""
+    ctx = {**context, "employees": [{"id": "e1", "name": "Mary Bandah"}]}
+    # The name column holds the name; the wording around it is what says "wage".
+    out = attach.resolve_row({}, "june salary", 4500, ctx, None, "out", ["Mary Bandra"])
+    assert out["question"] is not None, "a near-miss must still be asked about"
+    assert out["question"]["closest"] == "Mary Bandah"
+
+
+def test_merged_cells_do_not_repeat_the_description(cashbook, cashbook_context):
+    """A merged cell repeats across columns, so joining them produced
+    "from mr mulima from mr mulima from mr mulima"."""
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    for q in res["questions"]:
+        for line in q["lines"]:
+            words = line["description"].split(" · ")
+            assert len(words) == len(set(words)), line["description"]
+
+
+# ── The answer must reach the rows it was about ──────────────────────────────
+
+def test_an_answer_reaches_its_rows(cashbook, cashbook_context):
+    """apply_answers rebuilt the question key from the verdict. For a money-in
+    question neither the employee nor the match exists, so the key came out as
+    "money_in_kind::" and matched nothing: the owner could answer, and the
+    answer did nothing at all. Silent, and about money."""
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    q = next(q for q in res["questions"] if q["type"] == "money_in_kind")
+    rows = attach.apply_answers(res["rows"], {q["key"]: {"action": "sale"}})
+    touched = [r for r in rows if r.get("_answered") == "sale"]
+    assert len(touched) == q["count"]
+    assert all(r["_resolved"]["event_type"] == "Sale" for r in touched)
+
+
+@pytest.mark.parametrize("action,event_type", [
+    ("sale", "Sale"),
+    ("funding", "Loan"),
+    ("transfer", "Transfer"),
+])
+def test_the_money_in_answers_do_what_they_say(cashbook, cashbook_context, action, event_type):
+    import nervous_system as nervous
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    q = next(q for q in res["questions"] if q["type"] == "money_in_kind")
+    rows = attach.apply_answers(res["rows"], {q["key"]: {"action": action}})
+    touched = [r for r in rows if r.get("_answered") == action]
+    assert touched
+    for r in touched:
+        v = r["_resolved"]
+        assert v["event_type"] == event_type
+        payload = {"currency": "ZMW", "amount": 100.0, **v["payload_extra"]}
+        nervous.validate(nervous.EventIn(event_type=v["event_type"], payload=payload,
+                                         source="excel"))
+
+
+def test_choosing_to_leave_lines_out_removes_exactly_those_lines(cashbook, cashbook_context):
+    _, res = _cash_resolved(cashbook, cashbook_context)
+    q = next(q for q in res["questions"] if q["type"] == "money_in_kind")
+    rows = attach.apply_answers(res["rows"], {q["key"]: {"action": "skip"}})
+    left_out = [r for r in rows if r.get("_skip") == "owner"]
+    assert len(left_out) == q["count"]
+
+
+def test_the_answers_travel_all_the_way_through_the_import(cashbook):
+    """End to end: the owner answers, and the books change accordingly."""
+    import main
+    import json as _json
+    from collections import Counter
+    db = _books()
+    main.get_db = lambda: db
+    client = _client(db, "/documents/scan")
+    try:
+        scan = client.post("/documents/scan?use_ai=false",
+                           files={"file": ("E.xlsx", cashbook, "x")}).json()
+        q = next(q for q in scan["questions"] if q["type"] == "money_in_kind")
+
+        client2 = _client(db, "/documents/import")
+        res = client2.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
+                           data={"tables": "[]", "use_ai": "false",
+                                 "answers": _json.dumps({q["key"]: {"action": "sale"}})}).json()
+        assert res["error_count"] == 0 and not res.get("skipped")
+        kinds = Counter(e["event_type"] for e in db.rows["business_events"])
+        assert kinds["Sale"] >= q["count"]
+    finally:
+        main.app.dependency_overrides.clear()

@@ -4391,8 +4391,15 @@ def documents_scan(
     merged: dict = {}
     for q in questions:
         key = f"{q['type']}::{attach._norm(q.get('name'))}"
-        slot = merged.setdefault(key, {**q, "key": key, "tables": [], "count": 0})
+        slot = merged.setdefault(key, {**q, "key": key, "tables": [], "count": 0,
+                                       "lines": [], "total": 0.0, "sheets": []})
         slot["count"] += q.get("count", 1)
+        slot["total"] = round(slot["total"] + float(q.get("total") or 0), 2)
+        for ln in (q.get("lines") or []):
+            if len(slot["lines"]) < 8:
+                slot["lines"].append({**ln, "sheet": q.get("sheet")})
+        if q.get("sheet") and q["sheet"] not in slot["sheets"]:
+            slot["sheets"].append(q["sheet"])
         if q["table"] not in slot["tables"]:
             slot["tables"].append(q["table"])
     questions = sorted(merged.values(), key=lambda q: -q["count"])[:MAX_QUESTIONS]

@@ -337,6 +337,67 @@ def payment_method_of(text) -> str:
     return best
 
 
+# Below this, a "closest match" is noise. Offering "Wakalala" as the nearest
+# thing to "loveness chanda" does not help anyone decide anything, and a wrong
+# suggestion in a money tool costs trust that is hard to win back.
+SUGGEST_ABOVE = 0.62
+
+# How many example lines travel with a question. Enough to recognise what is
+# being asked about; not so many that the screen becomes a spreadsheet again.
+EVIDENCE_LINES = 6
+
+
+def _evidence(row: dict, mapping: dict, cols: list) -> dict:
+    """The one line, as a person would read it off the page."""
+    def val(field):
+        col = mapping.get(field)
+        return row.get(col) if col else None
+
+    amount = to_number_safe(val("amount"))
+    # Merged cells repeat the same value across several columns, so joining them
+    # produced "from mr mulima from mr mulima from mr mulima". Each distinct
+    # phrase once, in the order it appears.
+    seen, phrases = set(), []
+    for c in cols:
+        v = str(row.get(c) or "").strip()
+        if v and _norm(v) not in seen:
+            seen.add(_norm(v))
+            phrases.append(v)
+    words = " · ".join(phrases)
+    return {
+        "row": row.get("_row"),
+        "date": _date_text(val("date")),
+        "amount": amount,
+        "description": " ".join(words.split())[:90],
+        "direction": row.get("Direction"),
+        "method": row.get("_method") or "",
+    }
+
+
+def _date_text(v) -> str:
+    """A date as a person writes it, or "" when the row has none."""
+    if v is None or str(v).strip() == "":
+        return ""
+    s = str(v)
+    return s[:10] if len(s) >= 10 and s[4] == "-" else s[:30]
+
+
+def to_number_safe(v):
+    """The amount as a number, without importing the scanner into this module."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v == v else None
+    s = str(v).strip().replace(",", "")
+    for junk in ("K", "k", "ZMW", "zmw", "ZMK", "zmk", "$"):
+        if s.startswith(junk):
+            s = s[len(junk):].strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def _first_text(row: dict, columns: list) -> str:
     parts = []
     for c in columns or []:
@@ -451,9 +512,15 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
                     # Named by the phrase that identified it ("from mr mulima"),
                     # not the whole line, so seventeen floats from the same
                     # person are ONE question rather than seventeen.
-                    "type": "money_in_kind", "name": payer_of(text) or d.get("detail") or text[:40],
-                    "ask": "Money came in here. Was this money the business EARNED, "
-                           "or money put in to spend?",
+                    "type": "money_in_kind",
+                    "name": payer_of(text) or d.get("detail") or text[:40],
+                    "title": (f"Money in from {payer_of(text)}" if payer_of(text)
+                              else "Money came in"),
+                    "ask": ("Was this money the business EARNED, or money put in "
+                            "to spend?"),
+                    "why": ("A sale counts as income and lifts the month's profit. "
+                            "A float does not — it is money to spend, and counting it "
+                            "as income would make a bad month look like a good one."),
                     "options": ["It was a sale", "Money put in (a float or loan)",
                                 "Moved between my own accounts"],
                 },
@@ -464,7 +531,12 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             "kind": "sale", "match": None, "confidence": 0.45,
             "question": {
                 "type": "money_in_kind", "name": text[:80],
-                "ask": "Money came in here, but AIBOS cannot tell what for.",
+                "title": "Money came in",
+                "ask": ("Was this money the business EARNED, or money put in "
+                        "to spend?"),
+                "why": ("A sale counts as income and lifts the month's profit. "
+                        "A float does not — it is money to spend, and counting it "
+                        "as income would make a bad month look like a good one."),
                 "options": ["It was a sale", "Money put in (a float or loan)",
                             "Moved between my own accounts"],
             },
@@ -517,10 +589,14 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             "question": {
                 "type": "unknown_worker",
                 "name": named,
-                "closest": (emp or {}).get("name"),
-                "closest_score": emp_score,
-                "ask": (f"This looks like a payment to {named}, who is not on your worker list."
-                        if named else "This looks like a payment to a worker who is not on your list."),
+                "closest": (emp or {}).get("name") if emp_score >= SUGGEST_ABOVE else None,
+                "closest_score": emp_score if emp_score >= SUGGEST_ABOVE else None,
+                "title": (f"Who is {named}?" if named else "Who was this paid to?"),
+                "ask": (f"This looks like wages, but {named} is not on your worker list yet."
+                        if named else
+                        "This looks like wages, but AIBOS does not know who it was paid to."),
+                "why": ("Wages need a worker behind them so their pay, NAPSA and PAYE "
+                        "are worked out properly from here on."),
                 "options": ["Add them as a worker", "Point it at an existing worker",
                             "Record it as an ordinary expense"],
             },
@@ -556,7 +632,10 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             "question": None if qty else {
                 "type": "missing_quantity",
                 "name": prod.get("name"),
-                "ask": f"How many {prod.get('name')} did this buy? The sheet gives the money but not the count.",
+                "title": f"How many {prod.get('name')}?",
+                "ask": (f"The sheet gives the money for {prod.get('name')} but not how many "
+                        "were bought."),
+                "why": "Without a count, stock cannot move — only the cost is recorded.",
                 "options": ["Type the quantity", "Record it as a purchase without stock"],
             },
         }
@@ -570,9 +649,12 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             "question": {
                 "type": "unknown_product",
                 "name": text[:80],
-                "closest": (prod or {}).get("name"),
-                "closest_score": prod_score,
-                "ask": "This bought goods, but the item is not in your product list.",
+                "closest": (prod or {}).get("name") if prod_score >= SUGGEST_ABOVE else None,
+                "closest_score": prod_score if prod_score >= SUGGEST_ABOVE else None,
+                "title": "What was bought here?",
+                "ask": "This bought goods, but the item is not on your product list yet.",
+                "why": ("A product on the list means stock moves when you buy and sell it, "
+                        "instead of the money simply disappearing into costs."),
                 "options": ["Add it as a product", "Point it at an existing product",
                             "Record it as an ordinary expense"],
             },
@@ -598,7 +680,11 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
         "question": None if not amount else {
             "type": "uncategorised",
             "name": text[:80],
-            "ask": "AI-BOS could not tell what this was for.",
+            "title": "What was this spent on?",
+            "ask": ("AIBOS could not tell what this was for from the wording on "
+                    "the line."),
+            "why": ("Naming it puts the money in the right place on your expense "
+                    "breakdown instead of a general pile you cannot act on."),
             "options": ["Pick a category", "Leave it under general"],
         },
     }
@@ -661,10 +747,27 @@ def resolve_table(rows: list, mapping: dict, context: dict,
         q = verdict.pop("question", None)
         if q:
             key = f"{q['type']}::{_norm(q.get('name'))}"
-            slot = questions.setdefault(key, {**q, "rows": [], "count": 0})
+            # The key lives ON the question too, so a caller that only has
+            # resolve_table's output can still answer it.
+            slot = questions.setdefault(key, {**q, "key": key, "rows": [], "count": 0,
+                                              "lines": [], "total": 0.0})
             slot["rows"].append(row.get("_row", i))
             slot["count"] += 1
-        out_rows.append({**row, "_resolved": verdict, "_question": (q or {}).get("type")})
+            # The lines themselves, so the owner can SEE what is being asked
+            # about instead of being asked about "2 lines" they cannot find.
+            if len(slot["lines"]) < EVIDENCE_LINES:
+                slot["lines"].append(_evidence(row, mapping, cols))
+            amt = to_number_safe(row.get(amt_col)) if amt_col else None
+            if amt:
+                slot["total"] = round(slot["total"] + abs(amt), 2)
+            q = {**q, "key": key}
+        out_rows.append({**row, "_resolved": verdict,
+                         "_question": (q or {}).get("type"),
+                         # The exact key the screen will answer under. Rebuilding
+                         # it later from the verdict produced "money_in_kind::"
+                         # for every money-in question, so those answers silently
+                         # did nothing at all.
+                         "_question_key": (q or {}).get("key")})
 
     return {
         "rows": out_rows,
@@ -685,9 +788,9 @@ def apply_answers(resolved_rows: list, answers: dict) -> list:
         if not qtype:
             out.append(row)
             continue
-        text = _norm(verdict.get("payload_extra", {}).get("employee")
-                     or verdict.get("match") or "")
-        ans = answers.get(f"{qtype}::{text}") or answers.get(qtype)
+        # By the key stamped on the row, not by rebuilding a string and hoping
+        # it comes out the same twice.
+        ans = answers.get(row.get("_question_key") or "") or answers.get(qtype)
         if not ans:
             out.append(row)
             continue
@@ -721,6 +824,25 @@ def apply_answers(resolved_rows: list, answers: dict) -> list:
             extra.pop("quantity_assumed", None)
             verdict = {**verdict, "event_type": "Expense", "payload_extra": extra,
                        "match": extra["category"], "confidence": 1.0}
+        elif action == "sale":
+            # Earned. It counts as income and lifts the month.
+            extra.pop("direction", None)
+            extra.pop("category", None)
+            verdict = {**verdict, "event_type": "Sale", "payload_extra": extra,
+                       "kind": "sale", "match": None, "confidence": 1.0}
+        elif action == "funding":
+            # Money put IN to spend. Counting it as income would make a bad
+            # month look like a good one.
+            extra.update({"direction": "received", "category": "funding"})
+            verdict = {**verdict, "event_type": "Loan", "payload_extra": extra,
+                       "kind": "funding", "match": None, "confidence": 1.0}
+        elif action == "transfer":
+            # The owner's own money, moved. Neither earned nor spent.
+            extra.pop("category", None)
+            extra.update({"from": "cash", "to": "bank"})
+            verdict = {**verdict, "event_type": "Transfer", "payload_extra": extra,
+                       "kind": "banking", "match": "moved between your own accounts",
+                       "confidence": 1.0}
         elif action == "skip":
             out.append({**row, "_skip": "owner", "_why": "You chose not to import this line."})
             continue
