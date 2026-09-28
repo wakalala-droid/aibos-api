@@ -979,7 +979,9 @@ def test_the_upload_screen_accepts_a_real_cash_book(cashbook):
     ("K,4259.00", 4259.0),
     ("(1,500)", -1500.0),           # accountants' brackets are negative
     ("-258", -258.0),
-    ("k 1 500", None),              # a space is not a separator we invent
+    ("K1 234,56", 1234.56),         # a space between digits groups thousands
+    ("1 234 567", 1234567.0),
+    ("2 bags", None),               # a description is not an amount
 ])
 def test_money_is_read_as_written(written, value):
     got = sheetscan.to_number(written)
@@ -1227,5 +1229,173 @@ def test_the_importer_reports_anything_it_could_not_save(cashbook, monkeypatch):
         res = client.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
                           data={"tables": "[]", "answers": "{}", "use_ai": "false"}).json()
         assert any("deliberate test rejection" in s["why"] for s in res["skipped"])
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Every sheet at once, and the HOW as well as the what
+# ══════════════════════════════════════════════════════════════════════════════
+# The analysis screen read ONE sheet, chosen by a keyword score, and offered
+# buttons for the rest — four of which answered "no recognisable revenue
+# column" for figures that were perfectly readable.
+
+@pytest.fixture
+def multi_sheet_book() -> bytes:
+    """One month per tab, the way a workbook is actually kept, plus a tab that
+    holds nothing an old column-resolver would recognise."""
+    def build(wb):
+        def ledger(ws, rows):
+            for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE", "VIA", "COMMENT"]):
+                ws.cell(row=3, column=1 + j, value=h)
+            for i, r in enumerate(rows, start=4):
+                for j, v in enumerate(r):
+                    ws.cell(row=i, column=1 + j, value=v)
+
+        ws = wb.active
+        ws.title = "July"
+        ledger(ws, [
+            (datetime(2026, 7, 2), "from mr mulima", 10000, None, 10000, "AIRTEL MONEY", None),
+            (datetime(2026, 7, 3), "faith kasisi", None, 2000, 8000, "cash", "july salary"),
+            (datetime(2026, 7, 4), "laundry", None, 500, 7500, "AIRTEL MONEY", "guest linen"),
+        ])
+        ledger(wb.create_sheet("August"), [
+            (datetime(2026, 8, 2), "accomodation sale", 9000, None, 9000, "bank", "mr abdulla"),
+            (datetime(2026, 8, 3), "zesco", None, 1200, 7800, "ELECTRONIC PAY", "electricity"),
+        ])
+        ledger(wb.create_sheet("September"), [
+            (datetime(2026, 9, 2), "spa sale", 400, None, 400, "AIRTEL MONEY", "massage"),
+            (datetime(2026, 9, 3), "yango", None, 80, 320, "cash", "transport"),
+        ])
+    return _book(build)
+
+
+def test_every_sheet_is_added_up_together(multi_sheet_book):
+    """One month per tab is normal. Reading the highest-scoring tab shows the
+    owner a fraction of their own money."""
+    import main
+    r = main._ledger_rollup(multi_sheet_book, "book.xlsx")
+    assert sorted(r["sheets"]) == ["August", "July", "September"]
+    assert r["skipped_sheets"] == []
+    assert [m["month"] for m in r["monthly"]] == ["2026-07", "2026-08", "2026-09"]
+    # July: the float is not revenue; the wage and the laundry are costs.
+    july = next(m for m in r["monthly"] if m["month"] == "2026-07")
+    assert july["revenue"] == 0
+    assert july["costs"] == pytest.approx(2500.0)
+
+
+@pytest.mark.parametrize("sheet", ["July", "August", "September"])
+def test_each_sheet_also_reads_on_its_own(multi_sheet_book, sheet):
+    """Switching to a tab must never answer "no recognisable revenue column"
+    about figures AIBOS can plainly read when it reads them all together."""
+    import main
+    df = main._ledger_to_monthly(multi_sheet_book, "book.xlsx", only_sheet=sheet)
+    assert df is not None and not df.empty
+    assert main._resolve_columns(df)[:2] == ("revenue", "costs")
+
+
+def test_a_single_transaction_on_a_tab_is_still_that_tabs_money():
+    """Three transactions is the bar for calling a whole FILE a ledger. One
+    tab the owner explicitly opened is different: answering "nothing here"
+    about a sheet they can see is worse than showing them a short month."""
+    import main
+    def build(wb):
+        ws = wb.active
+        ws.title = "Odds"
+        for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
+            ws.cell(row=1, column=1 + j, value=h)
+        ws.cell(row=2, column=1, value=datetime(2026, 7, 1))
+        ws.cell(row=2, column=2, value="rent")
+        ws.cell(row=2, column=4, value=900)
+        ws.cell(row=2, column=5, value=-900)
+    book = _book(build)
+    assert main._ledger_to_monthly(book, "b.xlsx", only_sheet="Odds") is not None
+
+
+def test_how_the_money_moved_is_read_from_the_via_column(multi_sheet_book):
+    """Knowing it was Airtel money rather than cash is the difference between a
+    figure and something the owner can act on."""
+    import main
+    r = main._ledger_rollup(multi_sheet_book, "book.xlsx")
+    assert r["methods"]["mobile money"] == pytest.approx(500.0)     # the laundry
+    assert r["methods"]["cash"] == pytest.approx(2080.0)            # wage + yango
+    assert r["methods"]["electronic"] == pytest.approx(1200.0)      # zesco
+
+
+@pytest.mark.parametrize("written,method", [
+    ("AIRTEL MONEY", "mobile money"),
+    ("airtime money", "mobile money"),      # the owner's own spelling
+    ("ELECTRONIC PAY", "electronic"),
+    ("cash", "cash"),
+    ("bank", "bank"),
+    ("zanaco", "bank"),
+    ("", ""),
+])
+def test_the_payment_method_is_recognised_however_it_is_written(written, method):
+    assert attach.payment_method_of(written) == method
+
+
+def test_what_the_money_went_on_comes_from_description_and_notes(multi_sheet_book):
+    import main
+    cats = main._ledger_rollup(multi_sheet_book, "book.xlsx")["categories"]
+    assert cats["salaries"] == pytest.approx(2000.0)
+    assert cats["laundry"] == pytest.approx(500.0)
+    assert cats["utilities"] == pytest.approx(1200.0)
+    assert cats["transport"] == pytest.approx(80.0)
+
+
+def test_every_event_says_where_it_came_from_and_how_it_was_paid(cashbook):
+    """A figure the owner cannot trace back to a row is a figure they cannot
+    check. Every event carries its sheet, its row and the owner's own words."""
+    import main
+    db = _books()
+    main.get_db = lambda: db
+    client = _client(db, "/documents/import")
+    try:
+        client.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
+                    data={"tables": "[]", "answers": "{}", "use_ai": "false"})
+        events = db.rows["business_events"]
+        assert events
+        assert all((e["payload"] or {}).get("note") for e in events)
+        assert all((e["payload"] or {}).get("source_sheet") for e in events)
+        assert all((e["payload"] or {}).get("source_row") for e in events)
+        assert any((e["payload"] or {}).get("payment_method") for e in events)
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_the_owners_note_is_kept_whole_on_the_event(cashbook):
+    """"june salary" beside a name is the only reason the line is a wage. It is
+    kept on the event, not thrown away once the category was worked out."""
+    import main
+    db = _books()
+    main.get_db = lambda: db
+    client = _client(db, "/documents/import")
+    try:
+        client.post("/documents/import", files={"file": ("E.xlsx", cashbook, "x")},
+                    data={"tables": "[]", "answers": "{}", "use_ai": "false"})
+        notes = [(e["payload"] or {}).get("note", "") for e in db.rows["business_events"]]
+        assert any("june salary" in n for n in notes)
+        assert any("faith kasisi" in n for n in notes)
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_the_analyse_screen_reads_the_whole_workbook(multi_sheet_book):
+    """End to end: one upload, every sheet, no switching."""
+    import main
+    from fastapi.testclient import TestClient
+    route = next(r for r in main.app.routes if getattr(r, "path", "") == "/upload")
+    dep = next(d.call for d in route.dependant.dependencies)
+    main.app.dependency_overrides[dep] = lambda: "u1"
+    try:
+        r = TestClient(main.app).post("/upload", files={"file": ("book.xlsx", multi_sheet_book, "x")})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rolled_up_from_transactions"] is True
+        assert sorted(body["sheets_read"]) == ["August", "July", "September"]
+        assert len(body["monthly"]) == 3
+        assert body["by_payment_method"]
+        assert len(body["by_sheet"]) == 3
     finally:
         main.app.dependency_overrides.clear()

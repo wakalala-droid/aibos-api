@@ -302,6 +302,41 @@ def find_quantity(row: dict, text: str, product_name: str | None = None) -> floa
     return None
 
 
+# ── How the money moved ───────────────────────────────────────────────────────
+# The "VIA" column of a cash book. Knowing the method is the difference between
+# "we spent K6,032 on diesel" and "K6,032 left the Airtel float on the 23rd",
+# which is the one the owner can actually act on.
+
+PAYMENT_METHODS = (
+    # (canonical, what people write)
+    ("mobile money", ("airtel money", "airtime money", "airtel", "mtn money", "mtn momo",
+                      "momo", "zamtel kwacha", "mobile money", "mobile-money", "zoona")),
+    ("bank",         ("bank", "access", "zanaco", "fnb", "stanbic", "absa", "indo",
+                      "bank transfer", "eft", "rtgs", "deposit slip")),
+    ("card",         ("card", "visa", "mastercard", "pos", "swipe")),
+    ("electronic",   ("electronic payment", "electronic pay", "electronic", "online",
+                      "portal", "zra engine", "e payment")),
+    ("cheque",       ("cheque", "check")),
+    ("cash",         ("cash", "petty cash", "hand", "notes")),
+)
+
+
+def payment_method_of(text) -> str:
+    """How the money moved, from the VIA column — "" when it does not say.
+
+    Longest match wins, so "airtel money" is mobile money rather than being
+    caught by a shorter word somewhere else in the line."""
+    t = _norm(text)
+    if not t:
+        return ""
+    best, best_len = "", 0
+    for canonical, words in PAYMENT_METHODS:
+        hit = _longest_phrase(t, words)
+        if hit and len(hit) > best_len:
+            best, best_len = canonical, len(hit)
+    return best
+
+
 def _first_text(row: dict, columns: list) -> str:
     parts = []
     for c in columns or []:

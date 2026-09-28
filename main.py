@@ -444,32 +444,42 @@ def _load_sheet(content: bytes, filename: str, sheet_name: Optional[str] = None)
 # FILE TYPE DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ledger_to_monthly(content: bytes, filename: str):
-    """A file of individual transactions → the month/revenue/costs an engine needs.
+def _ledger_rollup(content: bytes, filename: str, only_sheet: str | None = None) -> dict:
+    """Every sheet of a file of transactions, added up together.
 
-    The engines were written for a monthly summary, and most small businesses
-    keep a ledger instead: one row per payment, money in one column and money
-    out in another. Every figure the engine wants is in there; it just has to be
-    added up. Returns None when the file is not a ledger, so the normal path is
-    unchanged for the summaries that already worked.
+    Returns months, and the breakdowns that make them mean something: how the
+    money moved, what it went on, and which sheet each figure came from. The
+    engines only need the months; the rest is what the owner actually asks
+    about once they can see it.
 
-    Transfers between the owner's own accounts, and money put IN to be spent,
-    are in neither total: banking your own takings is not a second sale, and a
-    director's float is not income."""
+    `only_sheet` narrows it to one sheet, for looking at a single tab. Nothing
+    else changes, so a sheet cannot be unreadable on its own but fine together."""
     try:
         scanned = sheetscan.scan(content, filename)
     except Exception as exc:  # noqa: BLE001
         logger.info("ledger rollup: could not read %s (%s)", filename, exc)
-        return None
+        return {"monthly": [], "counted": 0, "sheets": [], "methods": {},
+                "categories": {}, "per_sheet": {}, "skipped_sheets": []}
 
     months: dict = {}
+    methods: dict = {}
+    categories: dict = {}
+    per_sheet: dict = {}
+    sheets_used: list = []
     counted = 0
+
     for table in scanned.get("tables", []):
+        if only_sheet and table["sheet"] != only_sheet:
+            continue
         mapping = ingestion.suggest_mapping(table["columns"], table["rows"])
         amt_col, date_col = mapping.get("amount"), mapping.get("date")
         if not amt_col or not date_col:
             continue
-        name_cols = [c for c in (mapping.get("description"), mapping.get("counterparty")) if c]
+        name_cols = _text_columns(table, mapping)
+        method_col = _method_column(table)
+        heading = _heading(table, mapping)
+        hint = attach.classify_text(heading) if heading else None
+
         for row in table["rows"]:
             if row.get("_is_total"):
                 continue
@@ -479,28 +489,23 @@ def _ledger_to_monthly(content: bytes, filename: str):
                 continue
             text = " ".join(str(row.get(c) or "") for c in name_cols).strip()
             direction = row.get("Direction")
-            kind = attach.classify_direction(text)["kind"] if direction == "in" else None
 
             if direction == "in":
+                kind = attach.classify_direction(text)["kind"]
                 if kind in ("banking", "funding"):
-                    continue                       # not earned
-                # Money that came back out of the OUT column is a cost reversed,
-                # not income earned: it reduces what was spent.
-                if row.get("_reversal"):
-                    months.setdefault(when[:7], {"month": when[:7], "revenue": 0.0,
-                                                 "costs": 0.0})["costs"] -= abs(amount)
+                    continue                       # moved or put in, not earned
+                if row.get("_reversal"):            # a cost reversed, not income
+                    key = when[:7]
+                    months.setdefault(key, {"month": key, "revenue": 0.0, "costs": 0.0})
+                    months[key]["costs"] -= abs(amount)
                     counted += 1
                     continue
                 bucket = "revenue"
             elif direction == "out":
-                # Asked directly, because one line often describes both legs
-                # ("sale 15,000, sent to access") and classify_direction reads
-                # the sale first. On the way OUT it is the banking happening.
                 if attach.is_banking(text):
                     continue                       # moved, not spent
                 bucket = "costs"
             else:
-                # No in/out columns: the wording decides.
                 bucket = "revenue" if attach.classify_direction(text)["kind"] == "sale" else "costs"
 
             key = when[:7]
@@ -508,11 +513,62 @@ def _ledger_to_monthly(content: bytes, filename: str):
             slot[bucket] += abs(amount)
             counted += 1
 
-    if counted < 3 or not months:
+            sheet = table["sheet"]
+            if sheet not in sheets_used:
+                sheets_used.append(sheet)
+            ps = per_sheet.setdefault(sheet, {"sheet": sheet, "revenue": 0.0,
+                                              "costs": 0.0, "rows": 0})
+            ps[bucket] += abs(amount)
+            ps["rows"] += 1
+
+            # Where the money moved, and what it went on — only for costs, so a
+            # "biggest spend" list is about spending.
+            if bucket == "costs":
+                method = attach.payment_method_of(row.get(method_col)) if method_col else ""
+                if method:
+                    methods[method] = round(methods.get(method, 0.0) + abs(amount), 2)
+                verdict = attach.classify_text(text)
+                cat = (verdict.get("detail")
+                       or ("salaries" if verdict["kind"] == "wages" else None)
+                       or ("stock" if verdict["kind"] == "stock" else None)
+                       or "other")
+                categories[cat] = round(categories.get(cat, 0.0) + abs(amount), 2)
+
+    for v in months.values():
+        v["revenue"] = round(v["revenue"], 2)
+        v["costs"] = round(v["costs"], 2)
+    for v in per_sheet.values():
+        v["revenue"] = round(v["revenue"], 2)
+        v["costs"] = round(v["costs"], 2)
+
+    skipped = [s["name"] for s in scanned.get("sheets", [])
+               if s["name"] not in sheets_used and not only_sheet]
+    return {
+        "monthly": [months[k] for k in sorted(months)],
+        "counted": counted,
+        "sheets": sheets_used,
+        "skipped_sheets": skipped,
+        "methods": methods,
+        "categories": categories,
+        "per_sheet": [per_sheet[k] for k in per_sheet],
+    }
+
+
+def _ledger_to_monthly(content: bytes, filename: str, only_sheet: str | None = None):
+    """The months alone, as a DataFrame, or None when this is not a ledger.
+
+    Three transactions is the bar for deciding a WHOLE FILE is a ledger, so a
+    summary with a stray date column is not mistaken for one. A single sheet the
+    owner has explicitly asked to see is different: one figure on it is still
+    their money, and answering "nothing here" about a sheet they can see with
+    their own eyes is worse than showing them a short month."""
+    out = _ledger_rollup(content, filename, only_sheet)
+    floor = 1 if only_sheet else 3
+    if out["counted"] < floor or not out["monthly"]:
         return None
-    rows = [months[k] for k in sorted(months)]
-    logger.info("ledger rollup: %s rows over %s months from %s", counted, len(rows), filename)
-    return pd.DataFrame(rows)
+    logger.info("ledger rollup: %s rows over %s months across %s sheet(s) from %s",
+                out["counted"], len(out["monthly"]), len(out["sheets"]), filename)
+    return pd.DataFrame(out["monthly"])
 
 
 def _far_off_months(months: list) -> list:
@@ -1066,16 +1122,19 @@ def upload_file(
         # ── Resolve columns ───────────────────────────────────────────────────
         rev_col, cost_col, month_col = _resolve_columns(df)
 
-        # A ledger of individual payments has every figure the engine needs, one
-        # row at a time. Add it up by month rather than telling the owner their
-        # own books are the wrong shape.
+        # EVERY sheet, together. A workbook keeps one month per tab as often as
+        # not, and reading the highest-scoring one showed the owner a fraction
+        # of their own money and made them click through the rest — where four
+        # tabs in six answered "no recognisable revenue column", because a cash
+        # book does not have one.
         rolled_up = False
-        if rev_col is None or cost_col is None:
-            monthly_df = _ledger_to_monthly(content, filename)
-            if monthly_df is not None and not monthly_df.empty:
-                df = monthly_df
-                rev_col, cost_col, month_col = _resolve_columns(df)
-                rolled_up = True
+        rollup = _ledger_rollup(content, filename, only_sheet=sheet_name)
+        if rollup["counted"] >= 3 and rollup["monthly"]:
+            df = pd.DataFrame(rollup["monthly"])
+            rev_col, cost_col, month_col = _resolve_columns(df)
+            rolled_up = True
+            logger.info("ledger rollup: %s rows over %s months across %s sheet(s)",
+                        rollup["counted"], len(rollup["monthly"]), len(rollup["sheets"]))
 
         if rev_col is None or cost_col is None:
             raise ValueError(
@@ -1129,6 +1188,13 @@ def upload_file(
             "rolled_up_from_transactions": rolled_up,
             "odd_dates": _far_off_months([str(r.get("month")) for r in monthly_rows
                                           if r.get("month")]) if rolled_up else [],
+            # Every sheet that contributed, so the owner can see nothing was left out.
+            "sheets_read": rollup["sheets"] if rolled_up else [],
+            "sheets_without_figures": rollup["skipped_sheets"] if rolled_up else [],
+            "by_sheet": rollup["per_sheet"] if rolled_up else [],
+            "by_payment_method": rollup["methods"] if rolled_up else {},
+            "by_category": rollup["categories"] if rolled_up else {},
+            "transactions_counted": rollup["counted"] if rolled_up else 0,
             "cabinet_id": cab_id,
             "filename": filename,
             "sheets": all_sheets,
@@ -1178,17 +1244,23 @@ def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...),
         raise HTTPException(status_code=400, detail=f"Could not read that sheet: {type(exc).__name__}")
     rev_col, cost_col, month_col = _resolve_columns(df)
 
-    if rev_col is None:
+    # The same reader the whole file uses. A cash book has no column called
+    # "revenue", and four tabs in six used to answer "no recognisable revenue
+    # column" for figures that were perfectly readable — the owner was told
+    # their own books were wrong.
+    if rev_col is None or cost_col is None:
+        rolled = _ledger_to_monthly(content, filename, only_sheet=sheet_name)
+        if rolled is not None and not rolled.empty:
+            df = rolled
+            selected = sheet_name
+            rev_col, cost_col, month_col = _resolve_columns(df)
+
+    if rev_col is None or cost_col is None:
         raise HTTPException(
             status_code=400,
-            detail=f"Sheet '{sheet_name}' has no recognisable revenue column. "
-                   f"Columns: {list(df.columns)}",
-        )
-    if cost_col is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Sheet '{sheet_name}' has no recognisable cost column. "
-                   f"Columns: {list(df.columns)}",
+            detail=(f"There are no figures AIBOS can add up on sheet '{sheet_name}'. "
+                    "It needs either revenue and cost columns, or dated payments with "
+                    f"an amount. Columns on this sheet: {list(df.columns)}"),
         )
 
     built = _engine1_file_analysis(df, rev_col, cost_col, month_col)
@@ -4197,6 +4269,33 @@ _NOT_DESCRIPTIVE = ("date", "day", "via", "channel", "method", "balance", "bal",
                     "unit p", "no", "ref", "total", "rate", "price")
 
 
+def _method_column(table: dict) -> str | None:
+    """The column saying HOW the money moved ("VIA", "Paid by", "Channel")."""
+    for c in table.get("columns", []):
+        n = _norm_col(c)
+        if n in ("via", "method", "channel", "paid by", "payment method", "mode",
+                 "payment mode", "paid via", "through", "type of payment"):
+            return c
+    return None
+
+
+def _note_columns(table: dict, mapping: dict) -> list:
+    """Columns carrying the owner's own words about a line.
+
+    A comment is often the only thing that makes a row mean anything: on this
+    cash book "june salary" beside a name is the sole reason the line is a wage
+    and not a transfer to a stranger."""
+    out = []
+    for c in table.get("columns", []):
+        n = _norm_col(c)
+        if n.startswith("comment") or n in ("note", "notes", "remark", "remarks",
+                                            "details", "narration", "particulars",
+                                            "memo", "purpose", "reason"):
+            if c not in out:
+                out.append(c)
+    return out
+
+
 def _heading(table: dict, mapping: dict) -> str:
     """What the table as a whole is about, for lines that do not say.
 
@@ -4447,11 +4546,43 @@ def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table:
     if amount is None or amount == 0:
         return None
     payload = {"currency": currency, "amount": abs(amount)}
-    # A figure that was negative in its column is money coming back. Booking it
-    # as an ordinary receipt would show it as income the business never earned.
+    payload.update(verdict.get("payload_extra") or {})
+
+    desc = row.get(mapping.get("description")) if mapping.get("description") else None
+    cp = row.get(mapping.get("counterparty")) if mapping.get("counterparty") else None
+
+    # How the money moved, kept on the event: the difference between "we spent
+    # K6,032 on diesel" and "K6,032 left the Airtel float on the 23rd".
+    method_col = _method_column(table)
+    method = attach.payment_method_of(row.get(method_col)) if method_col else ""
+    if method:
+        payload["payment_method"] = method
+
+    # The owner's own words, which are often the only thing that makes the line
+    # mean anything. Kept whole on the note rather than thrown away after the
+    # category was worked out from them.
+    notes = []
+    for col in _note_columns(table, mapping):
+        v = row.get(col)
+        if v not in (None, "") and str(v).strip() not in notes:
+            notes.append(str(v).strip())
+    note_parts = [str(x).strip() for x in (desc, cp) if x not in (None, "")]
+    for n in notes:
+        if n not in note_parts:
+            note_parts.append(n)
+    label = " — ".join(note_parts)
+    payload["note"] = (label or f'{table["title"]} ({table["sheet"]})')[:300]
+    payload["source_sheet"] = str(table.get("sheet"))[:60]
+    if row.get("_row"):
+        payload["source_row"] = row["_row"]
+
+    # A figure that was negative in its column is money coming back. Booked as an
+    # ordinary receipt it would show as income the business never earned.
+    # Decided HERE, once the note, the payment method and the source row are
+    # already on the payload, so a reversal is as traceable as any other line —
+    # returning earlier left the one refund in the file with no note, no sheet
+    # and no row number to find it by.
     if row.get("_reversal"):
-        # A credit in the money-out column is money coming back from whoever
-        # was paid; a negative receipt is money going back to a customer.
         payload["direction"] = ("from_supplier" if row.get("Direction") == "in"
                                 else "to_customer")
         payload["note_reversal"] = True
@@ -4460,13 +4591,6 @@ def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table:
             occurred_at=ingestion._parse_date(row.get(mapping.get("date")))
             if mapping.get("date") else None,
             confidence=0.7)
-    payload.update(verdict.get("payload_extra") or {})
-
-    desc = row.get(mapping.get("description")) if mapping.get("description") else None
-    cp = row.get(mapping.get("counterparty")) if mapping.get("counterparty") else None
-    note_parts = [str(x).strip() for x in (desc, cp) if x not in (None, "")]
-    label = " — ".join(note_parts)
-    payload["note"] = (label or f'{table["title"]} ({table["sheet"]})')[:300]
 
     etype = verdict.get("event_type") or "Expense"
     if cp not in (None, "") and not any(k in payload for k in ("customer", "supplier", "employee")):

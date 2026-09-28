@@ -145,6 +145,23 @@ def col_letter(i: int) -> str:
     return s
 
 
+def _squeeze_digit_spaces(s: str) -> str:
+    """Drop a space that sits BETWEEN two digits.
+
+    "1 234 567" and "K1 234,56" are ordinary ways to write money, and read
+    strictly they parsed as nothing, so the row was dropped without a word. A
+    space anywhere else is left alone, so "K 1,500" and "2 bags" are unaffected."""
+    if " " not in s:
+        return s
+    out = []
+    for i, ch in enumerate(s):
+        if (ch == " " and 0 < i < len(s) - 1
+                and s[i - 1].isdigit() and s[i + 1].isdigit()):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _decimal_point(s: str) -> str:
     """A written number with its separators resolved, whichever convention it uses.
 
@@ -159,6 +176,7 @@ def _decimal_point(s: str) -> str:
         5,650.77    -> 5650.77    (a period is present, so the comma groups)
         1.234,56    -> 1234.56    (the comma is last, so it is the decimal)
     """
+    s = _squeeze_digit_spaces(s)
     has_comma, has_dot = "," in s, "." in s
     if has_comma and has_dot:
         # Whichever comes last is the decimal separator.
