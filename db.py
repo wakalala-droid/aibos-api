@@ -285,6 +285,8 @@ _SCHEMA_PROBES = (
     (35, "booking_payments", "settled"),
     (36, "push_subscriptions", "endpoint"),
     (37, "card_subscriptions", "subscription_id"),
+    (38, "payment_accounts", "secret_enc"),
+    (38, "booking_payments", "provider"),
 )
 
 _schema_cache: tuple[dict, float] | None = None

@@ -29,6 +29,8 @@ from engine3 import run_engine3
 from intelligence import run_cross_engine
 from extensions import generate_proposals  # SAFEGUARD Layer 2 (isolated from core)
 import payments
+import payment_accounts
+import field_crypto
 import paddle
 import billing as billing_api
 
@@ -2396,7 +2398,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 37
+EXPECTS_MIGRATION = 38
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -2515,10 +2517,14 @@ def health_setup():
          "needs": ["CRON_SECRET"],
          "without_it": "The nightly iCal sync with Booking.com and Airbnb cannot "
                        "be triggered, so OTA calendars drift."},
-        {"key": "mobile_money", "live": any(payments.configured_networks().values()),
-         "needs": ["MTN_MOMO_SUBSCRIPTION_KEY", "AIRTEL_CLIENT_ID"],
-         "without_it": "Invoice and booking payment links run in simulation. No real money "
-                       "moves. (Plans are paid by card only, so this does not affect them.)"},
+        # Each business connects its OWN account in Business profile (0038), so
+        # this is live when the server can lock those keys away. The platform's
+        # MTN/Airtel keys never collect a business's money.
+        {"key": "mobile_money", "live": field_crypto.is_configured() and 38 in schema_health()["applied"],
+         "needs": ["FIELD_ENCRYPTION_KEY", "migration 0038"],
+         "businesses_connected": payment_accounts.connected_count(get_db()) if get_db() is not None else None,
+         "without_it": "No business can connect its own mobile money account, so invoice and "
+                       "stay payment links ask the payer to pay the business directly."},
         {"key": "card_payments", "live": paddle.status()["ready"],
          "needs": ["PADDLE_API_KEY"],
          "environment": paddle.environment(),
@@ -3082,7 +3088,9 @@ def _settle(rec: Dict[str, Any], new_status: str) -> None:
 
 @app.get("/payments/config")
 def payments_config():
-    """Which networks are live (real API) vs simulated (no creds yet)."""
+    """Which of the PLATFORM's own MTN/Airtel keys are live. They only settle
+    old mobile money plan payments. Whether a business takes mobile money on
+    its payment links depends on its own account (GET /payments/account)."""
     return {"networks": payments.configured_networks(), "mode": "live" if any(payments.configured_networks().values()) else "simulation"}
 
 
@@ -3146,6 +3154,10 @@ def payments_callback(network: str, body: Dict[str, Any],
             res = (db.table("invoice_payments").select("*")
                    .eq("reference", reference).limit(1).execute())
             rows = getattr(res, "data", None) or []
+            if rows and rows[0].get("provider"):
+                # Collected into the business's own account (0038): only that
+                # provider, asked with that business's key, may settle it.
+                return {"ok": False, "detail": "settled by its own provider"}
             if rows:
                 status = _settle_invoice_payment(db, rows[0], resolved) if resolved else rows[0]["status"]
                 return {"ok": True, "status": status}
@@ -3156,6 +3168,8 @@ def payments_callback(network: str, body: Dict[str, Any],
             res = (db.table("booking_payments").select("*")
                    .eq("reference", reference).limit(1).execute())
             rows = getattr(res, "data", None) or []
+            if rows and rows[0].get("provider"):
+                return {"ok": False, "detail": "settled by its own provider"}
             if rows:
                 status = _settle_booking_payment(db, rows[0], resolved) if resolved else rows[0]["status"]
                 return {"ok": True, "status": status}
@@ -5416,13 +5430,39 @@ def public_invoice(token: str, request: Request):
     return {
         "ok": True,
         "invoice": invoices_api.public_view(inv, name, logo),
-        "networks": payments.configured_networks(),
+        # THIS business's own account decides what the payer is offered.
+        "networks": payments.networks_for(payment_accounts.for_owner(db, inv["user_id"]),
+                                          inv.get("currency") or "ZMW"),
     }
 
 
 class PublicPayRequest(BaseModel):
-    network: str                      # "mtn" | "airtel"
+    network: str                      # "mtn" | "airtel" | "zamtel"
     payer_phone: str
+
+
+def _collect_for(db, owner_id: str, network: str, reference: str, amount: float,
+                 currency: str, phone: str) -> tuple[str, Optional[payments.Account]]:
+    """Start a collection into the account of the business that issued the
+    link and nowhere else. Turns every outcome a payer can meet into a plain
+    HTTP answer, so the two payment-link routes cannot drift apart."""
+    if network not in payments.LENCO_NETWORKS:
+        raise HTTPException(status_code=400, detail="Choose MTN, Airtel or Zamtel.")
+    if not (phone or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the phone number to charge.")
+    account = payment_accounts.for_owner(db, owner_id)
+    try:
+        state = payments.collect(account, network, reference, amount, currency, phone)
+    except payments.CollectRefused as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if state == "unconfigured":
+        raise HTTPException(
+            status_code=503,
+            detail="Paying by mobile money isn’t switched on for this business yet. "
+                   "Please pay them directly.")
+    if state == "failed":
+        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
+    return state, account
 
 
 @app.post("/pay/{token}/initiate")
@@ -5441,12 +5481,6 @@ def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
     if inv.get("status") != "sent":
         raise HTTPException(status_code=409, detail="This invoice is not awaiting payment.")
 
-    network = (body.network or "").lower()
-    if network not in ("mtn", "airtel"):
-        raise HTTPException(status_code=400, detail="Choose MTN or Airtel.")
-    if not (body.payer_phone or "").strip():
-        raise HTTPException(status_code=400, detail="Enter the phone number to charge.")
-
     # The amount is the INVOICE's, read server-side. The payer's request carries
     # no number a client could tamper with.
     amount = float(inv.get("total") or 0)
@@ -5455,22 +5489,15 @@ def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
     currency = inv.get("currency") or "ZMW"
 
     reference = str(uuid.uuid4())
-    note = f"Invoice {inv.get('number')}"
-    state = payments.initiate(network, reference, amount, currency, body.payer_phone, note)
-
-    if state == "unconfigured":
-        raise HTTPException(
-            status_code=503,
-            detail="Mobile money payment isn’t switched on yet. Please pay the business directly — they can mark this invoice paid.",
-        )
-    if state == "failed":
-        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
+    network = (body.network or "").lower()
+    state, account = _collect_for(db, inv["user_id"], network, reference, amount,
+                                  currency, body.payer_phone)
 
     # PERSISTED, unlike the subscription flow's in-memory dict: the customer may
     # approve the prompt minutes from now and the webhook may land after a
     # deploy. A reference the server forgot is money taken with no invoice
     # settled. See migration 0025.
-    db.table("invoice_payments").insert({
+    row = {
         "invoice_id": inv["id"],
         "user_id": inv["user_id"],
         "reference": reference,
@@ -5479,7 +5506,10 @@ def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
         "amount": amount,
         "currency": currency,
         "status": state,
-    }).execute()
+    }
+    if account is not None:
+        row["provider"] = account.provider         # migration 0038
+    db.table("invoice_payments").insert(row).execute()
 
     return {"ok": True, "reference": reference, "status": state, "amount": amount, "currency": currency}
 
@@ -5573,7 +5603,8 @@ def public_pay_status(token: str, reference: str, request: Request):
             except ValueError:
                 ts = None
         status = _settle_invoice_payment(
-            db, row, payments.status(row["network"], reference, ts))
+            db, row, payments.collection_status(payment_accounts.for_owner(db, row["user_id"]),
+                                                row["network"], reference, ts))
 
     return {"ok": True, "reference": reference, "status": status}
 
@@ -5681,7 +5712,8 @@ def public_stay(token: str, request: Request):
     return {"ok": True,
             "stay": hospitality_api.public_stay_view(
                 booking, _unit_name(db, booking["user_id"], booking.get("unit_id")), name, logo),
-            "networks": payments.configured_networks()}
+            "networks": payments.networks_for(payment_accounts.for_owner(db, booking["user_id"]),
+                                              booking.get("currency") or "ZMW")}
 
 
 @app.post("/pay/stay/{token}/initiate")
@@ -5690,29 +5722,23 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
     _throttle_public(request, "pay_initiate", 60, 60, token=token, token_limit=5)
     db = _require_db()
     booking = _stay_or_404(db, token)
-    network = (body.network or "").lower()
-    if network not in ("mtn", "airtel"):
-        raise HTTPException(status_code=400, detail="Choose MTN or Airtel.")
-    if not (body.payer_phone or "").strip():
-        raise HTTPException(status_code=400, detail="Enter the phone number to charge.")
     # The amount is the booking's, read here. Nothing the guest sends sets it.
     amount = hospitality_api.amount_due(booking)
     if amount <= 0.005:
         raise HTTPException(status_code=409, detail="Nothing is owed on this stay. Thank you!")
     currency = booking.get("currency") or "ZMW"
     reference = str(uuid.uuid4())
-    note = f"Stay {str(booking.get('check_in'))[:10]}" + (f" ref {booking['reference']}" if booking.get("reference") else "")
-    state = payments.initiate(network, reference, amount, currency, body.payer_phone, note)
-    if state == "unconfigured":
-        raise HTTPException(status_code=503,
-                            detail="Paying by mobile money isn't switched on yet. Please pay the property directly.")
-    if state == "failed":
-        raise HTTPException(status_code=502, detail="Could not reach the mobile money provider. Please try again.")
-    db.table("booking_payments").insert({
+    network = (body.network or "").lower()
+    state, account = _collect_for(db, booking["user_id"], network, reference, amount,
+                                  currency, body.payer_phone)
+    row = {
         "booking_id": booking["id"], "user_id": booking["user_id"], "reference": reference,
         "network": network, "payer_phone": body.payer_phone.strip(),
         "amount": amount, "currency": currency, "status": state,
-    }).execute()
+    }
+    if account is not None:
+        row["provider"] = account.provider         # migration 0038
+    db.table("booking_payments").insert(row).execute()
     return {"ok": True, "reference": reference, "status": state, "amount": amount, "currency": currency}
 
 
@@ -5780,8 +5806,114 @@ def public_stay_status(token: str, reference: str, request: Request):
     if status == "pending":
         created = entitlements._parse_ts(row.get("created_at"))
         status = _settle_booking_payment(
-            db, row, payments.status(row["network"], reference, created.timestamp() if created else None))
+            db, row, payments.collection_status(payment_accounts.for_owner(db, row["user_id"]), row["network"],
+                                                reference, created.timestamp() if created else None))
     return {"ok": True, "reference": reference, "status": status}
+
+
+# ── Each business's own payment account (migration 0038) ──────────────────────
+# The owner pastes their Lenco API key once in Business profile. From then on
+# their invoice and stay payment links collect straight into their own Lenco
+# account. The key is checked with Lenco, sealed and never shown again.
+
+class PaymentAccountIn(BaseModel):
+    provider: str = "lenco"
+    api_key: str
+
+
+def _lenco_webhook_url() -> Optional[str]:
+    base = (os.environ.get("PUBLIC_API_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+    return f"{base.rstrip('/')}/payments/lenco/webhook" if base else None
+
+
+def _payment_account_view(db, owner_id: str) -> Dict[str, Any]:
+    try:
+        view = payment_accounts.status(db, owner_id)
+    except payment_accounts.NotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"ok": True, **view, "webhook_url": _lenco_webhook_url()}
+
+
+@app.get("/payments/account")
+def payment_account_get(ctx: membership.Context = Depends(membership.require_owner)):
+    """Is this business taking mobile money into its own account? Never the key."""
+    return _payment_account_view(_require_db(), ctx.tenant)
+
+
+@app.put("/payments/account")
+def payment_account_connect(body: PaymentAccountIn, request: Request,
+                            ctx: membership.Context = Depends(membership.require_owner)):
+    """Check the owner's Lenco key with Lenco, then keep it, sealed."""
+    # Each attempt asks Lenco. Capped so this cannot be used to test stolen keys.
+    _throttle_public(request, "pay_account", 20, 600, token=ctx.tenant, token_limit=8)
+    db = _require_db()
+    try:
+        payment_accounts.connect(db, ctx.tenant, ctx.actor, body.provider, body.api_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except field_crypto.FieldCryptoUnavailable:
+        raise HTTPException(status_code=503, detail="The server cannot lock payment keys away yet, "
+                                                    "so nothing was saved. The AIBOS team has to switch this on.")
+    except payment_accounts.NotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return _payment_account_view(db, ctx.tenant)
+
+
+@app.delete("/payments/account")
+def payment_account_disconnect(ctx: membership.Context = Depends(membership.require_owner)):
+    """Stop taking mobile money on this business's links and forget the key."""
+    db = _require_db()
+    try:
+        payment_accounts.disconnect(db, ctx.tenant)
+    except payment_accounts.NotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return _payment_account_view(db, ctx.tenant)
+
+
+@app.post("/payments/lenco/webhook")
+async def lenco_webhook(request: Request):
+    """Lenco tells us a collection finished. Signed with the key of the business
+    the money went to, so the signature is checked against THAT business's key.
+    The event's own "successful" is never believed: Lenco is asked again with
+    the business's key and only its answer settles anything."""
+    from starlette.concurrency import run_in_threadpool
+
+    raw = await request.body()
+    try:
+        event = json.loads(raw or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Not JSON")
+    reference = str(((event.get("data") or {}) if isinstance(event, dict) else {}).get("reference") or "")
+    if not reference:
+        return {"ok": True, "detail": "nothing to settle"}      # e.g. a transfer event
+    signature = request.headers.get("x-lenco-signature")
+
+    def settle() -> Dict[str, Any]:
+        db = _require_db()
+        for table, settle_row in (("invoice_payments", _settle_invoice_payment),
+                                  ("booking_payments", _settle_booking_payment)):
+            try:
+                res = db.table(table).select("*").eq("reference", reference).limit(1).execute()
+            except Exception as e:  # noqa: BLE001 (pre-0035 there is no stay table)
+                log.info("[lenco] %s lookup failed: %s", table, e)
+                continue
+            rows = getattr(res, "data", None) or []
+            if not rows:
+                continue
+            row = rows[0]
+            account = payment_accounts.for_owner(db, row["user_id"])
+            if account is None or not payments.lenco_signature_ok(account.secret, raw, signature):
+                raise HTTPException(status_code=403, detail="Invalid signature")
+            if row.get("status") != "pending":
+                return {"ok": True, "status": row.get("status")}
+            state = payments.collection_status(account, row["network"], reference)
+            return {"ok": True, "status": settle_row(db, row, state)}
+        # Not one of ours. 200, so Lenco does not retry it for a day.
+        return {"ok": True, "detail": "unknown reference"}
+
+    return await run_in_threadpool(settle)
 
 
 # ── Anomaly auto-investigation (audit #13) ────────────────────────────────────
@@ -6583,16 +6715,30 @@ PAYMENTS_SWEEP_HOURS = 48
 
 
 def sweep_pending_payments(db) -> dict:
-    live = any(payments.configured_networks().values()) or payments.SIMULATION_ENABLED
-    if db is None or not live:
-        return {"ok": True, "skipped": "mobile money is not switched on"}
+    if db is None:
+        return {"ok": True, "skipped": "no database"}
     from datetime import datetime, timedelta, timezone
     since = (datetime.now(timezone.utc) - timedelta(hours=PAYMENTS_SWEEP_HOURS)).isoformat()
     out = {"ok": True, "subscriptions": 0, "invoices": 0, "stays": 0, "errors": 0}
 
+    # Plan payments went through the platform's own MTN/Airtel keys, so there
+    # is nothing to ask while those are off. Invoice and stay payments are
+    # checked below whatever the platform has: each went into its business's
+    # own account and is asked about with that business's key.
+    platform_live = any(payments.configured_networks().values()) or payments.SIMULATION_ENABLED
+    accounts: Dict[str, Optional[payments.Account]] = {}
+
+    def business_status(row) -> str:
+        owner = row.get("user_id")
+        if owner not in accounts:
+            accounts[owner] = payment_accounts.for_owner(db, owner)
+        created = entitlements._parse_ts(row.get("created_at"))
+        return payments.collection_status(accounts[owner], row["network"], row["reference"],
+                                          created.timestamp() if created else None)
+
     try:
         subs = (db.table("subscription_payments").select("*").eq("status", "pending")
-                .gte("created_at", since).limit(200).execute())
+                .gte("created_at", since).limit(200).execute()) if platform_live else None
         for row in getattr(subs, "data", None) or []:
             try:
                 rec = PAYMENTS.get(row["reference"]) or _sub_row_to_rec(row)
@@ -6611,9 +6757,7 @@ def sweep_pending_payments(db) -> dict:
                 .gte("created_at", since).limit(200).execute())
         for row in getattr(invs, "data", None) or []:
             try:
-                created = entitlements._parse_ts(row.get("created_at"))
-                new = payments.status(row["network"], row["reference"], created.timestamp() if created else None)
-                if _settle_invoice_payment(db, row, new) != "pending":
+                if _settle_invoice_payment(db, row, business_status(row)) != "pending":
                     out["invoices"] += 1
             except Exception as e:  # noqa: BLE001
                 out["errors"] += 1
@@ -6626,9 +6770,7 @@ def sweep_pending_payments(db) -> dict:
                  .gte("created_at", since).limit(200).execute())
         for row in getattr(stays, "data", None) or []:
             try:
-                created = entitlements._parse_ts(row.get("created_at"))
-                new = payments.status(row["network"], row["reference"], created.timestamp() if created else None)
-                if _settle_booking_payment(db, row, new) != "pending":
+                if _settle_booking_payment(db, row, business_status(row)) != "pending":
                     out["stays"] += 1
             except Exception as e:  # noqa: BLE001
                 out["errors"] += 1

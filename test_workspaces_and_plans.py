@@ -217,14 +217,25 @@ def test_a_payment_nobody_is_watching_still_switches_the_plan_on():
         main.PAYMENTS.clear()
 
 
-def test_the_sweep_does_nothing_while_mobile_money_is_off():
+def test_plan_payments_are_not_asked_about_while_the_platform_keys_are_off():
+    # Business payment links are still checked (each with its own business's
+    # key, see test_payment_accounts.py); only plan payments wait.
     import payments
-    real = payments.configured_networks
+    db = _fresh()
+    db.rows["subscription_payments"] = [{
+        "reference": "ref-off", "user_id": "u1", "network": "mtn", "plan": "pro",
+        "billing": "monthly", "amount": 500, "currency": "ZMW", "status": "pending",
+        "granted": False, "created_at": datetime.now(timezone.utc).isoformat()}]
+    asked = []
+    real = (payments.configured_networks, payments.status)
     payments.configured_networks = lambda: {"mtn": False, "airtel": False}
+    payments.status = lambda *a, **k: asked.append(a) or "successful"
     try:
-        assert "skipped" in main.sweep_pending_payments(_fresh())
+        out = main.sweep_pending_payments(db)
+        assert out["subscriptions"] == 0 and asked == []
     finally:
-        payments.configured_networks = real
+        payments.configured_networks, payments.status = real
+        main.PAYMENTS.clear()
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
