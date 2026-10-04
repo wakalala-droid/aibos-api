@@ -349,6 +349,94 @@ def run_tool(db, user_id: str, name: str, args: dict, business_id: str | None = 
         return {"error": f"{name} failed: {type(exc).__name__}"}
 
 
+# ── Show your working (UI/UX audit 2026-10 C8) ────────────────────────────────
+# After each lookup the stream says, in the owner's words, what it read and
+# for which dates, with the ids of the entries behind it, so an answer can be
+# trusted or checked ("That's wrong" opens those entries, each with "Fix").
+
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+
+_PLURAL = {
+    "Sale": "sales", "Expense": "expenses", "Purchase": "purchases",
+    "Salary": "wage payments", "SupplierPayment": "payments to suppliers",
+    "CustomerPayment": "payments received", "TaxPayment": "tax payments",
+    "AssetPurchase": "equipment purchases", "InventoryReceipt": "stock deliveries",
+    "InventoryAdjustment": "stock count changes", "Loan": "loan entries",
+    "Refund": "refunds", "Transfer": "transfers",
+}
+
+
+def _day(iso: str):
+    """'2026-09-01' as (1, 'September', 2026), or None."""
+    try:
+        y, m, d = (int(x) for x in str(iso)[:10].split("-"))
+        return d, _MONTHS[m - 1], y
+    except (ValueError, IndexError):
+        return None
+
+
+def _dates_in_words(first: str, last: str) -> str:
+    a, b = _day(first), _day(last)
+    if not a or not b:
+        return ""
+    if a == b:
+        return f" on {a[0]} {a[1]} {a[2]}"
+    if a[1:] == b[1:]:
+        return f" from {a[0]} to {b[0]} {b[1]} {b[2]}"
+    if a[2] == b[2]:
+        return f" from {a[0]} {a[1]} to {b[0]} {b[1]} {b[2]}"
+    return f" from {a[0]} {a[1]} {a[2]} to {b[0]} {b[1]} {b[2]}"
+
+
+def describe_read(name: str, args: dict, result: dict) -> dict:
+    """One plain line about a lookup, plus the entry ids it used (up to 50)."""
+    args = args or {}
+    result = result if isinstance(result, dict) else {}
+    if result.get("error"):
+        return {"tool": name, "said": "One lookup could not be done, so the answer may be missing something.", "ids": []}
+    ids: list = []
+    if name == "query_events":
+        n = int(result.get("count") or 0)
+        kind = _PLURAL.get(str(args.get("event_type") or ""), "records")
+        if n == 1:
+            kind = {"sales": "sale", "expenses": "expense", "purchases": "purchase"}.get(kind, kind.rstrip("s"))
+        events = result.get("events") or []
+        ids = [e.get("id") for e in events if e.get("id")]
+        dates = sorted(str(e.get("date") or "") for e in events if e.get("date"))
+        first = str(args.get("since") or (dates[0] if dates else ""))
+        last = str(args.get("until") or (dates[-1] if dates else ""))
+        who = next((f" for {args[k]}" for k in ("customer", "supplier", "category") if args.get(k)), "")
+        said = f"Read {n} {kind}{who}{_dates_in_words(first, last)}" if n else f"Found no {kind}{who}{_dates_in_words(first, last)}"
+        if result.get("truncated"):
+            said += f" (the first {len(events)} listed)"
+    elif name == "get_business_snapshot":
+        said = "Read your cash, totals and the last six months"
+    elif name == "list_products":
+        said = f"Read your {int(result.get('count') or 0)} products and their stock"
+    elif name == "upcoming_schedule":
+        said = f"Read your diary for the next {int(result.get('days') or 14)} days"
+    elif name == "list_invoices":
+        said = f"Read {int(result.get('count') or 0)} invoices"
+    elif name == "simulate_scenario":
+        said = "Worked out a what-if on a copy of your books"
+    elif name == "cash_forecast":
+        said = "Worked out your cash ahead from your monthly history"
+    elif name == "who_owes_me":
+        said = f"Read who owes you ({len(result.get('customers') or [])} customers)"
+    elif name == "investigate_month":
+        month = str(result.get("month") or args.get("month") or "")
+        d = _day(month + "-01") if len(month) == 7 else None
+        said = f"Looked at what changed in {d[1]} {d[2]}" if d else "Looked at what changed in a recent month"
+        for drv in result.get("drivers") or []:
+            ids.extend(i for i in (drv.get("event_ids") or []) if i)
+    elif name == "customer_summary":
+        said = "Read your customers from your recorded sales"
+    else:
+        said = "Looked something up in your books"
+    return {"tool": name, "said": said, "ids": ids[:50]}
+
+
 # ── Agent loop (client-injected → offline-testable) ───────────────────────────
 
 
@@ -531,6 +619,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
     Streaming twin of run_agent_loop (audit #21). Yields (kind, data) tuples:
 
         ("tool",  name)   — a lookup started (the UI can show "checking …")
+        ("read",  {...})  — what that lookup read, in words, with entry ids (C8)
         ("token", text)   — a piece of the answer, as the model writes it
         ("done",  {...})  — finished; carries tools_used
 
@@ -626,6 +715,10 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
             tools_used.append(name)
             yield ("tool", name)
             result = run_tool(db, user_id, name, args, business_id, allowed)
+            try:
+                yield ("read", describe_read(name, args, result))
+            except Exception as exc:  # noqa: BLE001 — a summary must never stop the answer
+                log.warning("[cfo_tools] could not describe %s: %s", name, exc)
             convo.append({
                 "role": "tool",
                 "tool_call_id": c["id"] or f"call_{i}",

@@ -2205,7 +2205,8 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
     same citations as /chat — which stays as the non-streaming fallback for any
     client that can't stream.
 
-    Frames: {"tool": name} · {"t": "…"} · {"done": true, "tools_used": [...], "ms": {...}}
+    Frames: {"tool": name} · {"read": {"tool", "said", "ids"}} · {"t": "…"} ·
+    {"done": true, "tools_used": [...], "ms": {...}}
 
     `ms` on the last frame says where the time went (setup, first word,
     whole answer), so a slow answer can be diagnosed from the browser.
@@ -2252,6 +2253,8 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                         yield f"data: {json.dumps({'t': data})}\n\n"
                     elif kind == "tool":
                         yield f"data: {json.dumps({'tool': data})}\n\n"
+                    elif kind == "read":
+                        yield f"data: {json.dumps({'read': data}, default=str)}\n\n"
                     elif kind == "done":
                         if taster_note:
                             yield f"data: {json.dumps({'t': taster_note})}\n\n"

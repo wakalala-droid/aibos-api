@@ -400,3 +400,38 @@ def test_a_refused_tool_declaration_still_answers():
     assert calls == [True, False]                 # tried with tools, then without
     assert out["reply"] == "Roughly K12,000 last month."
     assert out["tools_used"] == []
+
+
+# ── Show your working (UI/UX audit 2026-10 C8) ────────────────────────────────
+
+def test_describe_read_query_events_in_words():
+    out = cfo_tools.describe_read(
+        "query_events", {"event_type": "Sale", "since": "2026-09-01", "until": "2026-09-30"},
+        {"count": 214, "events": [{"id": "e1", "date": "2026-09-02"}, {"id": "e2", "date": "2026-09-29"}],
+         "truncated": True})
+    assert out["said"] == "Read 214 sales from 1 to 30 September 2026 (the first 2 listed)"
+    assert out["ids"] == ["e1", "e2"]
+
+
+def test_describe_read_dates_from_events_and_errors():
+    out = cfo_tools.describe_read("query_events", {"category": "fuel"},
+                                  {"count": 1, "events": [{"id": "x", "date": "2026-08-14"}]})
+    assert out["said"] == "Read 1 record for fuel on 14 August 2026"
+    bad = cfo_tools.describe_read("list_products", {}, {"error": "list_products failed"})
+    assert bad["ids"] == [] and "could not be done" in bad["said"]
+
+
+def test_describe_read_investigate_takes_driver_ids():
+    out = cfo_tools.describe_read("investigate_month", {"month": "2026-07"},
+                                  {"month": "2026-07", "drivers": [{"event_ids": ["a", "b"]}, {"event_ids": ["c"]}]})
+    assert out["said"] == "Looked at what changed in July 2026" and out["ids"] == ["a", "b", "c"]
+
+
+def test_stream_says_what_it_read():
+    round1 = [_chunk(tool_calls=[_tc_delta(0, id="c1", name="query_events", arguments='{"category": "fuel"}')])]
+    round2 = [_chunk("Done.")]
+    client = _FakeStreamClient([round1, round2])
+    out = list(cfo_tools.run_agent_loop_stream(
+        client, "m", [{"role": "user", "content": "fuel?"}], _seeded_db(), "u1"))
+    reads = [d for k, d in out if k == "read"]
+    assert len(reads) == 1 and reads[0]["tool"] == "query_events" and reads[0]["said"].startswith(("Read ", "Found no "))
