@@ -5077,6 +5077,9 @@ def get_parties(kind: Optional[str] = Query(None),
                       ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     rows = parties_api.list_parties(db, ctx.tenant, kind=kind, business_id=ctx.business_id)
+    # Phrases saved as contacts before the name check are hidden, not deleted
+    # (UI/UX audit 2026-10 A24): their entries stay in the books untouched.
+    rows = [r for r in rows if parties_api.looks_like_name(r.get("name"))]
     if rows:
         events = nervous.list_events(db, ctx.tenant, limit=2000, business_id=ctx.business_id)
         stats = parties_api.party_stats(events)

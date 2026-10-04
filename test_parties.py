@@ -207,3 +207,20 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} parties/customer-intel tests passed ===")
+
+
+# ── A phrase is not a contact (UI/UX audit 2026-10 A24) ──────────────────────
+
+def test_looks_like_name_rejects_phrases_and_headings():
+    for junk in ["balance for 25 days stay.", "COMPANY NUMBER", "Customer Name", "N/A",
+                 "payment for room 3 and breakfast", "being part payment of invoice 12"]:
+        assert not parties.looks_like_name(junk), junk
+    for real in ["Chanda's Grill", "Mwansa Farms Ltd.", "Zoe", "AUDIT TEST A (cancel)",
+                 "Room 4 guest", "Mr. Banda", "Lusaka Bites 2"]:
+        assert parties.looks_like_name(real), real
+
+
+def test_extract_parties_skips_phrases():
+    assert parties.extract_parties({"customer": "balance for 25 days stay."}) == []
+    assert parties.extract_parties({"customer": "COMPANY NUMBER", "supplier": "Mwansa Farms"}) == [
+        {"name": "Mwansa Farms", "key": "mwansa farms", "kind": "supplier"}]

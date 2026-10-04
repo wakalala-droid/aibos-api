@@ -39,6 +39,46 @@ _FIELD_KIND = {"customer": "customer", "supplier": "supplier"}
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
+# Words that make up a column heading or a bookkeeping phrase, never a person
+# or business on their own: "COMPANY NUMBER", "CUSTOMER NAME", "N/A".
+_NOT_A_NAME_WORDS = {
+    "company", "number", "no", "name", "customer", "customers", "client", "supplier",
+    "total", "totals", "amount", "date", "description", "details", "ref", "reference",
+    "n/a", "na", "none", "unknown", "nil", "balance", "account", "item", "items",
+}
+# A phrase that opens like a sentence about money, not like a name.
+_SENTENCE_OPENERS = {"balance", "payment", "paid", "deposit", "for", "being", "to", "from", "the", "part"}
+
+
+def looks_like_name(name) -> bool:
+    """Could this be a customer's or supplier's name? Pure.
+
+    Imports and quick notes put phrases in the customer field ("balance for
+    25 days stay.", "COMPANY NUMBER"), and each became a contact that the
+    owner's customer list, churn and reminders then used (UI/UX audit
+    2026-10 A24). Real names pass: "Chanda's Grill", "Mwansa Farms Ltd.",
+    "Room 4 guest" is borderline and passes (short, not a sentence).
+    """
+    text = str(name or "").strip()
+    if not text:
+        return False
+    words = [w for w in text.replace(",", " ").split() if w]
+    lower = [w.lower().strip(".:;()") for w in words]
+    if len(words) > 6:
+        return False
+    if all(w in _NOT_A_NAME_WORDS for w in lower if w):
+        return False
+    has_digit = any(ch.isdigit() for ch in text)
+    if has_digit and len(words) >= 4:
+        return False
+    # A full stop ends a sentence, except after a company word ("Farms Ltd.").
+    sentence_end = text.endswith(("?", "!")) or (
+        text.endswith(".") and lower[-1] not in {"ltd", "co", "inc", "plc", "bros", "jr", "sr", "corp", "llc"})
+    if len(words) >= 3 and (lower[0] in _SENTENCE_OPENERS or sentence_end):
+        return False
+    return True
+
+
 
 def extract_parties(payload: dict) -> list[dict]:
     """Party mentions in one event payload → [{name, key, kind}]. Pure."""
@@ -47,7 +87,7 @@ def extract_parties(payload: dict) -> list[dict]:
         raw = (payload or {}).get(field)
         name = str(raw).strip() if raw else ""
         key = normalize_key(name)
-        if name and key:
+        if name and key and looks_like_name(name):
             out.append({"name": name, "key": key, "kind": kind})
     return out
 
