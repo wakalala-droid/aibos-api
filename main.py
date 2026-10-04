@@ -1792,6 +1792,15 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
         )
         return "\n".join(lines)
 
+    # The period the owner picked on the page they are looking at (UI/UX audit
+    # 2026-10 C6): "why" questions without dates of their own mean this period.
+    period = ctx.get("period_on_screen")
+    if isinstance(period, dict) and period.get("from") and period.get("to"):
+        lines.append(
+            f"The owner is looking at {period.get('label') or 'a chosen period'} "
+            f"({period['from']} to {period['to']}) on {period.get('page') or 'a page'}. "
+            "When a question does not name its own dates, answer for this period and say so.")
+
     # Frontend sends the P&L under "pnl"; also accept "kpi" for safety.
     kpi = ctx.get("pnl") or ctx.get("kpi") or {}
     if kpi:

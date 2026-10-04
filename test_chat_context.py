@@ -206,3 +206,13 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} chat-context tests passed ===")
+
+
+def test_period_on_screen_reaches_the_model():
+    # UI/UX audit 2026-10 C6: the period picked on the page frames dateless questions.
+    import main
+    text = main._context_to_text({"currency_symbol": "K", "has_data": True,
+                                  "period_on_screen": {"label": "Last month", "from": "2026-09-01",
+                                                       "to": "2026-09-30", "page": "/dashboard/cash"}})
+    assert "Last month (2026-09-01 to 2026-09-30) on /dashboard/cash" in text
+    assert "answer for this period" in text
