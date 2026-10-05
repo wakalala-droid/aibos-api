@@ -3006,7 +3006,8 @@ def _send_plan_receipt(rec: Dict[str, Any]) -> None:
             url = f"{PUBLIC_APP_URL.rstrip('/')}/dashboard/billing"
             notify.send_email(to, title, body + "\n\n" + text.replace("*", ""),
                               notify.aibos_email_html(body + "\n\n" + text.replace("*", ""),
-                                                      ("See your plan and receipts", url)))
+                                                      ("See your plan and receipts", url),
+                                                      title="Payment received"))
     except Exception as e:  # noqa: BLE001
         log.warning("[billing] receipt for %s not sent: %s", rec.get("reference"), e)
 
@@ -6968,7 +6969,7 @@ def run_plan_renewals() -> dict:
     def _email(to, subject, body, button):
         label, link = button
         url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
-        return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url)))
+        return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url), title="Your plan"))
 
     return billing_api.run_renewals(db, PLAN_PRICES, send_email=_email,
                                     record=notify.record_notification,

@@ -54,8 +54,21 @@ def email_logo_url() -> str:
     return os.environ.get("EMAIL_LOGO_URL") or f"{_app_url()}/brand/aibos-email-logo.png"
 
 
-def aibos_email_html(body: str, button: tuple[str, str] | None = None) -> str:
-    """A plain-text email body, wearing the AI-BOS logo.
+def email_art_url() -> str:
+    """The What's new splash art as an image (emails cannot draw SVG)."""
+    return os.environ.get("EMAIL_ART_URL") or f"{_app_url()}/brand/email-art.png"
+
+
+def aibos_email_html(body: str, button: tuple[str, str] | None = None,
+                     title: str | None = None) -> str:
+    """A plain-text email body, in the AIBOS x Mercury look.
+
+    The owner, 5 Oct 2026: every notice, payment reminders and scheduled
+    meetings included, is built from the What's new screen's pieces. In an
+    email that is: a white card on the cream page, the splash art across its
+    top (the hairline tiles, the money line and the mark in its rings), the
+    AI-BOS logo, the subject in spaced capitals, 18px words, the brand pill,
+    and the grey mark at the foot like the PDFs.
 
     The words are the text version's words, one paragraph per blank-line block,
     so the two versions can never say different things.
@@ -63,25 +76,44 @@ def aibos_email_html(body: str, button: tuple[str, str] | None = None) -> str:
     import html as _html
 
     e = _html.escape
+    font = "font-family:Geist,Helvetica,Arial,sans-serif;"
     paras = [p.strip() for p in str(body or "").split("\n\n") if p.strip()]
     rows = "".join(
-        '<p style="margin:0 0 16px;font-size:18px;line-height:1.6;color:#1a1a1a;">'
+        '<p style="margin:0 0 16px;font-size:18px;line-height:1.6;color:#1c1917;' + font + '">'
         + e(p).replace("\n", "<br>") + "</p>"
         for p in paras
     )
+    heading = ""
+    if title:
+        heading = ('<p style="margin:0 0 16px;font-size:16px;line-height:1.4;font-weight:600;'
+                   'letter-spacing:0.2em;text-transform:uppercase;color:#57534e;' + font + '">'
+                   + e(title) + "</p>")
     cta = ""
     if button:
-        cta = ('<p style="margin:24px 0 8px;"><a href="' + e(button[1], quote=True) + '" '
-               'style="display:inline-block;padding:12px 22px;border-radius:8px;background:#0c1b2a;'
-               'color:#ffffff;font-size:17px;font-weight:700;text-decoration:none;">'
+        cta = ('<p style="margin:24px 0 4px;"><a href="' + e(button[1], quote=True) + '" '
+               'style="display:inline-block;padding:14px 26px;border-radius:999px;background:#00d4ff;'
+               'color:#04121a;font-size:18px;font-weight:600;text-decoration:none;' + font + '">'
                + e(button[0]) + "</a></p>")
+    grey_mark = f"{_app_url()}/brand/aibos-mark-grey.png"
     return (
-        '<div style="background:#ffffff;padding:24px 12px;">'
-        '<div style="max-width:560px;margin:0 auto;font-family:Geist,Helvetica,Arial,sans-serif;">'
-        '<p style="margin:0 0 28px;"><img src="' + e(email_logo_url(), quote=True) + '" alt="AI-BOS" '
+        '<div style="background:#f4f3ef;padding:32px 12px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        'style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e7e5e0;'
+        'border-radius:16px;border-collapse:separate;overflow:hidden;">'
+        '<tr><td style="padding:0;line-height:0;font-size:0;">'
+        '<img src="' + e(email_art_url(), quote=True) + '" alt="" width="560" '
+        'style="display:block;width:100%;max-width:560px;height:auto;border:0;border-radius:16px 16px 0 0;"></td></tr>'
+        '<tr><td style="padding:28px 32px 28px;">'
+        '<p style="margin:0 0 24px;"><img src="' + e(email_logo_url(), quote=True) + '" alt="AI-BOS" '
         'width="134" style="display:block;width:134px;height:auto;border:0;"></p>'
-        + rows + cta +
-        "</div></div>"
+        + heading + rows + cta +
+        '</td></tr>'
+        '<tr><td style="padding:16px 32px 20px;border-top:1px solid #efece7;">'
+        '<img src="' + e(grey_mark, quote=True) + '" alt="" width="18" height="19" '
+        'style="display:inline-block;vertical-align:middle;width:18px;height:auto;border:0;">'
+        '<span style="vertical-align:middle;margin-left:8px;font-size:18px;color:#78716c;' + font + '">'
+        'Sent by AIBOS</span>'
+        '</td></tr></table></div>'
     )
 
 
@@ -547,7 +579,8 @@ def dispatch_briefs(db) -> dict:
             to = (p.get("contact_email") or p.get("email") or "").strip()
             if p.get("brief_email_enabled") and to and can_access(tier, "scheduled_brief"):
                 if send_email(to, subject, body,
-                              aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"))):
+                              aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"),
+                                               title="Morning brief")):
                     sent_email += 1
             # The same morning, on the phone. One preference, both channels: an
             # owner who asked for the brief gets it wherever they turned
@@ -761,7 +794,8 @@ def booking_received(db, user_id: str, result: dict) -> dict:
             out["email"] = send_email(
                 contacts["email"], f"New booking request: {title}", body,
                 aibos_email_html(body, ("Answer this request",
-                                        f"{_app_url()}/dashboard/hospitality/bookings")))
+                                        f"{_app_url()}/dashboard/hospitality/bookings"),
+                                 title="Booking request"))
         except Exception as e:  # noqa: BLE001
             log.warning("[notify] booking email failed: %s", e)
 

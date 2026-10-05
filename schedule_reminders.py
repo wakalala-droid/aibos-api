@@ -250,8 +250,10 @@ def _email(to: str, title: str, body: str) -> bool:
     import notify
     url = f"{notify._app_url()}{LINK}"
     text = f"{body}\n\nOpen your schedule to see it or mark it done."
+    # "Meeting: Bank manager" is label, then name: the label is the heading.
+    label = title.split(": ", 1)[0] if ": " in title[:24] else "Reminder"
     return notify.send_email(to, title, text,
-                             notify.aibos_email_html(text, ("Open your schedule", url)))
+                             notify.aibos_email_html(text, ("Open your schedule", url), title=label))
 
 
 def send_due(db, now: datetime | None = None, *, allowed=None, push=None, email=None) -> dict:
