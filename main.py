@@ -6284,7 +6284,7 @@ def payslip_pdf(run_id: str, employee_id: str = Query(...),
     slip = {**slip, "period": slip.get("period") or run.get("period")}
     text = payroll_api.payslip_text(slip, business_name)
     if pdfdoc.available():
-        pdf = pdfdoc.render(f"Payslip — {slip.get('period')}", text)
+        pdf = pdfdoc.render(f"Payslip, {slip.get('period')}", text)
         return Response(content=pdf, media_type="application/pdf",
                         headers={"Content-Disposition": f"attachment; filename=payslip_{slip.get('period')}.pdf"})
     return Response(content=text, media_type="text/plain",
@@ -6303,7 +6303,7 @@ def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
         raise HTTPException(status_code=404, detail=str(e))
     text = payroll_api.compliance_text(run, business_name)
     if pdfdoc.available():
-        pdf = pdfdoc.render(f"Statutory summary — {run.get('period')}", text)
+        pdf = pdfdoc.render(f"Statutory summary, {run.get('period')}", text)
         return Response(content=pdf, media_type="application/pdf",
                         headers={"Content-Disposition": f"attachment; filename=statutory_{run.get('period')}.pdf"})
     return Response(content=text, media_type="text/plain",
