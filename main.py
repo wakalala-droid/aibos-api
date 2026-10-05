@@ -216,6 +216,46 @@ def _owned_cabinet(cabinet_id: str, user_id: str) -> Dict[str, Any]:
     return entry
 
 
+# ─── The latest analysis per business (5 Oct 2026) ───────────────────────────
+# The till reports (Engine 3) and the customer reports (Engine 2) read from the
+# last file of that kind. That analysis lived only in the browser tab that
+# uploaded it, so after a reload, or on another device, the till reports showed
+# "Needs your till data" although the owner had uploaded their till file that
+# morning. Each business now keeps its latest analysis per engine in
+# business_memory (kind "latest_analysis", key "<engine>:<business>"), and
+# GET /analysis/latest hands it back on every visit.
+_LATEST_KIND = "latest_analysis"
+
+
+def _latest_key(engine: str, business_id: Optional[str]) -> str:
+    return f"{engine}:{business_id or 'default'}"
+
+
+def _plain_json(obj: Any) -> Any:
+    """numpy numbers and dates in an analysis, made plain for a JSON column."""
+    return json.loads(json.dumps(obj, default=lambda o: o.item() if hasattr(o, "item") else str(o)))
+
+
+def _remember_latest(user_id: str, x_business_id: Optional[str], x_acting_as: Optional[str],
+                     engine: str, cab_id: str, filename: str, payload: Dict[str, Any]) -> None:
+    """Keep this analysis as the business's latest for its engine. Best-effort:
+    a failure here never fails the upload the owner is waiting on."""
+    try:
+        db = get_db()
+        if db is None:
+            return
+        ctx = membership.resolve_context(user_id, db=db, acting_as=x_acting_as)
+        biz = businesses_api.resolve_business_id(db, ctx.tenant, x_business_id)
+        from datetime import datetime, timezone
+        memory.remember(db, ctx.tenant, _LATEST_KIND, _latest_key(engine, biz), {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "cabinet_id": cab_id, "filename": filename,
+            "payload": _plain_json({k: v for k, v in payload.items() if k != "content"}),
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.info("latest %s analysis not remembered: %s", engine, exc)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # COLUMN DETECTION — 4-PASS FAULT-TOLERANT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -984,6 +1024,10 @@ def upload_file(
     # Each upload runs pandas over up to 15 MB and can ask the AI model for a
     # summary: throttled so one account cannot tie up the server or the bill.
     user_id: str = Depends(rate_limit.limiter("upload", 20, 60)),
+    # Which books this file belongs to, so its till or customer analysis is
+    # kept as that business's latest (see _remember_latest).
+    x_business_id: Optional[str] = Header(default=None),
+    x_acting_as: Optional[str] = Header(default=None),
 ):
     """
     Upload a file and run engine analysis.
@@ -1036,7 +1080,7 @@ def upload_file(
                     "analysis": e3_result,
                     "df_preview": e3_result.get("top_items", [])[:10],
                 }, user_id)
-                return {
+                response = {
                     "success": True,
                     "engine": "engine3",
                     "cabinet_id": cab_id,
@@ -1057,6 +1101,11 @@ def upload_file(
                     "menuGaps": e3_result.get("menu_gaps", []),
                     "opsIntelBrief": e3_result.get("ops_intel_brief", ""),
                 }
+                _remember_latest(user_id, x_business_id, x_acting_as, "engine3", cab_id, filename,
+                                 {**_frontend_payload("engine3", e3_result, []),
+                                  "posBusinessName": e3_result.get("business_name"),
+                                  "posPeriod": e3_result.get("period")})
+                return response
             except HTTPException:
                 # A tier gate (402) is a real answer — don't fall through to E1.
                 raise
@@ -1102,7 +1151,7 @@ def upload_file(
                 "analysis": e2_result,
                 "df_json": df.to_json(orient="records"),
             }, user_id)
-            return {
+            response = {
                 "success": True,
                 "engine": "engine2",
                 "cabinet_id": cab_id,
@@ -1120,6 +1169,9 @@ def upload_file(
                 "basketPairs": e2_result.get("basket_pairs", []),
                 "customerIntelBrief": e2_result.get("customer_intel_brief", ""),
             }
+            _remember_latest(user_id, x_business_id, x_acting_as, "engine2", cab_id, filename,
+                             _frontend_payload("engine2", e2_result, []))
+            return response
 
         # ── Resolve columns ───────────────────────────────────────────────────
         rev_col, cost_col, month_col = _resolve_columns(df)
@@ -1452,6 +1504,60 @@ def get_cabinet_entry(cabinet_id: str, user_id: str = Depends(require_user)):
         "engine": engine,
         **_frontend_payload(engine, entry.get("analysis") or {}, entry.get("monthly", [])),
     }
+
+
+def _latest_from_cabinet(db, ctx: "membership.Context", engine: str) -> Optional[Dict[str, Any]]:
+    """A file uploaded before /analysis/latest existed: the newest file of this
+    engine in the owner's own cabinet. Only for the owner's default books,
+    since those files carry no business; the result is remembered so the next
+    visit is a single read."""
+    try:
+        if ctx.actor != ctx.tenant:
+            return None
+        default = businesses_api.default_business_id(db, ctx.tenant)
+        if default is not None and ctx.business_id not in (None, default):
+            return None
+        rows = cabinet_store.list_rows(db, ctx.tenant) or []
+        ids = [r["id"] for r in rows if r.get("engine") == engine]
+        ids += [cid for cid, e in CABINET.items()
+                if e.get("user_id") == ctx.tenant and e.get("engine") == engine and cid not in ids]
+        for cid in ids[:3]:
+            try:
+                entry = _owned_cabinet(cid, ctx.tenant)
+            except HTTPException:
+                continue
+            analysis = entry.get("analysis") or {}
+            payload = _frontend_payload(engine, analysis, [])
+            if engine == "engine3" and not payload.get("posGrandTotals"):
+                continue
+            from datetime import datetime, timezone
+            value = {"at": datetime.now(timezone.utc).isoformat(), "cabinet_id": cid,
+                     "filename": entry.get("name"), "payload": _plain_json(payload)}
+            memory.remember(db, ctx.tenant, _LATEST_KIND, _latest_key(engine, ctx.business_id), value)
+            return value
+    except Exception as exc:  # noqa: BLE001
+        logger.info("latest %s from cabinet failed: %s", engine, exc)
+    return None
+
+
+@app.get("/analysis/latest")
+def latest_analysis(ctx: membership.Context = Depends(membership.require_context)):
+    """The latest till (Engine 3) and customer (Engine 2) analysis for the
+    business on screen, so those reports open with the owner's figures on
+    every visit and every device, not only in the tab that uploaded the file.
+    {"engine3": {at, cabinet_id, filename, payload} | null, "engine2": ...}"""
+    db = get_db()
+    out: Dict[str, Any] = {"engine3": None, "engine2": None}
+    if db is None:
+        return out
+    for engine in ("engine3", "engine2"):
+        value = memory.recall(db, ctx.tenant, _LATEST_KIND, _latest_key(engine, ctx.business_id))
+        if value is None:
+            value = _latest_from_cabinet(db, ctx, engine)
+        # {"cleared": true} is Start fresh: these books were wiped, so the old
+        # file in the cabinet must not bring its figures back.
+        out[engine] = value if value and not value.get("cleared") else None
+    return out
 
 
 @app.delete("/cabinet/{cabinet_id}")
@@ -3952,6 +4058,29 @@ class ResetRequest(BaseModel):
     reset_opening_cash: bool = False
 
 
+def _forget_after_reset(db, ctx: "membership.Context", source: Optional[str]) -> None:
+    """After Start fresh, forget what the wiped books were built from:
+    - the "already imported" marks, or the same file brought back in after a
+      reset is refused as a repeat although its rows are gone;
+    - on a full reset, this business's latest till and customer analysis, or
+      those reports would come back on the next visit (a "cleared" marker).
+    Best-effort: the reset itself has already succeeded."""
+    try:
+        if source in (None, "excel", "csv"):
+            (db.table("business_memory").delete().eq("user_id", ctx.tenant)
+             .eq("kind", "excel_import").execute())
+        if source is None:
+            # A marker, not a delete: with nothing remembered, /analysis/latest
+            # would fall back to the old file in the cabinet and bring the
+            # wiped figures straight back. The next upload replaces it.
+            from datetime import datetime, timezone
+            for engine in ("engine3", "engine2"):
+                memory.remember(db, ctx.tenant, _LATEST_KIND, _latest_key(engine, ctx.business_id),
+                                {"cleared": True, "at": datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:  # noqa: BLE001
+        logger.info("forget after reset skipped: %s", exc)
+
+
 @app.post("/events/reset")
 def reset_timeline(req: ResetRequest, ctx: membership.Context = Depends(membership.require_owner)):
     """
@@ -3975,6 +4104,7 @@ def reset_timeline(req: ResetRequest, ctx: membership.Context = Depends(membersh
             wipe_parties=req.wipe_parties, reset_opening_cash=req.reset_opening_cash,
             business_id=ctx.business_id,
         )
+        _forget_after_reset(db, ctx, req.source)
         return {"ok": True, **result}
     except Exception as exc:  # noqa: BLE001
         logger.error("reset_timeline error: %s\n%s", exc, traceback.format_exc())

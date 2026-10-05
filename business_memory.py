@@ -153,7 +153,7 @@ def recall_all(db, user_id: str, kind: str) -> dict:
 # Bookkeeping the app keeps for itself (the last column mapping, which files
 # were imported), not something AIBOS learned about the business. Shown in the
 # "What AIBOS has learned" list they read as nonsense like "excel_import: 3f9a…".
-_INTERNAL_KINDS = ("excel_mapping", "excel_import")
+_INTERNAL_KINDS = ("excel_mapping", "excel_import", "latest_analysis")
 
 
 def list_mappings(db, user_id: str) -> list:
