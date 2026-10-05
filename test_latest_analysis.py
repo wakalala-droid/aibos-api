@@ -65,10 +65,12 @@ def _client(main, business_id="b1"):
     for d in upload.dependant.dependencies:
         if d.call.__name__ == "_dep":
             main.app.dependency_overrides[d.call] = lambda: "u1"
-    latest = next(r for r in main.app.routes if getattr(r, "path", "") == "/analysis/latest")
-    for d in latest.dependant.dependencies:
-        if d.call.__name__ == "require_context":
-            main.app.dependency_overrides[d.call] = lambda: _ctx(business_id)
+    for r in main.app.routes:
+        if getattr(r, "path", "") != "/analysis/latest":
+            continue
+        for d in r.dependant.dependencies:
+            if d.call.__name__ in ("require_context", "require_write"):
+                main.app.dependency_overrides[d.call] = lambda: _ctx(business_id)
     return TestClient(main.app)
 
 
@@ -141,7 +143,7 @@ def test_start_fresh_forgets_the_analysis_and_the_already_imported_marks(app):
     assert rows["m1"]["value"].get("cleared") is True
     # The old file in the cabinet does not bring the wiped figures back.
     body = _client(main, "b1").get("/analysis/latest").json()
-    assert body["engine3"] is None
+    assert body["engine3"] == {"cleared": True}    # the app must not use its own copy either
     # The next till upload replaces the marker.
     _client(main).post("/upload", headers={"X-Business-Id": "b1"},
                        files={"file": ("pos.xls", io.BytesIO(b"x"), "application/vnd.ms-excel")})
@@ -154,3 +156,37 @@ def test_undoing_one_manual_entry_source_keeps_the_marks(app):
         {"id": "m3", "user_id": "u1", "kind": "excel_import", "key": "abc", "value": {}})
     main._forget_after_reset(db, _ctx("b1"), "manual")
     assert [r["id"] for r in db.rows["business_memory"]] == ["m3"]
+
+
+def _device_copy():
+    return {"engine": "engine3", "filename": "item sales by category by date.xls",
+            "payload": {"hasEngine3Data": True, "posGrandTotals": FAKE_E3["grand_totals"],
+                        "categories": FAKE_E3["categories"]}}
+
+
+def test_a_copy_kept_on_the_device_is_kept_for_every_device(app):
+    main, db = app
+    r = _client(main, "b1").post("/analysis/latest", json=_device_copy())
+    assert r.json() == {"ok": True, "kept": True}
+    body = _client(main, "b1").get("/analysis/latest").json()
+    assert body["engine3"]["payload"]["posGrandTotals"]["gross_revenue"] == 215529.3
+    assert body["engine3"]["from_device"] is True
+
+
+def test_a_device_copy_never_replaces_a_newer_upload_or_a_reset(app):
+    main, db = app
+    _client(main).post("/upload", headers={"X-Business-Id": "b1"},
+                       files={"file": ("new.xls", io.BytesIO(b"x"), "application/vnd.ms-excel")})
+    assert _client(main, "b1").post("/analysis/latest", json=_device_copy()).json()["kept"] is False
+    assert _client(main, "b1").get("/analysis/latest").json()["engine3"]["filename"] == "new.xls"
+    main._forget_after_reset(db, _ctx("b1"), None)
+    assert _client(main, "b1").post("/analysis/latest", json=_device_copy()).json()["kept"] is False
+    assert _client(main, "b1").get("/analysis/latest").json()["engine3"] == {"cleared": True}
+
+
+def test_a_device_copy_must_be_a_real_till_analysis(app):
+    main, db = app
+    bad = {"engine": "engine3", "payload": {"hasEngine3Data": True}}
+    assert _client(main, "b1").post("/analysis/latest", json=bad).status_code == 400
+    odd = {"engine": "engine1", "payload": {"monthly": []}}
+    assert _client(main, "b1").post("/analysis/latest", json=odd).status_code == 400

@@ -1555,9 +1555,42 @@ def latest_analysis(ctx: membership.Context = Depends(membership.require_context
         if value is None:
             value = _latest_from_cabinet(db, ctx, engine)
         # {"cleared": true} is Start fresh: these books were wiped, so the old
-        # file in the cabinet must not bring its figures back.
-        out[engine] = value if value and not value.get("cleared") else None
+        # file in the cabinet must not bring its figures back, and the app
+        # must not bring back its own copy either. It is passed on as is.
+        out[engine] = {"cleared": True} if value and value.get("cleared") else (value or None)
     return out
+
+
+class LatestAnalysisIn(BaseModel):
+    engine: str
+    filename: Optional[str] = None
+    payload: Dict[str, Any]
+
+
+@app.post("/analysis/latest")
+def save_latest_analysis(req: LatestAnalysisIn,
+                         ctx: membership.Context = Depends(membership.require_write)):
+    """The app hands back a till or customer analysis this server no longer
+    has (a file analysed before /analysis/latest, while the cabinet's storage
+    was not keeping copies). Kept as the business's latest so every device
+    gets it. Never replaces a newer one or undoes Start fresh."""
+    if req.engine not in ("engine3", "engine2"):
+        raise HTTPException(status_code=400, detail="engine must be engine3 or engine2.")
+    if len(json.dumps(req.payload, default=str)) > 2_000_000:
+        raise HTTPException(status_code=413, detail="That analysis is too large to keep.")
+    if req.engine == "engine3" and not req.payload.get("posGrandTotals"):
+        raise HTTPException(status_code=400, detail="A till analysis needs its totals.")
+    db = _require_db()
+    key = _latest_key(req.engine, ctx.business_id)
+    if memory.recall(db, ctx.tenant, _LATEST_KIND, key):
+        return {"ok": True, "kept": False}            # the server's own copy, or a reset, wins
+    from datetime import datetime, timezone
+    memory.remember(db, ctx.tenant, _LATEST_KIND, key, {
+        "at": datetime.now(timezone.utc).isoformat(), "cabinet_id": None,
+        "filename": (req.filename or "")[:200], "from_device": True,
+        "payload": _plain_json(req.payload),
+    })
+    return {"ok": True, "kept": True}
 
 
 @app.delete("/cabinet/{cabinet_id}")
