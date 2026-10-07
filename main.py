@@ -6959,19 +6959,20 @@ def sweep_pending_payments(db) -> dict:
     return out
 
 
+def _plan_email(to, subject, body, button):
+    """A plan email in AIBOS's own name, its button opening the app."""
+    label, link = button
+    url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
+    return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url), title="Your plan"))
+
+
 def run_plan_renewals() -> dict:
     """Remind the owners whose plan was paid for a fixed period (by mobile
     money before the switch to cards, or by hand) to set up card payment, so
     it renews automatically from then on. A card plan renews by itself and is
     never reminded."""
     db = get_db()
-
-    def _email(to, subject, body, button):
-        label, link = button
-        url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
-        return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url), title="Your plan"))
-
-    return billing_api.run_renewals(db, PLAN_PRICES, send_email=_email,
+    return billing_api.run_renewals(db, PLAN_PRICES, send_email=_plan_email,
                                     record=notify.record_notification,
                                     card_environment=paddle.environment())
 
@@ -7384,6 +7385,34 @@ def admin_announce(req: Announcement, user_id: str = Depends(require_user)):
                                                req.key, dry_run=req.dry_run)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class CardReminder(BaseModel):
+    # Names the send so nobody is reminded twice by it. Defaults to today's date.
+    key: str = ""
+    dry_run: bool = False
+
+
+@app.post("/admin/card-reminder")
+def admin_card_reminder(req: CardReminder, user_id: str = Depends(require_user)):
+    """Ask every account on a paid plan that a card is not paying for to put it
+    on a card (plans are card only since 25 September 2026): the bell, their
+    phone or computer, and an email with a "Set up card payment" button.
+
+    Only an AI-BOS administrator (membership.is_admin). `dry_run` answers who
+    would get it and shows the message, sending nothing."""
+    db = _require_db()
+    if not membership.is_admin(db, user_id):
+        raise HTTPException(status_code=403, detail="Only an AI-BOS administrator can send this.")
+    import webpush
+
+    def _push(db_, uid, title, body, link):
+        return int((webpush.send_to_user(db_, uid, title, body, link, wait=True,
+                                         extra={"tag": "card-reminder"}) or {}).get("sent") or 0)
+
+    return {"ok": True, **billing_api.card_drive(db, PLAN_PRICES, send_email=_plan_email, push=_push,
+                                                 key=req.key, dry_run=req.dry_run,
+                                                 card_environment=paddle.environment())}
 
 
 @app.get("/notifications")

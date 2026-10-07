@@ -307,6 +307,145 @@ def run_renewals(db, prices: dict, send_email=None,
         _RUN_LOCK.release()
 
 
+# ── One reminder to every paying account not on a card (admin, 7 Oct 2026) ───
+# The renewal run only asks an owner when their own date comes round, so an
+# account paid up to December would hear nothing for two months. This is the
+# owner's "tell them all now": every account on a paid plan that a card is not
+# paying for is asked once to put it on a card, in the bell, on their phone or
+# computer, and by email.
+
+CARD_DRIVE_KIND = "plan_card_reminder"
+
+
+def card_drive_audience(db, prices: dict, now: datetime | None = None,
+                        card_environment: str | None = None) -> list:
+    """The accounts to ask: on a paid plan, bought for a period (tier_source
+    'payment'), still on or in their grace week, and no card paying for it.
+
+    Left out on purpose: a card plan (Paddle renews it, and asking invites a
+    second payment), the Free plan (nothing to pay), a plan AIBOS set up with
+    no end date, and a plan that has already switched off."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        res = (db.table("profiles")
+               .select("id,tier,tier_source,paid_until,email,contact_email")
+               .eq("tier_source", "payment").limit(5000).execute())
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — pre-0033: no paid periods
+        log.info("[billing] card reminder audience unreadable: %s", e)
+        return []
+    live = []
+    for p in rows:
+        until = _parse(p.get("paid_until")) if p.get("paid_until") else None
+        if p.get("tier") not in prices or not p.get("id"):
+            continue
+        if until is not None and now > until + timedelta(days=GRACE_DAYS):
+            continue
+        live.append(p)
+    by_card = card_renews_itself(db, [p["id"] for p in live], card_environment)
+    return [p for p in live if p["id"] not in by_card]
+
+
+def card_drive_message(plan: str, billing: str, amount: float,
+                       paid_until: datetime | None, now: datetime) -> tuple[str, str]:
+    """The reminder in plain words, for one account. Pure."""
+    name = PLAN_NAMES.get(plan, plan.capitalize())
+    period = "year" if billing == "annual" else "month"
+    renews = f"It then renews automatically for {money(amount)} each {period} until you cancel."
+    title = "Update your payment details: AIBOS is card only now"
+    lead = "AIBOS plans are now paid by card only."
+    if paid_until is None:
+        return title, f"{lead} Add your card to keep your {name} plan on. {renews}"
+    if now <= paid_until:
+        return title, (f"{lead} Your {name} plan is paid up to {_day(paid_until)}. Add your card "
+                       f"before then and it carries on without a gap. {renews}")
+    off = paid_until + timedelta(days=GRACE_DAYS)
+    return title, (f"{lead} Your {name} plan was due on {_day(paid_until)} and switches off on "
+                   f"{_day(off)}. Add your card to keep everything on. {renews}")
+
+
+def card_drive(db, prices: dict, send_email=None, push=None, key: str = "",
+               dry_run: bool = False, now: datetime | None = None,
+               card_environment: str | None = None, budget_seconds: float = 25.0) -> dict:
+    """Ask every account in card_drive_audience to put its plan on a card.
+
+    ONCE PER KEY: the bell row is stamped with `key` and migration 0030's
+    unique index refuses a second copy, so pressing Send again (or a retry
+    after a timeout) never reaches anyone twice. The email and the phone go
+    only with a bell row that is new.
+
+    OUT OF TIME, THE REST WAIT: accounts are taken one at a time inside the
+    time budget; whoever is left is counted in `remaining` and a second press
+    reaches them, skipping everyone already told.
+
+    `dry_run` counts who would get it and shows the first message, sending
+    nothing. send_email(to, subject, body, button) -> bool and
+    push(db, user_id, title, body, link) -> int are injected for tests."""
+    import time
+
+    now = now or datetime.now(timezone.utc)
+    key = key or f"card-only-{now.astimezone(LUSAKA).date().isoformat()}"
+    stamp = f"card-drive:{key}"
+    people = card_drive_audience(db, prices, now, card_environment)
+    try:
+        devices = {r["user_id"] for r in
+                   (getattr(db.table("push_subscriptions").select("user_id").limit(5000).execute(),
+                            "data", None) or []) if r.get("user_id")}
+    except Exception as e:  # noqa: BLE001 — pre-0036: nobody has notifications on
+        log.info("[billing] no devices for the card reminder: %s", e)
+        devices = set()
+
+    def _for(p):
+        plan = p["tier"]
+        billing = _billing_of(db, p["id"])
+        amount = float(prices[plan][billing])
+        title, body = card_drive_message(plan, billing, amount, _parse(p.get("paid_until"))
+                                         if p.get("paid_until") else None, now)
+        return plan, billing, amount, title, body, f"/checkout?plan={plan}&billing={billing}"
+
+    emails = [p for p in people if (p.get("contact_email") or p.get("email") or "").strip()]
+    out = {"key": key, "people": len(people), "with_email": len(emails),
+           "with_devices": len([p for p in people if p["id"] in devices]),
+           "told": 0, "already": 0, "emailed": 0, "pushed": 0, "remaining": 0, "errors": 0}
+    if dry_run:
+        sample = None
+        if people:
+            _, _, _, title, body, link = _for(people[0])
+            sample = {"title": title, "body": body, "button": SET_UP_CARD, "link": link}
+        return {**out, "dry_run": True, "sample": sample}
+
+    deadline = time.time() + budget_seconds
+    for i, p in enumerate(people):
+        if time.time() > deadline:
+            out["remaining"] = len(people) - i      # a second press reaches them
+            break
+        try:
+            plan, billing, amount, title, body, link = _for(p)
+            try:
+                db.table("notifications").insert({
+                    "user_id": p["id"], "kind": CARD_DRIVE_KIND, "title": title, "body": body,
+                    "link": link, "meta": {"booking_id": stamp, "plan": plan, "billing": billing,
+                                           "amount": amount},
+                }).execute()
+            except Exception as e:  # noqa: BLE001
+                text = str(e).lower()
+                if "duplicate" in text or "23505" in text:
+                    out["already"] += 1          # told on an earlier press
+                    continue
+                raise
+            out["told"] += 1
+            to = (p.get("contact_email") or p.get("email") or "").strip()
+            if to and send_email is not None and send_email(to, title, body, (SET_UP_CARD, link)):
+                out["emailed"] += 1
+            if p["id"] in devices and push is not None:
+                out["pushed"] += int(push(db, p["id"], title, body, link) or 0)
+        except Exception as e:  # noqa: BLE001 — one account must not stop the rest
+            out["errors"] += 1
+            log.warning("[billing] card reminder for %s failed: %s", p.get("id"), e)
+    log.info("[billing] card reminder %s: %s", key, out)
+    return out
+
+
 # ── What the customer sees (Plan & billing page, receipts) ───────────────────
 # Only the admin could see a customer's plan end date and payments. The owner
 # found out their plan was ending from a reminder, and had nowhere to look up
