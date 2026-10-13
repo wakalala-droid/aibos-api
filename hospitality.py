@@ -979,12 +979,17 @@ def _booking_payments(db, user_id: str, booking_id: str) -> list:
 
 
 def _payment_payload(booking: dict, sale_payload: dict, amount: float) -> dict:
-    method = str(booking.get("payment_method") or "").strip().lower()
+    # How the guest paid, when the booking says (the owner says it when marking
+    # the stay paid). Never guessed: a payment that does not say used to go in
+    # as cash, so money paid into the bank showed in the cash drawer. It goes
+    # to "Not said how" on the Money page instead, where the owner can say.
+    method = nervous.twin.method_key(booking.get("payment_method"))
+    said = method if nervous.twin.method_bucket(method) != "unsaid" else None
     return {
         "amount": round(amount, 2),
         "currency": sale_payload.get("currency") or booking.get("currency") or "ZMW",
         "customer": sale_payload.get("customer") or _customer_name(None, None, booking),
-        "payment_method": method if method in ("cash", "mobile_money", "card", "bank") else "cash",
+        **({"payment_method": said} if said else {}),
         "unit_id": booking.get("unit_id"),
         "booking_id": booking.get("id"),
         "guest_id": booking.get("guest_id"),
@@ -2648,7 +2653,8 @@ def list_booking_payments(db, user_id: str, booking_id: str) -> list:
         "id": r.get("id"),
         "date": str(r.get("occurred_at") or "")[:10],
         "amount": round(_num((r.get("payload") or {}).get("amount"), 0.0), 2),
-        "method": (r.get("payload") or {}).get("payment_method") or "cash",
+        # As the entry says it, or None: "Not said how" is shown as that.
+        "method": (r.get("payload") or {}).get("payment_method") or None,
     } for r in rows]
     out.sort(key=lambda p: (p["date"], p["id"] or ""))
     return out

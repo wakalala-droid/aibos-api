@@ -20,7 +20,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Query, Depends, Body, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ─── Engine imports ──────────────────────────────────────────────────────────
 from engine import run_engine1
@@ -59,6 +59,7 @@ import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
 import books_check
+import books_views
 import debtors as debtors_api
 import cash_forecast as cash_forecast_api
 import rec_store
@@ -5290,7 +5291,10 @@ def get_parties(kind: Optional[str] = Query(None),
     # (UI/UX audit 2026-10 A24): their entries stay in the books untouched.
     rows = [r for r in rows if parties_api.looks_like_name(r.get("name"))]
     if rows:
-        events = nervous.list_events(db, ctx.tenant, limit=2000, business_id=ctx.business_id)
+        # Every confirmed entry, not the newest 2,000 of any status: a
+        # contact's totals are money, and money counts what is confirmed.
+        events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000,
+                                     business_id=ctx.business_id)
         stats = parties_api.party_stats(events)
         for r in rows:
             r["stats"] = stats.get(r.get("normalized_key"), None)
@@ -5471,11 +5475,17 @@ def _staff_may_not_touch_money(ctx: membership.Context, body: Optional[Dict[str,
 
 
 @app.post("/invoices/{invoice_id}/mark-paid")
-def mark_invoice_paid(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
+def mark_invoice_paid(invoice_id: str, body: Optional[Dict[str, Any]] = Body(None),
+                      ctx: membership.Context = Depends(membership.require_write)):
+    """The owner saw the money arrive some other way. `payment_method` says how
+    (cash, mobile_money, bank or card), so it lands where it sits on the Money
+    page; an older app that sends nothing still settles the invoice."""
     _staff_may_not_touch_money(ctx)
     db = _require_db()
+    paid_by = (body or {}).get("payment_method")
     try:
-        return {"ok": True, "invoice": invoices_api.mark_paid(db, ctx.tenant, invoice_id)}
+        return {"ok": True, "invoice": invoices_api.mark_paid(
+            db, ctx.tenant, invoice_id, paid_by=twin.method_key(paid_by) if paid_by else None)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -5531,7 +5541,9 @@ def get_debtors(business_name: Optional[str] = Query(None),
     it from their own phone."""
     db = _require_db()
     invoices = invoices_api.list_invoices(db, ctx.tenant, business_id=ctx.business_id)
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
+    # Every confirmed entry: what customers owe must add up to the receivables
+    # on Home, and the newest 10,000 alone did not for a busy business.
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=ctx.business_id)
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
     report = debtors_api.aging_report(invoices, events)
@@ -6256,15 +6268,21 @@ def cash_forecast_route(ctx: membership.Context = Depends(membership.require_con
     """P10/P50/P90 cash bands from the caller's own monthly history (audit
     #19). Ungated like the other Engine-1 sub-features' free preview."""
     db = _require_db()
-    state = twin.get_state(db, ctx.tenant, ctx.business_id)
-    return {"ok": True, "forecast": cash_forecast_api.forecast_cash(state)}
+    biz = twin._books_for(db, ctx.tenant, ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, biz)
+    # From the money that actually moved each month, not the profit and loss
+    # (books_views.cash_months), so the outlook starts from and moves like the
+    # money figure itself.
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz)
+    return {"ok": True, "forecast": cash_forecast_api.forecast_cash(
+        state, cash_months=books_views.cash_months(events))}
 
 
 @app.get("/investigate")
 def investigate_anomaly(month: Optional[str] = Query(None),
                               ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=ctx.business_id)
     result = (investigate_api.investigate_month(events, month)
               if month else investigate_api.auto_investigation(events))
     return {"ok": True, "investigation": result}
@@ -6278,7 +6296,7 @@ def customers_intelligence(ctx: membership.Context = Depends(membership.require_
     living-model counterpart of the upload flow. Pro feature, same gate."""
     entitlements.require_feature(ctx.tenant, "engine2")
     db = _require_db()
-    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=10000, business_id=ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=ctx.business_id)
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     sym = "K" if state.get("currency", "ZMW") == "ZMW" else state.get("currency", "K")
     try:
@@ -7809,6 +7827,147 @@ def twin_cash_by_method(ctx: membership.Context = Depends(membership.require_con
                                  business_id=twin._books_for(db, ctx.tenant, ctx.business_id))
     split = twin.cash_by_method(events, state.get("opening_cash") or 0.0)
     return {"ok": True, **split, "cash": round(float(state.get("cash") or 0.0), 2)}
+
+
+# ── The money views (books_views.py): every money figure from one read ───────
+
+def _sees_money(ctx: "membership.Context") -> None:
+    """The money pages are the owner's and the accountant's, as on screen."""
+    if ctx.role not in ("owner", "accountant"):
+        raise HTTPException(status_code=403, detail="Only the owner or the accountant can see the money.")
+
+
+def _money_books(db, ctx: "membership.Context") -> Dict[str, Any]:
+    """One business's money, read once: the twin's state and every confirmed
+    entry behind it. When the stored money figure has fallen behind its
+    entries it is counted again here, so every figure in the reply agrees."""
+    biz = twin._books_for(db, ctx.tenant, ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, biz)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz)
+    split = twin.cash_by_method(events, state.get("opening_cash") or 0.0)
+    if abs(split["total"] - float(state.get("cash") or 0.0)) >= 0.005:
+        logger.warning("[books] money figure for %s was behind its entries (%.2f, entries say %.2f): "
+                       "counting it again", ctx.tenant, float(state.get("cash") or 0.0), split["total"])
+        state = twin.rebuild(db, ctx.tenant, biz)
+    return {"biz": biz, "state": state, "events": events, "split": split}
+
+
+@app.get("/books/money")
+def books_money(days: int = Query(30, ge=1, le=400), tz: int = Query(0, ge=-840, le=840),
+                ctx: membership.Context = Depends(membership.require_context)):
+    """The money right now and everything said about it, from one read of the
+    confirmed entries: where it sits, the line of the last `days` days on the
+    owner's calendar (`tz` minutes from UTC), money in and out each month, how
+    long it lasts, and what is still waiting for the owner (in no figure yet)."""
+    _sees_money(ctx)
+    db = _require_db()
+    books = _money_books(db, ctx)
+    split = books["split"]
+    pending = nervous.list_events(db, ctx.tenant, status="pending", limit=20000, business_id=books["biz"])
+    months = books_views.cash_months(books["events"])
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    local_now = _dt.now(_tz.utc) + _td(minutes=tz)
+    return {
+        "ok": True,
+        "cash": split["total"],
+        "opening": split["opening"],
+        "split": split,
+        "line": books_views.money_line(books["events"], split["total"], days, tz),
+        "months": months,
+        "lasts": books_views.how_long(split["total"], months, local_now.strftime("%Y-%m")),
+        "waiting": books_views.waiting(pending),
+        "entries": len(books["events"]),
+    }
+
+
+@app.get("/books/how-paid")
+def books_how_paid(how: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
+    """The entries behind one "Where it is" figure (cash, mobile_money, bank or
+    unsaid), newest first, each with what it adds to that figure. They add up
+    to the figure exactly; `figure` is the figure itself, to hold them against."""
+    _sees_money(ctx)
+    if how not in books_views.HOW:
+        raise HTTPException(status_code=400, detail="Ask for cash, mobile_money, bank or unsaid.")
+    books = _money_books(_require_db(), ctx)
+    return {"ok": True, **books_views.how_paid(books["events"], how), "figure": books["split"][how]}
+
+
+class SayHow(BaseModel):
+    how: Optional[str] = None            # cash | mobile_money | bank | card
+    from_: Optional[str] = Field(None, alias="from")
+    to: Optional[str] = None
+
+
+@app.post("/books/how-paid/{event_id}")
+def books_say_how(event_id: str, body: SayHow, ctx: membership.Context = Depends(membership.require_owner)):
+    """Say how an entry's money moved: cash, mobile money, bank or card; for
+    money moved between places, where it came from and where it went. The
+    owner's, like every change to a confirmed entry. Saved as a correction, so
+    the entry's history shows what was changed and by whom."""
+    db = _require_db()
+    try:
+        ev = nervous._get_event(db, ctx.tenant, event_id)
+    except nervous.PipelineError:
+        raise HTTPException(status_code=404, detail="That entry is not in your books.")
+    if ev.get("status") == "void":
+        raise HTTPException(status_code=400, detail="That entry was removed from your books.")
+    if ev.get("event_type") == "Transfer":
+        sides = {"from": body.from_, "to": body.to}
+        if any(v is None or twin.method_bucket(v) == "unsaid" for v in sides.values()):
+            raise HTTPException(status_code=400, detail="Say where the money came from and where it went: cash, mobile money or bank.")
+        if twin.method_bucket(sides["from"]) == twin.method_bucket(sides["to"]):
+            raise HTTPException(status_code=400, detail="The money has to come from one place and go to another.")
+        patch = {"from": twin.method_key(sides["from"]), "to": twin.method_key(sides["to"])}
+    else:
+        how = twin.method_key(body.how)
+        if how not in books_views.SAY_HOW:
+            raise HTTPException(status_code=400, detail="Choose cash, mobile money, bank or card.")
+        if not twin.cash_direction(ev.get("event_type"), ev.get("payload") or {}):
+            raise HTTPException(status_code=400, detail=(
+                "No money moved on this entry: a sale or purchase on credit is money owed. "
+                "Record the payment when it is made and say how then."))
+        patch = {"payment_method": how}
+    try:
+        saved = nervous.correct(db, ctx.tenant, event_id, {"payload": patch},
+                                actor_role=ctx.role, actor_id=ctx.actor)
+    except nervous.PipelineError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    books = _money_books(db, ctx)
+    return {"ok": True, "event": saved, "split": books["split"]}
+
+
+@app.get("/books/money-out")
+def books_money_out(start: Optional[str] = Query(None), end: Optional[str] = Query(None),
+                    ctx: membership.Context = Depends(membership.require_context)):
+    """Where the money went between `start` (included) and `end` (left out),
+    ISO timestamps; everything when they are left out. Confirmed entries only,
+    every one of them, by what each was for."""
+    _sees_money(ctx)
+
+    def when(value):
+        if not value:
+            return None
+        parsed = books_views._parse(value)
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="start and end must be dates, like 2026-10-01T00:00:00Z.")
+        return parsed
+
+    books = _money_books(_require_db(), ctx)
+    return {"ok": True, **books_views.money_out(books["events"], when(start), when(end))}
+
+
+@app.get("/books/costs")
+def books_costs(tz: int = Query(0, ge=-840, le=840),
+                ctx: membership.Context = Depends(membership.require_context)):
+    """What a month costs whatever is sold and what grows with sales, from the
+    recorded entries (books_views.cost_split), for the breakeven."""
+    _sees_money(ctx)
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    db = _require_db()
+    biz = twin._books_for(db, ctx.tenant, ctx.business_id)
+    events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz)
+    month = (_dt.now(_tz.utc) + _td(minutes=tz)).strftime("%Y-%m")
+    return {"ok": True, "costs": books_views.cost_split(events, month)}
 
 
 @app.get("/twin/financials")

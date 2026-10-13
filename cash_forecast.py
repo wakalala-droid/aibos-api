@@ -6,7 +6,8 @@ next three months of cash are projected as P10 / P50 / P90 bands — honest
 uncertainty on display instead of a single fabricated-precision line.
 
 Method (deterministic, assumptions stated in the payload):
-  • monthly net = revenue − costs from the twin's monthly[] (cash-basis fold);
+  • monthly net = money in less money out from trading (books_views.cash_months),
+    or revenue − costs from the twin's monthly[] when the entries are not to hand;
   • the current calendar month is EXCLUDED from the baseline — it's mid-
     flight and would drag the mean;
   • cumulative net over h months ≈ Normal(h·μ, σ·√h); cash bands follow.
@@ -36,14 +37,29 @@ def _num(v, d=0.0):
         return d
 
 
-def forecast_cash(state: dict, today: str | None = None, horizon: int = HORIZON) -> dict:
-    """Twin state → {"bands": [{month_ahead, p10, p50, p90}], assumptions,…}."""
+def forecast_cash(state: dict, today: str | None = None, horizon: int = HORIZON,
+                  cash_months: list | None = None) -> dict:
+    """Twin state → {"bands": [{month_ahead, p10, p50, p90}], assumptions,…}.
+
+    `cash_months` (books_views.cash_months) is the money that actually came in
+    and went out each month. With it the trend is what trading brings in less
+    what it takes, which is what the money figure moves by. Without it the
+    profit and loss stands in, as it always did: a stay booked on credit then
+    counts as money in the month it was booked, and stock, equipment and a
+    loan repaid never count as money out."""
     today = today or datetime.now(timezone.utc).isoformat()
     current_month = str(today)[:7]
 
-    monthly = [m for m in (state.get("monthly") or [])
-               if m.get("month") and m["month"] != current_month]
-    nets = [_num(m.get("revenue")) - _num(m.get("costs")) for m in monthly]
+    if cash_months is not None:
+        done = [m for m in cash_months if m.get("month") and m["month"] < current_month]
+        nets = [_num(m.get("trading_in")) - _num(m.get("trading_out")) for m in done]
+        basis = ("money in and out from trading (loans, equipment and money moved "
+                 "between your accounts are left out: they are one-offs)")
+    else:
+        monthly = [m for m in (state.get("monthly") or [])
+                   if m.get("month") and m["month"] != current_month]
+        nets = [_num(m.get("revenue")) - _num(m.get("costs")) for m in monthly]
+        basis = "net cashflow"
     n = len(nets)
     if n < MIN_MONTHS:
         return {"ok": False,
@@ -83,7 +99,7 @@ def forecast_cash(state: dict, today: str | None = None, horizon: int = HORIZON)
         "bands": bands,
         "runway_p10_months": runway_p10,
         "assumptions": [
-            f"Based on your {n} completed months of recorded net cashflow "
+            f"Based on your {n} completed months of recorded {basis} "
             f"(the current month is excluded as incomplete).",
             "Future months are assumed to look like your own history — no growth "
             "or seasonality is invented.",

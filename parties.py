@@ -101,31 +101,33 @@ def merge_kind(existing: str, incoming: str) -> str:
 
 def party_stats(events: list) -> dict:
     """
-    {normalized_key: stats} folded from events in one pass. Pure; void events
-    are skipped like every other projection.
+    {normalized_key: stats} folded from events in one pass. Pure; only
+    CONFIRMED entries count, like every other figure: a spreadsheet of sales
+    still waiting for the owner used to show as money a customer had spent.
+    Added up in whole ngwee.
 
     Sale amounts are revenue and Purchase/Expense amounts are spend;
     Customer/SupplierPayment are settlements of those, so they are tracked
     separately rather than summed into value (no double counting).
     """
+    import money
+
     stats: dict = {}
+    money_keys = ("revenue", "payments_in", "spend", "payments_out")
 
     def _bucket(key):
         return stats.setdefault(key, {
-            "revenue": 0.0, "payments_in": 0.0, "spend": 0.0, "payments_out": 0.0,
+            "revenue": 0, "payments_in": 0, "spend": 0, "payments_out": 0,
             "txn_count": 0, "first_seen": None, "last_seen": None,
         })
 
     for ev in events or []:
-        if ev.get("status") == "void":
+        if ev.get("status") not in (None, "confirmed"):
             continue
         p = ev.get("payload") or {}
         et = ev.get("event_type")
         when = ev.get("occurred_at")
-        try:
-            amount = float(p.get("amount") or 0)
-        except (TypeError, ValueError):
-            amount = 0.0
+        amount = money.ngwee(p.get("amount"))
 
         for mention in extract_parties(p):
             b = _bucket(mention["key"])
@@ -150,6 +152,9 @@ def party_stats(events: list) -> dict:
                     b["payments_out"] += amount
                 elif et == "Refund":
                     b["spend"] -= amount
+    for b in stats.values():
+        for k in money_keys:
+            b[k] = money.kwacha(b[k])
     return stats
 
 

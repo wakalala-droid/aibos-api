@@ -54,7 +54,9 @@ def _rows(db, table: str, user_id: str, order: str = "id") -> list | None:
 
 
 def _k(value) -> str:
-    return f"K{money.kwacha(money.ngwee(value)):,.2f}"
+    """K1,234.50, and −K200.00 (the sign before the K) for a figure below nothing."""
+    v = money.kwacha(money.ngwee(value))
+    return f"{'−' if v < 0 else ''}K{abs(v):,.2f}"
 
 
 def _day(value) -> str:
@@ -349,6 +351,57 @@ def check(db, user_id: str, heal: bool = True, now: datetime | None = None) -> d
                 "it belongs in the books and your money figure is too high by that much.",
                 amount=p.get("amount"), ref=e.get("id"), link="/dashboard/employees")
 
+    # ── 9. What customers owe, by name, against "Owed to you" ─────────────────
+    # Home shows the receivables; Invoices lists who owes what. The two are
+    # worked out differently (a running total; each customer's sales less their
+    # payments), and a payment that names nobody, or more than that customer
+    # owed, lowers the first and not the second. Said with the payments behind it.
+    import debtors
+    for state in states:
+        bid = state.get("business_id")
+        mine = [e for e in confirmed if bid is None or e.get("business_id") == bid]
+        invs = [i for i in invoices if bid is None or i.get("business_id") in (None, bid)]
+        owed = debtors.aging_report(invs, mine, today=now.isoformat())["totals"]["all"]
+        if money.ngwee(owed) == money.ngwee(state.get("receivables")):
+            continue
+        loose: dict = defaultdict(int)
+        for e in mine:
+            p = e.get("payload") or {}
+            if (e.get("event_type") == "Sale" and str(p.get("payment_method") or "").lower() == "credit"
+                    and not p.get("invoice_number")):
+                loose[debtors.normalize_key(p.get("customer") or "")] += money.ngwee(p.get("amount"))
+        odd = []
+        for e in mine:
+            p = e.get("payload") or {}
+            if e.get("event_type") != "CustomerPayment" or p.get("invoice_number"):
+                continue
+            key = debtors.normalize_key(p.get("customer") or "")
+            if not key:
+                odd.append(f"{_k(p.get('amount'))} on {_day(e.get('occurred_at'))} names no customer")
+            else:
+                loose[key] -= money.ngwee(p.get("amount"))
+                if loose[key] < 0:
+                    odd.append(f"{p.get('customer')} has paid {_k(-money.kwacha(loose[key]))} more than they owed")
+                    loose[key] = 0
+        problem("owed_differs",
+                f"Owed to you shows {_k(state.get('receivables'))}, but your customers' own sales and payments "
+                f"add up to {_k(owed)}."
+                + (f" Payments that do not match a sale on credit: {'; '.join(odd[:3])}." if odd else "")
+                + " Put the customer's name on each payment so both agree.",
+                amount=money.total([owed, -money.dec(state.get("receivables"))]), link="/dashboard/timeline?type=CustomerPayment")
+
+    # ── 10. Money that does not say how it moved ──────────────────────────────
+    # The total is right; only where it sits is unknown. Not a money problem,
+    # a note with the way to put it right.
+    import books_views
+    unsaid = books_views.how_paid(confirmed, "unsaid")
+    if unsaid["count"]:
+        problem("not_said_how",
+                f"{unsaid['count']} entr{'y does' if unsaid['count'] == 1 else 'ies do'} not say how the money "
+                f"moved ({_k(abs(unsaid['total']))}), so it shows under Not said how. Say cash, mobile money "
+                "or bank for each and the drawer, the wallet and the bank show what they really hold.",
+                amount=abs(unsaid["total"]), link="/dashboard/cash?how=unsaid", money_problem=False)
+
     money_problems = [p for p in problems if p["money"]]
     return {
         "ok": not money_problems,
@@ -359,7 +412,7 @@ def check(db, user_id: str, heal: bool = True, now: datetime | None = None) -> d
         "problem_count": len(problems),
         "money_problem_count": len(money_problems),
         "healed": healed,
-        "summary": _summary(len(live), len(money_problems), len(problems), healed),
+        "summary": _summary(len(live), len(money_problems), problems, healed),
     }
 
 
@@ -368,15 +421,18 @@ def _num(v) -> float:
     return float(d) if d is not None else 0.0
 
 
-def _summary(entries: int, money_problems: int, problems: int, healed: list) -> str:
+def _summary(entries: int, money_problems: int, problems: list, healed: list) -> str:
     if money_problems:
         return (f"{money_problems} thing{'s' if money_problems != 1 else ''} in the books "
                 f"need{'s' if money_problems == 1 else ''} a look. Each is listed with what to do.")
     text = f"Every one of {entries:,} entries checked: the books agree with every invoice, payment, stay and payslip, to the ngwee."
     if healed:
         text += " The totals were counted again from the entries."
-    if problems:
+    kinds = {p["kind"] for p in problems}
+    if "amount_below_a_ngwee" in kinds:
         text += " Nothing is missing; a few entries carry a fraction of a ngwee and are counted to the nearest one."
+    if "not_said_how" in kinds:
+        text += " Some entries do not say how the money moved: listed below to put right."
     return text
 
 

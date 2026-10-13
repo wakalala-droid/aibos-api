@@ -33,7 +33,10 @@ import llm
 log = logging.getLogger("aibos.cfo_tools")
 
 MAX_TOOL_ROUNDS = 4
-_EVENT_SCAN_CAP = 2000
+# Every confirmed entry, not the newest 2,000: a total over a year, what a
+# customer owes or a month's drivers worked out from a slice disagreed with
+# the money figure on screen for any business busier than that.
+_EVENT_SCAN_CAP = 200000
 
 
 # ── Tool schemas (OpenAI function-calling format) ─────────────────────────────
@@ -151,12 +154,29 @@ def _books(db, user_id, business_id):
     return twin._books_for(db, user_id, business_id)
 
 
+def _stock_value(db, user_id, biz):
+    """What the stock on hand is worth at buy price, as the Stock page shows it,
+    or None when there is no catalog to count."""
+    prods = products_api.list_products(db, user_id, business_id=biz)
+    if not prods:
+        return None
+    events = nervous.list_events(db, user_id, status="confirmed", limit=200000, business_id=biz,
+                                 event_types=("InventoryReceipt", "Sale", "InventoryAdjustment"))
+    return products_api.stock_value(prods, products_api.compute_stock(prods, events))
+
+
 def _snapshot(db, user_id, business_id=None):
-    s = twin.get_state(db, user_id, business_id)
-    keep = ("cash", "opening_cash", "receivables", "payables", "inventory_value",
+    biz = _books(db, user_id, business_id)
+    s = twin.get_state(db, user_id, biz)
+    # Not the twin's inventory_value: that adds up every delivery ever received
+    # and never comes down when stock is sold. stock_value is the stock on hand.
+    keep = ("cash", "opening_cash", "receivables", "payables",
             "total_revenue", "total_costs", "total_profit", "avg_margin",
             "event_count", "currency", "health_label")
     out = {k: s.get(k) for k in keep if k in s}
+    value = _stock_value(db, user_id, biz)
+    if value is not None:
+        out["stock_value"] = value
     monthly = s.get("monthly") or []
     out["monthly_recent"] = monthly[-6:]
     return out
@@ -188,17 +208,28 @@ def _query_events(db, user_id, args, business_id=None):
             continue
         matches.append(ev)
 
-    total = sum(_num((e.get("payload") or {}).get("amount")) for e in matches)
+    import books_views
+    import money
     slim = [{
         "id": e.get("id"),
         "date": str(e.get("occurred_at") or "")[:10],
         "type": e.get("event_type"),
         "amount": _num((e.get("payload") or {}).get("amount")),
         **{k: (e.get("payload") or {}).get(k)
-           for k in ("customer", "supplier", "category", "note") if (e.get("payload") or {}).get(k)},
+           for k in ("customer", "supplier", "category", "payment_method", "note")
+           if (e.get("payload") or {}).get(k)},
     } for e in matches[:limit]]
-    return {"count": len(matches), "total_amount": round(total, 2),
-            "events": slim, "truncated": len(matches) > limit}
+    moved = [books_views.movement(e) for e in matches]
+    out = {"count": len(matches), "events": slim, "truncated": len(matches) > limit,
+           # By the money figure's own rule: a sale on credit is in neither.
+           "money_in": money.kwacha(sum(m for m in moved if m > 0)),
+           "money_out": money.kwacha(-sum(m for m in moved if m < 0))}
+    # Sales and expenses added together are not a figure anyone means.
+    if len({e.get("event_type") for e in matches}) <= 1:
+        out["total_amount"] = money.total((e.get("payload") or {}).get("amount") for e in matches)
+    else:
+        out["note"] = "Several kinds of entry: use money_in and money_out, or filter by event_type for a total."
+    return out
 
 
 def _list_products(db, user_id, args, business_id=None):
@@ -214,9 +245,10 @@ def _list_products(db, user_id, args, business_id=None):
     slim = [{
         "name": p.get("name"), "on_hand": stock.get(products_api.normalize_name(p.get("name")), 0),
         "reorder_level": p.get("reorder_level"), "sell_price": p.get("sell_price"),
-        "unit": p.get("unit"),
+        "buy_price": p.get("buy_price"), "unit": p.get("unit"),
     } for p in prods[:50]]
-    return {"products": slim, "count": len(prods), "low_stock_count": len(low)}
+    return {"products": slim, "count": len(prods), "low_stock_count": len(low),
+            "stock_value": products_api.stock_value(prods, stock)}
 
 
 def _upcoming_schedule(db, user_id, args, business_id=None):
@@ -307,6 +339,16 @@ def _investigate(db, user_id, args, business_id=None):
             if month else investigate.auto_investigation(events))
 
 
+def _cash_forecast(db, user_id, business_id=None):
+    """The cash outlook as the Money page shows it: from the money that moved
+    each month (books_views.cash_months), not the profit and loss."""
+    import books_views
+    biz = _books(db, user_id, business_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP, business_id=biz)
+    return cash_forecast.forecast_cash(twin.get_state(db, user_id, biz),
+                                       cash_months=books_views.cash_months(events))
+
+
 def _who_owes(db, user_id, args, business_id=None):
     import invoices as invoices_api
     import debtors
@@ -324,7 +366,7 @@ _EXECUTORS = {
     "get_business_snapshot": lambda db, uid, a, biz=None: _snapshot(db, uid, biz),
     "investigate_month": _investigate,
     "who_owes_me": _who_owes,
-    "cash_forecast": lambda db, uid, a, biz=None: cash_forecast.forecast_cash(twin.get_state(db, uid, biz)),
+    "cash_forecast": lambda db, uid, a, biz=None: _cash_forecast(db, uid, biz),
     "query_events": _query_events,
     "list_products": _list_products,
     "upcoming_schedule": _upcoming_schedule,

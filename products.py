@@ -125,6 +125,21 @@ def compute_stock(products: list, events: list | None = None) -> dict:
     return out
 
 
+def stock_value(products: list, stock: dict) -> float:
+    """What the stock on hand is worth at its buy price, to the ngwee: each
+    product's count (never below nothing) times its buy price, rounded half up,
+    then added up. The Stock page shows this same figure.
+
+    Not the books' inventory_value, which adds up every delivery ever received
+    and is never reduced when stock is sold: the assistant quoted that as
+    "your stock on hand is worth", and it only ever grew."""
+    import money
+    return money.total(
+        money.times(max(stock.get(normalize_name(p.get("name")), _num(p.get("opening_stock"))), 0.0),
+                    _num(p.get("buy_price")))
+        for p in products)
+
+
 def low_stock(products: list, stock: dict) -> list:
     """Products at/under their reorder level (only those with a level set)."""
     out = []

@@ -401,8 +401,13 @@ def get_by_pay_token(db, token: str) -> dict | None:
     return rows[0] if rows else None
 
 
+# How an owner may say a customer paid an invoice they mark paid themselves.
+PAID_BY = ("cash", "mobile_money", "bank", "card")
+
+
 def mark_paid(db, user_id: str, invoice_id: str,
-              method: str = "manual", reference: str | None = None) -> dict:
+              method: str = "manual", reference: str | None = None,
+              paid_by: str | None = None) -> dict:
     """Sent → paid. Posts the CustomerPayment (receivable settles into cash).
 
     ONE settlement path, two callers: the owner's "Mark paid" button (method
@@ -410,7 +415,14 @@ def mark_paid(db, user_id: str, invoice_id: str,
     (method 'mtn'/'airtel', carrying the provider reference for reconciliation).
     Keeping them on the same function is what stops the two from drifting into
     different accounting.
+
+    `paid_by` is how the owner says the customer paid (PAID_BY). The button
+    used to save the payment as paid "manual", which says nothing about where
+    the money went, so every invoice marked paid landed in "Not said how" on
+    the Money page.
     """
+    if paid_by is not None and paid_by not in PAID_BY:
+        raise ValueError("Say how the customer paid: cash, mobile money, bank or card.")
     inv = _get(db, user_id, invoice_id)
     if inv["status"] != "sent":
         raise ValueError(f"Only a sent invoice can be marked paid (this one is {inv['status']}).")
@@ -427,7 +439,7 @@ def mark_paid(db, user_id: str, invoice_id: str,
         "currency": inv.get("currency") or "ZMW",
         "customer": inv["customer_name"],
         "invoice_number": inv["number"],
-        "payment_method": method,
+        "payment_method": paid_by or method,
         "note": note,
     }
     if reference:

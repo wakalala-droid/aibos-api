@@ -84,17 +84,33 @@ def cash_direction(event_type: str, payload: dict | None) -> str:
 # Where the cash is (upgrade 9). The fold keeps one cash pool; this splits it by
 # how each payment was made, so an owner can see the cash drawer, the mobile
 # money wallet and the bank apart. Card payments settle into the bank.
+#
+# Read, never rewritten: an entry keeps the words it was saved with. Spreadsheets
+# and the AI say "Airtel Money", "bank transfer" or "POS" as often as "bank", and
+# each of those used to land in "Not said how" although it said exactly how.
 _METHOD_BUCKET = {
-    "cash": "cash",
-    "mobile_money": "mobile_money", "momo": "mobile_money", "mobile money": "mobile_money",
-    "mtn": "mobile_money", "airtel": "mobile_money", "zamtel": "mobile_money",
-    "bank": "bank", "card": "bank", "transfer": "bank", "eft": "bank", "cheque": "bank",
+    "cash": "cash", "petty_cash": "cash", "till": "cash", "cash_drawer": "cash",
+    "cash_in_hand": "cash",
+    "mobile_money": "mobile_money", "momo": "mobile_money", "mobile": "mobile_money",
+    "mtn": "mobile_money", "mtn_money": "mobile_money", "mtn_momo": "mobile_money",
+    "mtn_mobile_money": "mobile_money", "airtel": "mobile_money", "airtel_money": "mobile_money",
+    "zamtel": "mobile_money", "zamtel_kwacha": "mobile_money", "zamtel_money": "mobile_money",
+    "wallet": "mobile_money", "e_wallet": "mobile_money", "ewallet": "mobile_money",
+    "bank": "bank", "bank_transfer": "bank", "bank_deposit": "bank", "transfer": "bank",
+    "eft": "bank", "rtgs": "bank", "swift": "bank", "direct_deposit": "bank",
+    "cheque": "bank", "check": "bank", "card": "bank", "debit_card": "bank",
+    "credit_card": "bank", "visa": "bank", "mastercard": "bank", "pos": "bank", "swipe": "bank",
 }
+
+
+def method_key(method) -> str:
+    """A payment method as one lower-case word: "Airtel Money" is airtel_money."""
+    return "_".join(str(method or "").strip().lower().replace("-", " ").split())
 
 
 def method_bucket(method) -> str:
     """cash | mobile_money | bank | unsaid, from a payload's payment_method."""
-    return _METHOD_BUCKET.get(str(method or "").strip().lower().replace("-", "_"), "unsaid")
+    return _METHOD_BUCKET.get(method_key(method), "unsaid")
 
 
 def cash_by_method(events: list, opening_cash: float = 0.0) -> dict:

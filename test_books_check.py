@@ -43,7 +43,8 @@ def test_clean_books_agree_to_the_ngwee():
     db = _books()
     _invoice(db, 700.0, pay=True)
     _invoice(db, 250.55)
-    nervous.ingest(db, "u1", EventIn(event_type="Sale", payload={"amount": 99.99}, source="manual"))
+    nervous.ingest(db, "u1", EventIn(event_type="Sale", payload={"amount": 99.99, "payment_method": "cash"},
+                                     source="manual"))
     out = books_check.check(db, "u1")
     assert out["ok"] is True and out["problems"] == [], out["problems"]
     assert out["checked"]["invoices"] == 2 and out["checked"]["entries"] == 4
@@ -152,11 +153,35 @@ def test_a_fraction_of_a_ngwee_is_noted_but_is_not_a_money_problem():
     db.table("business_events").insert({
         "user_id": "u1", "event_type": "Expense", "status": "confirmed", "occurred_at": "2026-10-01",
         "business_id": db.rows["businesses"][0]["id"],
-        "payload": {"amount": 10.005, "category": "fuel"}}).execute()
+        "payload": {"amount": 10.005, "category": "fuel", "payment_method": "cash"}}).execute()
     twin.rebuild(db, "u1")
     out = books_check.check(db, "u1")
     assert out["ok"] is True and _kinds(out) == ["amount_below_a_ngwee"]
     assert "K10.01" in out["problems"][0]["message"]
+
+
+def test_money_that_does_not_say_how_it_moved_is_listed_to_put_right():
+    db = _books()
+    nervous.ingest(db, "u1", EventIn(event_type="Loan", payload={"amount": 13000, "direction": "repayment",
+                                                                  "lender": "Zanaco"}, source="manual"))
+    out = books_check.check(db, "u1")
+    assert out["ok"] is True                                   # the money is right, only where it sits is not
+    p = next(p for p in out["problems"] if p["kind"] == "not_said_how")
+    assert p["amount"] == 13000.0 and p["money"] is False and p["link"] == "/dashboard/cash?how=unsaid"
+    assert "Some entries do not say how" in out["summary"]
+
+
+def test_a_payment_of_more_than_was_owed_is_why_owed_differs():
+    db = _books()
+    nervous.ingest(db, "u1", EventIn(event_type="Sale", source="manual", payload={
+        "amount": 500, "payment_method": "credit", "customer": "Chanda"}))
+    nervous.ingest(db, "u1", EventIn(event_type="CustomerPayment", source="manual", payload={
+        "amount": 700, "customer": "chanda ", "payment_method": "cash"}))
+    out = books_check.check(db, "u1")
+    p = next(p for p in out["problems"] if p["kind"] == "owed_differs")
+    assert "Owed to you shows −K200.00" in p["message"], p["message"]
+    assert "add up to K0.00" in p["message"] and "has paid K200.00 more than they owed" in p["message"]
+    assert p["amount"] == 200.0
 
 
 # ── The pipeline keeps every figure to the ngwee ─────────────────────────────
