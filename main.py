@@ -58,6 +58,7 @@ import webpush
 import cabinet_store
 import whatsapp_bot
 import investigate as investigate_api
+import books_check
 import debtors as debtors_api
 import cash_forecast as cash_forecast_api
 import rec_store
@@ -4342,6 +4343,11 @@ def excel_commit_file(
 
     rows = _json_safe_frame(df).to_dict(orient="records")
     events, map_errors = ingestion.rows_to_events(rows, mapping_d, defaults_d)
+    # Every figure keeps the file, sheet and row it came from, so any amount
+    # in the books can be traced back to the line someone typed.
+    for ev in events:
+        ev.payload.update({"source_file": (file.filename or "")[:120], "source_sheet": str(selected or "")[:60],
+                           "import_id": fingerprint[:16]})
     result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
                                   actor_role=ctx.role, actor_id=ctx.actor)
     result["errors"] = _errors_by_row(len(rows), map_errors, result.get("errors", []))
@@ -5435,8 +5441,35 @@ def send_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.r
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# Money a person says has changed hands is the owner's to put in the books as
+# final. A staff member's ordinary entries already wait for the owner (the
+# spine makes them pending); these routes posted CONFIRMED money directly, so a
+# cashier could mark an invoice paid and keep the cash, and the books agreed.
+STAFF_MONEY_NOTE = ("Only the owner can record money as received, paid back or cancelled. "
+                    "Record it on the Record page, where the owner confirms it.")
+
+# Booking fields that change what a stay earns or what was paid for it.
+BOOKING_MONEY_FIELDS = ("total_amount", "payment_status", "deposit_amount", "kept_amount",
+                        "currency", "payment_method", "pay_request")
+
+
+def _staff_may_not_touch_money(ctx: membership.Context, body: Optional[Dict[str, Any]] = None) -> None:
+    """403 for anyone but the owner when `body` (or, with no body, the action
+    itself) changes money that has been received, kept or cancelled."""
+    if ctx.is_owner:
+        return
+    if body is None:
+        raise HTTPException(status_code=403, detail=STAFF_MONEY_NOTE)
+    touched = [k for k in BOOKING_MONEY_FIELDS if k in body]
+    if str(body.get("payment_status") or "unpaid") == "unpaid" and touched == ["payment_status"]:
+        return                                  # "not paid yet" moves no money
+    if touched or str(body.get("status") or "") in ("cancelled", "no_show"):
+        raise HTTPException(status_code=403, detail=STAFF_MONEY_NOTE)
+
+
 @app.post("/invoices/{invoice_id}/mark-paid")
 def mark_invoice_paid(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     db = _require_db()
     try:
         return {"ok": True, "invoice": invoices_api.mark_paid(db, ctx.tenant, invoice_id)}
@@ -5446,6 +5479,7 @@ def mark_invoice_paid(invoice_id: str, ctx: membership.Context = Depends(members
 
 @app.post("/invoices/{invoice_id}/cancel")
 def cancel_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     db = _require_db()
     try:
         return {"ok": True, "invoice": invoices_api.cancel_invoice(db, ctx.tenant, invoice_id)}
@@ -5647,6 +5681,35 @@ class PublicPayRequest(BaseModel):
     payer_phone: str
 
 
+# One prompt at a time (audit upgrade 2). A payer who taps Pay again while the
+# first request is still on their phone gets a second request, and approving
+# both paid twice. A second prompt to the SAME number is refused while the first
+# can still be approved; a different number (the first was mistyped, or another
+# phone will pay) is allowed.
+PROMPT_WAIT_SECONDS = 120
+
+
+def _prompt_still_waiting(db, table: str, key_col: str, key_val, phone: str) -> None:
+    """Refuse a new prompt to a phone that already has one waiting. A failed
+    check never stands between a payer and paying."""
+    from datetime import datetime, timedelta, timezone
+    since = (datetime.now(timezone.utc) - timedelta(seconds=PROMPT_WAIT_SECONDS)).isoformat()
+    try:
+        res = (db.table(table).select("payer_phone,created_at").eq(key_col, key_val)
+               .eq("status", "pending").gte("created_at", since).limit(20).execute())
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001
+        log.info("[pay] prompt check skipped: %s", e)
+        return
+    want = payments._normalize_msisdn(phone)
+    if any(payments._normalize_msisdn(r.get("payer_phone") or "") == want for r in rows):
+        shown = want[-9:]
+        masked = f"0{shown[:2]}••••{shown[-3:]}" if len(shown) == 9 else "that phone"
+        raise HTTPException(status_code=409, detail=(
+            f"A payment request is already on {masked}. Approve it there, or wait 2 minutes "
+            "to send a new one, so you are not asked to pay twice."))
+
+
 def _collect_for(db, owner_id: str, network: str, reference: str, amount: float,
                  currency: str, phone: str) -> tuple[str, Optional[payments.Account]]:
     """Start a collection into the account of the business that issued the
@@ -5696,6 +5759,7 @@ def public_pay_initiate(token: str, body: PublicPayRequest, request: Request):
 
     reference = str(uuid.uuid4())
     network = (body.network or "").lower()
+    _prompt_still_waiting(db, "invoice_payments", "invoice_id", inv["id"], body.payer_phone)
     state, account = _collect_for(db, inv["user_id"], network, reference, amount,
                                   currency, body.payer_phone)
 
@@ -5887,6 +5951,7 @@ def hospitality_booking_payments(booking_id: str, ctx: membership.Context = Depe
 def hospitality_add_booking_payment(booking_id: str, body: StayPaymentIn,
                                     ctx: membership.Context = Depends(membership.require_write)):
     """Record one payment a guest made: amount, day and how they paid."""
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     try:
         return {"ok": True, **hospitality_api.add_booking_payment(
@@ -5899,6 +5964,7 @@ def hospitality_add_booking_payment(booking_id: str, body: StayPaymentIn,
 def hospitality_remove_booking_payment(booking_id: str, event_id: str,
                                        ctx: membership.Context = Depends(membership.require_write)):
     """Take a payment recorded by mistake off a stay (voided in the books, not erased)."""
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     try:
         return {"ok": True, **hospitality_api.remove_booking_payment(_require_db(), ctx.tenant, booking_id, event_id)}
@@ -5959,6 +6025,7 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
     currency = booking.get("currency") or "ZMW"
     reference = str(uuid.uuid4())
     network = (body.network or "").lower()
+    _prompt_still_waiting(db, "booking_payments", "booking_id", booking["id"], body.payer_phone)
     state, account = _collect_for(db, booking["user_id"], network, reference, amount,
                                   currency, body.payer_phone)
     row = {
@@ -6748,6 +6815,7 @@ def hospitality_list_bookings(
 
 @app.post("/hospitality/bookings")
 def hospitality_create_booking(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx, {k: v for k, v in body.items() if k in BOOKING_MONEY_FIELDS and k not in ("total_amount", "currency", "payment_method")})
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -6796,6 +6864,7 @@ def hospitality_get_booking(booking_id: str, ctx: membership.Context = Depends(m
 
 @app.patch("/hospitality/bookings/{booking_id}")
 def hospitality_patch_booking(booking_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx, body)
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -6856,6 +6925,7 @@ class CancelStayRequest(BaseModel):
 @app.post("/hospitality/bookings/{booking_id}/cancel")
 def hospitality_cancel_booking(booking_id: str, body: CancelStayRequest = Body(default=None),
                                ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -6879,6 +6949,7 @@ def hospitality_list_expenses(
 
 @app.post("/hospitality/expenses")
 def hospitality_create_expense(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -6889,6 +6960,7 @@ def hospitality_create_expense(body: Dict[str, Any] = Body(...), ctx: membership
 
 @app.patch("/hospitality/expenses/{expense_id}")
 def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     db = _require_db()
     try:
@@ -6899,6 +6971,7 @@ def hospitality_patch_expense(expense_id: str, body: Dict[str, Any] = Body(...),
 
 @app.delete("/hospitality/expenses/{expense_id}")
 def hospitality_delete_expense(expense_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    _staff_may_not_touch_money(ctx)
     _require_hospitality(ctx.tenant)
     db = _require_db()
     hospitality_api.delete_expense(db, ctx.tenant, expense_id)
@@ -7167,6 +7240,11 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Normally sent on the minute by their own loop; this catches any
             # the API missed while it slept.
             ("schedule_reminders", lambda: schedule_reminders.send_due(db)),
+            # Totals a failed rebuild left behind, counted again.
+            ("stale_totals", lambda: nervous.rebuild_stale(db)),
+            # Once a day: every owner's books held against every invoice,
+            # payment, stay and payslip, and the owner told if one disagrees.
+            ("books_check", lambda: _daily_books_check(db)),
         ):
             try:
                 out[name] = job()
@@ -7635,6 +7713,30 @@ def cleanup_apply(body: TidyRequest, ctx: membership.Context = Depends(membershi
     """Clear the kinds the owner picked. Nothing that still carries money goes."""
     import cleanup
     return {"ok": True, "done": cleanup.tidy(_require_db(), ctx.tenant, ctx.business_id, body.kinds)}
+
+
+_BOOKS_CHECKED: Dict[str, Any] = {"day": None}
+
+
+def _daily_books_check(db) -> Dict[str, Any]:
+    """The books check for every owner, once a UTC day (the hourly jobs call it)."""
+    from datetime import datetime as _dt, timezone as _tz
+    today = _dt.now(_tz.utc).date().isoformat()
+    if _BOOKS_CHECKED["day"] == today:
+        return {"skipped": "already checked today"}
+    _BOOKS_CHECKED["day"] = today
+    return books_check.daily(db, notify.record_notification)
+
+
+@app.get("/books/check")
+def books_check_route(ctx: membership.Context = Depends(membership.require_context)):
+    """Every money record held against the books, to the ngwee: invoices,
+    mobile money payments, stays, payslips and the totals on screen. Owner and
+    accountant. Totals that fell behind their entries are counted again;
+    everything else is reported, never changed."""
+    if ctx.role not in ("owner", "accountant"):
+        raise HTTPException(status_code=403, detail="Only the owner or the accountant can check the books.")
+    return {"ok": True, "check": books_check.check(_require_db(), ctx.tenant, heal=True)}
 
 
 @app.get("/twin/cash-by-method")

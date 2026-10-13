@@ -154,7 +154,9 @@ def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW",
 
     amt = (ev.get("payload") or {}).get("amount")
     sym = "K" if currency == "ZMW" else currency
-    amount_txt = f" {sym}{float(amt):,.0f}" if amt else ""
+    # The figure as recorded, ngwee and all: K1,234.50 used to come back as K1,234.
+    amount_txt = (f" {sym}{float(amt):,.0f}" if float(amt) == int(float(amt))
+                  else f" {sym}{float(amt):,.2f}") if amt else ""
     status_txt = "saved" if ev.get("status") == "confirmed" else "saved as pending — confirm it in AIBOS"
     return f"Got it: {ev.get('event_type')}{amount_txt}, {status_txt}. ✅"
 

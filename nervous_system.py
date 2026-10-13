@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 import digital_twin as twin
 import business_memory as memory
+import money
 import parties as parties_api
 
 log = logging.getLogger("aibos.nervous")
@@ -85,6 +86,13 @@ class PipelineError(ValueError):
 _NUMERIC_KEYS = ("amount", "quantity", "quantities", "qty", "unit_price", "unit_cost",
                  "price", "cost", "total", "tax", "vat", "discount", "fee")
 
+# Payload fields that hold MONEY (not a quantity): each is kept to the ngwee.
+# A quantity (qty, delta_qty, quantities) can be 2.5 kg and is left alone.
+MONEY_KEYS = ("amount", "unit_price", "unit_cost", "price", "cost", "total", "tax", "vat",
+              "discount", "fee", "gross", "net", "paye", "napsa", "nhima", "napsa_employer",
+              "nhima_employer", "sdl", "basic", "allowances", "loan_deduction",
+              "employee_share", "employer_share")
+
 
 def _non_finite(value, numeric: bool = False) -> bool:
     """True if a NaN or infinity hides anywhere in this value.
@@ -138,6 +146,10 @@ def validate(ev: EventIn) -> None:
             raise PipelineError("amount must be a real number.")
         if amt < 0:
             raise PipelineError("amount must be a positive magnitude; direction is implied by event_type.")
+        if amt > float(money.MAX_AMOUNT):
+            # A trillion kwacha is never one entry: it is a phone number or an
+            # account number in the amount column, or ngwee typed as kwacha.
+            raise PipelineError("amount is far too large to be one entry. Check the figure.")
 
     if _non_finite(payload):
         raise PipelineError("Numbers must be real numbers (not NaN or infinity).")
@@ -168,12 +180,11 @@ def normalize(ev: EventIn, default_currency: str = "ZMW", db=None, user_id: str 
     # Currency: explicit on event → payload → caller default.
     payload["currency"] = (ev.currency or payload.get("currency") or default_currency)
 
-    # Coerce amount to float when present.
-    if "amount" in payload and payload["amount"] is not None:
-        try:
-            payload["amount"] = float(payload["amount"])
-        except (TypeError, ValueError):
-            pass
+    # Money to the ngwee, from the figure as written (money.py): 1234.565 is
+    # K1,234.57, never the K1,234.56 float rounding makes of it. When the
+    # rounding changed what was typed, what was typed is kept beside it, so the
+    # entry can always be traced back to its source exactly.
+    _to_ngwee(payload)
 
     # Canonicalize a couple of low-cardinality fields.
     if payload.get("payment_method"):
@@ -187,6 +198,24 @@ def normalize(ev: EventIn, default_currency: str = "ZMW", db=None, user_id: str 
     # Apply Business Memory (Phase 5) — enrich missing fields from learned mappings.
     if db is not None and user_id:
         payload = memory.apply(db, user_id, ev.event_type, payload)
+    return payload
+
+
+def _to_ngwee(payload: dict) -> dict:
+    """Round every money field of a payload to the ngwee, in place."""
+    for key in MONEY_KEYS:
+        value = payload.get(key)
+        if value is None or isinstance(value, (bool, list, dict)):
+            continue
+        rounded = money.round_ngwee(value, default=None)
+        if rounded is None:
+            continue                       # not a number: validate() says so for amount
+        # Kept only when a real fraction of a ngwee was typed (K10.005), not for
+        # the float noise of a sum done in a browser (0.30000000000000004).
+        if (key == "amount" and "amount_entered" not in payload
+                and abs(money.dec(value) - money.dec(rounded)) > money.FLOAT_NOISE):
+            payload["amount_entered"] = str(value)
+        payload[key] = rounded
     return payload
 
 
@@ -310,9 +339,31 @@ def _rebuild_after_write(db, user_id: str, business_id: str | None) -> None:
     spreadsheet import that "failed" was imported again."""
     try:
         twin.rebuild(db, user_id, business_id)
+        STALE.discard((user_id, business_id))
     except Exception as e:  # noqa: BLE001
+        # Remembered, so the hourly jobs count these totals again (rebuild_stale)
+        # rather than leave them behind until somebody records something else.
+        STALE.add((user_id, business_id))
         log.error("[nervous] %s events saved but the twin rebuild failed (it catches up on the "
-                  "next write): %s", user_id, e)
+                  "next write or the hourly jobs): %s", user_id, e)
+
+
+# Books whose totals could not be counted after a save: (user_id, business_id).
+STALE: set = set()
+
+
+def rebuild_stale(db) -> dict:
+    """Count again the totals a failed rebuild left behind. Hourly."""
+    out = {"rebuilt": 0, "still_behind": 0}
+    for user_id, business_id in list(STALE):
+        try:
+            twin.rebuild(db, user_id, business_id)
+            STALE.discard((user_id, business_id))
+            out["rebuilt"] += 1
+        except Exception as e:  # noqa: BLE001
+            out["still_behind"] += 1
+            log.warning("[nervous] totals for %s still behind: %s", user_id, e)
+    return out
 
 
 BATCH_INSERT_SIZE = 500
@@ -485,8 +536,7 @@ def correct(db, user_id: str, event_id: str, patch: dict,
     # or as money flowing the wrong way.
     validate(EventIn(event_type=update.get("event_type", ev.get("event_type")),
                      payload=new_payload, source=ev.get("source") or "manual"))
-    if new_payload.get("amount") is not None:
-        new_payload["amount"] = float(new_payload["amount"])
+    _to_ngwee(new_payload)                 # an edit is money too: to the ngwee
 
     # Accumulate corrections (don't overwrite prior ones) + audit.
     corrections = dict(ev.get("corrections") or {})

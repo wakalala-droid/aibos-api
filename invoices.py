@@ -34,6 +34,7 @@ import logging
 import secrets
 from datetime import datetime, timezone
 
+import money
 import nervous_system as nervous
 
 log = logging.getLogger("aibos.invoices")
@@ -79,7 +80,12 @@ def validate_lines(lines) -> list[dict]:
 
 
 def compute_total(lines: list[dict]) -> float:
-    return round(sum(_num(l.get("qty")) * _num(l.get("unit_price")) for l in lines), 2)
+    """The invoice total, worked in exact decimals and rounded half up to the
+    ngwee once, at the end. Float rounding made 3 × K33.335 = K100.00 when it
+    is K100.005, which is K100.01: a customer billed a ngwee short."""
+    from decimal import ROUND_HALF_UP, Decimal
+    total = sum((money.dec(l.get("qty")) * money.dec(l.get("unit_price")) for l in lines), Decimal(0))
+    return float(total.quantize(money.NGWEE, rounding=ROUND_HALF_UP))
 
 
 def next_number(existing_numbers: list[str]) -> str:

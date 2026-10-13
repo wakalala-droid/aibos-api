@@ -92,6 +92,34 @@ def _qr_to_dict(payload: str) -> dict:
     return out
 
 
+# A negative figure in a column of money is money going back the other way.
+# Which way depends on what the column was: a negative sale is a refund to the
+# customer, a negative expense is money back from the supplier.
+_REVERSAL_DIRECTION = {
+    "Sale": "to_customer", "CustomerPayment": "to_customer",
+    "Purchase": "from_supplier", "Expense": "from_supplier", "SupplierPayment": "from_supplier",
+    "InventoryReceipt": "from_supplier", "AssetPurchase": "from_supplier",
+}
+
+
+def _amount_and_sign(v) -> tuple[float | None, bool]:
+    """A cell's amount and whether it was written as negative: -200, (200),
+    K-200 or -K200. _coerce_amount alone kept only the size, so a refund line
+    in a sales sheet came in as a sale of the same amount."""
+    if v is None or isinstance(v, bool):
+        return None, False
+    if isinstance(v, (int, float)):
+        if v != v or v in (float("inf"), float("-inf")):
+            return None, False
+        return abs(float(v)), float(v) < 0
+    text = str(v).strip()
+    n = sheetscan.to_number(text)
+    if n is not None:
+        return abs(n), n < 0
+    amount = _coerce_amount(text)
+    return amount, amount is not None and (text.startswith("-") or text.startswith("−"))
+
+
 def _coerce_amount(v) -> float | None:
     if v is None or isinstance(v, bool):
         return None
@@ -330,12 +358,26 @@ def rows_to_events(rows: list[dict], mapping: dict, defaults: dict | None = None
     for i, row in enumerate(rows):
         try:
             etype = infer_type(str(cell(row, "type")), default_type) if mapping.get("type") else default_type
-            payload: dict = {"currency": currency}
+            # Where the figure came from: its row in what was imported (1 is
+            # the first data row). The commit route adds the file and sheet.
+            payload: dict = {"currency": currency, "import_row": i + 1}
 
             amt_raw = cell(row, "amount")
-            amt = _coerce_amount(amt_raw)
+            amt, negative = _amount_and_sign(amt_raw)
             if amt is not None:
+                if amt == 0:
+                    # Not money: a K0 line is a blank or a heading, never a sale.
+                    raise nervous.PipelineError("the amount is zero, so there is nothing to record.")
                 payload["amount"] = amt
+            reversal = False
+            if negative and amt:
+                if etype not in _REVERSAL_DIRECTION:
+                    raise nervous.PipelineError(
+                        f"the amount is negative ({amt_raw}). Fix it in the sheet, or import it as a refund.")
+                payload["direction"] = _REVERSAL_DIRECTION[etype]
+                payload["note_reversal"] = True
+                payload["reversal_of"] = etype
+                etype, reversal = "Refund", True
 
             desc = cell(row, "description")
             if desc not in (None, ""):
@@ -358,7 +400,10 @@ def rows_to_events(rows: list[dict], mapping: dict, defaults: dict | None = None
                 payload=payload,
                 source="excel",
                 occurred_at=occurred,
-                confidence=1.0,           # reviewed in the import preview
+                # Reviewed in the import preview, except a negative line turned
+                # into a refund here: that was AIBOS's reading, so it waits for
+                # the owner to confirm it (SAFEGUARD 0.4).
+                confidence=0.7 if reversal else 1.0,
             )
             nervous.validate(ev)          # fail fast so the row reports a clear error
             events.append(ev)

@@ -43,6 +43,8 @@ import logging
 import math
 from collections import OrderedDict
 
+import money
+
 log = logging.getLogger("aibos.twin")
 
 EVENT_TYPES = (
@@ -102,13 +104,14 @@ def cash_by_method(events: list, opening_cash: float = 0.0) -> dict:
     of its payment_method; a Transfer moves money between buckets (payload
     from / to). A record that does not say how it was paid is counted as
     "unsaid" rather than guessed. The buckets plus the opening balance add up
-    to exactly the twin's cash."""
-    out = {"cash": 0.0, "mobile_money": 0.0, "bank": 0.0, "unsaid": 0.0}
+    to exactly the twin's cash: both are added up in whole ngwee, so they
+    cannot drift apart by a rounding."""
+    out = {"cash": 0, "mobile_money": 0, "bank": 0, "unsaid": 0}
     for ev in events or []:
         if ev.get("status") not in (None, "confirmed"):
             continue
         p = ev.get("payload") or {}
-        amount = _num(p.get("amount"))
+        amount = money.ngwee(p.get("amount"))
         if ev.get("event_type") == "Transfer":
             src, dst = method_bucket(p.get("from")), method_bucket(p.get("to"))
             out[src] -= amount
@@ -117,9 +120,10 @@ def cash_by_method(events: list, opening_cash: float = 0.0) -> dict:
         direction = cash_direction(ev.get("event_type"), p)
         if direction:
             out[method_bucket(p.get("payment_method"))] += amount if direction == "in" else -amount
-    result = {k: round(v, 2) for k, v in out.items()}
-    result["opening"] = round(_num(opening_cash), 2)
-    result["total"] = round(sum(out.values()) + _num(opening_cash), 2)
+    opening = money.ngwee(opening_cash)
+    result = {k: money.kwacha(v) for k, v in out.items()}
+    result["opening"] = money.kwacha(opening)
+    result["total"] = money.kwacha(sum(out.values()) + opening)
     return result
 
 
@@ -175,17 +179,26 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
     Pure fold: confirmed (non-void) events → current state dict.
     `events` should already be filtered to status == 'confirmed' and ordered by
     occurred_at ascending; project() also self-guards by skipping void rows.
-    """
-    s = _empty_state()
-    s["opening_cash"] = _num(opening_cash)
-    s["currency"] = currency or "ZMW"
-    cash = s["opening_cash"]
 
-    monthly = OrderedDict()  # month -> {"revenue": x, "costs": y}
+    Every figure is added up in whole ngwee (money.py), each amount first
+    rounded to the ngwee from its decimal text. A float sum of thousands of
+    entries drifts, and so did totals that were each rounded on their own: the
+    cash, what is owed, the months and the split by payment method now agree
+    with each other exactly, to the last ngwee.
+    """
+    N = money.ngwee
+    s = _empty_state()
+    s["currency"] = currency or "ZMW"
+    opening = N(opening_cash)
+    cash = opening
+    t = {"total_revenue": 0, "total_costs": 0, "receivables": 0, "payables": 0,
+         "inventory_value": 0, "assets_value": 0, "liabilities": 0}
+
+    monthly = OrderedDict()  # month -> {"revenue": x, "costs": y}, in ngwee
     customers, suppliers, employees = set(), set(), set()
 
-    def bump_month(month, *, revenue=0.0, costs=0.0):
-        m = monthly.setdefault(month, {"revenue": 0.0, "costs": 0.0})
+    def bump_month(month, *, revenue=0, costs=0):
+        m = monthly.setdefault(month, {"revenue": 0, "costs": 0})
         m["revenue"] += revenue
         m["costs"] += costs
 
@@ -200,16 +213,16 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
             continue  # unknown type — never fabricate behaviour (SAFEGUARD §0.1)
 
         p = ev.get("payload") or {}
-        amount = _num(p.get("amount"))
+        amount = N(p.get("amount"))
         on_credit = str(p.get("payment_method", "")).lower() == "credit"
         month = _month_key(ev.get("occurred_at"))
         direction = str(p.get("direction", "")).lower()
 
         if etype == "Sale":
-            s["total_revenue"] += amount
+            t["total_revenue"] += amount
             bump_month(month, revenue=amount)
             if on_credit:
-                s["receivables"] += amount
+                t["receivables"] += amount
             else:
                 cash += amount
             if p.get("customer"):
@@ -217,15 +230,15 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
 
         elif etype == "CustomerPayment":
             cash += amount
-            s["receivables"] -= amount
+            t["receivables"] -= amount
             if p.get("customer"):
                 customers.add(str(p["customer"]).strip().lower())
 
         elif etype == "Purchase":
-            s["total_costs"] += amount
+            t["total_costs"] += amount
             bump_month(month, costs=amount)
             if on_credit:
-                s["payables"] += amount
+                t["payables"] += amount
             else:
                 cash -= amount
             if p.get("supplier"):
@@ -233,57 +246,57 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
 
         elif etype == "SupplierPayment":
             cash -= amount
-            s["payables"] -= amount
+            t["payables"] -= amount
             if p.get("supplier"):
                 suppliers.add(str(p["supplier"]).strip().lower())
 
         elif etype in ("Expense", "Salary"):
-            s["total_costs"] += amount
+            t["total_costs"] += amount
             bump_month(month, costs=amount)
             cash -= amount
             if etype == "Salary" and p.get("employee"):
                 employees.add(str(p["employee"]).strip().lower())
 
         elif etype == "TaxPayment":
-            s["total_costs"] += amount
+            t["total_costs"] += amount
             bump_month(month, costs=amount)
             cash -= amount
 
         elif etype == "AssetPurchase":
-            s["assets_value"] += amount
+            t["assets_value"] += amount
             cash -= amount
 
         elif etype == "InventoryReceipt":
-            s["inventory_value"] += amount
+            t["inventory_value"] += amount
             # Stock delivered on credit is owed to the supplier, as a credit
             # Purchase is (and as the ledger export already said). It used to
             # owe nobody, so paying that supplier drove payables below zero.
             if on_credit:
-                s["payables"] += amount
+                t["payables"] += amount
             else:
                 cash -= amount
             if p.get("supplier"):
                 suppliers.add(str(p["supplier"]).strip().lower())
 
         elif etype == "InventoryAdjustment":
-            s["inventory_value"] += _num(p.get("delta_qty")) * _num(p.get("unit_cost"))
+            t["inventory_value"] += N(money.dec(p.get("delta_qty")) * money.dec(p.get("unit_cost")))
 
         elif etype == "Loan":
             if direction == "repayment":
                 cash -= amount
-                s["liabilities"] -= amount
+                t["liabilities"] -= amount
             else:  # received (default)
                 cash += amount
-                s["liabilities"] += amount
+                t["liabilities"] += amount
 
         elif etype == "Refund":
             if direction == "from_supplier":
                 cash += amount
-                s["total_costs"] -= amount
+                t["total_costs"] -= amount
                 bump_month(month, costs=-amount)
             else:  # to_customer (default)
                 cash -= amount
-                s["total_revenue"] -= amount
+                t["total_revenue"] -= amount
                 bump_month(month, revenue=-amount)
 
         elif etype == "Transfer":
@@ -294,17 +307,14 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
         last_at = ev.get("occurred_at", last_at)
 
     # ── Derive totals ─────────────────────────────────────────────────────────
-    s["cash"] = round(cash, 2)
-    s["total_revenue"] = round(s["total_revenue"], 2)
-    s["total_costs"] = round(s["total_costs"], 2)
-    s["total_profit"] = round(s["total_revenue"] - s["total_costs"], 2)
-    s["receivables"] = round(s["receivables"], 2)
-    s["payables"] = round(s["payables"], 2)
-    s["inventory_value"] = round(s["inventory_value"], 2)
-    s["assets_value"] = round(s["assets_value"], 2)
-    s["liabilities"] = round(s["liabilities"], 2)
+    K = money.kwacha
+    s["opening_cash"] = K(opening)
+    s["cash"] = K(cash)
+    for key, value in t.items():
+        s[key] = K(value)
+    s["total_profit"] = K(t["total_revenue"] - t["total_costs"])
     s["avg_margin"] = round(
-        (s["total_profit"] / s["total_revenue"] * 100) if s["total_revenue"] > 0 else 0.0, 2
+        ((t["total_revenue"] - t["total_costs"]) / t["total_revenue"] * 100) if t["total_revenue"] > 0 else 0.0, 2
     )
 
     score = max(0, min(100, int(s["avg_margin"] * 2.5)))  # mirrors engine1 health
@@ -324,9 +334,9 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
     s["suppliers"] = len(suppliers)
     s["employees"] = len(employees)
 
-    # Monthly bridge (RFC-001 §7) — ordered, rounded, lowercase keys.
+    # Monthly bridge (RFC-001 §7) — ordered, to the ngwee, lowercase keys.
     s["monthly"] = [
-        {"month": k, "revenue": round(v["revenue"], 2), "costs": round(v["costs"], 2)}
+        {"month": k, "revenue": K(v["revenue"]), "costs": K(v["costs"])}
         for k, v in sorted(monthly.items())
         if k != "unknown"
     ]
@@ -450,7 +460,9 @@ def seed(db, user_id: str, opening_cash: float | None = None, currency: str | No
     patch = {"user_id": user_id}
     if business_id is not None:
         patch["business_id"] = business_id
-    patch["opening_cash"] = _num(opening_cash) if opening_cash is not None else _num(existing.get("opening_cash"))
+    # The opening balance is money like any other: kept to the ngwee.
+    patch["opening_cash"] = money.round_ngwee(opening_cash if opening_cash is not None
+                                              else existing.get("opening_cash"))
     patch["currency"] = currency or existing.get("currency") or "ZMW"
     db.table("business_state").upsert(patch, on_conflict="user_id,business_id" if business_id is not None else "user_id").execute()
     return rebuild(db, user_id, business_id)  # recompute cash off the new opening balance

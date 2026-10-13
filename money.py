@@ -18,6 +18,8 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 NGWEE = Decimal("0.01")
 ZERO = Decimal("0")
+# Below this a difference is the noise of binary floats, not a figure anyone typed.
+FLOAT_NOISE = Decimal("0.000000001")
 
 # The largest amount one entry may carry: K1 trillion. Anything bigger is a
 # typo, a unit mistake (ngwee typed as kwacha twice over) or a spreadsheet
