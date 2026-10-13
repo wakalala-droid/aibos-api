@@ -80,7 +80,7 @@ so past runs stay truthful after a rate change (a replayable history).
 """
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 import money
@@ -771,11 +771,19 @@ def recheck_run(db, user_id: str, run_id: str) -> dict:
                         "nhima_employer", "sdl", "net")}
     owed_to_staff = money.total(max(0.0, p["difference"]["net"]) for p in people)
     short_from_staff = money.total(max(0.0, -p["difference"]["net"]) for p in people)
-    return {"run_id": run_id, "period": period, "pay_date": pay, "rates": public_rates(rates),
-            "sdl": sdl, "people": people, "difference": totals,
-            "changed": any(p["changed"] for p in people),
-            "owed_to_staff": owed_to_staff, "under_deducted_from_staff": short_from_staff,
-            "summary": _recheck_summary(totals, owed_to_staff, short_from_staff)}
+    out = {"run_id": run_id, "period": period, "pay_date": pay, "rates": public_rates(rates),
+           "sdl": sdl, "people": people, "difference": totals,
+           "changed": any(p["changed"] for p in people),
+           "owed_to_staff": owed_to_staff, "under_deducted_from_staff": short_from_staff,
+           "summary": _recheck_summary(totals, owed_to_staff, short_from_staff)}
+    # What each authority is still owed or was paid too much, and whether the
+    # correction for it is already waiting for the owner.
+    live = {(e.get("payload") or {}).get("tax_type"): e
+            for e in existing_corrections(db, user_id, run_id) if e.get("status") != "void"}
+    out["to_settle"] = [{**row, "drafted": row["tax_type"] in live,
+                         "draft_status": (live.get(row["tax_type"]) or {}).get("status")}
+                        for row in correction_rows(out)]
+    return out
 
 
 def _recheck_summary(d: dict, owed_to_staff: float, short: float) -> str:
@@ -802,6 +810,147 @@ def _recheck_summary(d: dict, owed_to_staff: float, short: float) -> str:
     if owed_to_staff >= 0.005:
         text += f" Too much was taken from staff pay ({k(owed_to_staff)} in all): that is owed back to them."
     return text
+
+
+# ── Putting a past run right: the corrections ────────────────────────────────
+# A run is a record of what was paid, and keeps its figures. When the recheck
+# shows an authority was paid too little, what is still owed is drafted as a
+# payment WAITING for the owner (a pending TaxPayment: out of the books until
+# the owner confirms it as paid), once per run and authority. What was paid
+# too much is said in words, never drafted: it is the authority's to give back
+# or set against a later month. Nothing is taken from anyone's future pay;
+# recovering tax from staff needs their agreement, which is not AIBOS's to give.
+
+CORRECTION_AUTHORITY = {"PAYE": "ZRA", "SDL": "ZRA", "NAPSA": "NAPSA", "NHIMA": "NHIMA"}
+CORRECTION_NAME = {"PAYE": "PAYE", "SDL": "Skills Development Levy", "NAPSA": "NAPSA", "NHIMA": "NHIMA"}
+# Which recheck figures make up each authority's amount: (from the pay, from the employer).
+_CORRECTION_KEYS = {"PAYE": ("paye", None), "SDL": (None, "sdl"),
+                    "NAPSA": ("napsa_employee", "napsa_employer"),
+                    "NHIMA": ("nhima_employee", "nhima_employer")}
+
+
+def correction_ref(run_id: str, tax_type: str, attempt: int = 1) -> str:
+    """The idempotency key of a run's correction to one authority. A second key
+    only after the first draft was voided, so it is drafted once per attempt."""
+    base = f"payroll-fix:{run_id}:{tax_type}"
+    return (base if attempt <= 1 else f"{base}:{attempt}")[:64]
+
+
+def correction_rows(recheck: dict) -> list:
+    """What each authority is still owed (owed=True) or was paid too much, for
+    one run, from its recheck: the whole amount, its two halves, what was
+    worked out then and now, and each person's part. Pure."""
+    def figure(source: dict, key):
+        return money.round_ngwee(source.get(key)) if key else 0.0
+
+    rows = []
+    for tax, (emp_key, er_key) in _CORRECTION_KEYS.items():
+        d = recheck.get("difference") or {}
+        emp, er = figure(d, emp_key), figure(d, er_key)
+        total = money.total([emp, er])
+        if abs(total) < 0.005:
+            continue
+        people = recheck.get("people") or []
+        was = money.total(figure(p.get("was") or {}, k) for p in people for k in (emp_key, er_key) if k)
+        now = money.total(figure(p.get("now") or {}, k) for p in people for k in (emp_key, er_key) if k)
+        parts = [{"employee_id": p.get("employee_id"), "employee_name": p.get("employee_name"),
+                  "amount": money.total(figure(p.get("difference") or {}, k) for k in (emp_key, er_key) if k)}
+                 for p in people]
+        rows.append({"tax_type": tax, "authority": CORRECTION_AUTHORITY[tax], "owed": total > 0,
+                     "amount": abs(total), "employee_share": abs(emp), "employer_share": abs(er),
+                     "was": was, "now": now,
+                     "people": [x for x in parts if abs(x["amount"]) >= 0.005]})
+    return rows
+
+
+def existing_corrections(db, user_id: str, run_id: str) -> list:
+    """Every correction ever drafted for a run, voided ones included."""
+    try:
+        res = (db.table("business_events").select("id,status,payload,occurred_at")
+               .eq("user_id", user_id).eq("event_type", "TaxPayment")
+               .eq("payload->>correction_of_run", run_id).execute())
+        return getattr(res, "data", None) or []
+    except Exception as exc:  # noqa: BLE001
+        log.info("[payroll] corrections not read for run %s: %s", run_id, exc)
+        return []
+
+
+def draft_corrections(db, user_id: str, run_id: str) -> dict:
+    """Draft what a past run still owes ZRA, NAPSA and NHIMA, as payments
+    waiting for the owner to confirm when they pay. Returns what was drafted,
+    what was already drafted, what was paid too much, and a plain summary.
+    Changes nothing on the run itself, its payslips or its wages."""
+    import nervous_system as nervous
+    check = recheck_run(db, user_id, run_id)
+    period = check["period"]
+    held: dict = {}
+    for e in existing_corrections(db, user_id, run_id):
+        held.setdefault((e.get("payload") or {}).get("tax_type"), []).append(e)
+    today = (datetime.now(timezone.utc) + timedelta(hours=2)).date().isoformat()     # Lusaka
+    drafted, already, overpaid = [], [], []
+    for row in correction_rows(check):
+        if not row["owed"]:
+            overpaid.append(row)
+            continue
+        before = held.get(row["tax_type"]) or []
+        live = next((e for e in before if e.get("status") != "void"), None)
+        if live is not None:
+            already.append({**row, "event_id": live.get("id"), "status": live.get("status"),
+                            "drafted_amount": _num((live.get("payload") or {}).get("amount"))})
+            continue
+        name = CORRECTION_NAME[row["tax_type"]]
+        payload = {
+            "amount": row["amount"], "currency": "ZMW", "tax_type": row["tax_type"],
+            "authority": row["authority"], "period": period, "payment_method": "bank",
+            "employee_share": row["employee_share"], "employer_share": row["employer_share"],
+            "payroll_run_id": run_id, "correction_of_run": run_id,
+            "client_ref": correction_ref(run_id, row["tax_type"], len(before) + 1),
+            "people": row["people"],
+            "note": (f"{name} still owed for the {period} payroll: worked out again with the rules in "
+                     f"force, it is K{row['now']:,.2f}, and K{row['was']:,.2f} was worked out then. "
+                     "Confirm this when you pay it."),
+        }
+        ev = nervous.ingest(db, user_id, nervous.EventIn(
+            event_type="TaxPayment", payload=payload, source="manual", status="pending",
+            occurred_at=f"{today}T00:00:00+00:00"))
+        drafted.append({**row, "event_id": (ev or {}).get("id"), "status": (ev or {}).get("status")})
+    return {"run_id": run_id, "period": period, "drafted": drafted, "already": already,
+            "overpaid": overpaid, "under_deducted_from_staff": check["under_deducted_from_staff"],
+            "owed_to_staff": check["owed_to_staff"],
+            "summary": _corrections_summary(period, drafted, already, overpaid, check)}
+
+
+def _corrections_summary(period: str, drafted: list, already: list, overpaid: list, check: dict) -> str:
+    """What the corrections did and what is left for the owner, in plain words."""
+    def k(v):
+        return f"K{abs(v):,.2f}"
+
+    def named(rows):
+        return "; ".join(f"{CORRECTION_NAME[r['tax_type']]} {k(r['amount'])} to {r['authority']}" for r in rows)
+
+    if not (drafted or already or overpaid):
+        return "This run already matches the rules. Nothing to put right."
+    parts = []
+    if drafted:
+        parts.append(f"Drafted for you to confirm when you pay them: {named(drafted)}.")
+    if already:
+        parts.append(f"Already drafted: {named(already)}.")
+    for r in overpaid:
+        name = CORRECTION_NAME[r["tax_type"]]
+        parts.append(f"{name} was {k(r['amount'])} too much. If the {name} payment for {period} is still "
+                     f"waiting for you in AIBOS, change it to {k(r['now'])} before you confirm it; if it is "
+                     f"paid, ask {r['authority']} to set {k(r['amount'])} against a later month.")
+    if any(r["tax_type"] == "PAYE" for r in drafted + already):
+        parts.append("ZRA may add a penalty and interest for PAYE paid late (5% a month). AIBOS does not "
+                     "work those out: your accountant or ZRA will give the amount.")
+    if check.get("under_deducted_from_staff", 0) >= 0.005:
+        parts.append(f"Too little was taken from staff pay ({k(check['under_deducted_from_staff'])} in all). "
+                     "The business pays it now. Taking it back from staff needs their agreement, so AIBOS "
+                     "takes nothing from anyone's pay.")
+    if check.get("owed_to_staff", 0) >= 0.005:
+        parts.append(f"Too much was taken from staff pay ({k(check['owed_to_staff'])} in all): that is owed "
+                     "back to them.")
+    return " ".join(parts)
 
 
 class _NothingToPost(Exception):
@@ -1079,6 +1228,21 @@ def delete_run(db, user_id: str, run_id: str) -> dict:
             out["tax_drafts_voided"] += 1
         except Exception as exc:  # noqa: BLE001
             log.warning("[payroll] could not void tax draft %s: %s", eid, exc)
+
+    # Corrections drafted for this run go with it while they are unpaid: the
+    # month run again works its taxes out afresh, and an unpaid correction left
+    # behind would ask for the difference a second time. A paid one stays.
+    for ev in existing_corrections(db, user_id, run_id):
+        if ev.get("status") == "void":
+            continue
+        if ev.get("status") == "confirmed":
+            out["tax_payments_kept"] += 1
+            continue
+        try:
+            nervous.void(db, user_id, ev["id"], reason=reason)
+            out["tax_drafts_voided"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[payroll] could not void correction %s: %s", ev.get("id"), exc)
 
     db.table("payslips").delete().eq("run_id", run_id).eq("user_id", user_id).execute()
     db.table("payroll_runs").delete().eq("id", run_id).eq("user_id", user_id).execute()

@@ -6426,6 +6426,20 @@ def recheck_payroll_run(run_id: str, ctx: membership.Context = Depends(membershi
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.post("/payroll/runs/{run_id}/corrections")
+def draft_payroll_corrections(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """What a past run still owes ZRA, NAPSA and NHIMA, drafted as payments
+    waiting for the owner to confirm when they pay. Once per run and
+    authority; what was paid too much is explained, never drafted; nothing on
+    the run, its payslips or its wages changes. Owner only, like running payroll."""
+    entitlements.require_feature(ctx.tenant, "payroll")
+    db = _require_db()
+    try:
+        return {"ok": True, "corrections": payroll_api.draft_corrections(db, ctx.tenant, run_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/payroll/runs")
 def get_payroll_runs(ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
