@@ -297,6 +297,58 @@ def check(db, user_id: str, heal: bool = True, now: datetime | None = None) -> d
                     f"{_k((ev.get('payload') or {}).get('amount'))}.", amount=net, ref=s.get("id"),
                     link="/dashboard/employees")
 
+    # ── 7. Statutory money paid twice ─────────────────────────────────────────
+    # A month's PAYE, NAPSA or NHIMA confirmed from payroll, and the same money
+    # recorded again when its Schedule reminder was ticked off (what happened
+    # on a live account on 13 October 2026, before the reminders learned to
+    # settle payroll's own payment).
+    import compliance
+    paid_by_payroll: dict = {}
+    for e in by_type("TaxPayment"):
+        p = e.get("payload") or {}
+        if e.get("status") == "confirmed" and p.get("period") and p.get("tax_type"):
+            paid_by_payroll.setdefault((p["period"], p["tax_type"]), e)
+    for it in _rows(db, "schedule_items", user_id) or []:
+        tax = compliance.tax_of_title(it.get("title"))
+        linked = by_id.get(it.get("linked_event_id"))
+        if not tax or not linked or linked.get("status") != "confirmed":
+            continue
+        period = compliance.period_paid_by(it.get("starts_at"))
+        first = paid_by_payroll.get((period, tax))
+        if first is None or first.get("id") == linked.get("id"):
+            continue
+        name = compliance.TAX_NAMES[tax]
+        problem("statutory_paid_twice",
+                f"{name} for {compliance._month_words(period)} is in the books twice: "
+                f"{_k((first.get('payload') or {}).get('amount'))} confirmed from payroll on "
+                f"{_day(first.get('occurred_at'))}, and {_k((linked.get('payload') or {}).get('amount'))} "
+                f"recorded from the Schedule reminder on {_day(linked.get('occurred_at'))}. If it was paid "
+                "once, void the second on Activity.",
+                amount=(linked.get("payload") or {}).get("amount"), ref=linked.get("id"),
+                link="/dashboard/timeline")
+
+    # ── 8. Paid wages taken out by deleting their payroll run ─────────────────
+    # Deleting a run voids its wages. For wages that were really paid that
+    # puts the money back into the cash figure as if it never left (a live
+    # account's July wages, K11,128.75, on 13 October 2026). The run itself is
+    # gone, so only the voided wage still says so; reported for 60 days.
+    for e in events:
+        p = e.get("payload") or {}
+        if e.get("event_type") != "Salary" or e.get("status") != "void" or p.get("scheduled_payday"):
+            continue
+        void = next((a for a in reversed(e.get("audit") or [])
+                     if a.get("action") == "voided" and str(a.get("note") or "").startswith("Payroll run for")), None)
+        voided_at = _parse((void or {}).get("at"))
+        paid_on = _parse(e.get("occurred_at"))
+        if not void or not voided_at or voided_at < since or not paid_on or paid_on > voided_at:
+            continue
+        problem("paid_wages_removed",
+                f"The wage of {_k(p.get('amount'))} for {p.get('employee') or 'an employee'} "
+                f"({p.get('period') or str(e.get('occurred_at'))[:7]}) was taken out of the books when its "
+                f"payroll run was deleted on {_day(voided_at.isoformat())}, after its payday. If it was paid, "
+                "it belongs in the books and your money figure is too high by that much.",
+                amount=p.get("amount"), ref=e.get("id"), link="/dashboard/employees")
+
     money_problems = [p for p in problems if p["money"]]
     return {
         "ok": not money_problems,

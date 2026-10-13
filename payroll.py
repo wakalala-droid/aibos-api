@@ -1168,8 +1168,73 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     return run
 
 
-def delete_run(db, user_id: str, run_id: str) -> dict:
+class PaidWages(ValueError):
+    """The run's wages are in the books as PAID. Deleting it would take money
+    that really left out of the books and put it back in the cash figure."""
+
+    def __init__(self, amount: float, days: list):
+        self.amount, self.days = amount, days
+        when = ", ".join(sorted(set(days)))
+        super().__init__(
+            f"These wages are in your books as paid (K{amount:,.2f} on {when}). Deleting this run takes "
+            f"them out, and your money figure goes UP by K{amount:,.2f} as if they were never paid. Only "
+            "delete it if these wages were never paid. To put a paid month right, use Check against "
+            "today's rules and Draft the corrections instead.")
+
+
+def _run_wages(db, user_id: str, run: dict) -> list:
+    """The wage entries a run posted, as they stand in the books now."""
+    out = []
+    for slip in run.get("payslips") or []:
+        eid = slip.get("linked_event_id")
+        if not eid:
+            continue
+        res = (db.table("business_events").select("id,status,occurred_at,payload,audit")
+               .eq("id", eid).eq("user_id", user_id).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        if rows:
+            out.append(rows[0])
+    return out
+
+
+def pay_wages_now(db, user_id: str, run_id: str, paid_on=None) -> dict:
+    """The wages of a run that are waiting for payday, paid early: they go into
+    the books as paid on `paid_on` (today when left out), and out of the cash.
+
+    Running payroll before payday keeps the wages waiting for that day. An
+    owner who paid staff on the 13th had no way to say so, and the money
+    figure did not move although the money had left."""
+    import nervous_system as nervous
+    run = get_run(db, user_id, run_id)
+    today = (datetime.now(timezone.utc) + timedelta(hours=2)).date()             # Lusaka
+    day = parse_date(paid_on) or today
+    if day > today:
+        raise ValueError("Wages cannot be marked paid on a day still to come.")
+    stamp = f"{day.isoformat()}T00:00:00+00:00"
+    out = {"paid": 0, "amount": 0.0, "paid_on": day.isoformat()}
+    for ev in _run_wages(db, user_id, run):
+        if ev.get("status") != "pending":
+            continue
+        audit = list(ev.get("audit") or []) + [{
+            "at": datetime.now(timezone.utc).isoformat(), "actor": user_id, "action": "corrected",
+            "note": f"Paid on {day.isoformat()}, before the payday the run was made for"}]
+        (db.table("business_events").update({"occurred_at": stamp, "audit": audit})
+         .eq("id", ev["id"]).eq("user_id", user_id).execute())
+        nervous.confirm(db, user_id, ev["id"])
+        out["paid"] += 1
+        out["amount"] = money.total([out["amount"], (ev.get("payload") or {}).get("amount")])
+    if out["paid"]:
+        (db.table("payroll_runs").update({"pay_date": day.isoformat()})
+         .eq("id", run_id).eq("user_id", user_id).execute())
+    return out
+
+
+def delete_run(db, user_id: str, run_id: str, wages_never_paid: bool = False) -> dict:
     """Undo a payroll run made by mistake, books included.
+
+    A run whose wages are in the books as PAID is refused (PaidWages) unless
+    the owner says they were never paid: deleting it took July's paid wages
+    out of a live account and its money figure jumped by K11,128.75.
 
     A run can only be made once per month, so a run for the wrong month, or a
     test, sat in the list for good with its wages in the books. Deleting it:
@@ -1184,6 +1249,11 @@ def delete_run(db, user_id: str, run_id: str) -> dict:
     """
     import nervous_system as nervous
     run = get_run(db, user_id, run_id)                      # ValueError when not theirs
+    if not wages_never_paid:
+        paid = [w for w in _run_wages(db, user_id, run) if w.get("status") == "confirmed"]
+        if paid:
+            raise PaidWages(money.total((w.get("payload") or {}).get("amount") for w in paid),
+                            [str(w.get("occurred_at") or "")[:10] for w in paid])
     period = run.get("period")
     reason = f"Payroll run for {period} deleted"
     out = {"period": period, "wages_voided": 0, "tax_drafts_voided": 0,

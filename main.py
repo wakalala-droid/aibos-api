@@ -6338,6 +6338,27 @@ def set_schedule_status(item_id: str, req: ScheduleStatusRequest,
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/schedule/{item_id}/settle")
+def settle_schedule_item(item_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    """A ticked-off PAYE, NAPSA, NHIMA or levy reminder, put in the books ONCE:
+    it confirms the payment payroll drafted for that month, says so when it is
+    already paid, and records one of its own only when payroll drafted none.
+    The Schedule used to record every ticked-off reminder as a new expense,
+    so money already confirmed from payroll was counted twice."""
+    db = _require_db()
+    res = (db.table("schedule_items").select("*").eq("id", item_id).eq("user_id", ctx.tenant)
+           .limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Reminder not found.")
+    import compliance as compliance_api
+    try:
+        out = compliance_api.settle_reminder(db, ctx.tenant, rows[0], actor_role=ctx.role, actor_id=ctx.actor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, **out}
+
+
 @app.delete("/schedule/{item_id}")
 def remove_schedule_item(item_id: str, ctx: membership.Context = Depends(membership.require_write)):
     db = _require_db()
@@ -6540,15 +6561,37 @@ class PayrollRunRequest(BaseModel):
 
 
 @app.delete("/payroll/runs/{run_id}")
-def delete_payroll_run(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+def delete_payroll_run(run_id: str, wages_never_paid: bool = Query(False),
+                       ctx: membership.Context = Depends(membership.require_owner)):
     """Undo a run made by mistake: its wages voided in the books, its unpaid tax
     drafts voided, loan instalments given back, the month free to run again.
-    Owner only, like running payroll."""
+    Owner only, like running payroll. A run whose wages are in the books as
+    PAID is refused (409, code paid_wages) unless wages_never_paid: deleting it
+    put paid wages back into a live account's money figure."""
     db = _require_db()
     try:
-        return {"ok": True, **payroll_api.delete_run(db, ctx.tenant, run_id)}
+        return {"ok": True, **payroll_api.delete_run(db, ctx.tenant, run_id, wages_never_paid=wages_never_paid)}
+    except payroll_api.PaidWages as e:
+        raise HTTPException(status_code=409, detail={"code": "paid_wages", "message": str(e),
+                                                     "amount": e.amount, "paid_on": e.days})
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+class PayWagesRequest(BaseModel):
+    paid_on: Optional[str] = None           # YYYY-MM-DD; today when left out
+
+
+@app.post("/payroll/runs/{run_id}/pay")
+def pay_payroll_wages(run_id: str, body: PayWagesRequest = Body(default=None),
+                      ctx: membership.Context = Depends(membership.require_owner)):
+    """The run's wages that wait for payday, paid now: into the books as paid
+    on that day and out of the money figure. Owner only."""
+    db = _require_db()
+    try:
+        return {"ok": True, **payroll_api.pay_wages_now(db, ctx.tenant, run_id, body.paid_on if body else None)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/payroll/run")
