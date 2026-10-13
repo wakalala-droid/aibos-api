@@ -37,15 +37,16 @@ def _num(v, d=0.0):
         return d
 
 
+SDL_ITEM = {"slug": "sdl", "title": "Skills Development Levy to ZRA", "with_whom": "ZRA",
+            "notes": "The employer's own 0.5% of gross pay, on the same ZRA return as PAYE: due the 10th."}
+
+
 def _amounts_from_totals(totals: dict | None) -> dict:
-    """Latest payroll-run totals → {slug: amount}, same maths as
-    payroll.remittance_drafts (employer sides included)."""
-    t = totals or {}
-    return {
-        "paye": round(_num(t.get("paye")), 2),
-        "napsa": round(_num(t.get("napsa_employee")) + _num(t.get("napsa_employer")), 2),
-        "nhima": round(_num(t.get("nhima_employee")) * 2, 2),
-    }
+    """Latest payroll-run totals → {slug: amount}: exactly what
+    payroll.remittance_drafts drafts, so the reminder and the books agree."""
+    import payroll
+    drafts = payroll.remittance_drafts(totals or {}, "2000-01")
+    return {d["tax_type"].lower(): d["amount"] for d in drafts}
 
 
 def next_due(today: str | None = None, day: int = STATUTORY_DAY) -> str:
@@ -64,7 +65,8 @@ def statutory_items(latest_totals: dict | None = None, today: str | None = None)
     amounts = _amounts_from_totals(latest_totals)
     starts = next_due(today)
     items = []
-    for s in STATUTORY:
+    # The levy only for an employer that pays it (its last run worked one out).
+    for s in STATUTORY + ((SDL_ITEM,) if amounts.get("sdl", 0) > 0 else ()):
         item = {
             "kind": "payment_due",
             "title": s["title"],

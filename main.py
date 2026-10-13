@@ -2217,6 +2217,9 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
         "point-in-time sales for its stated period — never call it 'months' or imply "
         "monthly/yearly history unless an explicit time-series with month rows is present. "
         "If the context gives a reporting period (e.g. '1st-7th March'), quote it verbatim.",
+        # The statutory rules the payroll itself uses, so the chat and the
+        # payslips can never give an owner two different answers.
+        payroll_api.rules_for_ai(),
     ]
 
     injected = False
@@ -2549,7 +2552,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 38
+EXPECTS_MIGRATION = 39
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -6315,6 +6318,45 @@ def remove_employee(employee_id: str, ctx: membership.Context = Depends(membersh
 def get_payroll_rates(ctx: membership.Context = Depends(membership.require_owner)):
     """The statutory rates AIBOS applies (transparency — the owner reads, never edits)."""
     return {"ok": True, "rates": payroll_api.public_rates(payroll_api.current_rates(None, "ZMW"))}
+
+
+class PayrollSettingsIn(BaseModel):
+    sdl: str                                # 'auto' | 'pays' | 'exempt'
+
+
+@app.get("/payroll/settings")
+def get_payroll_settings(period: Optional[str] = Query(None),
+                         ctx: membership.Context = Depends(membership.require_owner)):
+    """Whether this business pays the Skills Development Levy, and why."""
+    db = _require_db()
+    from datetime import date as _date
+    month = period or _date.today().isoformat()[:7]
+    try:
+        rates = payroll_api.current_rates(f"{payroll_api.valid_period(month)}-15", "ZMW")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "sdl": payroll_api.sdl_for(db, ctx.tenant, month, rates)}
+
+
+@app.put("/payroll/settings")
+def put_payroll_settings(body: PayrollSettingsIn, ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    try:
+        payroll_api.set_sdl_setting(db, ctx.tenant, body.sdl)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_payroll_settings(None, ctx)
+
+
+@app.get("/payroll/runs/{run_id}/recheck")
+def recheck_payroll_run(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """A past run worked out again with today's rules: what was deducted too
+    much or too little, person by person. Changes nothing."""
+    db = _require_db()
+    try:
+        return {"ok": True, "recheck": payroll_api.recheck_run(db, ctx.tenant, run_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/payroll/runs")

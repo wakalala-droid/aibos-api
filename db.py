@@ -287,6 +287,8 @@ _SCHEMA_PROBES = (
     (37, "card_subscriptions", "subscription_id"),
     (38, "payment_accounts", "secret_enc"),
     (38, "booking_payments", "provider"),
+    (39, "employees", "allowances"),
+    (39, "profiles", "payroll_sdl"),
 )
 
 _schema_cache: tuple[dict, float] | None = None

@@ -70,15 +70,19 @@ def test_nhima_and_gratuity():
 
 
 def test_payslip_full_example():
-    # K10,000 permanent, no loan. NAPSA is deductible before PAYE.
+    # K10,000 permanent, no loan. PAYE is on the WHOLE gross: ZRA's Employer's
+    # Guide to PAYE, 3.2, stopped taking NAPSA off first on 1 January 2018.
     emp = {"id": "e1", "name": "Grace", "basic_pay": 10_000, "currency": "ZMW"}
     s = payroll.compute_payslip(emp, "2026-07", RATES)
     assert s["napsa_employee"] == 500.0
     assert s["nhima_employee"] == 100.0
-    assert s["taxable"] == 9_500.0          # gross − NAPSA
-    assert s["paye"] == 1_141.0
-    assert s["net"] == 8_259.0              # 10000 − 500 − 100 − 1141
+    assert s["taxable"] == 10_000.0         # gross, NAPSA not taken off
+    assert s["paye"] == 1_326.0             # 400 + 630 + (10000-9200)*0.37 = 296
+    assert s["net"] == 8_074.0              # 10000 - 500 - 100 - 1326
     assert s["gratuity_accrued"] == 0.0
+    # What the employer adds on top: the other half of NAPSA and NHIMA.
+    assert s["napsa_employer"] == 500.0 and s["nhima_employer"] == 100.0
+    assert s["employer_cost"] == 10_600.0   # 10000 + 500 + 100 (no levy here)
 
 
 def test_payslip_loan_deduction_capped_at_balance():
@@ -87,29 +91,41 @@ def test_payslip_loan_deduction_capped_at_balance():
     s = payroll.compute_payslip(emp, "2026-07", RATES)
     # Loan deduction never exceeds the outstanding balance.
     assert s["loan_deduction"] == 200.0
-    # taxable 5700 → paye (5700−5100)*0.20 = 120.
-    # net = 6000 − napsa(300) − nhima(60) − paye(120) − loan(200) = 5320.
+    # paye on 6000: (6000-5100)*0.20 = 180.
+    # net = 6000 - napsa(300) - nhima(60) - paye(180) - loan(200) = 5260.
     assert s["napsa_employee"] == 300.0
-    assert s["paye"] == 120.0
-    assert s["net"] == 5_320.0
+    assert s["paye"] == 180.0
+    assert s["net"] == 5_260.0
+
+
+def test_a_loan_instalment_never_takes_pay_below_nothing():
+    emp = {"id": "e9", "name": "Bwalya", "basic_pay": 2_000, "loan_balance": 9_000, "loan_monthly": 5_000}
+    s = payroll.compute_payslip(emp, "2026-07", RATES)
+    # 2000 - napsa(100) - nhima(20) - paye(0) = 1880 is all that is left.
+    assert s["loan_deduction"] == 1_880.0 and s["net"] == 0.0
 
 
 def test_remittance_drafts():
     # From a run's totals, draft PAYE→ZRA, NAPSA (both sides), NHIMA (both sides),
     # all due the 10th of the month AFTER the period. No double counting: net
     # salaries are posted separately, these are the withheld statutory money.
-    totals = {"paye": 1220.0, "napsa_employee": 500.0, "napsa_employer": 500.0,
-              "nhima_employee": 100.0}
+    totals = {"paye": 1326.0, "napsa_employee": 500.0, "napsa_employer": 500.0,
+              "nhima_employee": 100.0, "nhima_employer": 100.0}
     drafts = payroll.remittance_drafts(totals, "2026-07", "ZMW")
     by_type = {d["tax_type"]: d for d in drafts}
-    assert by_type["PAYE"]["amount"] == 1220.0 and by_type["PAYE"]["authority"] == "ZRA"
+    assert by_type["PAYE"]["amount"] == 1326.0 and by_type["PAYE"]["authority"] == "ZRA"
     assert by_type["NAPSA"]["amount"] == 1000.0          # 500 employee + 500 employer
+    assert (by_type["NAPSA"]["employee_share"], by_type["NAPSA"]["employer_share"]) == (500.0, 500.0)
     assert by_type["NHIMA"]["amount"] == 200.0           # employer matches employee 1%
+    assert "SDL" not in by_type                          # no levy worked out, none drafted
     assert all(d["due_date"] == "2026-08-10" for d in drafts)
     # December period rolls the due date into the next January.
     assert payroll.remittance_drafts(totals, "2026-12")[0]["due_date"] == "2027-01-10"
     # Zero statutory (e.g. everyone below the tax floor) → nothing drafted.
     assert payroll.remittance_drafts({"paye": 0, "napsa_employee": 0, "napsa_employer": 0, "nhima_employee": 0}, "2026-07") == []
+    # A run saved before the employer's NHIMA half was kept still drafts both halves.
+    old = payroll.remittance_drafts({"paye": 0, "napsa_employee": 0, "nhima_employee": 80}, "2026-07")
+    assert old[0]["tax_type"] == "NHIMA" and old[0]["amount"] == 160.0
 
 
 def test_non_zmw_is_register_only():
@@ -121,14 +137,17 @@ def test_non_zmw_is_register_only():
 
 def test_payslip_text():
     slip = {"period": "2026-07", "employee_name": "Mwansa Banda", "gross": 8000,
-            "napsa_employee": 400, "nhima_employee": 80, "paye": 1200,
+            "napsa_employee": 400, "napsa_employer": 400, "nhima_employee": 80, "paye": 1200,
             "loan_deduction": 250, "net": 6070, "gratuity_accrued": 0}
     txt = payroll.payslip_text(slip, business_name="Zoe's Kitchen")
-    assert "*Payslip — 2026-07*" in txt and "Zoe's Kitchen" in txt
+    assert "*Payslip, 2026-07*" in txt and "Zoe's Kitchen" in txt
     assert "Mwansa Banda" in txt and "K8,000.00" in txt
     assert "Loan repayment: −K250.00" in txt
-    assert "*Net pay:        K6,070.00*" in txt
+    assert "*Take-home pay:  K6,070.00*" in txt
     assert "Gratuity" not in txt                       # zero → line omitted
+    # The employer's half is on the payslip too, and the whole of NAPSA.
+    assert "Paid by your employer on top of your pay:" in txt
+    assert "NAPSA receives K800.00 for you this month" in txt
 
     no_loan = payroll.payslip_text({**slip, "loan_deduction": 0, "gratuity_accrued": 33.5})
     assert "Loan repayment" not in no_loan and "K33.50" in no_loan
@@ -139,13 +158,14 @@ def test_compliance_text():
         "headcount": 3, "gross": 24000, "napsa_employee": 1200, "napsa_employer": 1200,
         "nhima_employee": 240, "paye": 3600}}
     txt = payroll.compliance_text(run, business_name="Zoe's Kitchen")
-    assert "*Statutory summary — 2026-07*" in txt and "Zoe's Kitchen" in txt
+    assert "*Statutory summary, 2026-07*" in txt and "Zoe's Kitchen" in txt
     assert "Staff paid: 3" in txt
-    assert "PAYE → ZRA:    K3,600.00" in txt
-    assert "NAPSA:         K2,400.00" in txt          # both sides
-    assert "NHIMA:         K480.00" in txt            # employer matches
-    assert "*Total statutory: K6,480.00*" in txt
+    assert "PAYE to ZRA: K3,600.00" in txt
+    assert "NAPSA: K2,400.00 (staff K1,200.00 + employer K1,200.00)" in txt
+    assert "NHIMA: K480.00 (staff K240.00 + employer K240.00)" in txt
+    assert "*Total: K6,480.00*" in txt
     assert "due 2026-08-10" in txt
+    assert "Skills Development Levy" not in txt
 
 
 if __name__ == "__main__":
