@@ -293,10 +293,26 @@ def ingest(db, user_id: str, ev: EventIn, default_currency: str = "ZMW",
     parties_api.upsert_from_event(db, user_id, payload, row["occurred_at"], business_id)
 
     if status == "confirmed":
-        twin.rebuild(db, user_id, business_id)
+        _rebuild_after_write(db, user_id, business_id)
 
     log.info("[nervous] %s ingested type=%s status=%s conf=%.2f", user_id, ev.event_type, status, confidence)
     return saved
+
+
+def _rebuild_after_write(db, user_id: str, business_id: str | None) -> None:
+    """Rebuild the twin after events were SAVED, without letting a failed
+    rebuild report the save as failed.
+
+    The event is the record; the twin is a fold over it that the next rebuild
+    catches up. Raising here told every caller the write had failed when it had
+    not, and callers act on that: an invoice marked paid went back to "sent"
+    with its payment still in the books, a retry posted it twice, and a
+    spreadsheet import that "failed" was imported again."""
+    try:
+        twin.rebuild(db, user_id, business_id)
+    except Exception as e:  # noqa: BLE001
+        log.error("[nervous] %s events saved but the twin rebuild failed (it catches up on the "
+                  "next write): %s", user_id, e)
 
 
 BATCH_INSERT_SIZE = 500
@@ -386,7 +402,7 @@ def ingest_batch(db, user_id: str, events: list[EventIn], default_currency: str 
 
     errors.sort(key=lambda e: e.get("index", 0))
     if any(r.get("status") == "confirmed" for r in saved):
-        twin.rebuild(db, user_id, business_id)
+        _rebuild_after_write(db, user_id, business_id)
     return {"saved": saved, "errors": errors, "saved_count": len(saved), "error_count": len(errors)}
 
 

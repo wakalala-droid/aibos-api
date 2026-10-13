@@ -21,17 +21,28 @@ so past runs stay truthful after a rate change (a replayable history).
 
 ── Verified statutory figures (2026 charge year, effective 2026-01-01) ──────────
   PAYE (monthly, progressive):  0%  ≤ K5,100
-                                25% K5,100.01 – K7,100
-                                30% K7,100.01 – K9,900
-                                37.5% > K9,900
+                                20% K5,100.01 – K7,100
+                                30% K7,100.01 – K9,200
+                                37% > K9,200
+     (annual: K61,200 / K85,200 / K110,400). The 2026 Budget Speech left PAYE
+     unchanged from 2025, and PwC's Zambia summary (reviewed 24 July 2026)
+     gives exactly these bands for the 2026 charge year.
      base = gross − NAPSA(employee); NAPSA is deductible for PAYE, NHIMA is not.
+     (The deduction is NOT confirmed by a primary source: see the audit in
+     docs/MONEY_AUDIT_2026-10.md. An accountant must confirm it.)
   NAPSA: 5% employee + 5% employer of gross, monthly earnings ceiling K37,236
-         → max contribution K1,861.80 each.
+         → max contribution K1,861.80 each. (2025: K34,164 → K1,708.20.)
   NHIMA: 1% employee + 1% employer of basic pay (not PAYE-deductible).
   Gratuity: fixed-term contracts only, ≥25% of basic pay (Employment Code Act
             No.3 of 2019, s.54/73) — contractual, hence a per-employee rate.
-  Sources: ZRA / PwC Worldwide Tax Summaries (Zambia); NAPSA 2026 ceiling notice
-  (National Average Earnings revision); NHIMA Act; Employment Code Act 2019.
+  Sources: 2026 Budget Speech (Ministry of Finance, October 2025); PwC Worldwide
+  Tax Summaries (Zambia); NAPSA 2026 ceiling notice (National Average Earnings
+  revision); NHIMA Act; Employment Code Act 2019.
+
+  Until 13 October 2026 this file held 25% / 30% to K9,900 / 37.5%, which no
+  ZRA table ever said: every employee over K5,100 had too much PAYE withheld
+  (K79 a month too much at K10,000 gross, K96.50 at K20,000). Past runs keep the figures they
+  were computed with, so a run made before the fix shows the old PAYE.
 """
 
 import logging
@@ -49,15 +60,32 @@ STATUTORY: dict[str, list[dict]] = {
             # (upper_bound, rate) per band; upper_bound None = top open band.
             "paye_bands": [
                 (5100.0, 0.0),
-                (7100.0, 0.25),
-                (9900.0, 0.30),
-                (None,   0.375),
+                (7100.0, 0.20),
+                (9200.0, 0.30),
+                (None,   0.37),
             ],
             "napsa_rate": 0.05,          # each — employee AND employer
             "napsa_ceiling": 37236.0,    # monthly earnings ceiling (max contrib K1,861.80)
             "nhima_rate": 0.01,          # each — employee AND employer, on basic
             "napsa_deductible_for_paye": True,
-            "source": "ZRA 2026 PAYE bands; NAPSA 2026 ceiling K37,236; NHIMA 1%.",
+            "source": "ZRA 2026 PAYE bands (unchanged from 2025); NAPSA 2026 ceiling K37,236; NHIMA 1%.",
+        },
+        {
+            # The same PAYE bands; only the NAPSA ceiling was lower. Kept so a
+            # run back-dated into 2025 uses the ceiling that was in force then.
+            "effective_from": "2025-01-01",
+            "currency": "ZMW",
+            "paye_bands": [
+                (5100.0, 0.0),
+                (7100.0, 0.20),
+                (9200.0, 0.30),
+                (None,   0.37),
+            ],
+            "napsa_rate": 0.05,
+            "napsa_ceiling": 34164.0,    # max contrib K1,708.20
+            "nhima_rate": 0.01,
+            "napsa_deductible_for_paye": True,
+            "source": "ZRA 2025 PAYE bands; NAPSA 2025 ceiling K34,164; NHIMA 1%.",
         },
     ],
 }

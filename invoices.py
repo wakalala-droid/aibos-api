@@ -323,6 +323,9 @@ def send_invoice(db, user_id: str, invoice_id: str) -> dict:
             "payment_method": "credit",           # +receivables, no cash (twin fold)
             "invoice_number": inv["number"],
             "note": f"Invoice {inv['number']} issued",
+            # One Sale per invoice, however many times sending is retried: a
+            # save whose reply was lost is found, not posted again.
+            "client_ref": f"invoice-sale:{invoice_id}",
         },
         source="manual", status="confirmed",
         ), business_id=inv.get("business_id"))
@@ -332,10 +335,20 @@ def send_invoice(db, user_id: str, invoice_id: str) -> dict:
         _claim(db, user_id, invoice_id, "sent", {"status": "draft", "issued_at": None})
         raise
 
-    patch = {"sale_event_id": ev.get("id")}
-    res = (db.table("invoices").update(patch)
-           .eq("id", invoice_id).eq("user_id", user_id).execute())
-    return (getattr(res, "data", None) or [{**inv, **claim, **patch}])[0]
+    return _link_event(db, user_id, invoice_id, {"sale_event_id": ev.get("id")}, {**inv, **claim})
+
+
+def _link_event(db, user_id: str, invoice_id: str, patch: dict, fallback: dict) -> dict:
+    """Note which event an invoice posted. The event is already in the books,
+    so a failure here is logged, never raised: raising told the caller the
+    invoice had not been sent (or paid) when its money was already recorded."""
+    try:
+        res = (db.table("invoices").update(patch)
+               .eq("id", invoice_id).eq("user_id", user_id).execute())
+        return (getattr(res, "data", None) or [{**fallback, **patch}])[0]
+    except Exception as e:  # noqa: BLE001
+        log.error("[invoices] %s posted but its link %s was not saved: %s", invoice_id, patch, e)
+        return {**fallback, **patch}
 
 
 def ensure_pay_token(db, user_id: str, invoice_id: str) -> dict:
@@ -413,6 +426,8 @@ def mark_paid(db, user_id: str, invoice_id: str,
     }
     if reference:
         payload["payment_reference"] = reference
+    # Paid is final, so an invoice has one payment: a retry finds it.
+    payload["client_ref"] = f"invoice-pay:{invoice_id}"
 
     try:
         ev = nervous.ingest(db, user_id, nervous.EventIn(
@@ -433,10 +448,7 @@ def mark_paid(db, user_id: str, invoice_id: str,
         _claim(db, user_id, invoice_id, "paid", {"status": "sent", "paid_at": None})
         raise
 
-    patch = {"payment_event_id": ev.get("id")}
-    res = (db.table("invoices").update(patch)
-           .eq("id", invoice_id).eq("user_id", user_id).execute())
-    return (getattr(res, "data", None) or [{**inv, **claimed, **patch}])[0]
+    return _link_event(db, user_id, invoice_id, {"payment_event_id": ev.get("id")}, {**inv, **claimed})
 
 
 def cancel_invoice(db, user_id: str, invoice_id: str) -> dict:

@@ -3208,8 +3208,16 @@ def _load_subscription_payment(reference: str) -> Optional[Dict[str, Any]]:
 def _settle(rec: Dict[str, Any], new_status: str) -> None:
     """Apply a resolved status once. On first transition to 'successful', grant
     the paid tier. The persisted `granted` flag is claimed with a conditional
-    write, so a status poll and the provider webhook cannot both grant."""
-    if new_status not in ("successful", "failed") or rec.get("status") == new_status:
+    write, so a status poll and the provider webhook cannot both grant.
+
+    A payment already 'successful' whose plan was never switched on is granted
+    on the next attempt. It used to stop at "the status has not changed", so a
+    grant that failed (or a server that stopped between the two writes) kept
+    the customer's money and gave them nothing, however often Paddle retried.
+    A grant that fails gives its claim back for the same reason."""
+    if new_status not in ("successful", "failed"):
+        return
+    if rec.get("status") == new_status and (new_status == "failed" or rec.get("granted")):
         return
     rec["status"] = new_status
     db = get_db()
@@ -3236,6 +3244,18 @@ def _settle(rec: Dict[str, Any], new_status: str) -> None:
     if _grant_tier(rec.get("user_id"), rec.get("plan", ""), rec.get("billing") or "monthly",
                    rec.get("period_end")):
         _send_plan_receipt(rec)
+        return
+    # Paid, and the plan is not on. Release the claim so the next attempt (a
+    # Paddle retry, a status poll, the sweep) switches it on.
+    rec["granted"] = False
+    if persisted:
+        try:
+            (db.table("subscription_payments").update({"granted": False})
+             .eq("reference", rec["reference"]).execute())
+        except Exception as e:  # noqa: BLE001
+            log.error("[payments] could not release the grant claim on %s: %s", rec["reference"], e)
+    log.error("[payments] %s paid (%s) but the plan was not switched on; it will be retried",
+              rec.get("user_id"), rec.get("reference"))
 
 
 @app.get("/payments/config")
@@ -3539,7 +3559,11 @@ def _paddle_payment(db, data: Dict[str, Any]) -> Dict[str, Any]:
     rec["period_end"] = fact["period_end"]
     _settle(rec, "successful")
     _note_card_payment(db, fact, user_id)
-    return {"ok": True, "granted": bool(rec.get("granted"))}
+    if not rec.get("granted"):
+        # A 200 here would tell Paddle the payment is dealt with while the
+        # customer has paid for a plan they do not have. Paddle retries a 5xx.
+        raise HTTPException(status_code=500, detail="The plan could not be switched on; Paddle will retry.")
+    return {"ok": True, "granted": True}
 
 
 def _paddle_subscription(db, data: Dict[str, Any], occurred_at) -> Dict[str, Any]:
@@ -5698,12 +5722,20 @@ def _settle_invoice_payment(db, row: Dict[str, Any], new_status: str) -> str:
 
     `settled` is flipped BEFORE the spine event is posted, so a re-poll racing
     the provider webhook cannot post two CustomerPayments for one collection.
-    """
-    if new_status not in ("successful", "failed") or new_status == row.get("status"):
-        return row.get("status", "pending")
 
-    db.table("invoice_payments").update({"status": new_status}).eq("id", row["id"]).execute()
-    row["status"] = new_status
+    A row already 'successful' but not settled is settled now (the sweep sends
+    these). If posting fails for a reason other than the invoice's own state,
+    the claim is given back so the sweep tries again: before, it stayed
+    claimed and the customer's money never reached the invoice.
+    """
+    if new_status not in ("successful", "failed"):
+        return row.get("status", "pending")
+    if new_status == row.get("status") and (new_status == "failed" or row.get("settled")):
+        return new_status
+
+    if new_status != row.get("status"):
+        db.table("invoice_payments").update({"status": new_status}).eq("id", row["id"]).execute()
+        row["status"] = new_status
 
     if new_status == "successful" and not row.get("settled"):
         # Conditional, so of a poll and a webhook arriving together exactly one
@@ -5746,7 +5778,23 @@ def _settle_invoice_payment(db, row: Dict[str, Any], new_status: str) -> str:
                 )
             except Exception as ne:  # noqa: BLE001 — telling the owner must never fail the payer
                 log.warning("[pay] could not alert the owner about %s: %s", row["reference"], ne)
+        except Exception:
+            _release_settle_claim(db, "invoice_payments", row)
+            raise
     return new_status
+
+
+def _release_settle_claim(db, table: str, row: Dict[str, Any]) -> None:
+    """Hand back a collection's `settled` claim after its posting failed, so the
+    payment sweep settles it later instead of the money staying unrecorded."""
+    try:
+        db.table(table).update({"settled": False}).eq("id", row["id"]).execute()
+        row["settled"] = False
+        log.error("[pay] %s %s was paid but not recorded; the sweep will retry",
+                  table, row.get("reference"))
+    except Exception as e:  # noqa: BLE001
+        log.error("[pay] %s %s was paid, not recorded, and its claim could not be released: %s",
+                  table, row.get("reference"), e)
 
 
 def _payment_row(db, token: str, reference: str) -> Dict[str, Any]:
@@ -5924,11 +5972,16 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
 def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
     """Apply a resolved status once; on success the booking records the money.
     `settled` is claimed with a conditional write first, so a status check and
-    the provider's confirmation cannot both record it."""
-    if new_status not in ("successful", "failed") or new_status == row.get("status"):
+    the provider's confirmation cannot both record it. As with invoices, a row
+    already 'successful' but not settled is settled now, and a failure to post
+    gives the claim back for the sweep."""
+    if new_status not in ("successful", "failed"):
         return row.get("status", "pending")
-    db.table("booking_payments").update({"status": new_status}).eq("id", row["id"]).execute()
-    row["status"] = new_status
+    if new_status == row.get("status") and (new_status == "failed" or row.get("settled")):
+        return new_status
+    if new_status != row.get("status"):
+        db.table("booking_payments").update({"status": new_status}).eq("id", row["id"]).execute()
+        row["status"] = new_status
     if new_status != "successful" or row.get("settled"):
         return new_status
     claimed = (db.table("booking_payments").update({"settled": True})
@@ -5937,19 +5990,13 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
         return new_status
     row["settled"] = True
     # A stay is paid by mobile money, in Kwacha (plans are the ones in dollars).
-    money = billing_api.money(float(row.get("amount") or 0), row.get("currency") or "ZMW")
+    currency = row.get("currency") or "ZMW"
+    money = billing_api.money(float(row.get("amount") or 0), currency)
+    link = f"/dashboard/hospitality?booking={row['booking_id']}"
     try:
-        saved = hospitality_api.record_link_payment(db, row["user_id"], row["booking_id"],
-                                                    float(row.get("amount") or 0))
-        notify.record_notification(
-            db, row["user_id"], "booking_paid_by_link",
-            f"A guest paid {money} for their stay",
-            f"{str(saved.get('check_in'))[:10]} to {str(saved.get('check_out'))[:10]}: "
-            f"{'paid in full' if saved.get('payment_status') == 'paid' else 'deposit received'} "
-            f"by {row['network'].upper()} mobile money, reference {row['reference']}. "
-            "It is in your books.",
-            link=f"/dashboard/hospitality?booking={row['booking_id']}",
-            meta={"booking_id": f"pay-{row['reference']}"})
+        out = hospitality_api.record_link_payment(db, row["user_id"], row["booking_id"],
+                                                  float(row.get("amount") or 0),
+                                                  reference=row["reference"])
     except ValueError as e:
         # Cancelled while the guest was approving. Their money arrived anyway,
         # so the owner must hear about it: it is owed back or to be recorded.
@@ -5962,10 +6009,42 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
                 f"{row['network'].upper()} mobile money reference {row['reference']}. The stay "
                 f"changed ({e}) while they were paying, so this money is not in your books. "
                 "Record it or refund it.",
-                link=f"/dashboard/hospitality?booking={row['booking_id']}",
-                meta={"booking_id": f"pay-{row['reference']}"})
+                link=link, meta={"booking_id": f"pay-{row['reference']}"})
         except Exception:  # noqa: BLE001 — telling the owner must never fail the payer
             pass
+        return new_status
+    except Exception:
+        # The books could not take it. Only this releases the claim: a failure
+        # telling the owner below must not post the payment a second time.
+        _release_settle_claim(db, "booking_payments", row)
+        raise
+
+    saved = out["booking"]
+    try:
+        if out["applied"] > 0.005:
+            notify.record_notification(
+                db, row["user_id"], "booking_paid_by_link",
+                f"A guest paid {billing_api.money(out['applied'], currency)} for their stay",
+                f"{str(saved.get('check_in'))[:10]} to {str(saved.get('check_out'))[:10]}: "
+                f"{'paid in full' if saved.get('payment_status') == 'paid' else 'deposit received'} "
+                f"by {row['network'].upper()} mobile money, reference {row['reference']}. "
+                "It is in your books.",
+                link=link, meta={"booking_id": f"pay-{row['reference']}"})
+        if out["excess"] > 0.005:
+            # Paid twice (two prompts approved), or paid after the owner had
+            # recorded the stay as paid. The money arrived and the stay did not
+            # owe it, so it is owed back. Never absorbed in silence.
+            extra = billing_api.money(out["excess"], currency)
+            notify.record_notification(
+                db, row["user_id"], "booking_payment_unmatched",
+                f"A guest paid {extra} more than their stay owed",
+                f"{row['network'].upper()} mobile money reference {row['reference']} brought {money}"
+                + (f", of which {billing_api.money(out['applied'], currency)} went to the stay"
+                   if out["applied"] > 0.005 else ", and the stay was already paid in full")
+                + f". The other {extra} is not in your books. Check and refund it if they paid twice.",
+                link=link, meta={"booking_id": f"over-{row['reference']}"})
+    except Exception as e:  # noqa: BLE001 — the money is recorded; the bell is best-effort
+        log.warning("[pay] could not tell the owner about stay payment %s: %s", row["reference"], e)
     return new_status
 
 
@@ -6930,6 +7009,37 @@ def sweep_pending_payments(db) -> dict:
                 log.warning("[payments] sweep of %s failed: %s", row.get("reference"), e)
     except Exception as e:  # noqa: BLE001 — pre-0033: no table to sweep
         log.info("[payments] subscription sweep skipped: %s", e)
+
+    # Paid but not finished: the money is in, and the plan was not switched on
+    # or the invoice or stay was not marked paid (a write failed, or the server
+    # stopped half way). Nothing asks the provider again; the answer is known.
+    # Without this, only rows still 'pending' were ever looked at, so a payment
+    # stuck after 'successful' was never put right.
+    out["finished"] = 0
+    for table, flag, finish in (
+        ("subscription_payments", "granted", None),
+        ("invoice_payments", "settled", _settle_invoice_payment),
+        ("booking_payments", "settled", _settle_booking_payment),
+    ):
+        try:
+            res = (db.table(table).select("*").eq("status", "successful").eq(flag, False)
+                   .gte("created_at", since).limit(200).execute())
+        except Exception as e:  # noqa: BLE001 — a table not there yet
+            log.info("[payments] %s finish sweep skipped: %s", table, e)
+            continue
+        for row in getattr(res, "data", None) or []:
+            try:
+                if finish is None:
+                    rec = PAYMENTS.get(row["reference"]) or _sub_row_to_rec(row)
+                    PAYMENTS.setdefault(row["reference"], rec)
+                    _settle(rec, "successful")
+                    out["finished"] += bool(rec.get("granted"))
+                else:
+                    finish(db, row, "successful")
+                    out["finished"] += bool(row.get("settled"))
+            except Exception as e:  # noqa: BLE001
+                out["errors"] += 1
+                log.warning("[payments] finishing %s %s failed: %s", table, row.get("reference"), e)
 
     try:
         invs = (db.table("invoice_payments").select("*").eq("status", "pending")

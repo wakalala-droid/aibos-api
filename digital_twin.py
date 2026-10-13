@@ -27,7 +27,7 @@ receivables/payables instead of cash.
   Expense / Salary     −amount         +costs           —
   TaxPayment           −amount         +costs           —
   AssetPurchase        −amount         —                +assets_value
-  InventoryReceipt     −amount*        —                +inventory_value
+  InventoryReceipt     −amount*        —                +inventory_value; credit → +payables
   InventoryAdjustment  —               —                ±inventory_value (delta·unit_cost)
   Loan (received)      +amount         —                +liabilities
   Loan (repayment)     −amount         —                −liabilities
@@ -85,7 +85,7 @@ def cash_direction(event_type: str, payload: dict | None) -> str:
 _METHOD_BUCKET = {
     "cash": "cash",
     "mobile_money": "mobile_money", "momo": "mobile_money", "mobile money": "mobile_money",
-    "mtn": "mobile_money", "airtel": "mobile_money",
+    "mtn": "mobile_money", "airtel": "mobile_money", "zamtel": "mobile_money",
     "bank": "bank", "card": "bank", "transfer": "bank", "eft": "bank", "cheque": "bank",
 }
 
@@ -255,7 +255,12 @@ def project(events: list, opening_cash: float = 0.0, currency: str = "ZMW") -> d
 
         elif etype == "InventoryReceipt":
             s["inventory_value"] += amount
-            if not on_credit:
+            # Stock delivered on credit is owed to the supplier, as a credit
+            # Purchase is (and as the ledger export already said). It used to
+            # owe nobody, so paying that supplier drove payables below zero.
+            if on_credit:
+                s["payables"] += amount
+            else:
                 cash -= amount
             if p.get("supplier"):
                 suppliers.add(str(p["supplier"]).strip().lower())

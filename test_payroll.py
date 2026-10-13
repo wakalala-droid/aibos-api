@@ -29,15 +29,35 @@ def test_napsa_cap():
     assert payroll.compute_napsa(37_236, RATES) == 1861.80
 
 
+def test_paye_bands_are_the_zra_2026_table():
+    # ZRA 2026 charge year (unchanged from 2025): K5,100 at 0%, to K7,100 at
+    # 20%, to K9,200 at 30%, then 37%. Annual: K61,200 / K85,200 / K110,400.
+    # This file once held 25% / K9,900 / 37.5%, a table ZRA never published.
+    assert RATES["paye_bands"] == [(5100.0, 0.0), (7100.0, 0.20), (9200.0, 0.30), (None, 0.37)]
+    annual = [round(u * 12) for u, _ in RATES["paye_bands"] if u is not None]
+    assert annual == [61_200, 85_200, 110_400]
+
+
 def test_paye_progressive_bands():
     # Wholly inside the 0% band → no tax.
     assert payroll.compute_paye(5_000, RATES["paye_bands"]) == 0.0
-    # Into the 25% band only: (5700−5100)*0.25 = 150.
-    assert payroll.compute_paye(5_700, RATES["paye_bands"]) == 150.0
-    # Into the 30% band: 500 (25% band) + (9500−7100)*0.30 = 500 + 720 = 1220.
-    assert payroll.compute_paye(9_500, RATES["paye_bands"]) == 1220.0
-    # Into the top 37.5% band: 500 + 840 + (20000−9900)*0.375 = 500+840+3787.5.
-    assert abs(payroll.compute_paye(20_000, RATES["paye_bands"]) - 5127.5) < 0.01
+    # Exactly at the threshold → still no tax.
+    assert payroll.compute_paye(5_100, RATES["paye_bands"]) == 0.0
+    # Into the 20% band only: (5700−5100)*0.20 = 120.
+    assert payroll.compute_paye(5_700, RATES["paye_bands"]) == 120.0
+    # Into the 30% band: 400 (20% band) + (9000−7100)*0.30 = 400 + 570 = 970.
+    assert payroll.compute_paye(9_000, RATES["paye_bands"]) == 970.0
+    # Into the top 37% band: 400 + 630 + (9500−9200)*0.37 = 400+630+111.
+    assert payroll.compute_paye(9_500, RATES["paye_bands"]) == 1141.0
+    # 400 + 630 + (20000−9200)*0.37 = 400+630+3996.
+    assert abs(payroll.compute_paye(20_000, RATES["paye_bands"]) - 5026.0) < 0.01
+
+
+def test_2025_runs_use_the_2025_napsa_ceiling():
+    r2025 = payroll.current_rates("2025-12-28", "ZMW")
+    assert r2025["effective_from"] == "2025-01-01"
+    assert payroll.compute_napsa(50_000, r2025) == 1708.20
+    assert r2025["paye_bands"] == RATES["paye_bands"]
 
 
 def test_nhima_and_gratuity():
@@ -56,8 +76,8 @@ def test_payslip_full_example():
     assert s["napsa_employee"] == 500.0
     assert s["nhima_employee"] == 100.0
     assert s["taxable"] == 9_500.0          # gross − NAPSA
-    assert s["paye"] == 1_220.0
-    assert s["net"] == 8_180.0              # 10000 − 500 − 100 − 1220
+    assert s["paye"] == 1_141.0
+    assert s["net"] == 8_259.0              # 10000 − 500 − 100 − 1141
     assert s["gratuity_accrued"] == 0.0
 
 
@@ -67,10 +87,11 @@ def test_payslip_loan_deduction_capped_at_balance():
     s = payroll.compute_payslip(emp, "2026-07", RATES)
     # Loan deduction never exceeds the outstanding balance.
     assert s["loan_deduction"] == 200.0
-    # net = 6000 − napsa(300) − nhima(60) − paye(150) − loan(200) = 5290.
+    # taxable 5700 → paye (5700−5100)*0.20 = 120.
+    # net = 6000 − napsa(300) − nhima(60) − paye(120) − loan(200) = 5320.
     assert s["napsa_employee"] == 300.0
-    assert s["paye"] == 150.0
-    assert s["net"] == 5_290.0
+    assert s["paye"] == 120.0
+    assert s["net"] == 5_320.0
 
 
 def test_remittance_drafts():

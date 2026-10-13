@@ -2578,25 +2578,56 @@ def public_stay_view(booking: dict, unit_name: str | None, business: str | None,
     }
 
 
-def record_link_payment(db, user_id: str, booking_id: str, amount: float) -> dict:
-    """A guest's link payment arrived: the booking says so, and the books follow
-    through update_booking. Raises ValueError when the stay no longer takes
-    money (cancelled meanwhile), so the caller can tell the owner."""
+def record_link_payment(db, user_id: str, booking_id: str, amount: float,
+                        reference: str | None = None) -> dict:
+    """A guest's link payment arrived: it goes into the books as a mobile money
+    CustomerPayment carrying the provider's reference, and the booking follows.
+
+    Returns {"booking", "applied", "excess"}. Only what the stay still owes is
+    applied. The rest (`excess`) is money the guest paid twice, or paid after
+    the owner had already recorded the stay as paid: the caller must tell the
+    owner, because it is owed back. Before, it was absorbed in silence, and a
+    link payment was booked as cash in the drawer when it sat in the business's
+    mobile money account.
+
+    Raises ValueError when the stay no longer takes money (cancelled meanwhile),
+    so the caller can tell the owner, and RuntimeError when the books could not
+    take the payment, so the caller can try again later. Safe to call again
+    for the same reference: a payment already in the books is not posted twice."""
     booking = get_booking(db, user_id, booking_id)
     if not _counts_as_income(booking):
         raise ValueError(f"the stay is {booking.get('status')}")
+    value = round(_num(amount, 0.0), 2)
+
     total = _num(booking.get("total_amount"), 0.0)
-    paid = round(_paid_target(booking) + _num(amount, 0.0), 2)
-    patch = ({"payment_status": "paid"} if paid >= total - 0.005
-             else {"payment_status": "partial", "deposit_amount": paid})
-    saved = update_booking(db, user_id, booking_id, patch)
+    existing = _booking_payments(db, user_id, booking_id) if reference else []
+    already = next((e for e in existing
+                    if (e.get("payload") or {}).get("payment_reference") == reference), None)
+    saved = booking
+    if already is not None:
+        # Posted on an earlier attempt that stopped after the post. Whether or
+        # not the booking moved on then, the books say what has been paid: the
+        # booking is brought to that figure, never to "booking + this payment"
+        # a second time.
+        applied = round(min(value, _num((already.get("payload") or {}).get("amount"), 0.0)), 2)
+        have = round(sum(_num((e.get("payload") or {}).get("amount"), 0.0) for e in existing), 2)
+        if abs(have - _paid_target(booking)) > 0.005:
+            saved = update_booking(db, user_id, booking_id, _paid_patch(total, have))
+    else:
+        applied = round(min(value, owed_on(booking)), 2)
+        if applied > 0.005:
+            if not _post_stay_payment(db, user_id, booking, applied, None, "mobile_money", reference):
+                raise RuntimeError("the payment could not be saved to the books")
+            saved = update_booking(db, user_id, booking_id,
+                                   _paid_patch(total, _paid_target(booking) + applied))
+    excess = round(max(0.0, value - applied), 2)
     # The link has done its job for this amount; the next one asks for the rest.
     try:
         (db.table("bookings").update({"pay_request": None})
          .eq("id", booking_id).eq("user_id", user_id).execute())
     except Exception:  # noqa: BLE001
         pass
-    return saved
+    return {"booking": saved, "applied": applied, "excess": excess}
 
 
 # ── Instalments: each payment on a stay with its own date and method ─────────
@@ -2655,6 +2686,18 @@ def add_booking_payment(db, user_id: str, booking_id: str, amount, paid_on=None,
             raise ValueError("A payment cannot be dated in the future.")
         day = f"{d.isoformat()}T12:00:00+00:00"
 
+    if not _post_stay_payment(db, user_id, booking, value, day, method):
+        raise ValueError("The payment could not be saved to your books. Try again in a moment.")
+    total = _num(booking.get("total_amount"), 0.0)
+    saved = update_booking(db, user_id, booking_id, _paid_patch(total, _paid_target(booking) + value))
+    return {"booking": saved, "payments": list_booking_payments(db, user_id, booking_id)}
+
+
+def _post_stay_payment(db, user_id: str, booking: dict, value: float, day: str | None,
+                       method: str, reference: str | None = None) -> bool:
+    """Post one payment on a stay as its own CustomerPayment. True when it is in
+    the books. The caller moves the booking on afterwards, so sync_booking_payment
+    finds the books already matching and posts nothing twice."""
     # Bring the books in line first (a Sale that still went to cash moves to
     # money owed), then post this payment as its own event.
     sync_booking_payment(db, user_id, booking)
@@ -2665,13 +2708,13 @@ def add_booking_payment(db, user_id: str, booking_id: str, amount, paid_on=None,
         rows = getattr(res, "data", None) or []
         sale_payload = (rows[0].get("payload") or {}) if rows else {}
     payload = {**_payment_payload(booking, sale_payload, value), "payment_method": method}
-    if not _post_event(db, user_id, "CustomerPayment", payload,
-                       note=f"Guest payment for booking {booking.get('check_in')}→{booking.get('check_out')}",
-                       occurred_at=day):
-        raise ValueError("The payment could not be saved to your books. Try again in a moment.")
-    total = _num(booking.get("total_amount"), 0.0)
-    saved = update_booking(db, user_id, booking_id, _paid_patch(total, _paid_target(booking) + value))
-    return {"booking": saved, "payments": list_booking_payments(db, user_id, booking_id)}
+    if reference:
+        payload["payment_reference"] = reference
+        # Once, however many times the settlement is retried.
+        payload["client_ref"] = f"stay-pay:{reference}"[:64]
+    return bool(_post_event(db, user_id, "CustomerPayment", payload,
+                            note=f"Guest payment for booking {booking.get('check_in')}→{booking.get('check_out')}",
+                            occurred_at=day))
 
 
 def remove_booking_payment(db, user_id: str, booking_id: str, event_id: str) -> dict:

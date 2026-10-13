@@ -85,13 +85,18 @@ def test_a_deposit_then_the_balance_move_the_booking_to_paid(monkeypatch):
         def eq(self, *a): return self
         def execute(self): return NS(data=[])
 
+    posted = []
     monkeypatch.setattr(hospitality, "get_booking", lambda db, uid, bid: state["b"])
     monkeypatch.setattr(hospitality, "update_booking", update)
+    monkeypatch.setattr(hospitality, "_post_stay_payment",
+                        lambda db, uid, b, value, day, method, ref=None: posted.append((value, method)) or True)
     db = NS(table=lambda n: _Q())
     hospitality.record_link_payment(db, "u1", "b1", 500)
     assert patches[-1] == {"payment_status": "partial", "deposit_amount": 500}
     hospitality.record_link_payment(db, "u1", "b1", 1500)
     assert patches[-1] == {"payment_status": "paid"}
+    # Each one in the books as mobile money, not the cash drawer.
+    assert posted == [(500, "mobile_money"), (1500, "mobile_money")]
 
 
 def test_a_payment_for_a_cancelled_stay_is_refused_so_the_owner_is_told(monkeypatch):
@@ -104,7 +109,8 @@ def test_a_payment_reported_twice_is_recorded_once(monkeypatch):
     import main
     recorded = []
     monkeypatch.setattr(main.hospitality_api, "record_link_payment",
-                        lambda db, uid, bid, amount: recorded.append(amount) or _stay(payment_status="paid"))
+                        lambda db, uid, bid, amount, reference=None: recorded.append(amount) or
+                        {"booking": _stay(payment_status="paid"), "applied": amount, "excess": 0.0})
     monkeypatch.setattr(main.notify, "record_notification", lambda *a, **k: True)
 
     class _Q:
