@@ -4894,7 +4894,10 @@ class TwinSeedRequest(BaseModel):
 
 @app.post("/twin/seed")
 def seed_twin(req: TwinSeedRequest, ctx: membership.Context = Depends(membership.require_write)):
-    """Seed the twin's opening cash + currency (Setup Wizard, Initiative 1)."""
+    """Seed the twin's opening cash + currency (Setup Wizard, Initiative 1).
+    The opening balance moves the money figure, so it is the owner's alone."""
+    if req.opening_cash is not None:
+        _staff_may_not_touch_money(ctx)
     db = _require_db()
     return {"ok": True, "twin": twin.seed(db, ctx.tenant, req.opening_cash, req.currency, ctx.business_id)}
 

@@ -99,3 +99,9 @@ def test_a_negative_line_in_a_spreadsheet_is_a_refund_waiting_for_the_owner():
     assert refund.payload["reversal_of"] == "Sale" and refund.confidence < 0.99    # the owner confirms it
     assert (money_back.event_type, money_back.payload["direction"]) == ("Refund", "from_supplier")
     assert [e["row"] for e in errors] == [3] and "zero" in errors[0]["error"]
+
+
+def test_staff_cannot_move_the_opening_balance(as_staff):
+    """The opening balance moves the money figure: the owner's alone."""
+    res = as_staff.post("/twin/seed", json={"opening_cash": 50000, "currency": "ZMW"})
+    assert res.status_code == 403 and "Only the owner can record money" in res.json()["detail"]
