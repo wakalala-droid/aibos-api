@@ -75,6 +75,11 @@ def _real_books():
                                                  "check_out": "2026-10-22", "total_amount": 3000,
                                                  "status": "confirmed", "guest_name": "Mimi Banda"})
     hospitality.update_booking(db, "u1", stay["id"], {"payment_status": "paid", "payment_method": "mobile_money"})
+    # The invoice and the stay are paid on the app's own clock. Left there, from
+    # the day after NOW they sat after it and the money line took them back.
+    for e in db.rows["business_events"]:
+        if str(e.get("occurred_at") or "") > NOW.isoformat():
+            e["occurred_at"] = "2026-10-12T12:00:00+00:00"
     # A spreadsheet the owner has not looked at yet: in no figure.
     _ev(db, "Sale", 999, "2026-10-11T12:00:00+00:00", status="pending", source="excel", payment_method="cash")
     _ev(db, "Expense", 111, "2026-10-11T12:00:00+00:00", status="pending", source="excel", category="fuel")
