@@ -134,6 +134,7 @@ services:
       # Email (Resend), WhatsApp and Google Places are all optional:
       #   RESEND_API_KEY, BRIEF_FROM_EMAIL
       #   WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_VERIFY_TOKEN,
-      #   WHATSAPP_APP_SECRET, WHATSAPP_TEMPLATE
+      #   WHATSAPP_APP_SECRET, WHATSAPP_TEMPLATE (the Morning Brief's;
+      #   wording in notify.send_brief_whatsapp)
       #   PLACES_API_KEY
       # Add them in the dashboard when you have the keys.

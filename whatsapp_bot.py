@@ -29,7 +29,7 @@ import re
 
 import llm
 import nervous_system as nervous
-from notify import whatsapp_enabled
+from notify import graph_messages_url, whatsapp_enabled
 
 log = logging.getLogger("aibos.whatsapp")
 
@@ -193,9 +193,8 @@ def _reply(to: str, text: str) -> None:
     try:
         if whatsapp_enabled():
             import httpx
-            phone_id = os.environ["WHATSAPP_PHONE_ID"]
             httpx.post(
-                f"https://graph.facebook.com/v19.0/{phone_id}/messages",
+                graph_messages_url(os.environ["WHATSAPP_PHONE_ID"]),
                 headers={"Authorization": f"Bearer {os.environ.get('WHATSAPP_TOKEN')}"},
                 json={"messaging_product": "whatsapp", "to": to,
                       "type": "text", "text": {"body": text}},

@@ -2662,9 +2662,17 @@ def health_setup():
          "without_it": "A booking request reaches the owner in the app only. "
                        "Nothing is emailed, so a closed laptop learns nothing."},
         {"key": "booking_whatsapp_alerts", "live": on("WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID"),
-         "needs": ["WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "WHATSAPP_TEMPLATE"],
+         "needs": ["WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID"],
+         "detail": "Sent as plain text, so it lands when the owner has written to the "
+                   "AI-BOS number in the last 24 hours.",
          "without_it": "No WhatsApp on a new booking, which is the channel a "
                        "Zambian owner actually watches."},
+        {"key": "whatsapp_morning_brief",
+         "live": on("WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "WHATSAPP_TEMPLATE"),
+         "needs": ["WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "WHATSAPP_TEMPLATE"],
+         "without_it": "The Morning Brief goes by email and phone notification only. "
+                       "Without the approved template, WhatsApp reaches only an owner "
+                       "who wrote to the AI-BOS number in the last 24 hours."},
         {"key": "guest_id_documents", "live": on("FIELD_ENCRYPTION_KEY"),
          "needs": ["FIELD_ENCRYPTION_KEY"],
          "without_it": "Capturing a guest's passport or NRC number is REFUSED "
@@ -3966,6 +3974,52 @@ def notify_dispatch(x_cron_secret: Optional[str] = Header(default=None)):
     if db is None:
         raise HTTPException(status_code=503, detail="Persistence is not configured")
     return notify.dispatch_briefs(db)
+
+
+@app.post("/notify/test-whatsapp")
+def notify_test_whatsapp(ctx: membership.Context = Depends(membership.require_context)):
+    """Send the owner's own Morning Brief to their own WhatsApp, now.
+
+    The only other way to see one is the 06:30 run, which goes to everyone who
+    asked for it. This is the same brief to the number saved on the profile,
+    for the owner only, and three a quarter hour: Meta charges for every
+    template message. A refusal comes back in Meta's own words, which say what
+    to fix (template not approved yet, no payment method, a wrong number).
+    """
+    if ctx.role != "owner":
+        raise HTTPException(status_code=403,
+                            detail="Only the owner can send the Morning Brief to WhatsApp.")
+    entitlements.require_feature(ctx.tenant, "morning_brief")
+    if not notify.whatsapp_enabled():
+        raise HTTPException(status_code=503,
+                            detail="WhatsApp is not switched on yet. Your number is saved and "
+                                   "the brief starts the morning it is.")
+    allowed, retry = rate_limit.check(ctx.actor, "whatsapp_test", 3, 900)
+    if not allowed:
+        raise HTTPException(status_code=429,
+                            detail=f"Three tests is plenty for now. Try again in about "
+                                   f"{max(1, retry // 60)} minutes.",
+                            headers={"Retry-After": str(retry)})
+    db = _require_db()
+    rows = getattr(db.table("profiles").select("whatsapp_number, business_name")
+                   .eq("id", ctx.tenant).limit(1).execute(), "data", None) or []
+    prof = rows[0] if rows else {}
+    number = notify.wa_number(prof.get("whatsapp_number"))
+    if not number:
+        raise HTTPException(status_code=400,
+                            detail="Save your WhatsApp number with its country code first, "
+                                   "for example +260 977 123 456.")
+    # The 06:30 run's brief exactly: the owner's default books.
+    brief = notify.compose_brief(db, ctx.tenant, prof.get("business_name"))
+    if brief is None:
+        raise HTTPException(status_code=409,
+                            detail="Nothing is recorded yet, so there is no brief to send. "
+                                   "Record a sale or an expense, then try again.")
+    why: list[str] = []
+    if not notify.send_brief_whatsapp(number, prof.get("business_name"), *brief, errors=why):
+        raise HTTPException(status_code=502,
+                            detail="WhatsApp did not take it. " + (why[0] if why else "Try again in a minute."))
+    return {"ok": True, "to": number[-3:]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

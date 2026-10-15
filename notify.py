@@ -11,9 +11,11 @@ Channels:
   • Email — Resend (https://resend.com). Free tier is plenty to start.
   • WhatsApp — Meta Cloud API. NOTE: business-initiated messages outside the
     24-hour service window require an approved TEMPLATE. Set
-    WHATSAPP_TEMPLATE to the approved template name (one {{1}} body param);
-    without it we send free-form text, which only lands inside a 24h window
-    after the user last messaged the number. Both modes are implemented.
+    WHATSAPP_TEMPLATE to the approved Morning Brief template's name. It has
+    TWO body variables: {{1}} who and when ("Dunslim, Thu 15 Oct"), {{2}} the
+    brief itself (see send_brief_whatsapp). Without it we send free-form
+    text, which only lands inside a 24h window after the user last messaged
+    the number. Both modes are implemented.
 
 Env:
   RESEND_API_KEY      Resend API key
@@ -21,13 +23,17 @@ Env:
                       DOMAIN is used: AI-BOS writes as hello@ that domain (see
                       sender()). Unset: Resend's test sender, for a first test.
   APP_FROM_EMAIL      optional: the exact "Name <address>" to send as instead
-  WHATSAPP_TOKEN      Meta Cloud API access token
+  WHATSAPP_TOKEN      Meta Cloud API access token (a system user's, which
+                      does not expire)
   WHATSAPP_PHONE_ID   sending phone-number id
-  WHATSAPP_TEMPLATE   approved template name (optional; see note above)
+  WHATSAPP_TEMPLATE   approved Morning Brief template name (see note above)
+  WHATSAPP_TEMPLATE_LANG  the template's language code (default "en")
+  WHATSAPP_API_VERSION    Graph API version (default in GRAPH_API_VERSION)
   CRON_SECRET         shared secret the cron caller must present
 """
 
 import os
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -138,6 +144,16 @@ def _day_start(days_back: int = 0) -> datetime:
     now_lusaka = datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET)
     start_lusaka = (now_lusaka - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
     return start_lusaka - timedelta(hours=LUSAKA_UTC_OFFSET)
+
+
+def brief_day() -> str:
+    """Today on the owner's clock, as the brief names it: "Thu 15 Oct"."""
+    return (datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET)).strftime("%a %d %b")
+
+
+# The brief's last paragraph. The WhatsApp template carries its own copy of it,
+# so the WhatsApp send leaves this one off rather than saying it twice.
+BRIEF_SIGNOFF = "Any questions? Open AI-BOS and just ask."
 
 
 def compose_brief(db, user_id: str, business_name: str | None,
@@ -262,10 +278,9 @@ def compose_brief(db, user_id: str, business_name: str | None,
     elif recv > 0:
         lines.append(f"One thing today: collect part of the {_money(recv, sym)} customers owe you.")
 
-    day = (datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET)).strftime("%a %d %b")
     name = f" for {business_name}" if business_name else ""
-    subject = f"Your Morning Brief{name} · {day}"
-    body = "\n\n".join(lines) + "\n\nAny questions? Open AI-BOS and just ask."
+    subject = f"Your Morning Brief{name} · {brief_day()}"
+    body = "\n\n".join(lines) + "\n\n" + BRIEF_SIGNOFF
     return subject, body
 
 
@@ -415,41 +430,135 @@ def send_email(to: str, subject: str, body: str, html: str | None = None) -> boo
     return True
 
 
-def send_whatsapp(to_number: str, body: str) -> bool:
+# Graph API versions retire about two years after release, and a call to a
+# retired one is quietly answered by the oldest version still running. v19.0,
+# which this used to name, retired on 21 May 2026. v25.0 runs to July 2028.
+GRAPH_API_VERSION = "v25.0"
+
+# Meta refuses a template message whose words, variables filled in, pass 1,024
+# characters. The Morning Brief template's own words are about 110 of them.
+WA_WHO_MAX = 60
+WA_BRIEF_MAX = 850
+
+
+def graph_messages_url(phone_id: str) -> str:
+    version = (os.environ.get("WHATSAPP_API_VERSION") or GRAPH_API_VERSION).strip()
+    return f"https://graph.facebook.com/{version}/{phone_id}/messages"
+
+
+def wa_number(raw) -> str | None:
+    """A WhatsApp recipient in full international form, +260977123456, or None
+    when it cannot be one.
+
+    Owners type their number the way they say it: 097 712 3456. Sent like that,
+    Meta puts the SENDING number's country code in front of it, and a Zambian
+    number with its leading 0 still on is a number nobody has. The same reading
+    as whatsapp_bot.phones_match: nine digits are the number, 260 the country.
+    """
+    d = re.sub(r"\D", "", str(raw or ""))
+    if d.startswith("00"):
+        d = d[2:]                                   # 00260 97..., dialled from abroad
+    if len(d) == 10 and d.startswith("0"):
+        d = "260" + d[1:]                           # 097 712 3456
+    elif len(d) == 13 and d.startswith("2600"):
+        d = "260" + d[4:]                           # +260 097 712 3456
+    elif len(d) == 9 and d[0] in "79":
+        d = "260" + d                               # 977 123 456
+    if len(d) < 8 or d.startswith("0"):
+        return None
+    return "+" + d
+
+
+def _wa_param(text: str, limit: int) -> str:
+    """Template variable text as Meta accepts it: one line, no tabs, no run of
+    spaces, and short enough to keep the whole message under its limit."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _meta_error(r) -> str:
+    """Meta's own reason for refusing a send, which says what to fix."""
+    try:
+        err = (r.json() or {}).get("error") or {}
+    except ValueError:
+        err = {}
+    why = (err.get("error_data") or {}).get("details") or err.get("message") or f"HTTP {r.status_code}"
+    code = err.get("code")
+    return (f"{why} (Meta {code})" if code else str(why))[:300]
+
+
+def send_whatsapp(to_number: str, body: str, template: str | None = None,
+                  params: list[str] | None = None, errors: list[str] | None = None) -> bool:
+    """One WhatsApp message from the AI-BOS number.
+
+    With `template`, that approved template, `params` filling its body
+    variables in order: the only kind Meta delivers to someone who has not
+    written to the number in the last 24 hours. Without one, `body` as
+    free-form text, which lands only inside that window. A refusal's reason is
+    added to `errors` when one is passed.
+    """
     if not whatsapp_enabled():
+        return False
+    to = wa_number(to_number)
+    if not to:
+        log.warning("[notify] whatsapp skipped: not a full phone number (%d digits)",
+                    len(re.sub(r"\D", "", str(to_number or ""))))
+        if errors is not None:
+            errors.append("That is not a full phone number.")
         return False
     import httpx
 
-    phone_id = os.environ["WHATSAPP_PHONE_ID"]
-    template = os.environ.get("WHATSAPP_TEMPLATE")
     if template:
-        # Template body params must be single-line — collapse the brief.
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_number,
-            "type": "template",
-            "template": {
-                "name": template,
-                "language": {"code": "en"},
-                "components": [{
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": " · ".join(body.split("\n\n"))[:1000]}],
-                }],
-            },
-        }
+        tpl = {"name": template,
+               "language": {"code": (os.environ.get("WHATSAPP_TEMPLATE_LANG") or "en").strip()}}
+        if params:
+            tpl["components"] = [{"type": "body",
+                                  "parameters": [{"type": "text", "text": p} for p in params]}]
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "template", "template": tpl}
     else:
-        payload = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": body[:4000]}}
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body[:4000]}}
 
     r = httpx.post(
-        f"https://graph.facebook.com/v19.0/{phone_id}/messages",
+        graph_messages_url(os.environ["WHATSAPP_PHONE_ID"]),
         headers={"Authorization": f"Bearer {os.environ['WHATSAPP_TOKEN']}"},
         json=payload,
         timeout=15,
     )
     if r.status_code >= 300:
         log.error("[notify] whatsapp %s: %s", r.status_code, r.text[:300])
+        if errors is not None:
+            errors.append(_meta_error(r))
         return False
     return True
+
+
+def send_brief_whatsapp(to_number: str, business_name: str | None,
+                        subject: str, body: str, errors: list[str] | None = None) -> bool:
+    """The Morning Brief on WhatsApp.
+
+    Through the approved template when WHATSAPP_TEMPLATE is set. Its body, as
+    submitted to Meta (category Utility, language English):
+
+        Good morning. Here is your AI-BOS Morning Brief for {{1}}.
+
+        At a glance: {{2}}
+
+        Any questions? Open AI-BOS and just ask.
+
+    {{1}} is who and when, "Dunslim, Thu 15 Oct". {{2}} is the brief's lines,
+    one after another: a variable cannot hold a line break, so they are joined
+    with " · ", and the sign-off is the template's own. Meta turns away a
+    variable alone on its line, hence "At a glance:".
+    """
+    template = (os.environ.get("WHATSAPP_TEMPLATE") or "").strip()
+    if not template:
+        return send_whatsapp(to_number, f"{subject}\n\n{body}", errors=errors)
+    who = ", ".join(x for x in ((business_name or "").strip(), brief_day()) if x)
+    lines = [p.strip() for p in body.split("\n\n") if p.strip() and p.strip() != BRIEF_SIGNOFF]
+    return send_whatsapp(to_number, body, template=template,
+                         params=[_wa_param(who, WA_WHO_MAX),
+                                 _wa_param(" · ".join(lines), WA_BRIEF_MAX)],
+                         errors=errors)
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
@@ -588,7 +697,8 @@ def dispatch_briefs(db) -> dict:
             if p.get("brief_email_enabled") and can_access(tier, "scheduled_brief"):
                 sent_push += push_brief(db, uid)
             if p.get("whatsapp_number") and can_access(tier, "morning_brief"):
-                if send_whatsapp(str(p["whatsapp_number"]), f"{subject}\n\n{body}"):
+                if send_brief_whatsapp(str(p["whatsapp_number"]), p.get("business_name"),
+                                       subject, body):
                     sent_wa += 1
         except Exception as e:  # noqa: BLE001
             errors += 1
@@ -799,6 +909,10 @@ def booking_received(db, user_id: str, result: dict) -> dict:
         except Exception as e:  # noqa: BLE001
             log.warning("[notify] booking email failed: %s", e)
 
+    # Free-form, never the Morning Brief template: a booking at 15:00 must not
+    # arrive as "Good morning". It lands when the owner has written to the
+    # AI-BOS number in the last 24 hours; a template of its own would make it
+    # land every time.
     out["whatsapp"] = False
     if contacts["whatsapp"] and whatsapp_enabled():
         try:
