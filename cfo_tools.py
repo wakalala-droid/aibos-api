@@ -101,6 +101,18 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
+        "name": "cash_plan",
+        "description": "The 13-week cash plan, day by day: today's money, the bills already known "
+                       "(wages on payday, ZRA and NAPSA on the 10th, rent), regular payments found in "
+                       "the history, money owed and when it is likely to come in, the chance the money "
+                       "goes short each week, the lowest point, what is safe to spend today and what "
+                       "fixes a shortfall. Use for 'will I have enough in December', 'can I afford X', "
+                       "'when will I run short'. Growth plan; on other plans it says so.",
+        "parameters": {"type": "object", "properties": {
+            "floor": {"type": "number", "description": "the least the owner wants to keep, default 0"},
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "who_owes_me",
         "description": "AR aging: which customers owe money, how much, and for how long — "
                        "sent invoices plus the loose credit book, bucketed current/1-30/31-60/60+.",
@@ -349,6 +361,38 @@ def _cash_forecast(db, user_id, business_id=None):
                                        cash_months=books_views.cash_months(events))
 
 
+def _cash_plan(db, user_id, args, business_id=None):
+    """The 13-week plan, short enough for the model: the headline figures, the
+    weeks with what is due in each, what fixes a shortfall and who owes what."""
+    import cash_watch
+    import entitlements
+    if not entitlements.can_access(entitlements.tier_detail(user_id)["tier"], "cash_plan"):
+        return {"available": False,
+                "note": "The 13-week cash plan is part of the Growth plan. cash_forecast gives the "
+                        "monthly outlook on this plan."}
+    floor = max(_num(args.get("floor")), 0.0)
+    plan = cash_watch.build(db, user_id, business_id, floor=floor, paths=600)
+    if not plan.get("ok"):
+        return {"available": True, "ok": False, "reason": plan.get("reason"),
+                "known": plan.get("known", [])[:10]}
+    keep = ("headline", "cash_now", "floor", "chance_short_pct", "chance_words", "lowest", "close",
+            "first_risk_date", "safe_to_spend", "cash_needed", "today", "until")
+    return {
+        "available": True, "ok": True, **{k: plan[k] for k in keep if k in plan},
+        "weeks": [{"week": w["week"], "from": w["start"], "to": w["end"], "money_in": w["in"],
+                   "money_out": w["out"], "close_cautious": w["close_p10"], "close_likely": w["close_p50"],
+                   "chance_short_pct": w["chance_short_pct"],
+                   "due": [f"{i['label']} {i['amount']:,.2f} on {i['day']}" for i in w["items"]][:6]}
+                  for w in plan["weeks"]],
+        "fixes": [{"what": lv["title"], "chance_short_after_pct": lv["chance_short_pct"]}
+                  for lv in plan.get("levers", [])],
+        "owed_to_you": [{k: d[k] for k in ("customer", "amount", "likely_by", "chance_in_plan_pct")}
+                        for d in plan.get("debts", [])[:8]],
+        "regular_payments": [{k: r[k] for k in ("label", "cadence", "amount")} for r in plan.get("regular", [])],
+        "how": plan.get("assumptions", []),
+    }
+
+
 def _who_owes(db, user_id, args, business_id=None):
     import invoices as invoices_api
     import debtors
@@ -367,6 +411,7 @@ _EXECUTORS = {
     "investigate_month": _investigate,
     "who_owes_me": _who_owes,
     "cash_forecast": lambda db, uid, a, biz=None: _cash_forecast(db, uid, biz),
+    "cash_plan": _cash_plan,
     "query_events": _query_events,
     "list_products": _list_products,
     "upcoming_schedule": _upcoming_schedule,
@@ -464,6 +509,9 @@ def describe_read(name: str, args: dict, result: dict) -> dict:
         said = "Worked out a what-if on a copy of your books"
     elif name == "cash_forecast":
         said = "Worked out your cash ahead from your monthly history"
+    elif name == "cash_plan":
+        said = ("Read your 13-week cash plan: bills, money owed and the chance of running short"
+                if result.get("ok") else "Looked for your 13-week cash plan")
     elif name == "who_owes_me":
         said = f"Read who owes you ({len(result.get('customers') or [])} customers)"
     elif name == "investigate_month":

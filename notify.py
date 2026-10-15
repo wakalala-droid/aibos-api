@@ -184,6 +184,16 @@ def compose_brief(db, user_id: str, business_name: str | None,
         m += f" You owe suppliers {_money(pay, sym)}."
     lines.append(m)
 
+    # Growth: the cash watch, one line from the 13-week plan (cash_watch.py).
+    try:
+        if can_access(user_tier(user_id), "cash_plan"):
+            import cash_watch
+            watch = cash_watch.brief_line(db, user_id, business_id)
+            if watch:
+                lines.append(watch)
+    except Exception as e:  # noqa: BLE001 — the brief goes out without it
+        log.info("[notify] cash watch line skipped for %s: %s", user_id, e)
+
     # Yesterday / today sales from confirmed events.
     try:
         since = _day_start(1).isoformat()

@@ -46,6 +46,10 @@ _PROPLUS: set[str] = _PRO | {
 }
 _GROWTH: set[str] = _PROPLUS | {
     "cross_engine", "multi_location", "multi_business", "api_access",
+    # The 13-week cash plan (cash_plan.py): known bills and collections, the
+    # chance of running short, what fixes it, decisions tried on it, the group
+    # view across businesses and the cash watch that warns ahead (16 Oct 2026).
+    "cash_plan",
 }
 
 _ACCESS: dict[str, set[str]] = {
@@ -239,6 +243,7 @@ _FEATURE_LABEL = {
     "cross_engine":   "the cross-engine composite score",
     "multi_location": "multiple locations",
     "multi_business": "running multiple businesses",
+    "cash_plan":      "the 13-week cash plan",
     "forecast":  "forecasting",
     "anomaly":   "anomaly detection",
     "variance":  "variance analysis",

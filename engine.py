@@ -1,8 +1,11 @@
 # engine.py — AIBOS Engine 1: Financial Intelligence
 # Contains run_engine1() wrapper called by main.py
 
-import numpy as np
 import logging
+
+import numpy as np
+
+import forecast_engine as fe
 
 logger = logging.getLogger("aibos.engine1")
 
@@ -44,17 +47,29 @@ def run_engine1(monthly_rows: list) -> dict:
     avg_margin   = sum(margins) / len(margins) if margins else 0
     n_periods    = len(monthly_rows)
 
-    # ── Forecast — linear regression ─────────────────────────────────────────
-    try:
-        x        = list(range(n_periods))
-        coeffs_r = np.polyfit(x, revenues, 1)
-        coeffs_c = np.polyfit(x, costs, 1)
-        next_r   = float(np.polyval(coeffs_r, n_periods))
-        next_c   = float(np.polyval(coeffs_c, n_periods))
-    except Exception as e:
-        logger.warning("Forecast regression failed: %s", e)
-        next_r = revenues[-1] if revenues else 0
-        next_c = costs[-1]    if costs    else 0
+    # ── Forecast ─────────────────────────────────────────────────────────────
+    # Four periods or more: the forecast engine (methods tested on these very
+    # periods, the best blended, P10 to P90 from simulation). Fewer: the old
+    # straight line, flagged as directional below.
+    month_keys = [str(m.get("month") or "") for m in monthly_rows]
+    months_ok = all(fe.month_index(k) is not None for k in month_keys)
+    fr = fe.forecast(revenues, months=month_keys if months_ok else None, horizon=1, nonneg=True) \
+        if n_periods >= fe.MIN_POINTS else {"ok": False}
+    fc_ = fe.forecast(costs, months=month_keys if months_ok else None, horizon=1, nonneg=True) \
+        if n_periods >= fe.MIN_POINTS else {"ok": False}
+    if fr["ok"] and fc_["ok"]:
+        next_r, next_c = fr["ahead"][0]["p50"], fc_["ahead"][0]["p50"]
+    else:
+        try:
+            x        = list(range(n_periods))
+            coeffs_r = np.polyfit(x, revenues, 1)
+            coeffs_c = np.polyfit(x, costs, 1)
+            next_r   = float(np.polyval(coeffs_r, n_periods))
+            next_c   = float(np.polyval(coeffs_c, n_periods))
+        except Exception as e:
+            logger.warning("Forecast regression failed: %s", e)
+            next_r = revenues[-1] if revenues else 0
+            next_c = costs[-1]    if costs    else 0
 
     next_revenue = round(max(next_r, 0), 2)
     next_costs   = round(max(next_c, 0), 2)
@@ -65,6 +80,12 @@ def run_engine1(monthly_rows: list) -> dict:
         # what the data says (SAFEGUARD §0.1).
         "next_profit":  round(next_revenue - next_costs, 2),
     }
+    if fr["ok"]:
+        forecast["revenue_range"] = [fr["ahead"][0]["p10"], fr["ahead"][0]["p90"]]
+        forecast["methods"] = fr["methods"]
+        forecast["accuracy"] = fr["accuracy"]
+        if fr["softened"]:
+            forecast["softened"] = fr["softened"]
     if n_periods < 3:
         forecast["note"] = (
             f"Based on only {n_periods} period(s) — directional at best. "

@@ -62,6 +62,9 @@ import books_check
 import books_views
 import debtors as debtors_api
 import cash_forecast as cash_forecast_api
+import cash_plan
+import cash_watch
+import outlook as outlook_api
 import rec_store
 import llm
 import compliance as compliance_api
@@ -6332,6 +6335,114 @@ def cash_forecast_route(ctx: membership.Context = Depends(membership.require_con
         state, cash_months=books_views.cash_months(events))}
 
 
+# ── The forecast engine: the Forecast page and the 13-week cash plan ─────────
+# forecast_engine.py tests several methods on the owner's own months and blends
+# the best; outlook.py turns it into the Forecast page; cash_plan.py is the
+# Growth plan (known bills and collections, the chance of running short, what
+# fixes it, decisions tried on it). 16 October 2026.
+
+@app.get("/forecast/outlook")
+def forecast_outlook(tz: int = Query(0, ge=-840, le=840),
+                     ctx: membership.Context = Depends(membership.require_context)):
+    """Sales, costs and profit for this month and the three after it, with
+    their ranges, this month's pace and how accurate the forecast has been.
+    Ungated like the other Engine-1 previews; the page gates the detail."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    db = _require_db()
+    biz = twin._books_for(db, ctx.tenant, ctx.business_id)
+    state = twin.get_state(db, ctx.tenant, biz)
+    sales = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
+                                event_types=("Sale",))
+    now = _dt.now(_tz.utc) + _td(minutes=tz)
+    return {"ok": True, "outlook": outlook_api.outlook(state.get("monthly") or [], today=now.isoformat(),
+                                                      daily=outlook_api.daily_sales(sales))}
+
+
+class SeriesRequest(BaseModel):
+    rows: List[Dict[str, Any]]
+
+
+@app.post("/forecast/series")
+def forecast_series(body: SeriesRequest, ctx: membership.Context = Depends(membership.require_context)):
+    """The same outlook for figures the owner uploaded rather than recorded:
+    every row a finished period. Pure arithmetic on what is sent."""
+    if len(body.rows) > 240:
+        raise HTTPException(status_code=400, detail="At most 240 periods.")
+    return {"ok": True, "outlook": outlook_api.outlook(body.rows, complete=True)}
+
+
+class CashPlanRequest(BaseModel):
+    floor: float = 0.0
+    tz: int = 0
+    scenarios: List[Dict[str, Any]] = []
+
+
+def _plan_tier_ok(ctx: "membership.Context") -> bool:
+    return entitlements.can_access(entitlements.tier_detail(ctx.tenant)["tier"], "cash_plan")
+
+
+@app.get("/forecast/cash-plan")
+def cash_plan_route(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
+                    ctx: membership.Context = Depends(membership.require_context)):
+    """The 13-week cash plan for the business being looked at. Growth sees all
+    of it; any other plan sees its own headline risk, so the upgrade is argued
+    with the owner's real numbers (FeatureGate's locked-but-visible)."""
+    _sees_money(ctx)
+    db = _require_db()
+    if not _plan_tier_ok(ctx):
+        plan = cash_watch.build(db, ctx.tenant, ctx.business_id, tz=tz, floor=floor, paths=300)
+        return {"ok": True, "plan": cash_watch.preview(plan)}
+    return {"ok": True, "plan": cash_watch.build(db, ctx.tenant, ctx.business_id, tz=tz, floor=floor)}
+
+
+@app.post("/forecast/cash-plan")
+def cash_plan_decide(body: CashPlanRequest, ctx: membership.Context = Depends(membership.require_context)):
+    """The plan with decisions tried on it (a purchase, a hire, a price or
+    spending change, collecting faster, moving a payment), on the same futures
+    as the plan itself. Growth."""
+    _sees_money(ctx)
+    entitlements.require_feature(ctx.tenant, "cash_plan")
+    if len(body.scenarios) > 10:
+        raise HTTPException(status_code=400, detail="At most 10 decisions at once.")
+    if not (-840 <= body.tz <= 840) or body.floor < 0:
+        raise HTTPException(status_code=400, detail="tz is minutes from UTC; the floor is zero or more.")
+    db = _require_db()
+    try:
+        plan = cash_watch.build(db, ctx.tenant, ctx.business_id, tz=body.tz, floor=body.floor,
+                                scenarios=body.scenarios)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "plan": plan}
+
+
+@app.get("/forecast/group")
+def cash_plan_group(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
+                    ctx: membership.Context = Depends(membership.require_owner)):
+    """Every business the owner runs, in one cash plan: each one's chance of
+    running short, the group's, and where moving money covers a gap. Growth,
+    owner only (an accountant is invited to books, not to the whole group)."""
+    entitlements.require_feature(ctx.tenant, "cash_plan")
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    db = _require_db()
+    today = (_dt.now(_tz.utc) + _td(minutes=tz)).date()
+    plans, missing, sym = [], [], "K"
+    for biz in businesses_api.list_businesses(db, ctx.tenant):
+        books = cash_watch.inputs(db, ctx.tenant, biz.get("id"))
+        sym = books["sym"]
+        prepared = cash_plan.prepare(books["events"], books["pending"], books["invoices"], books["schedule"],
+                                     books["cash"], today, tz, books["monthly_in"])
+        if not prepared["ok"]:
+            missing.append({"business_id": biz.get("id"), "name": biz.get("name"),
+                            "cash_now": round(books["cash"], 2), "reason": prepared["reason"]})
+            continue
+        sim = cash_plan.simulate(prepared, 600)
+        plans.append((biz.get("name") or "Business", biz.get("id"), prepared, sim, cash_plan.balances(sim)))
+    out = cash_plan.group(plans, floor, sym) if plans else {"ok": False,
+                                                            "reason": "No business has enough history for a plan yet."}
+    out["without_plan"] = missing
+    return {"ok": True, "group": out}
+
+
 @app.get("/investigate")
 def investigate_anomaly(month: Optional[str] = Query(None),
                               ctx: membership.Context = Depends(membership.require_context)):
@@ -7377,6 +7488,9 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a day: every owner's books held against every invoice,
             # payment, stay and payslip, and the owner told if one disagrees.
             ("books_check", lambda: _daily_books_check(db)),
+            # Once a day: every Growth business's 13-week plan, and the owner
+            # warned when the money is likely to go short within four weeks.
+            ("cash_watch", lambda: cash_watch.daily(db, notify.record_notification)),
         ):
             try:
                 out[name] = job()

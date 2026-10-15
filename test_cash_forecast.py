@@ -27,10 +27,13 @@ def test_bands_shape_and_ordering():
     assert out["ok"] and len(out["bands"]) == 3
     for b in out["bands"]:
         assert b["p10"] < b["p50"] < b["p90"]
-    # P50 follows cash + h·mean exactly (mean = 550).
-    assert out["bands"][0]["p50"] == 1000 + 550
-    assert out["bands"][2]["p50"] == 1000 + 3 * 550
-    # Uncertainty widens with the horizon (σ·√h).
+    # P50 is today's cash plus the blended forecast of the monthly net, which
+    # stays inside what the months have actually done (400 to 700).
+    assert 1000 + 400 <= out["bands"][0]["p50"] <= 1000 + 700
+    assert 1000 + 3 * 400 <= out["bands"][2]["p50"] <= 1000 + 3 * 700
+    assert [b["month"] for b in out["bands"]] == ["2026-05", "2026-06", "2026-07"]
+    assert out["methods"] and out["accuracy"]["tested"] >= 3
+    # Uncertainty widens with the horizon.
     w1 = out["bands"][0]["p90"] - out["bands"][0]["p10"]
     w3 = out["bands"][2]["p90"] - out["bands"][2]["p10"]
     assert w3 > w1 * 1.5
@@ -56,6 +59,28 @@ def test_runway_when_burning():
     # Healthy business → no runway cliff within the 36-month scan.
     healthy = cf.forecast_cash(_state([500, 700, 400, 600], cash=10000), today=TODAY)
     assert healthy["runway_p10_months"] is None
+
+
+def test_a_quiet_month_between_busy_ones_counts_as_zero():
+    months = [{"month": "2026-01", "trading_in": 900, "trading_out": 300},
+              {"month": "2026-02", "trading_in": 900, "trading_out": 300},
+              {"month": "2026-04", "trading_in": 900, "trading_out": 300},
+              {"month": "2026-05", "trading_in": 900, "trading_out": 300}]
+    out = cf.forecast_cash({"cash": 0}, today=TODAY, cash_months=months)
+    assert out["baseline_months"] == 5                  # March is in, as a zero
+
+
+def test_a_loss_making_trend_says_so_and_counts_the_chance_of_running_short():
+    out = cf.forecast_cash(_state([-100, -300, -500, -700, -900, -1100], cash=1500), today=TODAY)
+    assert out["ok"] and out["trend"] == "weakening"
+    assert out["chance_short_pct"] > 50
+    assert out["runway_p10_months"] is not None and out["runway_p10_months"] <= 3
+
+
+def test_same_books_same_fan():
+    a = cf.forecast_cash(_state([500, 700, 400, 600, 650]), today=TODAY)
+    b = cf.forecast_cash(_state([500, 700, 400, 600, 650]), today=TODAY)
+    assert a == b
 
 
 if __name__ == "__main__":
