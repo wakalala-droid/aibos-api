@@ -18,6 +18,7 @@ Discipline:
     chat.completions.create shape) so the loop is offline-testable.
 """
 
+import itertools
 import json
 import logging
 import time
@@ -665,24 +666,46 @@ def _create(client, kwargs: dict):
         raise
 
 
-def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
-    """The first request was refused because an allowance is spent.
+def _open(client, kwargs: dict):
+    """_create, then wait for the first piece of the answer.
 
-    Gemini's free limits are per model, so the smaller model gets one go; then
-    the second provider, when one is set (llm.secondary). Only on the first
-    request, before any lookup, because a lookup's thought signature belongs to
-    the model that made it. Returns (client, model, stream, thinking) or raises
-    the last refusal.
+    A provider that is not answering often accepts the request and then sends
+    nothing, so the timeout comes from the first read, not from the call. Read
+    it here and that timeout is raised where the first request's failures are
+    handled (a second provider can step in) instead of in the middle of the
+    answer, where nothing can."""
+    stream = iter(_create(client, kwargs))
+    first = next(stream, _NOTHING)
+    return stream if first is _NOTHING else itertools.chain([first], stream)
+
+
+_NOTHING = object()
+
+
+def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
+    """The first request was refused because an allowance is spent, or the
+    provider did not answer it at all.
+
+    A spent allowance: Gemini's free limits are per model, so the smaller model
+    gets one go. A provider not answering: the smaller model would only keep
+    the owner waiting as long again, so the first provider is rested
+    (llm.note_primary_unavailable) instead. Then the second provider, when one
+    is set (llm.secondary). Only on the first request, before any lookup,
+    because a lookup's thought signature belongs to the model that made it.
+    Returns (client, model, stream, thinking) or raises the first refusal.
 
     This used to fall through after the smaller model answered and send the
     question a third time with its lookups stripped, so the answer that came
     back had been written blind."""
     fb = llm.fallback_model()
-    if model != fb:
+    if not llm.is_quota_error(exc):
+        if llm.secondary_configured():
+            llm.note_primary_unavailable(exc)
+    elif model != fb:
         log.warning("[cfo] %s quota spent, streaming on %s", model, fb)
         kwargs["model"] = fb
         try:
-            return client, fb, _create(client, kwargs), True
+            return client, fb, _open(client, kwargs), True
         except Exception as e2:  # noqa: BLE001
             if not llm.is_quota_error(e2):
                 raise
@@ -691,10 +714,42 @@ def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
     if second is None:
         raise exc
     client2, model2 = second
-    log.warning("[cfo] allowance spent (%s); answering on the second provider %s", exc, model2)
+    log.warning("[cfo] %s; answering on the second provider %s", exc, model2)
     kwargs["model"] = model2
     kwargs.pop("reasoning_effort", None)
-    return client2, model2, client2.chat.completions.create(**kwargs), False
+    try:
+        try:
+            return client2, model2, _open(client2, kwargs), False
+        except Exception as e2:  # noqa: BLE001
+            model2, stream = _open_on_second(client2, model2, kwargs, e2)
+            return client2, model2, stream, False
+    except Exception as e2:  # noqa: BLE001 — the first refusal says why; see llm._on_second_provider
+        log.warning("[cfo] the second provider failed too: %s", e2)
+        raise exc from e2
+
+
+def _open_on_second(client, model: str, kwargs: dict, exc: Exception):
+    """`model` on the second provider has spent its allowance: the next model
+    there that still has some (llm.next_second_model), or the last one again
+    after a short wait when none has (llm.retry_after_seconds). Returns
+    (model, stream) or raises the last refusal."""
+    waited = False
+    while True:
+        nxt = llm.next_second_model(model, exc)
+        if nxt is None:
+            wait = llm.retry_after_seconds(exc)
+            if waited or wait is None or wait > llm.SECOND_WAIT_MAX:
+                raise exc
+            log.warning("[cfo] every backup model spent its minute; waiting %.1fs", wait)
+            time.sleep(wait)
+            waited, nxt = True, model
+        else:
+            log.warning("[cfo] %s spent its allowance (%s); answering on %s", model, exc, nxt)
+        model = kwargs["model"] = nxt
+        try:
+            return model, _open(client, kwargs)
+        except Exception as e:  # noqa: BLE001
+            exc = e
 
 
 def _out_of_time(deadline: float | None) -> bool:
@@ -729,6 +784,11 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
     tools_used: list[str] = []
 
     thinking = True                     # off once the second provider answers
+    if llm.primary_resting():           # the first provider is not answering
+        second = llm.secondary()
+        if second is not None:
+            client, model = second
+            thinking = False
     for round_no in range(max_rounds + 1):
         force_prose = round_no == max_rounds or (round_no > 0 and _out_of_time(deadline))
         kwargs = dict(model=model, messages=convo, temperature=temperature,
@@ -739,20 +799,27 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
             kwargs.update(tools=schemas, tool_choice="auto")
 
         try:
-            stream = _create(client, kwargs)
+            stream = _open(client, kwargs)
         except Exception as e:  # noqa: BLE001
-            # A spent quota on the first request: the smaller model, then the
-            # second provider (see _first_round_elsewhere). Any later quota
-            # refusal surfaces as it is.
-            if llm.is_quota_error(e) and round_no == 0:
+            # A spent quota or a provider not answering, on the first request:
+            # the smaller model or a rest, then the second provider (see
+            # _first_round_elsewhere). Any later refusal surfaces as it is.
+            if round_no == 0 and thinking and (llm.is_quota_error(e) or llm.is_unavailable_error(e)):
                 client, model, stream, thinking = _first_round_elsewhere(client, model, kwargs, e)
+            # On the second provider (thinking is off there), a lookup's
+            # second round can spend the model's per-minute allowance: its
+            # other models have their own, and no thought signature to carry.
+            elif not thinking and llm.is_quota_error(e):
+                model, stream = _open_on_second(client, model, kwargs, e)
             # A provider that refuses the TOOL declarations refuses the whole
             # request, so the owner got nothing at all. An answer without
             # lookups is worth far more than "the answer stopped early", and
             # the log line names the provider's own words so the cause is
-            # findable rather than guessed at. A spent quota is not that: the
-            # retry would be refused too, so it is not attempted.
-            elif force_prose or "tools" not in kwargs or llm.is_quota_error(e):
+            # findable rather than guessed at. A spent quota or a provider
+            # that is not answering is not that: the retry would fail too, and
+            # a timeout would keep the owner waiting as long again for it.
+            elif (force_prose or "tools" not in kwargs or llm.is_quota_error(e)
+                  or llm.is_unavailable_error(e)):
                 raise
             else:
                 log.warning("[cfo] the provider refused the tool declarations, "
@@ -844,7 +911,7 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                 **tool_kwargs, **thinking,
             )
         except Exception as e:  # noqa: BLE001 — see the streaming twin above
-            if not tool_kwargs or llm.is_quota_error(e):
+            if not tool_kwargs or llm.is_quota_error(e) or llm.is_unavailable_error(e):
                 raise
             log.warning("[cfo] the provider refused the tool declarations, "
                         "answering without lookups: %s", e)

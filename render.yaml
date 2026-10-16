@@ -59,8 +59,14 @@ services:
       - key: GEMINI_API_KEY
         sync: false
 
-      # ── Optional: a second AI for when Gemini's free allowance runs out ─
-      # Any OpenAI-compatible service. All three together, or none.
+      # ── A second AI, for when Gemini's allowance runs out or it stops answering
+      # The simplest is GROQ_API_KEY on its own (free key, console.groq.com):
+      # Groq then answers whenever Gemini cannot, on openai/gpt-oss-120b and
+      # stepping down to gpt-oss-20b and qwen3.8-27b as each spends its minute.
+      # SECOND_AI_MODEL / SECOND_AI_FALLBACK_MODEL (comma separated) change them.
+      # Or any OpenAI-compatible service: the three SECOND_AI_* together.
+      - key: GROQ_API_KEY
+        sync: false
       - key: SECOND_AI_BASE_URL
         sync: false
       - key: SECOND_AI_API_KEY
@@ -129,7 +135,7 @@ services:
       #   LLM_MODEL, LLM_FALLBACK_MODEL, LLM_VISION_MODEL, LLM_TRANSCRIBE_MODEL
       # Check https://ai.google.dev/gemini-api/docs/models before setting one.
       #
-      # GROQ_API_KEY is still read if you ever want to switch back.
+      # GROQ_API_KEY with no Gemini key makes Groq the only provider.
       #
       # Email (Resend), WhatsApp and Google Places are all optional:
       #   RESEND_API_KEY, BRIEF_FROM_EMAIL

@@ -82,7 +82,7 @@ def test_groq_when_only_groq_key():
     with env(GROQ_API_KEY="g"):
         assert llm.provider() == "groq"
         assert llm.api_key() == "g"
-        assert llm.chat_model() == "llama-3.3-70b-versatile"
+        assert llm.chat_model() == "openai/gpt-oss-120b"
         assert llm.transcribe_model() == "whisper-large-v3"
 
 
@@ -144,7 +144,7 @@ def test_fallback_on_model_error():
         c = _Client(fail_times=1)
         out = llm.chat_create(c, messages=[])
         assert out.choices[0].message.content == "ok"
-        assert c.models == ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        assert c.models == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 
 def test_fallback_uses_gemini_models_on_gemini():

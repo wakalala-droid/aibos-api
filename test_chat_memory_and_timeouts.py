@@ -379,3 +379,215 @@ def test_other_ai_features_also_use_the_second_provider(monkeypatch):
     calls = []
     assert llm.chat_create(_refusing(calls), messages=[], reasoning_effort="low") == "ok"
     assert seen[0]["model"] == "backup-model" and "reasoning_effort" not in seen[0]
+
+
+# ── A first provider that does not answer at all ─────────────────────────────
+# 16 October 2026: every Gemini request from the API hung until the 40 second
+# timeout, plain "reply ok" included, so every question failed. The second
+# provider only stepped in for a spent allowance, the stream then asked again
+# without lookups (40 seconds more), and the owner was told to ask again.
+
+class APITimeoutError(Exception):
+    """Named like the SDK's, which is what is_unavailable_error reads."""
+
+
+def _silent(calls):
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise APITimeoutError("Request timed out.")
+    return NS(chat=NS(completions=NS(create=create)))
+
+
+def _second(monkeypatch, seen, reply="Answered by the backup."):
+    def create(**kwargs):
+        seen.append(kwargs)
+        return iter([_chunk(reply)])
+    monkeypatch.setattr(llm, "secondary",
+                        lambda: (NS(chat=NS(completions=NS(create=create))), "backup-model"))
+    monkeypatch.setattr(llm, "secondary_configured", lambda: True)
+
+
+@pytest.fixture(autouse=False)
+def rested(monkeypatch):
+    """The first provider starts awake and is put back that way."""
+    monkeypatch.setattr(llm, "_primary_rest_until", 0.0)
+
+
+def test_what_counts_as_not_answering():
+    class E(Exception):
+        def __init__(self, msg, status=None):
+            super().__init__(msg)
+            if status is not None:
+                self.status_code = status
+    assert llm.is_unavailable_error(APITimeoutError("Request timed out."))
+    assert llm.is_unavailable_error(E("Service Unavailable", 503))
+    assert llm.is_unavailable_error(E("Internal error", 500))
+    assert not llm.is_unavailable_error(E("429 RESOURCE_EXHAUSTED", 429))
+    assert not llm.is_unavailable_error(E("model_not_found", 404))
+    assert not llm.is_unavailable_error(E("Invalid JSON payload", 400))
+
+
+def test_a_silent_first_provider_hands_the_question_to_the_second(monkeypatch, rested):
+    calls, seen = [], []
+    _second(monkeypatch, seen)
+    out = list(cfo_tools.run_agent_loop_stream(_silent(calls), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Answered by the backup."
+    # One wait on the silent provider: not the smaller model, not again without lookups.
+    assert len(calls) == 1
+    assert seen[0]["model"] == "backup-model" and "tools" in seen[0]
+    assert llm.primary_resting()
+
+
+def test_a_timeout_on_the_first_read_is_handed_over_too(monkeypatch, rested):
+    """The request is accepted and then nothing comes back."""
+    seen = []
+    _second(monkeypatch, seen)
+
+    def never(**kwargs):
+        def gen():
+            raise APITimeoutError("Request timed out.")
+            yield  # pragma: no cover
+        return gen()
+
+    out = list(cfo_tools.run_agent_loop_stream(NS(chat=NS(completions=NS(create=never))), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Answered by the backup."
+
+
+def test_while_the_first_rests_the_next_question_does_not_wait_on_it(monkeypatch, rested):
+    calls, seen = [], []
+    _second(monkeypatch, seen)
+    llm.note_primary_unavailable(APITimeoutError("Request timed out."))
+    out = list(cfo_tools.run_agent_loop_stream(_silent(calls), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Answered by the backup."
+    assert calls == [] and "reasoning_effort" not in seen[0]
+
+
+def test_with_no_second_provider_a_silent_one_is_waited_on_once(monkeypatch, rested):
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    monkeypatch.setattr(llm, "secondary_configured", lambda: False)
+    calls = []
+    with pytest.raises(APITimeoutError):
+        list(cfo_tools.run_agent_loop_stream(_silent(calls), "m",
+                                             [{"role": "user", "content": "hi"}], None, "u1"))
+    assert len(calls) == 1
+    assert not llm.primary_resting()
+
+
+def test_other_ai_features_are_handed_over_and_then_skip_the_silent_one(monkeypatch, rested):
+    seen = []
+    monkeypatch.setattr(llm, "secondary", lambda: (
+        NS(chat=NS(completions=NS(create=lambda **k: seen.append(k) or "ok"))), "backup-model"))
+    monkeypatch.setattr(llm, "secondary_configured", lambda: True)
+    calls = []
+    assert llm.chat_create(_silent(calls), messages=[], reasoning_effort="low") == "ok"
+    assert llm.chat_create(_silent(calls), messages=[]) == "ok"
+    assert len(calls) == 1 and len(seen) == 2
+
+
+def test_when_the_backup_fails_too_the_first_reason_is_the_one_given(monkeypatch, rested):
+    """A retired backup model used to replace "resting until 09:00" with its own 404."""
+    def broken(**kwargs):
+        raise Exception("Error code: 404 - model_not_found")
+    monkeypatch.setattr(llm, "secondary", lambda: (NS(chat=NS(completions=NS(create=broken))), "gone"))
+    monkeypatch.setattr(llm, "secondary_configured", lambda: True)
+    with pytest.raises(_Quota):
+        llm.chat_create(_refusing([]), messages=[])
+    with pytest.raises(_Quota):
+        list(cfo_tools.run_agent_loop_stream(_refusing([]), "m",
+                                             [{"role": "user", "content": "hi"}], None, "u1"))
+
+
+def test_the_groq_backup_model_is_a_setting(monkeypatch):
+    for k in ("SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    assert llm.secondary()[1] == "openai/gpt-oss-120b"
+    monkeypatch.setenv("SECOND_AI_MODEL", "qwen/qwen3.8-27b")
+    assert llm.secondary()[1] == "qwen/qwen3.8-27b"
+
+
+def test_the_stream_says_plainly_when_nothing_answers(monkeypatch, rested):
+    """No backup and a silent provider: one honest line, and retry:false so the
+    browser does not wait as long again on the buffered path."""
+    import auth
+    import main
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(auth, "verify_token", lambda token: "u1")
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    monkeypatch.setattr(llm, "secondary_configured", lambda: False)
+    calls = []
+    monkeypatch.setattr(main, "_prepare_chat", lambda *a, **k: {
+        "taster_note": None, "system_prompt": "s", "tool_system": "s",
+        "chat_messages": [{"role": "user", "content": "hi"}], "client": _silent(calls),
+        "injected": False, "db": object(), "tenant": "u1", "business_id": "b1",
+        "allowed_tools": None})
+    res = TestClient(main.app).post("/chat/stream", json={"message": "hi"},
+                                    headers={"Authorization": "Bearer t"})
+    frames = [f for f in res.text.split("\n\n") if f.startswith("data:")]
+    assert any(llm.UNAVAILABLE_MESSAGE in f and '"retry": false' in f for f in frames)
+    assert len(calls) == 1
+
+
+def test_the_backup_steps_down_its_models_as_each_spends_its_minute(monkeypatch, rested):
+    """Groq allows 8,000 tokens a minute per model, and one question with a
+    lookup nearly spends it: each other model has an allowance of its own."""
+    tried = []
+
+    def create(**kwargs):
+        tried.append(kwargs["model"])
+        if kwargs["model"] != "b3":
+            raise _Quota("Error code: 429 - Rate limit reached on tokens per minute (TPM)")
+        return iter([_chunk("From the third.")])
+
+    monkeypatch.setattr(llm, "secondary", lambda: (NS(chat=NS(completions=NS(create=create))), "b1"))
+    monkeypatch.setattr(llm, "secondary_configured", lambda: True)
+    monkeypatch.setattr(llm, "secondary_fallback_models", lambda: ["b2", "b3"])
+    out = list(cfo_tools.run_agent_loop_stream(_silent([]), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "From the third."
+    assert tried == ["b1", "b2", "b3"]
+    tried.clear()
+    assert llm.chat_create(_silent([]), messages=[]) is not None      # resting: straight to the backup
+    assert tried == ["b1", "b2", "b3"]
+
+
+def test_the_groq_backup_has_models_to_step_down_to(monkeypatch):
+    for k in ("SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL", "SECOND_AI_FALLBACK_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    spent = _Quota("429 tokens per minute")
+    assert llm.next_second_model("openai/gpt-oss-120b", spent) == "openai/gpt-oss-20b"
+    assert llm.next_second_model("openai/gpt-oss-20b", spent) == "qwen/qwen3.8-27b"
+    assert llm.next_second_model("qwen/qwen3.8-27b", spent) is None
+    assert llm.next_second_model("openai/gpt-oss-120b", Exception("400 bad request")) is None
+
+
+def test_when_every_backup_model_is_spent_a_short_wait_is_waited(monkeypatch, rested):
+    slept, tried = [], []
+
+    def create(**kwargs):
+        tried.append(kwargs["model"])
+        if len(tried) <= 2:
+            raise _Quota("429 Rate limit reached on tokens per minute. Please try again in 3.5s.")
+        return iter([_chunk("After the wait.")])
+
+    monkeypatch.setattr(llm, "secondary", lambda: (NS(chat=NS(completions=NS(create=create))), "b1"))
+    monkeypatch.setattr(llm, "secondary_configured", lambda: True)
+    monkeypatch.setattr(llm, "secondary_fallback_models", lambda: ["b2"])
+    monkeypatch.setattr(cfo_tools.time, "sleep", slept.append)
+    out = list(cfo_tools.run_agent_loop_stream(_silent([]), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "After the wait."
+    assert tried == ["b1", "b2", "b2"] and slept == [3.5]
+
+
+def test_a_long_wait_is_not_waited():
+    assert llm.retry_after_seconds(_Quota("429 Please try again in 1m12.5s.")) == 72.5
+    assert llm.retry_after_seconds(_Quota("429 Please try again in 8.8s.")) == 8.8
+    assert llm.retry_after_seconds(Exception("400 try again in 2s")) is None
+    assert 72.5 > llm.SECOND_WAIT_MAX

@@ -53,6 +53,7 @@ dashboard stops being read.
 import base64
 import logging
 import os
+import time
 
 log = logging.getLogger("aibos.llm")
 
@@ -67,9 +68,12 @@ _DEFAULTS = {
         "vision": "gemini-3.8-flash",
         "transcribe": "gemini-3.5-transcribe",
     },
+    # Groq retired the Llama chat models: by October 2026 both ids answered
+    # model_not_found. gpt-oss-120b passes every /health/ai probe there,
+    # lookups and streaming included.
     "groq": {
-        "chat": "llama-3.3-70b-versatile",
-        "fallback": "llama-3.1-8b-instant",
+        "chat": "openai/gpt-oss-120b",
+        "fallback": "openai/gpt-oss-20b",
         "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
         "transcribe": "whisper-large-v3",
     },
@@ -221,7 +225,8 @@ def note_reasoning_rejected() -> None:
 #     SECOND_AI_API_KEY    the key from that service
 #     SECOND_AI_MODEL      a model there that can call tools
 #
-# With Gemini as the first provider, a GROQ_API_KEY on its own also counts.
+# With Gemini as the first provider, a GROQ_API_KEY on its own also counts,
+# and SECOND_AI_MODEL on its own picks which Groq model answers.
 
 def secondary():
     """(client, model) for the second provider, or None when none is set."""
@@ -234,14 +239,120 @@ def secondary():
     if provider() == "gemini" and os.environ.get("GROQ_API_KEY"):
         from groq import Groq
         return (Groq(api_key=os.environ["GROQ_API_KEY"], timeout=request_timeout(), max_retries=0),
-                _DEFAULTS["groq"]["chat"])
+                model or _DEFAULTS["groq"]["chat"])
     return None
+
+
+# Groq's free limits are 8,000 tokens a minute PER MODEL, and one question
+# with a lookup comes close to that on its own (about 3,600 tokens a request
+# with a full snapshot, two requests). These have an allowance each, all three
+# call tools, and none writes its reasoning into the answer (checked 16 Oct
+# 2026), so the backup steps down through them before giving up.
+_GROQ_BACKUP_CHAIN = ("openai/gpt-oss-20b", "qwen/qwen3.8-27b")
+
+
+def secondary_fallback_models() -> list:
+    """The second provider's other models, in the order to try them.
+    SECOND_AI_FALLBACK_MODEL sets them (comma separated); the Groq backup has
+    _GROQ_BACKUP_CHAIN by default."""
+    named = [m.strip() for m in (os.environ.get("SECOND_AI_FALLBACK_MODEL") or "").split(",")
+             if m.strip()]
+    if named:
+        return named
+    generic = all((os.environ.get(k) or "").strip()
+                  for k in ("SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL"))
+    if not generic and provider() == "gemini" and os.environ.get("GROQ_API_KEY"):
+        return list(_GROQ_BACKUP_CHAIN)
+    return []
+
+
+# When every backup model has spent its minute, Groq says how long until one
+# has room again ("Please try again in 8.8s"). A wait that short is better
+# spent waiting than telling the owner to ask again; the chat keeps its line
+# alive meanwhile (main._with_heartbeat).
+SECOND_WAIT_MAX = 20.0
+
+
+def retry_after_seconds(exc: Exception):
+    """The provider's own "try again in Ns" from a per-minute refusal, or None."""
+    import re
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", str(exc))
+    if not m or not is_quota_error(exc):
+        return None
+    return int(m.group(1) or 0) * 60 + float(m.group(2))
+
+
+def next_second_model(model: str, exc: Exception):
+    """The second provider's next model once `model` there has spent its
+    allowance, or None when that was the last or the refusal was not that."""
+    if not is_quota_error(exc):
+        return None
+    second = secondary()
+    if second is None:
+        return None
+    chain = [second[1]] + [m for m in secondary_fallback_models() if m != second[1]]
+    if model not in chain:
+        return None
+    i = chain.index(model)
+    return chain[i + 1] if i + 1 < len(chain) else None
 
 
 def secondary_configured() -> bool:
     return bool((os.environ.get("SECOND_AI_BASE_URL") and os.environ.get("SECOND_AI_API_KEY")
                  and os.environ.get("SECOND_AI_MODEL"))
                 or (provider() == "gemini" and os.environ.get("GROQ_API_KEY")))
+
+
+# ── When the first provider is not answering at all ──────────────────────────
+# A spent allowance is refused at once (429). A provider that is down, or that
+# leaves a free project's requests waiting, is worse: each request hangs until
+# our timeout. In October 2026 every Gemini call from the API timed out after
+# 40 seconds, so every question failed, and the second provider never stepped
+# in because it only answered for a spent allowance. Now a timeout, a dropped
+# connection or a 5xx sends the question to the second provider too, and the
+# first is rested for a while so the next question does not wait 40 seconds to
+# learn the same thing.
+PRIMARY_REST_SECONDS = 15 * 60
+_primary_rest_until = 0.0
+
+_UNAVAILABLE_NAMES = ("APITimeoutError", "APIConnectionError", "TimeoutException",
+                      "ConnectTimeout", "ReadTimeout", "ConnectError", "RemoteProtocolError")
+_UNAVAILABLE_WORDS = ("timed out", "timeout", "connection error", "service unavailable",
+                      "unavailable", "overloaded", "502", "503", "504")
+
+
+def is_unavailable_error(exc: Exception) -> bool:
+    """The provider did not answer: a timeout, a dropped connection or a 5xx.
+
+    Never a spent allowance (is_quota_error) and never a request the provider
+    understood and refused, so a bad request is not hidden behind a backup."""
+    if is_quota_error(exc):
+        return False
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status >= 500
+    if type(exc).__name__ in _UNAVAILABLE_NAMES:
+        return True
+    text = str(exc).lower()
+    return any(w in text for w in _UNAVAILABLE_WORDS)
+
+
+def note_primary_unavailable(exc: Exception) -> None:
+    """Rest the first provider: the second answers until the rest is over."""
+    global _primary_rest_until
+    _primary_rest_until = time.monotonic() + PRIMARY_REST_SECONDS
+    log.warning("[llm] %s is not answering (%s); the second provider answers for the next "
+                "%d minutes", provider() or "the AI", exc, PRIMARY_REST_SECONDS // 60)
+
+
+def primary_resting() -> bool:
+    """True while the first provider is rested and a second one can answer."""
+    return time.monotonic() < _primary_rest_until and secondary_configured()
+
+
+UNAVAILABLE_MESSAGE = ("The AI assistant is not answering right now, so I could not get you an "
+                       "answer. The fault is on our side. Your records are all still there and "
+                       "every other page works. Please try again in a little while.")
 
 
 def not_configured_message() -> str:
@@ -317,6 +428,12 @@ def chat_create(client, **kwargs):
     """client.chat.completions.create with a one-shot model fallback.
     `model` defaults to chat_model(); everything else passes through."""
     kwargs.setdefault("model", chat_model())
+    if primary_resting():
+        try:
+            return _second_create(kwargs)
+        except Exception as exc:  # noqa: BLE001 — the first provider may be back
+            log.warning("[llm] the second provider failed while the first rests (%s); "
+                        "trying the first", exc)
     try:
         return client.chat.completions.create(**kwargs)
     except Exception as exc:  # noqa: BLE001
@@ -324,6 +441,9 @@ def chat_create(client, **kwargs):
             note_reasoning_rejected()
             kwargs.pop("reasoning_effort", None)
             return chat_create(client, **kwargs)
+        if is_unavailable_error(exc) and secondary_configured():
+            note_primary_unavailable(exc)
+            return _on_second_provider(kwargs, exc)
         fb = fallback_model()
         if kwargs.get("model") == fb or not _model_shaped_error(exc):
             if is_quota_error(exc):
@@ -340,16 +460,49 @@ def chat_create(client, **kwargs):
             raise
 
 
-def _on_second_provider(kwargs: dict, exc: Exception):
-    """The same request on the second provider, or the refusal as it was."""
+def _second_create(kwargs: dict):
+    """The same request on the second provider, stepping down its models while
+    each has spent its allowance (next_second_model). Raises when none is set."""
     second = secondary()
     if second is None:
-        raise exc
+        raise RuntimeError("no second AI provider is set")
     client2, model2 = second
-    log.warning("[llm] allowance spent (%s); answering on the second provider %s", exc, model2)
     retry = {k: v for k, v in kwargs.items() if k != "reasoning_effort"}
     retry["model"] = model2
-    return client2.chat.completions.create(**retry)
+    waited = False
+    while True:
+        try:
+            return client2.chat.completions.create(**retry)
+        except Exception as exc:  # noqa: BLE001
+            nxt = next_second_model(retry["model"], exc)
+            if nxt is None:
+                wait = retry_after_seconds(exc)
+                if waited or wait is None or wait > SECOND_WAIT_MAX:
+                    raise
+                log.warning("[llm] every backup model spent its minute; waiting %.1fs", wait)
+                time.sleep(wait)
+                waited = True
+                continue
+            log.warning("[llm] %s spent its allowance (%s); answering on %s",
+                        retry["model"], exc, nxt)
+            retry["model"] = nxt
+
+
+def _on_second_provider(kwargs: dict, exc: Exception):
+    """The same request on the second provider, or the first refusal as it was.
+
+    When the second fails too, the FIRST error is what is raised: it is the one
+    that says why (an allowance spent until 09:00, a provider not answering),
+    where the backup's own failure only told the owner about a model they have
+    never heard of."""
+    if secondary() is None:
+        raise exc
+    log.warning("[llm] %s; answering on the second provider", exc)
+    try:
+        return _second_create(kwargs)
+    except Exception as exc2:  # noqa: BLE001
+        log.warning("[llm] the second provider failed too: %s", exc2)
+        raise exc from exc2
 
 
 # Formats the OpenAI audio message type understands. A voice note recorded in

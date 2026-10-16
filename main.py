@@ -2445,6 +2445,11 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                 # retry:false — the browser's buffered fallback would only spend
                 # another request against the same spent quota.
                 yield f"data: {json.dumps({'error': llm.quota_message(exc), 'retry': False})}\n\n"
+            elif llm.is_unavailable_error(exc):
+                # The provider is not answering, and a second provider (if
+                # any) failed too. The buffered retry would wait as long again
+                # for the same silence.
+                yield f"data: {json.dumps({'error': llm.UNAVAILABLE_MESSAGE, 'retry': False})}\n\n"
             else:
                 detail = 'The answer stopped early. ' + _safe_error(exc)
                 yield f"data: {json.dumps({'error': detail})}\n\n"
@@ -2504,6 +2509,8 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
             except Exception as exc:  # noqa: BLE001
                 if llm.is_quota_error(exc):
                     raise HTTPException(status_code=503, detail=llm.quota_message(exc))
+                if llm.is_unavailable_error(exc):
+                    raise HTTPException(status_code=503, detail=llm.UNAVAILABLE_MESSAGE)
                 logger.warning("chat tool-loop failed (%s) — using single-shot fallback", exc)
 
         completion = llm.chat_create(
@@ -2532,6 +2539,8 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
     except Exception as exc:
         if llm.is_quota_error(exc):
             raise HTTPException(status_code=503, detail=llm.quota_message(exc))
+        if llm.is_unavailable_error(exc):
+            raise HTTPException(status_code=503, detail=llm.UNAVAILABLE_MESSAGE)
         logger.error("Chat error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(
             status_code=500,
@@ -2659,9 +2668,9 @@ def health_setup():
          "needs": ["GEMINI_API_KEY"],
          "without_it": "The AI CFO chat cannot answer at all."},
         {"key": "ai_second_provider", "live": llm.secondary_configured(),
-         "needs": ["SECOND_AI_BASE_URL", "SECOND_AI_API_KEY", "SECOND_AI_MODEL"],
-         "without_it": "When the free Gemini allowance runs out (most days) the chat and the "
-                       "other AI features stop until about 09:00 Lusaka time."},
+         "needs": ["GROQ_API_KEY", "or SECOND_AI_BASE_URL + SECOND_AI_API_KEY + SECOND_AI_MODEL"],
+         "without_it": "When the free Gemini allowance runs out (most days), or Gemini stops "
+                       "answering, the chat and the other AI features stop with it."},
         {"key": "booking_email_alerts", "live": on("RESEND_API_KEY"),
          "needs": ["RESEND_API_KEY", "BRIEF_FROM_EMAIL"],
          "without_it": "A booking request reaches the owner in the app only. "
@@ -2728,7 +2737,9 @@ def health_stream():
 
 
 @app.get("/health/ai")
-def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
+def health_ai(model: Optional[str] = Query(default=None, max_length=80,
+                                           pattern=r"^[A-Za-z0-9._/:-]+$"),
+              user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     """Which calls to the AI provider actually work.
 
     "The answer stopped early. Please try again." was the whole of what an owner
@@ -2741,6 +2752,9 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     that it breaks: a plain reply, a reply with the tools declared, and the
     streaming call the chat actually makes. Signed-in only and a few tokens a
     run, so it is cheap to ask and not worth abusing.
+
+    ?model=<id> probes that model on the same key instead of LLM_MODEL, so a
+    model that would answer can be found before LLM_MODEL is changed to it.
     """
     if not llm.configured():
         return {"ok": False, "provider": "none", "model": None,
@@ -2748,7 +2762,7 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
                 "probes": {}}
 
     client = llm.client()
-    model = llm.chat_model()
+    model = model or llm.chat_model()
     msgs = [{"role": "user", "content": "Reply with the single word: ok"}]
     probes = {}
 
@@ -2762,27 +2776,57 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     probe("plain", lambda: client.chat.completions.create(
         model=model, messages=msgs, max_tokens=5))
 
-    probe("with_tools", lambda: client.chat.completions.create(
-        model=model, messages=msgs, max_tokens=5,
-        tools=cfo_tools.tool_schemas(), tool_choice="auto"))
+    # A provider that did not answer the plain probe will not answer the rest
+    # either, and each would wait out the full timeout: four of them took three
+    # minutes to say what the first had already said.
+    silent = not probes["plain"]["ok"] and llm.is_unavailable_error(
+        Exception(probes["plain"]["error"]))
+    round_trip = {"ok": False, "error": "skipped: the plain probe got no answer"}
+    if silent:
+        for name in ("with_tools", "streaming_with_tools", "tool_round_trip"):
+            probes[name] = {"ok": False, "error": round_trip["error"]}
+    else:
+        probe("with_tools", lambda: client.chat.completions.create(
+            model=model, messages=msgs, max_tokens=5,
+            tools=cfo_tools.tool_schemas(), tool_choice="auto"))
 
-    def _stream():
-        st = client.chat.completions.create(
-            model=model, messages=msgs, max_tokens=5, stream=True,
-            tools=cfo_tools.tool_schemas(), tool_choice="auto")
-        for _ in st:
-            break
-    probe("streaming_with_tools", _stream)
+        def _stream():
+            st = client.chat.completions.create(
+                model=model, messages=msgs, max_tokens=5, stream=True,
+                tools=cfo_tools.tool_schemas(), tool_choice="auto")
+            for _ in st:
+                break
+        probe("streaming_with_tools", _stream)
 
-    # The round AFTER a lookup: the model asks for a tool, gets the result back,
-    # and answers. The three probes above all stop at the first call, so they
-    # stayed green while every real lookup died on this second request.
-    round_trip = _tool_round_trip_probe(client, model)
-    probes["tool_round_trip"] = {"ok": round_trip["ok"], "error": round_trip.get("error", "")}
+        # The round AFTER a lookup: the model asks for a tool, gets the result
+        # back, and answers. The three probes above all stop at the first call,
+        # so they stayed green while every real lookup died on this second
+        # request.
+        round_trip = _tool_round_trip_probe(client, model)
+        probes["tool_round_trip"] = {"ok": round_trip["ok"], "error": round_trip.get("error", "")}
 
-    quota = [p for p in probes.values() if not p["ok"] and
+    # The backup that answers when the first provider cannot. It used to go
+    # unprobed, so a retired backup model was found only when it was needed.
+    second = llm.secondary()
+    second_model = second[1] if second else None
+    if second is not None:
+        def _second():
+            c2, m2 = second
+            st = c2.chat.completions.create(
+                model=m2, messages=msgs, max_tokens=50, stream=True,
+                tools=cfo_tools.tool_schemas(), tool_choice="auto")
+            for _ in st:
+                break
+        probe("second_provider", _second)
+
+    first = {k: v for k, v in probes.items() if k != "second_provider"}
+    quota = [p for p in first.values() if not p["ok"] and
              ("429" in p["error"] or "quota" in p["error"].lower())]
-    if quota:
+    if silent:
+        verdict = ("The provider is not answering: every request waits until it times out. "
+                   "Check the key's project in Google AI Studio (billing, credits, limits): "
+                   + probes["plain"]["error"])
+    elif quota:
         verdict = ("The AI key has used up its quota, so the chat is refusing questions until "
                    "it resets. A paid Gemini plan raises the limit.")
     elif not probes["plain"]["ok"]:
@@ -2801,10 +2845,25 @@ def health_ai(user_id: str = Depends(rate_limit.limiter("health_ai", 6, 60))):
     else:
         verdict = "The AI chat is working."
 
+    first_ok = all(p["ok"] for p in first.values())
+    if "second_provider" in probes:
+        if probes["second_provider"]["ok"]:
+            if not first_ok:
+                verdict += (f" The backup AI ({second_model}) is answering instead, "
+                            "so the chat still works.")
+        else:
+            verdict += (f" The backup AI ({second_model}) is not answering either: "
+                        + probes["second_provider"]["error"])
+    elif not first_ok:
+        verdict += (" No backup AI is set, so nothing answers instead. GROQ_API_KEY on its own "
+                    "is enough (see SECOND_AI_* in render.yaml).")
+
     return {
-        "ok": all(p["ok"] for p in probes.values()),
+        "ok": first_ok or bool(probes.get("second_provider", {}).get("ok")),
         "provider": llm.provider(),
         "model": model,
+        "second_model": second_model,
+        "first_resting": llm.primary_resting(),
         "probes": probes,
         "round_trip": round_trip,
         "verdict": verdict,
