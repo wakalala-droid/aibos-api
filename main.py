@@ -62,6 +62,7 @@ import books_check
 import books_views
 import debtors as debtors_api
 import cash_forecast as cash_forecast_api
+import bank_pack
 import cash_plan
 import cash_watch
 import outlook as outlook_api
@@ -6456,6 +6457,40 @@ def cash_plan_group(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0,
                                                             "reason": "No business has enough history for a plan yet."}
     out["without_plan"] = missing
     return {"ok": True, "group": out}
+
+
+@app.get("/forecast/cash-plan/bank.pdf")
+def cash_plan_bank_pdf(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
+                       ctx: membership.Context = Depends(membership.require_context)):
+    """The cash flow projection a bank asks for with a loan application
+    (bank_pack.py): the money now, 12 months of money in, money out and
+    closing cash with their ranges, the 13-week plan, the bills already
+    known, money owed and when it is likely in, the regular payments and the
+    assumptions. From one read of the books, the same read as the plan's.
+    Growth, the owner and the accountant. Falls back to .txt without reportlab."""
+    _sees_money(ctx)
+    entitlements.require_feature(ctx.tenant, "cash_plan")
+    db = _require_db()
+    books = cash_watch.inputs(db, ctx.tenant, ctx.business_id)
+    plan = cash_watch.build(db, ctx.tenant, ctx.business_id, tz=tz, floor=floor, books=books)
+    if not plan.get("ok"):
+        raise HTTPException(status_code=409, detail=plan.get("reason") or "Not enough history for a projection yet.")
+    from datetime import date as _date
+    year = bank_pack.twelve_months(books["months"], books["cash"], _date.fromisoformat(plan["today"]),
+                                   plan.get("regular"))
+    try:
+        name = next((b.get("name") for b in businesses_api.list_businesses(db, ctx.tenant)
+                     if b.get("id") == books["business_id"] and b.get("name")), None)
+    except Exception as e:  # noqa: BLE001 — the profile's name stands in
+        log.info("[bank_pack] business name unreadable for %s: %s", ctx.tenant, e)
+        name = None
+    doc = bank_pack.document(name or _business_name_for(db, ctx.tenant) or "The business", books, plan, year, floor)
+    if pdfdoc.available():
+        return Response(content=pdfdoc.report(doc["title"], doc["blocks"], doc["sub"]),
+                        media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{doc["filename"]}.pdf"'})
+    return Response(content=pdfdoc.report_text(doc["title"], doc["blocks"], doc["sub"]), media_type="text/plain",
+                    headers={"Content-Disposition": f'attachment; filename="{doc["filename"]}.txt"'})
 
 
 @app.get("/investigate")

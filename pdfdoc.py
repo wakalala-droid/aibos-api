@@ -1,5 +1,6 @@
 """
-AIBOS — PDF rendering for payslips + compliance packs (audit #26/#66).
+AIBOS — PDF rendering for payslips + compliance packs (audit #26/#66), and
+reports with tables (report(), the bank's cash flow projection).
 
 A tiny wrapper over reportlab that turns the SAME text documents payroll.py
 already produces (payslip_text / compliance_text) into a clean A5/A4 PDF. The
@@ -95,3 +96,291 @@ def render(title: str, body_text: str) -> bytes:
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+# ── Reports with tables (the bank's cash flow projection, 16 October 2026) ───
+# The documents above are lines of text. A projection for a bank is mostly
+# tables, so report() lays out blocks instead, each a tuple:
+#   ("h", text)                      a section heading
+#   ("sub", text)                    a smaller heading inside a section
+#   ("p", text) / ("note", text)     a paragraph, or a small grey one
+#   ("bullets", [text, ...])
+#   ("kv", [(label, value, strong), ...])   labels with their figures beside
+#   ("table", {"cols": [(head, width_mm, "l"|"r"|"c"), ...],
+#              "groups": [(label, span), ...] or None,
+#              "rows": [[cell, ...], ...], "strong": [row index, ...]})
+# with the same grey mark and words in the footer and the page number beside
+# them. A table that runs onto the next page repeats its heads there.
+# report_text() is the same document as plain text, for when reportlab is
+# missing (the routes fall back to .txt as they do for payslips).
+
+_INK = (0.1, 0.11, 0.13)
+_GREY = (0.45, 0.45, 0.47)
+_RULE = (0.82, 0.82, 0.84)
+_BAND = (0.955, 0.958, 0.965)
+
+
+def _safe(text) -> str:
+    """Words the standard PDF fonts can draw: anything else becomes a
+    question mark rather than a missing glyph."""
+    return str(text if text is not None else "").encode("cp1252", "replace").decode("cp1252")
+
+
+class _Report:
+    def __init__(self, c, total: int | None):
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import mm
+        self.c, self.mm, self.total = c, mm, total
+        self.W, self.H = A4
+        self.x = 18 * mm
+        self.width = self.W - 36 * mm
+        self.bottom = 26 * mm
+        self.page = 1
+        self.y = self.H - 22 * mm
+
+    # ── pages ──
+    def foot(self) -> None:
+        _footer(self.c, self.x, self.mm)
+        if self.total:
+            c = self.c
+            c.saveState()
+            c.setFont("Helvetica", 8)
+            c.setFillColorRGB(*_GREY)
+            c.drawRightString(self.x + self.width, 15 * self.mm, f"Page {self.page} of {self.total}")
+            c.restoreState()
+
+    def new_page(self) -> None:
+        self.foot()
+        self.c.showPage()
+        self.page += 1
+        self.y = self.H - 22 * self.mm
+
+    def need(self, h: float) -> None:
+        if self.y - h < self.bottom:
+            self.new_page()
+
+    def rule(self, colour=_RULE, x0=None, x1=None) -> None:
+        self.c.setStrokeColorRGB(*colour)
+        self.c.setLineWidth(0.5)
+        self.c.line(self.x if x0 is None else x0, self.y, (self.x + self.width) if x1 is None else x1, self.y)
+
+    # ── words ──
+    def lines(self, text: str, font: str, size: float, width: float) -> list:
+        from reportlab.lib.utils import simpleSplit
+        return simpleSplit(_safe(text), font, size, width) or [""]
+
+    def fit(self, text: str, font: str, size: float, width: float) -> str:
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        s = _safe(text)
+        if stringWidth(s, font, size) <= width:
+            return s
+        while s and stringWidth(s + "...", font, size) > width:
+            s = s[:-1]
+        return s.rstrip() + "..."
+
+    def title(self, title: str, sub: list) -> None:
+        c, mm = self.c, self.mm
+        c.setFillColorRGB(*_INK)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(self.x, self.y, _safe(title))
+        self.y -= 7.5 * mm
+        for i, line in enumerate(sub or []):
+            c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 11 if i == 0 else 9.5)
+            c.setFillColorRGB(*(_INK if i == 0 else _GREY))
+            c.drawString(self.x, self.y, _safe(line))
+            self.y -= (5.6 if i == 0 else 4.6) * mm
+        self.y -= 1.5 * mm
+        self.rule()
+        self.y -= 4 * mm
+
+    def heading(self, text: str) -> None:
+        mm = self.mm
+        self.need(24 * mm)                    # never a heading alone at the foot of a page
+        self.y -= 4 * mm
+        self.c.setFillColorRGB(*_INK)
+        self.c.setFont("Helvetica-Bold", 12.5)
+        self.c.drawString(self.x, self.y, _safe(text))
+        self.y -= 2.6 * mm
+        self.rule()
+        self.y -= 5 * mm
+
+    def sub(self, text: str) -> None:
+        self.need(16 * self.mm)               # kept with the lines it leads into
+        self.y -= 1 * self.mm
+        self.c.setFillColorRGB(*_INK)
+        self.c.setFont("Helvetica-Bold", 10)
+        self.c.drawString(self.x, self.y, _safe(text))
+        self.y -= 5 * self.mm
+
+    def para(self, text: str, small: bool = False) -> None:
+        font, size = ("Helvetica-Oblique", 8.5) if small else ("Helvetica", 9.5)
+        lead = (3.9 if small else 4.6) * self.mm
+        for line in self.lines(text, font, size, self.width):
+            self.need(lead)
+            self.c.setFont(font, size)
+            self.c.setFillColorRGB(*(_GREY if small else _INK))
+            self.c.drawString(self.x, self.y, line)
+            self.y -= lead
+        self.y -= 2 * self.mm
+
+    def bullets(self, items: list) -> None:
+        mm = self.mm
+        lead = 4.6 * mm
+        for item in items:
+            lines = self.lines(item, "Helvetica", 9.5, self.width - 5 * mm)
+            self.need(lead * min(len(lines), 2))
+            for i, line in enumerate(lines):
+                self.need(lead)
+                self.c.setFont("Helvetica", 9.5)
+                self.c.setFillColorRGB(*_INK)
+                if i == 0:
+                    self.c.drawString(self.x + 1 * mm, self.y, "•")
+                self.c.drawString(self.x + 5 * mm, self.y, line)
+                self.y -= lead
+            self.y -= 1.2 * mm
+        self.y -= 1.5 * mm
+
+    def pairs(self, rows: list) -> None:
+        mm = self.mm
+        col = self.x + 120 * mm
+        for label, value, strong in rows:
+            size = 11 if strong else 9.5
+            self.need(6 * mm)
+            self.c.setFillColorRGB(*(_INK if strong else _GREY))
+            self.c.setFont("Helvetica-Bold" if strong else "Helvetica", size)
+            self.c.drawString(self.x, self.y, _safe(label))
+            self.c.setFillColorRGB(*_INK)
+            self.c.drawRightString(col, self.y, _safe(value))
+            self.y -= (6 if strong else 5) * mm
+        self.y -= 2 * mm
+
+    def table(self, spec: dict) -> None:
+        mm, c = self.mm, self.c
+        cols = spec["cols"]
+        widths = [w * mm for _, w, _ in cols]
+        scale = min(1.0, self.width / sum(widths))
+        widths = [w * scale for w in widths]
+        xs = [self.x]
+        for w in widths[:-1]:
+            xs.append(xs[-1] + w)
+        right = self.x + sum(widths)
+        size, head_size, row_h = 8, 7.5, 5.2 * mm
+        pad = 1.3 * mm
+        strong = set(spec.get("strong") or [])
+
+        def cell(text, k, font, sz):
+            x, w, align = xs[k], widths[k], cols[k][2]
+            s = self.fit(text, font, sz, w - 2 * pad)
+            c.setFont(font, sz)
+            if align == "r":
+                c.drawRightString(x + w - pad, self.y, s)
+            elif align == "c":
+                c.drawCentredString(x + w / 2, self.y, s)
+            else:
+                c.drawString(x + pad, self.y, s)
+
+        def heads():
+            c.setFillColorRGB(*_GREY)
+            if spec.get("groups"):
+                k = 0
+                for label, span in spec["groups"]:
+                    if label:
+                        x0, x1 = xs[k], xs[k] + sum(widths[k:k + span])
+                        c.setFont("Helvetica-Bold", head_size)
+                        c.drawCentredString((x0 + x1) / 2, self.y,
+                                            self.fit(label, "Helvetica-Bold", head_size, x1 - x0))
+                        self.y -= 1.4 * mm
+                        self.rule(x0=x0 + pad, x1=x1 - pad)
+                        self.y += 1.4 * mm
+                    k += span
+                self.y -= 4.2 * mm
+            for k, (head, _, _) in enumerate(cols):
+                cell(head, k, "Helvetica-Bold", head_size)
+            self.y -= 2 * mm
+            self.rule(colour=_GREY, x1=right)
+            self.y -= 3.6 * mm
+
+        self.need((9.5 if spec.get("groups") else 5.6) * mm + 3 * row_h)
+        heads()
+        for i, row in enumerate(spec["rows"]):
+            if self.y - row_h < self.bottom:
+                self.new_page()
+                heads()
+            bold = i in strong
+            if bold:                          # a line above, where the band above it ends
+                self.y += row_h - 1.6 * mm
+                self.rule(colour=_GREY, x1=right)
+                self.y -= row_h - 1.6 * mm
+            elif i % 2 == 1:
+                c.setFillColorRGB(*_BAND)
+                c.rect(self.x, self.y - 1.6 * mm, right - self.x, row_h, stroke=0, fill=1)
+            c.setFillColorRGB(*_INK)
+            for k, text in enumerate(row):
+                cell(text, k, "Helvetica-Bold" if bold else "Helvetica", size)
+            self.y -= row_h
+        self.y -= 3 * mm
+
+    def draw(self, title: str, sub: list, blocks: list) -> int:
+        self.title(title, sub)
+        for kind, body in blocks:
+            if kind == "h":
+                self.heading(body)
+            elif kind == "sub":
+                self.sub(body)
+            elif kind == "p":
+                self.para(body)
+            elif kind == "note":
+                self.para(body, small=True)
+            elif kind == "bullets":
+                self.bullets(body)
+            elif kind == "kv":
+                self.pairs(body)
+            elif kind == "table":
+                self.table(body)
+        self.foot()
+        self.c.showPage()
+        return self.page
+
+
+def report(title: str, blocks: list, sub: list | None = None) -> bytes:
+    """Render a report of blocks (see above) to PDF bytes. Laid out twice:
+    once to count the pages, once to draw them with "Page n of m"."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    pages = _Report(canvas.Canvas(io.BytesIO(), pagesize=A4), None).draw(title, sub or [], blocks)
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle(_safe(title))
+    c.setAuthor("AIBOS")
+    _Report(c, pages).draw(title, sub or [], blocks)
+    c.save()
+    return buf.getvalue()
+
+
+def report_text(title: str, blocks: list, sub: list | None = None) -> str:
+    """The same report as plain text, tables in padded columns."""
+    out = [title, "=" * len(title)] + list(sub or []) + [""]
+    for kind, body in blocks:
+        if kind == "h":
+            out += ["", body.upper(), "-" * len(body)]
+        elif kind == "sub":
+            out += [body]
+        elif kind in ("p", "note"):
+            out += [body, ""]
+        elif kind == "bullets":
+            out += [f"  * {b}" for b in body] + [""]
+        elif kind == "kv":
+            out += [f"  {label:<40} {value:>18}" for label, value, _ in body] + [""]
+        elif kind == "table":
+            cols = body["cols"]
+            rows = [[h for h, _, _ in cols]] + [[str(v) for v in r] for r in body["rows"]]
+            if body.get("groups"):
+                rows.insert(0, [g for label, span in body["groups"] for g in [label] + [""] * (span - 1)])
+            w = [max(len(r[k]) for r in rows) for k in range(len(cols))]
+            for r in rows:
+                out.append("  ".join(v.ljust(w[k]) if cols[k][2] == "l" else v.rjust(w[k])
+                                     for k, v in enumerate(r)).rstrip())
+            out.append("")
+    out += ["", FOOTER]
+    return "\n".join(out)

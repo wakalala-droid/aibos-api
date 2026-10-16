@@ -1111,6 +1111,9 @@ def build(events: list, pending: list, invoices: list, schedule: list, cash_now:
     plan = summarise(ctx, sim, base_run, floor, sym)
     plan["levers"] = levers(ctx, sim, plan, floor, sym)
     plan["debts"] = _debts(ctx, sim)
+    # All of it, not only the 12 largest the debts list shows.
+    plan["owed_total"] = round(sum(it["amount"] for it in ctx["receivables"]), 2)
+    plan["owed_count"] = len(ctx["receivables"])
     plan["regular"] = [{k: s[k] for k in ("key", "label", "cadence", "amount", "prob", "count", "last")}
                        | {"next": s["dates"][:1]} for s in ctx["regular"]]
     plan["known"] = sim.known

@@ -61,13 +61,17 @@ def inputs(db, owner_id: str, business_id: str | None) -> dict:
         schedule = []
     months = books_views.cash_months(events)
     return {"business_id": biz, "events": events, "pending": pending, "invoices": invoices,
-            "schedule": schedule, "cash": split["total"], "sym": symbol(state.get("currency")),
+            "schedule": schedule, "cash": split["total"], "split": split, "sym": symbol(state.get("currency")),
+            "months": months,
             "monthly_in": [{"month": m["month"], "in": m["trading_in"]} for m in months]}
 
 
 def build(db, owner_id: str, business_id: str | None, tz: int = 0, floor: float = 0.0,
-          scenarios: list | None = None, paths: int = cash_plan.PATHS) -> dict:
-    books = inputs(db, owner_id, business_id)
+          scenarios: list | None = None, paths: int = cash_plan.PATHS, books: dict | None = None) -> dict:
+    """The plan for one business. `books` is inputs() when the caller has
+    already read them (the bank's projection uses the same read for the money
+    now, the plan and the 12 months)."""
+    books = books or inputs(db, owner_id, business_id)
     today = (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
     plan = cash_plan.build(books["events"], books["pending"], books["invoices"], books["schedule"],
                            books["cash"], today=today, tz=tz, floor=floor, scenarios=scenarios,
