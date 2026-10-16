@@ -90,8 +90,8 @@ def test_gemini_when_gemini_key():
     with env(GEMINI_API_KEY="k"):
         assert llm.provider() == "gemini"
         assert llm.api_key() == "k"
-        assert llm.chat_model() == "gemini-3.8-flash"
-        assert llm.fallback_model() == "gemini-3.5-flash"
+        assert llm.chat_model() == "gemini-3.6-flash"
+        assert llm.fallback_model() == "gemini-3.5-flash-lite"
         assert llm.transcribe_model() == "gemini-3.5-transcribe"
 
 
@@ -151,7 +151,7 @@ def test_fallback_uses_gemini_models_on_gemini():
     with env(GEMINI_API_KEY="k"):
         c = _Client(fail_times=1)
         llm.chat_create(c, messages=[])
-        assert c.models == ["gemini-3.8-flash", "gemini-3.5-flash"]
+        assert c.models == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
 
 
 def test_no_fallback_on_other_errors():
@@ -231,3 +231,13 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\n=== {len(fns)}/{len(fns)} llm tests passed ===")
+
+
+def test_gemini_default_is_not_the_model_that_hangs():
+    """gemini-3.8-flash hung on every request from our key (16 Oct 2026), so
+    every chat question failed. It comes back only after /health/ai?model=
+    shows it answering."""
+    with env(GEMINI_API_KEY="k"):
+        for got in (llm.chat_model(), llm.fallback_model(), llm.vision_model()):
+            assert "3.8-flash" not in got, got
+        assert llm.fallback_model() != llm.chat_model()

@@ -36,9 +36,11 @@ AI features say so instead of erroring.
 MODEL IDS ARE ENV-DRIVEN, WHICH MATTERS MORE HERE THAN IT LOOKS
 
 A provider retiring a model id is a variable change, not a deploy. Google have
-already shut down `gemini-2.0-flash`, so the defaults below are the current
-Flash line as of September 2026. If one starts 404ing, check
-https://ai.google.dev/gemini-api/docs/models and set LLM_MODEL rather than
+already shut down `gemini-2.0-flash`, and in October 2026 `gemini-3.8-flash`
+hung on every request from our key, so the defaults below are the models that
+answer it (see _DEFAULTS). If one starts 404ing or hanging, find one that
+answers with /health/ai?model=<id> (models are listed at
+https://ai.google.dev/gemini-api/docs/models) and set LLM_MODEL rather than
 editing this file.
 
     LLM_MODEL            primary chat/classify model
@@ -59,13 +61,20 @@ log = logging.getLogger("aibos.llm")
 
 GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-# Defaults per provider. Gemini's are the current Flash line; note that
-# gemini-2.0-flash is shut down and must not be reintroduced as a default.
+# Defaults per provider. Note that gemini-2.0-flash is shut down and must not
+# be reintroduced as a default.
+#
+# NOT gemini-3.8-flash. On 16 Oct 2026, on our key (free tier, no prepaid
+# credits), every 3.8 Flash request hung until the timeout, a one-word reply
+# included, while 3.6 Flash and 3.5 Flash-Lite passed every /health/ai probe
+# on the same key. Try a newer model with /health/ai?model=<id> before making
+# it the default. The fallback is Flash-Lite because gemini-3.5-flash is now
+# routed to 3.6 Flash: the same model, so no fallback at all.
 _DEFAULTS = {
     "gemini": {
-        "chat": "gemini-3.8-flash",
-        "fallback": "gemini-3.5-flash",
-        "vision": "gemini-3.8-flash",
+        "chat": "gemini-3.6-flash",
+        "fallback": "gemini-3.5-flash-lite",
+        "vision": "gemini-3.6-flash",
         "transcribe": "gemini-3.5-transcribe",
     },
     # Groq retired the Llama chat models: by October 2026 both ids answered
