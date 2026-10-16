@@ -65,6 +65,7 @@ import cash_forecast as cash_forecast_api
 import cash_plan
 import cash_watch
 import outlook as outlook_api
+import track_record
 import rec_store
 import llm
 import compliance as compliance_api
@@ -2557,7 +2558,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 39
+EXPECTS_MIGRATION = 40
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -6358,6 +6359,20 @@ def forecast_outlook(tz: int = Query(0, ge=-840, le=840),
                                                       daily=outlook_api.daily_sales(sales))}
 
 
+@app.get("/forecast/track-record")
+def forecast_track_record(ctx: membership.Context = Depends(membership.require_context)):
+    """What AIBOS forecast before each month happened (kept once a month by
+    the hourly jobs, never rewritten), held against the confirmed books: each
+    month's range, the actual, whether it fell inside, and how often it has.
+    Next month's sales for everyone who sees the Forecast page; the cash
+    plan's week 4 for Growth, owner and accountant. Before migration 0040 it
+    answers available: false."""
+    db = _require_db()
+    with_cash = ctx.role in ("owner", "accountant") and _plan_tier_ok(ctx)
+    return {"ok": True, "record": track_record.for_business(db, ctx.tenant, ctx.business_id,
+                                                            with_cash=with_cash)}
+
+
 class SeriesRequest(BaseModel):
     rows: List[Dict[str, Any]]
 
@@ -7491,6 +7506,9 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a day: every Growth business's 13-week plan, and the owner
             # warned when the money is likely to go short within four weeks.
             ("cash_watch", lambda: cash_watch.daily(db, notify.record_notification)),
+            # Once a month: what each business's forecast says before the month
+            # happens, kept so the Forecast page's track record is earned.
+            ("track_record", lambda: track_record.keep(db)),
         ):
             try:
                 out[name] = job()
