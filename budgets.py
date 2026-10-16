@@ -64,6 +64,52 @@ def variance(monthly: list, budgets: list, month: str) -> dict:
     return {"month": month, "actuals": actuals, "lines": rows}
 
 
+# ── On pace? (the month still running, 16 Oct 2026) ──────────────────────────
+# A plan for the month measured against half a month always reads "off": K30,000
+# of sales on the 15th is behind a K50,000 target and perfectly on pace. For
+# the month still running each line also says what the month is on pace for
+# (outlook.py, from the forecast engine and how a month usually fills up), the
+# chance of meeting the plan, and what it takes a day from here.
+
+def _phi(z: float) -> float:
+    import math
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _spread(band: dict) -> float:
+    return max((_num(band.get("p90")) - _num(band.get("p10"))) / (2 * 1.2815515655446004), 1e-6)
+
+
+def pace(report: dict, this_month: dict | None) -> dict:
+    """Adds `projected`, `chance_pct`, `per_day` and `on_pace` to each line of
+    variance() for the month still running. Sales and profit want to reach the
+    target; costs want to stay under it. Unchanged for any other month."""
+    if not this_month or this_month.get("month") != report.get("month"):
+        return report
+    rev, cost = this_month.get("revenue") or {}, this_month.get("costs") or {}
+    days_left = max(int(this_month.get("days_left") or 0), 0)
+    est = {"revenue": _num(rev.get("estimate")), "costs": _num(cost.get("estimate"))}
+    est["profit"] = est["revenue"] - est["costs"]
+    sd = {"revenue": _spread(rev), "costs": _spread(cost)}
+    sd["profit"] = (sd["revenue"] ** 2 + sd["costs"] ** 2) ** 0.5
+    for line in report.get("lines", []):
+        m = line["metric"]
+        target = _num(line.get("target"))
+        projected = est[m]
+        z = (target - projected) / sd[m]
+        chance = _phi(z) if m == "costs" else 1.0 - _phi(z)
+        left = target - _num(line.get("actual"))
+        line["projected"] = round(projected, 2)
+        line["chance_pct"] = round(100 * chance)
+        line["on_pace"] = projected <= target if m == "costs" else projected >= target
+        line["days_left"] = days_left
+        if days_left > 0:
+            # Sales and profit: still to make a day. Costs: room left a day.
+            line["per_day"] = round(max(left, 0.0) / days_left, 2)
+    report["pace"] = True
+    return report
+
+
 # ── DB wrappers (tenant + business scoped) ────────────────────────────────────
 
 

@@ -388,6 +388,7 @@ def _cash_plan(db, user_id, args, business_id=None):
                   for lv in plan.get("levers", [])],
         "owed_to_you": [{k: d[k] for k in ("customer", "amount", "likely_by", "chance_in_plan_pct")}
                         for d in plan.get("debts", [])[:8]],
+        "ask_first": [{k: c.get(k) for k in ("customer", "amount", "why")} for c in plan.get("chase", [])[:3]],
         "regular_payments": [{k: r[k] for k in ("label", "cadence", "amount")} for r in plan.get("regular", [])],
         "how": plan.get("assumptions", []),
     }

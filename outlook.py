@@ -47,8 +47,33 @@ def _band(f: dict, h: int) -> dict:
     return {"p10": a["p10"], "p50": a["p50"], "p90": a["p90"]}
 
 
+# What the profit and loss counts as a cost (digital_twin's fold): money a
+# supplier refunds takes it back.
+COST_TYPES = ("Purchase", "Expense", "Salary", "TaxPayment", "Refund")
+
+
+def daily_costs(events: list) -> dict:
+    """Confirmed costs by day, as the profit and loss counts them."""
+    out: dict = {}
+    for ev in events or []:
+        et = ev.get("event_type")
+        if et not in COST_TYPES or ev.get("status") not in (None, "confirmed"):
+            continue
+        p = ev.get("payload") or {}
+        if et == "Refund":
+            if str(p.get("direction") or "").lower() != "from_supplier":
+                continue
+            sign = -1.0
+        else:
+            sign = 1.0
+        day = str(ev.get("occurred_at") or "")[:10]
+        if len(day) == 10:
+            out[day] = out.get(day, 0.0) + sign * _num(p.get("amount"))
+    return out
+
+
 def outlook(monthly: list, today: str | None = None, daily: dict | None = None,
-            complete: bool = False) -> dict:
+            complete: bool = False, daily_cost: dict | None = None) -> dict:
     """`monthly` rows {month, revenue, costs}. With `complete` (an uploaded
     file) every row is a finished period and none is the month running now."""
     today = today or datetime.now(timezone.utc).isoformat()
@@ -114,13 +139,20 @@ def outlook(monthly: list, today: str | None = None, daily: dict | None = None,
         first = ahead[0]
         sd = (first["revenue"]["p90"] - first["revenue"]["p10"]) / (2 * fe.Z90)
         now = fe.nowcast(_num((so_far or {}).get("revenue")), elapsed, first["revenue"]["p50"], sd, shape)
-        this_month = {"month": current, "revenue": now,
+        # Costs judged the same way, on how a month's costs usually fall (rent
+        # on the 1st puts most of them early; a straight line would cry wolf).
+        cshape = fe.month_shape(daily_cost or {}, months[-SHAPE_MONTHS:]) if daily_cost else None
+        csd = (first["costs"]["p90"] - first["costs"]["p10"]) / (2 * fe.Z90)
+        cnow = fe.nowcast(_num((so_far or {}).get("costs")), elapsed, first["costs"]["p50"], csd, cshape)
+        this_month = {"month": current, "revenue": now, "costs": cnow,
                       "costs_so_far": round(_num((so_far or {}).get("costs")), 2),
-                      "shape_learned": shape is not None}
+                      "shape_learned": shape is not None,
+                      "days_left": max(dim - (int(elapsed * dim) + 1), 0)}
         # This month's row says what the month is on pace for, the same figure
-        # as "on pace for" above it, and its profit moves with it.
-        shift = now["estimate"] - first["revenue"]["p50"]
+        # as "on pace for" above it, and its profit moves with both.
+        shift = (now["estimate"] - first["revenue"]["p50"]) - (cnow["estimate"] - first["costs"]["p50"])
         first["revenue"] = {"p10": now["p10"], "p50": now["estimate"], "p90": now["p90"]}
+        first["costs"] = {"p10": cnow["p10"], "p50": cnow["estimate"], "p90": cnow["p90"]}
         first["profit"] = {k: round(v + shift, 2) for k, v in first["profit"].items()}
 
     acc = fr["accuracy"]

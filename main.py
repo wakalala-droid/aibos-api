@@ -5258,7 +5258,8 @@ _BUDGETS_SETUP = ("Budgets are not set up on this database yet. "
 
 
 @app.get("/budgets")
-def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membership.require_context)):
+def get_budgets(month: str = Query(...), tz: int = Query(0, ge=-840, le=840),
+                ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     try:
         rows = budgets_api.list_budgets(db, ctx.tenant, month=month, business_id=ctx.business_id)
@@ -5269,6 +5270,20 @@ def get_budgets(month: str = Query(...), ctx: membership.Context = Depends(membe
         raise
     state = twin.get_state(db, ctx.tenant, ctx.business_id)
     var = budgets_api.variance(state.get("monthly", []), rows, month)
+    # The month still running is judged on pace, not on half a month's actuals.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    now = _dt.now(_tz.utc) + _td(minutes=tz)
+    if var["lines"] and month == now.strftime("%Y-%m"):
+        try:
+            biz = twin._books_for(db, ctx.tenant, ctx.business_id)
+            evs = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
+                                      event_types=("Sale",) + outlook_api.COST_TYPES)
+            ol = outlook_api.outlook(state.get("monthly") or [], today=now.isoformat(),
+                                     daily=outlook_api.daily_sales(evs), daily_cost=outlook_api.daily_costs(evs))
+            if ol.get("ok"):
+                var = budgets_api.pace(var, ol.get("this_month"))
+        except Exception as e:  # noqa: BLE001 — the plan against actual stands without the pace
+            logger.info("[budgets] pace skipped for %s: %s", ctx.tenant, e)
     return {"ok": True, "budgets": rows, **var}
 
 
@@ -6353,11 +6368,12 @@ def forecast_outlook(tz: int = Query(0, ge=-840, le=840),
     db = _require_db()
     biz = twin._books_for(db, ctx.tenant, ctx.business_id)
     state = twin.get_state(db, ctx.tenant, biz)
-    sales = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
-                                event_types=("Sale",))
+    evs = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
+                              event_types=("Sale",) + outlook_api.COST_TYPES)
     now = _dt.now(_tz.utc) + _td(minutes=tz)
     return {"ok": True, "outlook": outlook_api.outlook(state.get("monthly") or [], today=now.isoformat(),
-                                                      daily=outlook_api.daily_sales(sales))}
+                                                      daily=outlook_api.daily_sales(evs),
+                                                      daily_cost=outlook_api.daily_costs(evs))}
 
 
 @app.get("/forecast/track-record")
@@ -6409,6 +6425,24 @@ def cash_plan_route(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0,
         plan = cash_watch.build(db, ctx.tenant, ctx.business_id, tz=tz, floor=floor, paths=300)
         return {"ok": True, "plan": cash_watch.preview(plan)}
     return {"ok": True, "plan": cash_watch.build(db, ctx.tenant, ctx.business_id, tz=tz, floor=floor)}
+
+
+@app.get("/forecast/cash-watch")
+def cash_watch_route(tz: int = Query(0, ge=-840, le=840),
+                     ctx: membership.Context = Depends(membership.require_context)):
+    """The plan in a sentence, for Home: Growth sees the headline, what is safe
+    to spend, what is due out in two weeks and who to ask for money first;
+    any other plan its own headline risk. Kept a few minutes per set of books."""
+    _sees_money(ctx)
+    db = _require_db()
+    s = cash_watch.summary(db, ctx.tenant, ctx.business_id, tz=tz)
+    if not _plan_tier_ok(ctx):
+        if not s.get("ok"):
+            return {"ok": True, "watch": {"ok": False, "preview": True, "reason": s.get("reason")}}
+        return {"ok": True, "watch": {"ok": True, "preview": True, "chance_short_pct": s["chance_short_pct"],
+                                      "chance_words": s["chance_words"], "first_risk_date": s.get("first_risk_date"),
+                                      "at_risk": s["chance_short_pct"] >= 5}}
+    return {"ok": True, "watch": s}
 
 
 @app.post("/forecast/cash-plan")

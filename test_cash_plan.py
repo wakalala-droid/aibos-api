@@ -283,6 +283,58 @@ def test_chance_words():
     assert cp.chance_sentence(0.3, "of running short") == "1 in 3 chance of running short"
 
 
+
+# ── Who to ask for money first ───────────────────────────────────────────────
+
+def _owed(events, customer, amount, days_ago, **extra):
+    day = TODAY - timedelta(days=days_ago)
+    events.append(_ev("Sale", day, amount, payment_method="credit", customer=customer, **extra))
+
+
+def test_the_chase_list_leads_with_the_debt_that_matters_most_to_cash():
+    events, pending, invoices, schedule = shop()
+    _owed(events, "Big Trader", 15000.0, 40)
+    _owed(events, "Small Trader", 600.0, 70)
+    # Little money, so the plan is at risk and collecting matters.
+    plan = cp.build(events, pending, invoices, schedule, 3000.0, today=TODAY, paths=400)
+    assert plan["chance_short_pct"] >= 5
+    first = plan["chase"][0]
+    assert first["customer"] == "Big Trader" and first["cuts_risk_pct"] > 0
+    assert "falls from" in first["why"] and "Owed for 40 days" in first["why"]
+    assert all(c["kind"] != "stay" or c["age"] >= 0 for c in plan["chase"])     # a stay not started is not chased
+
+
+def test_with_no_risk_the_oldest_and_biggest_lead():
+    events, pending, invoices, schedule = shop()
+    _owed(events, "Old Debt", 2000.0, 90)
+    _owed(events, "New Debt", 2500.0, 2)
+    plan = cp.build(events, pending, invoices, schedule, 80000.0, today=TODAY, paths=300)
+    names = [c["customer"] for c in plan["chase"]]
+    assert names.index("Old Debt") < names.index("New Debt")
+    assert "cuts_risk_pct" not in plan["chase"][0]
+
+
+def test_a_debt_older_than_any_ever_paid_does_not_break_the_plan():
+    # Paid within 5 days, and some still open at 20 days: a debt of 200 days
+    # is past everything history knows. It gets a low chance, not a crash.
+    surv = cp.PaySurvival([(5, 100.0)] * 8, [{"amount": 100.0, "age": 20}] * 4)
+    days = surv.sample_days(200, np.random.default_rng(0).random(50))
+    assert (days == -10 ** 6).all()
+
+
+def test_two_debts_from_one_customer_are_one_reminder():
+    import cash_watch
+    events, pending, invoices, schedule = shop()
+    plan = cp.build(events, pending, invoices, schedule, 3000.0, today=TODAY, paths=300)
+    lodge = [c for c in plan["chase"] if c["customer"] == "Lusaka Lodge"]
+    assert len(lodge) == 1
+    open_invoices = [inv for inv in invoices if inv["status"] == "sent"]
+    assert lodge[0]["count"] == len(open_invoices) and lodge[0]["amount"] == sum(i["total"] for i in open_invoices)
+    msg = cash_watch.chase_message(lodge[0], "Zoe's Kitchen", "K", ["https://x/pay/a", "https://x/pay/b"])
+    if len(open_invoices) > 1:
+        assert "invoices INV-" in msg and " and INV-" in msg
+    assert "https://x/pay/a" in msg and "https://x/pay/b" in msg
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

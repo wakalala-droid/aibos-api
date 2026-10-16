@@ -224,7 +224,8 @@ def receivables(invoices: list, events: list, today: date, tz: int = 0) -> dict:
                                "customer": str(inv.get("customer_name") or "Unknown"),
                                "label": f"Invoice {inv.get('number') or ''}".strip(),
                                "amount": total, "owed": owed, "age": (today - owed).days,
-                               "kind": "invoice"})
+                               "kind": "invoice", "invoice_id": inv.get("id"),
+                               "number": inv.get("number")})
         elif status == "paid" and issued:
             paid_on = _local_day(inv.get("paid_at"), tz)
             if paid_on:
@@ -249,6 +250,7 @@ def receivables(invoices: list, events: list, today: date, tz: int = 0) -> dict:
                 continue
             sales.setdefault(key, []).append({"made": made, "owed": owed, "left": _num(p.get("amount")),
                                               "booking": p.get("source") == "hospitality_booking",
+                                              "booking_id": p.get("booking_id"),
                                               "ref": f"sale:{ev.get('id')}"})
             names.setdefault(key, name)
         elif et == "CustomerPayment":
@@ -294,7 +296,8 @@ def receivables(invoices: list, events: list, today: date, tz: int = 0) -> dict:
                                    "label": "Stay" if r["booking"] else "Credit sale",
                                    "amount": round(r["left"], 2), "owed": r["owed"],
                                    "age": (today - r["owed"]).days,
-                                   "kind": "stay" if r["booking"] else "credit"})
+                                   "kind": "stay" if r["booking"] else "credit",
+                                   "booking_id": r.get("booking_id")})
     open_items.sort(key=lambda it: -it["amount"])
     return {"open": open_items, "paid": paid, "unallocated": unallocated}
 
@@ -353,6 +356,8 @@ class PaySurvival:
             return np.full(u.shape, -10 ** 6)
         later = self.grid > age
         g, s = self.grid[later], self.surv[later]
+        if not len(g):
+            return np.full(u.shape, -10 ** 6)          # older than any debt ever paid
         target = s_a * (1.0 - u)
         # smallest delay whose survival has fallen to the target
         # (survival falls along the grid, so search on its negative)
@@ -710,7 +715,7 @@ def simulate(ctx: dict, paths: int = PATHS, seed: int = SEED) -> Sim:
     for i, it in enumerate(items):
         u = rng.random(P)
         surv = survs["stay" if it["kind"] == "stay" else "credit"]
-        if it["age"] > 0 and surv.s_at(it["age"]) < 0.02:
+        if it["age"] > 0 and (surv.s_at(it["age"]) < 0.02 or not (surv.grid > it["age"]).any()):
             # Older than any debt these customers have paid: a low chance, some
             # time in the plan.
             p_tail = 0.4 * math.exp(-max(0, it["age"] - int(surv.grid[-1])) / 120.0)
@@ -1111,6 +1116,7 @@ def build(events: list, pending: list, invoices: list, schedule: list, cash_now:
     plan = summarise(ctx, sim, base_run, floor, sym)
     plan["levers"] = levers(ctx, sim, plan, floor, sym)
     plan["debts"] = _debts(ctx, sim)
+    plan["chase"] = chase(ctx, sim, plan, floor)
     # All of it, not only the 12 largest the debts list shows.
     plan["owed_total"] = round(sum(it["amount"] for it in ctx["receivables"]), 2)
     plan["owed_count"] = len(ctx["receivables"])
@@ -1133,6 +1139,86 @@ def build(events: list, pending: list, invoices: list, schedule: list, cash_now:
             },
         }
     return plan
+
+
+CHASE_TOP = 8
+CHASE_TRY = 15
+
+
+def chase(ctx: dict, sim: Sim, plan: dict, floor: float = 0.0) -> list:
+    """Who to ask for money first, best first.
+
+    When the money is at risk, each debt is tried on the plan's own futures as
+    if it were collected this week, and the list is led by the one that cuts
+    the chance of running short most: K3,000 due before payday can matter more
+    than K9,000 that only comes in after the low point. When nothing is at
+    risk, the oldest and biggest lead (money that has waited longest is the
+    hardest to get). A stay not yet started is not chased: the guest pays on
+    arrival. One row per customer, so two open invoices are one message, not
+    two. Each says why it is on the list, in plain words."""
+    items = ctx["receivables"]
+    if not items:
+        return []
+    base = plan["chance_short_pct"]
+    at_risk = base >= 5
+    groups: dict = {}
+    for i, it in enumerate(items[:CHASE_TRY]):
+        if it["kind"] == "stay" and it["age"] < 0:
+            continue
+        groups.setdefault(normalize_key(it["customer"]), []).append(i)
+    rows = []
+    for idx in groups.values():
+        its = [items[i] for i in idx]
+        days = sim.debt_day[idx]
+        amounts = np.array([it["amount"] for it in its])
+        got = days >= 0
+        # The day the last of it is likely in, and how much of the money comes in at all.
+        last = np.where(got.all(axis=0), days.max(axis=0), -1)
+        likely = (sim.days[0] + timedelta(days=int(np.median(last[last >= 0])))).isoformat() \
+            if (last >= 0).any() else None
+        chance = float((got.mean(axis=1) * amounts).sum() / max(amounts.sum(), 1e-9))
+        kinds = {it["kind"] for it in its}
+        oldest = max(its, key=lambda it: it["age"])
+        row = {"ref": its[0]["ref"], "customer": its[0]["customer"],
+               "label": its[0]["label"] if len(its) == 1 else f"{len(its)} amounts owed",
+               "amount": round(float(amounts.sum()), 2), "age": oldest["age"],
+               "kind": kinds.pop() if len(kinds) == 1 else "credit", "owed": oldest["owed"].isoformat(),
+               "likely_by": likely, "chance_in_plan_pct": round(100 * chance), "count": len(its),
+               "invoice_ids": [it["invoice_id"] for it in its if it.get("invoice_id")],
+               "numbers": [it["number"] for it in its if it.get("number")],
+               "booking_ids": [it["booking_id"] for it in its if it.get("booking_id")]}
+        if at_risk:
+            after = 100 * _risk(balances(sim, {"collect_now": idx})["bal"], floor)["short"]
+            row["cuts_risk_pct"] = round(max(base - after, 0.0), 1)
+            row["chance_short_after_pct"] = round(after, 1)
+        rows.append(row)
+    if at_risk:
+        rows.sort(key=lambda r: (-r["cuts_risk_pct"], -r["amount"]))
+    else:
+        rows.sort(key=lambda r: -(r["amount"] * (1 + max(r["age"], 0) / 30.0)))
+    for r in rows:
+        r["why"] = _chase_why(r, base)
+    return rows[:CHASE_TOP]
+
+
+def _chase_why(r: dict, base: float) -> str:
+    """Why a customer is on the list: what collecting does to the plan, then
+    how long it has waited and how likely it is to come in by itself."""
+    first = ""
+    if r.get("cuts_risk_pct", 0) >= 1:
+        first = (f"Collected this week, your chance of running short falls from {base:g}% "
+                 f"to {r['chance_short_after_pct']:g}%.")
+    late = r["age"]
+    parts = []
+    if late > 0:
+        parts.append(f"owed for {late} day{'s' if late != 1 else ''}")
+    elif late == 0:
+        parts.append("owed from today")
+    if r["chance_in_plan_pct"] < 60:
+        parts.append(f"only {r['chance_in_plan_pct']}% likely to come in within 13 weeks on its own")
+    rest = "; ".join(parts)
+    rest = (rest[0].upper() + rest[1:] + ".") if rest else ""
+    return " ".join(x for x in (first, rest) if x) or "Owed to you."
 
 
 def _debts(ctx: dict, sim: Sim) -> list:

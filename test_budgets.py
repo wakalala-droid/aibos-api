@@ -101,6 +101,46 @@ def test_set_budget_upsert():
             pass
 
 
+
+# ── On pace for the month still running (16 Oct 2026) ───────────────────────
+
+def _half_month():
+    """Halfway through October: K30,000 of sales and K14,000 of costs in."""
+    report = budgets.variance([{"month": "2026-10", "revenue": 30000, "costs": 14000}],
+                              [{"month": "2026-10", "metric": "revenue", "target": 50000},
+                               {"month": "2026-10", "metric": "costs", "target": 30000},
+                               {"month": "2026-10", "metric": "profit", "target": 25000}], "2026-10")
+    this_month = {"month": "2026-10", "days_left": 15,
+                  "revenue": {"estimate": 58000, "p10": 54000, "p90": 62000},
+                  "costs": {"estimate": 29000, "p10": 27000, "p90": 31000}}
+    return report, this_month
+
+
+def test_half_a_month_on_pace_is_not_called_off_track():
+    report, this_month = _half_month()
+    assert all(l["on_track"] is False for l in report["lines"] if l["metric"] != "costs")   # the old reading
+    out = budgets.pace(report, this_month)
+    lines = {l["metric"]: l for l in out["lines"]}
+    assert lines["revenue"]["on_pace"] and lines["revenue"]["projected"] == 58000
+    assert lines["revenue"]["chance_pct"] >= 95
+    assert lines["revenue"]["per_day"] == round(20000 / 15, 2)          # still to make, a day
+    assert lines["costs"]["on_pace"] and lines["costs"]["per_day"] == round(16000 / 15, 2)   # room left, a day
+    assert lines["profit"]["projected"] == 29000 and lines["profit"]["on_pace"]
+
+
+def test_a_plan_out_of_reach_says_so():
+    report, this_month = _half_month()
+    this_month["revenue"] = {"estimate": 41000, "p10": 38000, "p90": 44000}
+    lines = {l["metric"]: l for l in budgets.pace(report, this_month)["lines"]}
+    assert not lines["revenue"]["on_pace"] and lines["revenue"]["chance_pct"] <= 5
+
+
+def test_another_month_is_left_as_it_was():
+    report, this_month = _half_month()
+    this_month["month"] = "2026-11"
+    out = budgets.pace(report, this_month)
+    assert "pace" not in out and "projected" not in out["lines"][0]
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

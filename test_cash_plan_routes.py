@@ -191,3 +191,91 @@ def test_the_morning_brief_carries_the_cash_watch_for_growth_only(books):
     _tier(db, "pro")
     _, body = notify.compose_brief(db, "u1", "Zoe's Kitchen")
     assert "Cash watch:" not in body
+
+
+# ── Home, the chase list, Monday and the plan card (second pass) ─────────────
+
+def test_home_reads_the_plan_in_a_sentence_and_keeps_it_a_few_minutes(books, monkeypatch):
+    api, db = books
+    _tier(db, "growth")
+    cash_watch._SUMMARY.clear()
+    calls = []
+    real = cash_watch.build
+    monkeypatch.setattr(cash_watch, "build", lambda *a, **k: calls.append(1) or real(*a, **k))
+    w = api.get("/forecast/cash-watch").json()["watch"]
+    assert w["ok"] and w["headline"] and "chance_short_pct" in w
+    assert ("safe_to_spend" in w) != ("cash_needed" in w)
+    api.get("/forecast/cash-watch")
+    assert len(calls) == 1                                   # the same books are read once
+    nervous.ingest(db, "u1", EventIn(event_type="Sale", source="manual",
+                                     occurred_at=datetime.now(timezone.utc).isoformat(),
+                                     payload={"amount": 50, "payment_method": "cash"}))
+    api.get("/forecast/cash-watch")
+    assert len(calls) == 2                                   # a new entry is never missing
+    _tier(db, "pro")
+    w = api.get("/forecast/cash-watch").json()["watch"]
+    assert w["preview"] and "headline" not in w and "safe_to_spend" not in w and "chase_first" not in w
+    main.app.dependency_overrides[membership.require_context] = lambda: STAFF
+    assert api.get("/forecast/cash-watch").status_code == 403
+
+
+def test_the_chase_list_comes_with_the_number_the_link_and_the_words(books):
+    import invoices
+    api, db = books
+    _tier(db, "growth")
+    nervous.ingest(db, "u1", EventIn(event_type="Sale", source="manual",
+                                     occurred_at=(datetime.now(timezone.utc) - timedelta(days=20)).isoformat(),
+                                     payload={"amount": 4000, "payment_method": "credit", "customer": "Chanda Stores"}))
+    db.rows["parties"].append({"id": "p-chanda", "user_id": "u1", "name": "Chanda Stores",
+                               "phone": "0977 123 456", "kind": "customer"})
+    import businesses
+    inv = invoices.create_invoice(db, "u1", {"customer_name": "Lusaka Hotels",
+                                             "lines": [{"description": "Catering", "qty": 1, "unit_price": 2500}]},
+                                  business_id=businesses.default_business_id(db, "u1"))
+    invoices.send_invoice(db, "u1", inv["id"])
+    invoices.ensure_pay_token(db, "u1", inv["id"])
+    plan = api.get("/forecast/cash-plan").json()["plan"]
+    chanda = next(c for c in plan["chase"] if c["customer"] == "Chanda Stores")
+    assert chanda["phone"] == "260977123456" and chanda["pay_url"] is None
+    assert "K4,000.00" in chanda["message"] and chanda["message"].startswith("Hi Chanda Stores")
+    hotel = next(c for c in plan["chase"] if c["customer"] == "Lusaka Hotels")
+    assert hotel["pay_url"] and "/pay/" in hotel["pay_url"] and hotel["pay_url"] in hotel["message"]
+    assert "invoice " in hotel["message"]
+    for c in plan["chase"]:                                   # house style in the words sent
+        assert "—" not in c["message"] and c["why"].endswith(".")
+
+
+def test_monday_brings_the_week_ahead_once(books):
+    api, db = books
+    _tier(db, "growth")
+    sent = []
+
+    def record(db_, uid, kind, title, body, link, meta):
+        if any(m["booking_id"] == meta["booking_id"] for *_, m in sent):
+            return True
+        sent.append((uid, kind, title, body, link, meta))
+        return True
+    today = datetime.now(timezone.utc)
+    monday = (today - timedelta(days=today.weekday())).replace(hour=6, minute=0)
+    cash_watch._CHECKED["day"] = None
+    out = cash_watch.daily(db, record, now=monday)
+    assert out["week_ahead"] == 1
+    kind, title, body = sent[0][1], sent[0][2], sent[0][3]
+    assert kind == "week_ahead" and title.startswith("Your week ahead") and "Likely in" in body
+    cash_watch._CHECKED["day"] = None
+    cash_watch.daily(db, record, now=monday)
+    assert sum(1 for s in sent if s[1] == "week_ahead") == 1    # once a week
+    cash_watch._CHECKED["day"] = None
+    out = cash_watch.daily(db, record, now=monday + timedelta(days=1))
+    assert "week_ahead" not in out
+    cash_watch._CHECKED["day"] = None
+
+
+def test_the_plan_card_judges_this_month_on_pace(books):
+    api, db = books
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    assert api.post("/budgets", json={"month": month, "metric": "revenue", "target": 1}).status_code == 200
+    out = api.get(f"/budgets?month={month}").json()
+    line = out["lines"][0]
+    assert out.get("pace") is True and line["on_pace"] is True and line["projected"] > 1
+    assert 0 <= line["chance_pct"] <= 100
