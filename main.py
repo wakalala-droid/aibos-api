@@ -6579,7 +6579,7 @@ def cash_plan_bank_pdf(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query
         name = None
     doc = bank_pack.document(name or _business_name_for(db, ctx.tenant) or "The business", books, plan, year, floor)
     if pdfdoc.available():
-        return Response(content=pdfdoc.report(doc["title"], doc["blocks"], doc["sub"]),
+        return Response(content=pdfdoc.report(doc["title"], doc["blocks"], [doc["source"]], facts=doc["facts"]),
                         media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="{doc["filename"]}.pdf"'})
     return Response(content=pdfdoc.report_text(doc["title"], doc["blocks"], doc["sub"]), media_type="text/plain",

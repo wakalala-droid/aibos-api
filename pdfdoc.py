@@ -60,24 +60,266 @@ def _footer(c, x: float, mm: float) -> None:
     c.restoreState()
 
 
-def render(title: str, body_text: str) -> bytes:
-    """Render a plain text document (newline-separated, *bold* lines) to PDF bytes."""
+# ── The document header (owner, 18 October 2026) ─────────────────────────────
+# The PDF twin of DocHeader in the app (aibos/components/ui/DocHeader.tsx and
+# .doc-head in globals.css, its print sizes): an ink band ending on the logo's
+# gold rule, the white mark and wordmark with "Business operating system", the
+# document name and its cyan tag; at the back the hairlines and the cyan trend
+# line across the whole band; on the right the emblem (the navy mark on a white
+# disc, the dashed ring, the cyan point, the rising double arrow); under the
+# band the facts row. CSS pixels become points at 0.75 (96 to 72 per inch).
+_BRAND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brand")
+_GLYPH = os.path.join(_BRAND_DIR, "aibos-mark-white-glyph.png")
+_WORD = os.path.join(_BRAND_DIR, "aibos-wordmark-white-tight.png")
+_MARK = os.path.join(_BRAND_DIR, "aibos-mark.png")
+_PX = 0.75
+_TREND = [(0, 152), [(90, 150), (150, 142), (230, 143)], [(310, 144), (360, 126), (430, 122)],
+          [(500, 118), (560, 94), (620, 82)], [(680, 70), (690, 54), (720, 42)]]
+_ARROWS = [[(214, 44), (228, 30), (242, 44), (236, 44), (228, 36), (220, 44)],
+           [(214, 58), (228, 44), (242, 58), (236, 58), (228, 50), (220, 58)]]
+
+
+def _hex(h: str) -> tuple:
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+def _over(top: tuple, alpha: float, under: tuple) -> tuple:
+    """A see-through colour laid on a solid one, as one solid colour."""
+    return tuple(alpha * t + (1 - alpha) * u for t, u in zip(top, under))
+
+
+_INK_BAND = _hex("#151413")
+_WHITE = (1.0, 1.0, 1.0)
+_CYAN_LINE = _hex("#22d3ee")
+_BRAND_FILL = _hex("#00d4ff")
+_ON_BRAND = _hex("#04121a")
+_TEXT_1 = _hex("#1c1917")
+_TEXT_3 = _hex("#5d5954")
+_GOLD_RULE = _over(_hex("#D3BD90"), 0.7, _INK_BAND)
+_HAIRLINE = _over(_hex("#1c1917"), 0.08, _WHITE)
+
+
+def _image(c, path: str, x: float, y: float, w: float, h: float) -> None:
+    if os.path.exists(path):
+        try:
+            c.setFillAlpha(1)
+            c.drawImage(path, x, y, width=w, height=h, mask="auto", preserveAspectRatio=True, anchor="c")
+        except Exception:  # noqa: BLE001 - a missing picture never stops the document
+            pass
+
+
+def _caps_width(text: str, font: str, size: float, space: float) -> float:
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    return stringWidth(text, font, size) + space * len(text)
+
+
+def _fit_caps(text: str, font: str, size: float, space: float, width: float) -> str:
+    if _caps_width(text, font, size, space) <= width:
+        return text
+    while text and _caps_width(text + "...", font, size, space) > width:
+        text = text[:-1]
+    return text.rstrip() + "..."
+
+
+def _letterhead(c, x: float, top: float, width: float, name: str,
+                tag: str | None = None, facts: list | None = None) -> float:
+    """Draw the document header from (x, top) across `width`; return the y
+    under it. `facts` are (label, value) pairs for the row under the band."""
+    px = _PX
+    facts = [(_safe(k), _safe(v)) for k, v in (facts or [])]
+    band_h = 128 * px
+    meta_h = (10 + 19.2 + 2 + 24 + 10) * px if facts else 0
+    band_bottom = top - band_h
+    bottom = band_bottom - meta_h
+    radius = 14 * px
+
+    def fill(rgb, alpha=1.0):
+        c.setFillColorRGB(*rgb, alpha=alpha)
+
+    def stroke(rgb, alpha=1.0):
+        c.setStrokeColorRGB(*rgb, alpha=alpha)
+
+    c.saveState()
+    outline = c.beginPath()
+    outline.roundRect(x, bottom, width, top - bottom, radius)
+    c.clipPath(outline, stroke=0, fill=0)
+    fill(_WHITE)
+    c.rect(x, bottom, width, top - bottom, stroke=0, fill=1)
+    fill(_INK_BAND)
+    c.rect(x, band_bottom, width, band_h, stroke=0, fill=1)
+
+    from reportlab.lib.colors import Color
+    # The faint blue light from the top-left corner.
+    c.saveState()
+    clip = c.beginPath()
+    clip.rect(x, band_bottom, width, band_h)
+    c.clipPath(clip, stroke=0, fill=0)
+    rx, ry = 0.55 * width, 1.30 * band_h
+    c.translate(x + 0.10 * width, top)
+    c.scale(1, ry / rx)
+    c.radialGradient(0, 0, rx, [Color(*_over(_hex("#3b82f6"), 0.22, _INK_BAND)), Color(*_INK_BAND)],
+                     [0, 0.7], extend=True)
+    c.restoreState()
+
+    # Back layer: the hairlines and the trend line across the whole band.
+    sx, sy = width / 720, band_h / 168
+
+    def tp(u, v):
+        return x + u * sx, top - v * sy
+
+    stroke(_WHITE, 0.05)
+    c.setLineWidth(1 * px)
+    for v in (42, 84, 126):
+        c.line(*tp(0, v), *tp(720, v))
+
+    def trend_path(close: bool):
+        p = c.beginPath()
+        p.moveTo(*tp(*_TREND[0]))
+        for (a, b, d) in _TREND[1:]:
+            p.curveTo(*tp(*a), *tp(*b), *tp(*d))
+        if close:
+            p.lineTo(*tp(720, 168))
+            p.lineTo(*tp(0, 168))
+            p.close()
+        return p
+
+    c.saveState()
+    c.clipPath(trend_path(True), stroke=0, fill=0)
+    c.linearGradient(x, top - 42 * sy, x, band_bottom,
+                     [Color(*_over(_CYAN_LINE, 0.10, _INK_BAND)), Color(*_INK_BAND)], extend=True)
+    c.restoreState()
+    stroke(_CYAN_LINE, 0.38)
+    c.setLineWidth(1.5 * px)
+    c.setLineCap(1)
+    c.drawPath(trend_path(False), stroke=1, fill=0)
+
+    # Front, on the right: the emblem, its art box as tall as the band.
+    s = band_h / 168
+    ox = x + width - 8 * px - 260 * s
+
+    def ap(u, v):
+        return ox + u * s, top - v * s
+
+    c.setLineWidth(1 * s)
+    stroke(_WHITE, 0.08)
+    c.circle(*ap(130, 84), 64 * s, stroke=1, fill=0)
+    stroke(_WHITE, 0.24)
+    c.setDash([2 * s, 6 * s])
+    c.circle(*ap(130, 84), 50 * s, stroke=1, fill=0)
+    c.setDash([])
+    fill(_WHITE)
+    c.circle(*ap(130, 84), 32 * s, stroke=0, fill=1)
+    mx, my = ap(111, 65 + 38)
+    _image(c, _MARK, mx, my, 38 * s, 38 * s)
+    fill(_CYAN_LINE)
+    c.circle(*ap(161.1, 44.8), 4 * s, stroke=0, fill=1)
+    fill(_WHITE, 0.88)
+    for arrow in _ARROWS:
+        p = c.beginPath()
+        p.moveTo(*ap(*arrow[0]))
+        for pt in arrow[1:]:
+            p.lineTo(*ap(*pt))
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
+
+    # Top left: the mark, the wordmark, the gold rule and the line.
+    pad_x, pad_y = 22 * px, 16 * px
+    mid = top - pad_y - 15 * px
+    gap = 12 * px
+    cur = x + pad_x
+    _image(c, _GLYPH, cur, mid - 15 * px, 30 * px, 30 * px)
+    cur += 30 * px + gap
+    word_w = 15 * px * 480 / 101
+    _image(c, _WORD, cur, mid - 7.5 * px, word_w, 15 * px)
+    cur += word_w + gap
+    fill(_hex("#D3BD90"))
+    c.rect(cur, mid - 0.5 * px, 28 * px, 1 * px, stroke=0, fill=1)
+    cur += 28 * px + gap
+    caps, caps_space = 12 * px, 12 * px * 0.2
+    fill(_WHITE, 0.62)
+    c.setFont("Helvetica", caps)
+    c.drawString(cur, mid - 0.718 * caps / 2, "BUSINESS OPERATING SYSTEM", charSpace=caps_space)
+
+    # Bottom left: the document name and its tag.
+    name_size = 22 * px
+    row_mid = band_bottom + 1 * px + pad_y + 22 * 1.2 * px / 2
+    room = width - 2 * pad_x
+    tag_w = 0.0
+    tag_text = _safe(tag).upper() if tag else ""
+    if tag_text:
+        tag_w = _caps_width(tag_text, "Helvetica-Bold", caps, caps_space) + 24 * px
+        room -= tag_w + 14 * px
+    shown = _fit_caps(_safe(name), "Helvetica-Bold", name_size, -0.01 * name_size, room)
+    fill(_WHITE)
+    c.setFont("Helvetica-Bold", name_size)
+    c.drawString(x + pad_x, row_mid - 0.718 * name_size / 2, shown, charSpace=-0.01 * name_size)
+    if tag_text:
+        tx = x + pad_x + _caps_width(shown, "Helvetica-Bold", name_size, -0.01 * name_size) + 14 * px
+        th = (12 * 1.6 + 6) * px
+        fill(_BRAND_FILL)
+        c.roundRect(tx, row_mid - th / 2, tag_w, th, th / 2, stroke=0, fill=1)
+        fill(_ON_BRAND)
+        c.setFont("Helvetica-Bold", caps)
+        c.drawString(tx + 12 * px, row_mid - 0.718 * caps / 2, tag_text, charSpace=caps_space)
+
+    # The gold rule the band ends on.
+    fill(_GOLD_RULE)
+    c.rect(x, band_bottom, width, 1 * px, stroke=0, fill=1)
+
+    # The facts row: spaced-capital labels, values on one line each.
+    if facts:
+        label_space, value_size, cell_x = caps * 0.12, 15 * px, 20 * px
+        natural = [max(_caps_width(k.upper(), "Helvetica-Bold", caps, label_space),
+                       _caps_width(v, "Helvetica-Bold", value_size, 0)) + 2 * cell_x for k, v in facts]
+        free = width - sum(natural)
+        if free >= 0:
+            cols = [n + free / len(natural) for n in natural]
+        else:
+            cols = [n * width / sum(natural) for n in natural]
+        cx = x
+        for i, ((label, value), w) in enumerate(zip(facts, cols)):
+            if i:
+                stroke(_HAIRLINE)
+                c.setLineWidth(1 * px)
+                c.line(cx, band_bottom, cx, bottom)
+            inner = w - 2 * cell_x
+            line_top = band_bottom - 10 * px
+            fill(_TEXT_3)
+            c.setFont("Helvetica-Bold", caps)
+            c.drawString(cx + cell_x, line_top - (19.2 * px + 0.718 * caps) / 2,
+                         _fit_caps(label.upper(), "Helvetica-Bold", caps, label_space, inner), charSpace=label_space)
+            line_top -= (19.2 + 2) * px
+            fill(_TEXT_1)
+            c.setFont("Helvetica-Bold", value_size)
+            c.drawString(cx + cell_x, line_top - (24 * px + 0.718 * value_size) / 2,
+                         _fit_caps(value, "Helvetica-Bold", value_size, 0, inner))
+            cx += w
+    c.restoreState()
+
+    # The hairline round the whole header, in the band's ink.
+    c.saveState()
+    stroke(_INK_BAND)
+    c.setLineWidth(1 * px)
+    half = 0.5 * px
+    c.roundRect(x + half, bottom + half, width - 2 * half, top - bottom - 2 * half, radius - half, stroke=1, fill=0)
+    c.restoreState()
+    return bottom
+
+
+def render(title: str, body_text: str, facts: list | None = None, tag: str | None = None) -> bytes:
+    """Render a plain text document (newline-separated, *bold* lines) to PDF
+    bytes, opening with the document header (title, optional tag and facts)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.pdfgen import canvas
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle(_safe(title))
+    c.setAuthor("AIBOS")
     width, height = A4
     x = 22 * mm
-    y = height - 28 * mm
-
-    c.setFont("Helvetica-Bold", 15)
-    c.drawString(x, y, title)
-    y -= 6 * mm
-    c.setStrokeColorRGB(0.8, 0.8, 0.8)
-    c.line(x, y, width - 22 * mm, y)
-    y -= 8 * mm
+    y = _letterhead(c, x, height - 14 * mm, width - 44 * mm, title, tag, facts) - 10 * mm
 
     for raw in body_text.splitlines():
         if y < 25 * mm:                       # new page, each with its own footer
@@ -178,17 +420,20 @@ class _Report:
             s = s[:-1]
         return s.rstrip() + "..."
 
-    def title(self, title: str, sub: list) -> None:
+    def title(self, title: str, sub: list, facts: list | None = None, tag: str | None = None) -> None:
+        """The document header (the letterhead), then any lines under it."""
         c, mm = self.c, self.mm
-        c.setFillColorRGB(*_INK)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(self.x, self.y, _safe(title))
-        self.y -= 7.5 * mm
-        for i, line in enumerate(sub or []):
-            c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 11 if i == 0 else 9.5)
-            c.setFillColorRGB(*(_INK if i == 0 else _GREY))
+        self.y = _letterhead(c, self.x, self.H - 14 * mm, self.width, title, tag, facts) - 18 * _PX
+        if not sub:
+            self.y -= 4 * mm
+            return
+        self.y -= 3 * mm
+        for i, line in enumerate(sub):
+            lead = i == 0 and not facts       # with a facts row, every line is a grey note
+            c.setFont("Helvetica-Bold" if lead else "Helvetica", 11 if lead else 9.5)
+            c.setFillColorRGB(*(_INK if lead else _GREY))
             c.drawString(self.x, self.y, _safe(line))
-            self.y -= (5.6 if i == 0 else 4.6) * mm
+            self.y -= (5.6 if lead else 4.6) * mm
         self.y -= 1.5 * mm
         self.rule()
         self.y -= 4 * mm
@@ -320,8 +565,8 @@ class _Report:
             self.y -= row_h
         self.y -= 3 * mm
 
-    def draw(self, title: str, sub: list, blocks: list) -> int:
-        self.title(title, sub)
+    def draw(self, title: str, sub: list, blocks: list, facts: list | None = None, tag: str | None = None) -> int:
+        self.title(title, sub, facts, tag)
         for kind, body in blocks:
             if kind == "h":
                 self.heading(body)
@@ -342,18 +587,20 @@ class _Report:
         return self.page
 
 
-def report(title: str, blocks: list, sub: list | None = None) -> bytes:
-    """Render a report of blocks (see above) to PDF bytes. Laid out twice:
-    once to count the pages, once to draw them with "Page n of m"."""
+def report(title: str, blocks: list, sub: list | None = None,
+           facts: list | None = None, tag: str | None = None) -> bytes:
+    """Render a report of blocks (see above) to PDF bytes, opening with the
+    document header (the title, an optional tag and the facts row). Laid out
+    twice: once to count the pages, once to draw them with "Page n of m"."""
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
 
-    pages = _Report(canvas.Canvas(io.BytesIO(), pagesize=A4), None).draw(title, sub or [], blocks)
+    pages = _Report(canvas.Canvas(io.BytesIO(), pagesize=A4), None).draw(title, sub or [], blocks, facts, tag)
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     c.setTitle(_safe(title))
     c.setAuthor("AIBOS")
-    _Report(c, pages).draw(title, sub or [], blocks)
+    _Report(c, pages).draw(title, sub or [], blocks, facts, tag)
     c.save()
     return buf.getvalue()
 

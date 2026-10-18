@@ -371,5 +371,10 @@ def document(name: str, books: dict, plan: dict, year: dict, floor: float = 0.0)
     if weeks_lines:
         blocks += [("sub", "For the 13 weeks"), ("bullets", weeks_lines)]
 
+    # The PDF opens with the document header: these facts in its row under the
+    # band, the source as a note under it (pdfdoc.report). The text keeps sub.
+    unit = "Zambian kwacha (K)" if sym.strip() == "K" else sym.strip()
     return {"title": TITLE, "filename": filename(name, today), "blocks": blocks,
-            "sub": [name, f"Prepared on {day_words(today)} from the business's own books in AIBOS", currency]}
+            "sub": [name, f"Prepared on {day_words(today)} from the business's own books in AIBOS", currency],
+            "facts": [("Prepared for", name), ("Date", day_words(today)), ("From", "AIBOS"), ("Amounts in", unit)],
+            "source": "Prepared from the business's own books in AIBOS."}
