@@ -88,7 +88,7 @@ def _over(top: tuple, alpha: float, under: tuple) -> tuple:
     return tuple(alpha * t + (1 - alpha) * u for t, u in zip(top, under))
 
 
-_INK_BAND = _hex("#151413")
+_INK_BAND = _hex("#1c1917")  # the If unpaid ink, as globals.css --band
 _WHITE = (1.0, 1.0, 1.0)
 _CYAN_LINE = _hex("#22d3ee")
 _BRAND_FILL = _hex("#00d4ff")
@@ -154,10 +154,10 @@ def _letterhead(c, x: float, top: float, width: float, name: str,
     clip = c.beginPath()
     clip.rect(x, band_bottom, width, band_h)
     c.clipPath(clip, stroke=0, fill=0)
-    rx, ry = 0.55 * width, 1.30 * band_h
-    c.translate(x + 0.10 * width, top)
+    rx, ry = 0.60 * width, 1.40 * band_h
+    c.translate(x + 0.12 * width, top)
     c.scale(1, ry / rx)
-    c.radialGradient(0, 0, rx, [Color(*_over(_hex("#3b82f6"), 0.22, _INK_BAND)), Color(*_INK_BAND)],
+    c.radialGradient(0, 0, rx, [Color(*_over(_hex("#3b82f6"), 0.34, _INK_BAND)), Color(*_INK_BAND)],
                      [0, 0.7], extend=True)
     c.restoreState()
 
