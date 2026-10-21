@@ -54,6 +54,7 @@ import customer_intel
 import invoices as invoices_api
 import cfo_tools
 import chat_history
+import apns
 import webpush
 import cabinet_store
 import whatsapp_bot
@@ -7912,8 +7913,9 @@ class PushSubscription(BaseModel):
 @app.get("/push/key")
 def push_key():
     """The key a browser needs to sign up for notifications, and whether this
-    deployment can send them at all."""
-    return {"ok": True, "configured": webpush.configured(), "key": webpush.public_key()}
+    deployment can send them at all (`apns`: to the iPhone app too)."""
+    return {"ok": True, "configured": webpush.configured(), "key": webpush.public_key(),
+            "apns": apns.configured()}
 
 
 @app.post("/push/subscribe")
@@ -7940,6 +7942,42 @@ def push_unsubscribe(body: PushSubscription,
     """Stop notifications reaching this browser."""
     try:
         return webpush.unsubscribe(_require_db(), ctx.actor, body.endpoint)
+    except Exception as e:  # noqa: BLE001
+        if missing_schema(e):
+            return {"ok": True}
+        raise
+
+
+class ApnsToken(BaseModel):
+    token: str
+
+
+@app.post("/push/apns")
+def push_apns_subscribe(body: ApnsToken, request: Request,
+                        ctx: membership.Context = Depends(membership.require_context)):
+    """Remember this iPhone (the AIBOS app hands over its Apple push token) so
+    alerts reach its lock screen. The app's web view has no web push."""
+    try:
+        return apns.subscribe(_require_db(), ctx.actor, body.token,
+                              request.headers.get("user-agent", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001 — pre-0036
+        if missing_schema(e):
+            raise HTTPException(status_code=503, detail=(
+                "Notifications on the phone need migration 0036. Run "
+                "supabase/migrations/0036_push_subscriptions.sql in the Supabase SQL editor."))
+        raise
+
+
+@app.delete("/push/apns")
+def push_apns_unsubscribe(body: ApnsToken,
+                          ctx: membership.Context = Depends(membership.require_context)):
+    """Stop alerts reaching this iPhone."""
+    try:
+        return apns.unsubscribe(_require_db(), ctx.actor, body.token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # noqa: BLE001
         if missing_schema(e):
             return {"ok": True}

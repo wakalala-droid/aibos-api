@@ -4,7 +4,9 @@ AIBOS: notifications to the phone (upgrade 10, migration 0036).
 Everything that lands in the bell (a booking request, a guest's payment, a plan
 renewal) now also reaches the owner's phone or computer as a notification, even
 with AIBOS closed, on any browser or installed app that allows it (Android,
-Windows, Mac; iPhone once AIBOS is added to the Home Screen).
+Windows, Mac; iPhone once AIBOS is added to the Home Screen). The iPhone app's
+web view has no web push: its alerts go through Apple's push service (apns.py)
+and are kept in the same list, so send_to_user reaches both.
 
 WHY THIS FILE DOES ITS OWN ENCRYPTION. A web push message is encrypted for the
 one browser that will show it (RFC 8291, aes128gcm) and signed by the sender
@@ -32,6 +34,8 @@ import os
 import threading
 import time
 from urllib.parse import urlparse
+
+import apns
 
 log = logging.getLogger("aibos.webpush")
 
@@ -146,11 +150,13 @@ def _send_one(sub: dict, message: dict, subject: str) -> int:
 
 def send_to_user(db, user_id: str, title: str, body: str = "", link: str = "",
                  wait: bool = False, extra: dict | None = None) -> dict:
-    """Notify every browser this person turned notifications on in. Runs on a
-    thread unless `wait`; dead subscriptions (404/410) are removed. `extra`
-    rides along to the service worker: `tag` keeps one notification from
-    replacing another, `sticky` keeps it on screen until it is dealt with."""
-    if db is None or not user_id or not configured():
+    """Notify every browser this person turned notifications on in, and every
+    iPhone with the AIBOS app (apns.py). Runs on a thread unless `wait`; dead
+    subscriptions (404/410, or Apple's "gone") are removed. `extra` rides along
+    to the service worker: `tag` keeps one notification from replacing
+    another, `sticky` keeps it on screen until it is dealt with."""
+    web = configured()
+    if db is None or not user_id or not (web or apns.configured()):
         return {"sent": 0, "skipped": True}
 
     def work() -> dict:
@@ -163,7 +169,19 @@ def send_to_user(db, user_id: str, title: str, body: str = "", link: str = "",
         subject = "mailto:" + (os.environ.get("PUSH_CONTACT_EMAIL") or "hello@ai-bos.website")
         message = {"title": title[:120], "body": (body or "")[:300], "link": link or "/dashboard",
                    **(extra or {})}
-        for sub in rows:
+        phones = [r for r in rows if apns.is_token(r.get("endpoint"))]
+        browsers = [r for r in rows if not apns.is_token(r.get("endpoint"))] if web else []
+        if phones:
+            res = apns.send(phones, message)
+            out["sent"] += res["sent"]
+            out["failed"] += res["failed"]
+            for sub_id in res["gone"]:
+                try:
+                    db.table(TABLE).delete().eq("id", sub_id).execute()
+                    out["gone"] += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[webpush] could not forget an iPhone: %s", e)
+        for sub in browsers:
             try:
                 code = _send_one(sub, message, subject)
                 if code in (404, 410):
@@ -213,6 +231,8 @@ def describe(agent: str | None) -> str:
                else "Firefox" if "firefox" in a or "fxios" in a
                else "Chrome" if "chrome" in a or "crios" in a
                else "Safari" if "safari" in a else "")
+    if "aibos-ios" in a:
+        return f"the AIBOS app on {'an iPad' if device == 'iPad' else 'an iPhone'}"
     if device and browser:
         return f"{browser} on {'an' if device[0].lower() in 'aeiou' else 'a'} {device}"
     return device or browser or "A browser"
@@ -222,6 +242,8 @@ def describe_service(endpoint: str | None) -> str:
     """What the push service alone says about a device. Used when the saved
     user agent says nothing: the website's relay used to pass on its own
     instead of the browser's, so early sign-ups were all "a browser"."""
+    if apns.is_token(endpoint):
+        return "the AIBOS app on an iPhone"
     host = urlparse(str(endpoint or "")).netloc.lower()
     if host.endswith("notify.windows.com"):
         return "Edge on a Windows computer"
@@ -235,14 +257,14 @@ def describe_service(endpoint: str | None) -> str:
 
 
 def devices(db, user_id: str) -> list[dict]:
-    """The browsers this person turned notifications on in, newest first. The
+    """The browsers and iPhones this person turned notifications on in, newest first. The
     delivery address is read only to name the device and is never returned."""
     res = (db.table(TABLE).select("id,user_agent,endpoint,created_at").eq("user_id", user_id)
            .order("created_at", desc=True).execute())
     out = []
     for r in getattr(res, "data", None) or []:
         name = describe(r.get("user_agent"))
-        if name == "A browser":
+        if name == "A browser" or (apns.is_token(r.get("endpoint")) and not name.startswith("the AIBOS app")):
             name = describe_service(r.get("endpoint"))
         out.append({"id": r.get("id"), "device": name, "since": r.get("created_at")})
     return out
