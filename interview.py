@@ -173,7 +173,7 @@ QUESTIONS: tuple = (
     {"id": "loan_monthly", "chapter": "money", "kind": "money", "label": "Loan repayment a month",
      "ask": "How much do you repay each month?", "placeholder": "e.g. 4,000",
      "after": {"id": "loan", "not": ["No"]},
-     "why": "AIBOS keeps it in mind when it talks about what is safe to spend."},
+     "why": "AIBOS keeps it in mind when you ask it what is safe to spend."},
 
     # Money goals
     {"id": "sales_goal", "chapter": "money_goals", "kind": "money", "label": "Sales goal a month",
@@ -190,7 +190,7 @@ QUESTIONS: tuple = (
     {"id": "cushion", "chapter": "money_goals", "kind": "money", "label": "Cash cushion",
      "ask": "How much cash do you want to keep in the business at all times, as a cushion?",
      "placeholder": "e.g. 20,000",
-     "why": "AIBOS keeps it in mind when it tells you what is safe to spend."},
+     "why": "AIBOS keeps it in mind when you ask it what is safe to spend."},
     {"id": "saving_for", "chapter": "money_goals", "kind": "text", "label": "Saving for",
      "ask": "Are you saving for something big? Say what and roughly how much.",
      "placeholder": "e.g. A delivery van, about K150,000",
