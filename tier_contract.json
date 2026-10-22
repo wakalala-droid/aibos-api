@@ -40,10 +40,8 @@
       "engine3",
       "forecast",
       "full_history",
-      "hospitality",
-      "payroll",
-      "schedule",
-      "scheduled_brief",
+      "invoices",
+      "team",
       "variance"
     ],
     "proplus": [
@@ -57,11 +55,12 @@
       "engine3",
       "forecast",
       "full_history",
-      "hospitality",
+      "invoices",
       "morning_brief",
       "payroll",
       "schedule",
       "scheduled_brief",
+      "team",
       "variance"
     ],
     "growth": [
@@ -79,12 +78,14 @@
       "forecast",
       "full_history",
       "hospitality",
+      "invoices",
       "morning_brief",
       "multi_business",
       "multi_location",
       "payroll",
       "schedule",
       "scheduled_brief",
+      "team",
       "variance"
     ]
   },

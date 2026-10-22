@@ -198,7 +198,7 @@ def _clean(data: dict, partial: bool = False) -> dict:
 
 
 def wants_paid_features(body: dict) -> bool:
-    """True when a create/patch asks for the Pro layer (recurrence or reminders)."""
+    """True when a create/patch asks for the Pro+ layer (recurrence or reminders)."""
     return bool(body.get("recurrence")) or body.get("remind_minutes_before") is not None
 
 

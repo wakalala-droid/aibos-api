@@ -31,18 +31,24 @@ log = logging.getLogger("aibos.entitlements")
 
 # Mirror of lib/tiers.ts ACCESS. Keep in lock-step with the frontend.
 # Each paid tier is a strict superset of the one below.
+# The ladder was re-cut on 22 Oct 2026 (owner's decision) so value climbs with
+# price: payroll, the scheduled brief and reminders moved Pro -> Pro+,
+# Hospitality moved Pro -> Growth, and sending invoices and inviting the team
+# moved Free -> Pro.
 _PRO: set[str] = {
     "forecast", "anomaly", "variance", "breakeven",
-    "ai_chat", "scheduled_brief", "full_history", "engine2", "engine3",
-    "schedule", "payroll",
-    # PROVISIONAL: the Hospitality (short-let PMS) vertical. Parked in Pro so it
-    # is enforced (Free cannot obtain it) and the v1 client (Dunslim, on a paid
-    # tier) can use it today. When it becomes its own add-on SKU, MOVE this out
-    # of _PRO into a dedicated grant path — a one-line change. See lib/tiers.ts.
-    "hospitality",
+    "ai_chat", "full_history", "engine2", "engine3",
+    # Creating and sending invoices with a payment link. Reading, settling and
+    # cancelling invoices stays open on every plan, so money already owed is
+    # never trapped, and the public pay page always works.
+    "invoices",
+    # Inviting staff and the accountant. Listing, changing and removing people
+    # stays open, so an owner who drops to Free can still take access away.
+    "team",
 }
 _PROPLUS: set[str] = _PRO | {
     "morning_brief", "chat_actions", "deliveries", "automation",
+    "scheduled_brief", "schedule", "payroll",
 }
 _GROWTH: set[str] = _PROPLUS | {
     "cross_engine", "multi_location", "multi_business", "api_access",
@@ -50,6 +56,10 @@ _GROWTH: set[str] = _PROPLUS | {
     # chance of running short, what fixes it, decisions tried on it, the group
     # view across businesses and the cash watch that warns ahead (16 Oct 2026).
     "cash_plan",
+    # PROVISIONAL: the Hospitality (short-let PMS) vertical. When it becomes its
+    # own add-on SKU, MOVE this out of _GROWTH into a dedicated grant path — a
+    # one-line change. See lib/tiers.ts.
+    "hospitality",
 }
 
 _ACCESS: dict[str, set[str]] = {
@@ -258,6 +268,8 @@ _FEATURE_LABEL = {
     "deliveries":     "expected-delivery tracking",
     "automation":     "automation proposals",
     "api_access":     "API access",
+    "invoices":       "sending invoices with a payment link",
+    "team":           "inviting your staff and accountant",
 }
 
 

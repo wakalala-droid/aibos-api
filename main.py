@@ -5238,6 +5238,9 @@ def list_members(ctx: membership.Context = Depends(membership.require_owner)):
 @app.post("/members")
 def invite_member(body: Dict[str, Any] = Body(...),
                         ctx: membership.Context = Depends(membership.require_owner)):
+    # Inviting is Pro ('team'). Listing, changing and removing people stays
+    # open, so an owner on Free can always take someone's access away.
+    entitlements.require_feature(ctx.tenant, "team")
     db = _require_db()
     try:
         member = membership.invite_member(db, ctx.tenant, body.get("email"),
@@ -5534,8 +5537,10 @@ async def whatsapp_webhook(request: Request):
 
 
 # ── Invoices: the get-paid loop (audit #7) ────────────────────────────────────
-# Free, like recording — an invoice is data capture wearing a suit. Send posts
-# a confirmed credit Sale (+receivables); mark-paid posts the CustomerPayment.
+# Send posts a confirmed credit Sale (+receivables); mark-paid posts the
+# CustomerPayment. Since 22 Oct 2026 creating, sending and minting a pay link
+# are Pro ('invoices'). Reading, editing, settling and cancelling stay open on
+# every plan, so an owner who drops to Free never has money owed trapped.
 
 @app.get("/invoices")
 def get_invoices(status: Optional[str] = Query(None),
@@ -5546,6 +5551,7 @@ def get_invoices(status: Optional[str] = Query(None),
 
 @app.post("/invoices")
 def create_invoice(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
+    entitlements.require_feature(ctx.tenant, "invoices")
     db = _require_db()
     try:
         return {"ok": True, "invoice": invoices_api.create_invoice(db, ctx.tenant, body, business_id=ctx.business_id)}
@@ -5575,6 +5581,7 @@ def remove_invoice(invoice_id: str, ctx: membership.Context = Depends(membership
 
 @app.post("/invoices/{invoice_id}/send")
 def send_invoice(invoice_id: str, ctx: membership.Context = Depends(membership.require_write)):
+    entitlements.require_feature(ctx.tenant, "invoices")
     db = _require_db()
     try:
         return {"ok": True, "invoice": invoices_api.send_invoice(db, ctx.tenant, invoice_id)}
@@ -5718,6 +5725,7 @@ def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(Non
 def invoice_pay_link(invoice_id: str, ctx: membership.Context = Depends(membership.require_context)):
     """Mint (or return) the invoice's public payment link, for the owner to copy
     anywhere — SMS, email, a printed QR. Sent invoices only."""
+    entitlements.require_feature(ctx.tenant, "invoices")
     db = _require_db()
     try:
         inv = invoices_api.ensure_pay_token(db, ctx.tenant, invoice_id)
@@ -6699,7 +6707,7 @@ def remove_schedule_item(item_id: str, ctx: membership.Context = Depends(members
 # ── Employees & Payroll (Zambian statutory engine) ────────────────────────────
 # The employee register is master data (free, like the product catalog). Running
 # a pay period — the statutory calculation + posting Salary events — is the paid
-# capability, enforced server-side via entitlements ("payroll" → Pro).
+# capability, enforced server-side via entitlements ("payroll" → Pro+).
 
 @app.get("/employees")
 def get_employees(ctx: membership.Context = Depends(membership.require_owner)):
@@ -6927,7 +6935,7 @@ def pay_payroll_wages(run_id: str, body: PayWagesRequest = Body(default=None),
 @app.post("/payroll/run")
 def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(membership.require_owner)):
     """Compute a pay period. Preview is free (the on-screen table); committing —
-    which posts Salary events into the books — is the Pro payroll capability."""
+    which posts Salary events into the books — is the Pro+ payroll capability."""
     db = _require_db()
     try:
         if req.preview:

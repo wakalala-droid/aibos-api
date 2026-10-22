@@ -124,11 +124,45 @@ def test_unbuilt_feature_is_a_501_not_an_upsell():
         entitlements.user_tier = original
 
 
-def test_hospitality_is_still_provisionally_in_pro():
-    # PROVISIONAL by decision, not accident: parked in Pro so the v1 client can
-    # use it, and it moves to its own add-on SKU later. If this fails, that move
-    # has happened (or someone fat-fingered it) — update the contract knowingly.
-    assert "hospitality" in CONTRACT["access"]["pro"]
+def test_hospitality_is_provisionally_in_growth():
+    # PROVISIONAL by decision, not accident: moved from Pro to Growth when the
+    # ladder was re-cut on 22 Oct 2026, and it moves to its own add-on SKU
+    # later. If this fails, that move has happened (or someone fat-fingered
+    # it) — update the contract knowingly.
+    assert "hospitality" in CONTRACT["access"]["growth"]
+    assert "hospitality" not in CONTRACT["access"]["proplus"]
+
+
+def test_value_climbs_with_price():
+    # The re-cut ladder (22 Oct 2026): each feature sits on the plan the owner
+    # chose for it. Pinned so a slip in either repo cannot quietly hand a
+    # cheaper plan what a dearer one sells.
+    lowest = {
+        "invoices": "pro", "team": "pro",
+        "payroll": "proplus", "scheduled_brief": "proplus", "schedule": "proplus",
+        "hospitality": "growth", "cash_plan": "growth", "multi_business": "growth",
+    }
+    for feature, tier in lowest.items():
+        assert entitlements._required_tier(feature) == tier, (
+            f"{feature} is first unlocked on {entitlements._required_tier(feature)}, not {tier}"
+        )
+
+
+def test_free_cannot_send_invoices_or_invite():
+    from fastapi import HTTPException
+    original = entitlements.tier_detail
+    entitlements.tier_detail = lambda _uid: {"tier": "free", "reason": "ok", "row": True}
+    try:
+        for feature, plan in (("invoices", "Pro"), ("team", "Pro")):
+            raised = None
+            try:
+                entitlements.require_feature("u1", feature)
+            except HTTPException as e:
+                raised = e
+            assert raised is not None and raised.status_code == 402, feature
+            assert f"a {plan} feature" in raised.detail, raised.detail
+    finally:
+        entitlements.tier_detail = original
 
 
 if __name__ == "__main__":

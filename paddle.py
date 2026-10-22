@@ -60,11 +60,11 @@ PLAN_NAMES = {"pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 
 PLAN_BLURBS = {
     "pro": "The full financial engine, the AI CFO chat, the customer and operations "
-           "engines and your whole history.",
-    "proplus": "Everything in Pro, plus the morning brief, recording by chat and "
-               "deliveries.",
-    "growth": "Everything in Pro+, plus several businesses under one login and the "
-              "cross-engine view.",
+           "engines, invoices with a payment link, your team and your whole history.",
+    "proplus": "Everything in Pro, plus payroll, the morning brief, reminders, "
+               "recording by chat and deliveries.",
+    "growth": "Everything in Pro+, plus several businesses under one login, the "
+              "13-week cash plan, Rooms & Stays and the cross-engine view.",
 }
 
 INTERVAL = {"monthly": "month", "annual": "year"}

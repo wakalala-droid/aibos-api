@@ -670,7 +670,7 @@ def push_brief(db, user_id: str) -> int:
 def dispatch_briefs(db) -> dict:
     """
     Send the morning brief to every opted-in, entitled user. Tier checks are
-    server-authoritative: email needs 'scheduled_brief' (Pro+ up... Pro),
+    server-authoritative: email needs 'scheduled_brief' (Pro+),
     WhatsApp needs 'morning_brief' (Pro+). Users with no recorded activity are
     skipped — an empty brief teaches people to ignore the real ones.
     """

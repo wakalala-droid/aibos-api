@@ -31,8 +31,9 @@ still goes out up to LATE_LIMIT after its time and says when it was. Older
 than that it is dropped. So is a reminder whose time had already passed when
 the owner made or last changed the item: they know.
 
-Reminders are part of the Pro Scheduler (the tier split of 4 July 2026): a Free
-owner's items still show under Coming up but do not notify.
+Reminders are part of the paid Scheduler (Pro from the tier split of 4 July
+2026, Pro+ since 22 Oct 2026): on a cheaper plan the owner's items still show
+under Coming up but do not notify.
 
 NEVER RAISES into a caller. A reminder that fails must not stop the others.
 """
