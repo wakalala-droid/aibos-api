@@ -75,6 +75,8 @@ import loyverse
 import membership
 import businesses as businesses_api
 import budgets as budgets_api
+import interview as interview_api
+import starter_book
 import rate_limit
 import exports as exports_api
 import pdfdoc
@@ -2272,6 +2274,13 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
     business_id = businesses_api.resolve_business_id(get_db(), ctx.tenant, x_business_id,
                                                      create=True)
 
+    # What the owner told AIBOS in the setup interview (interview.py), so the
+    # answer is about THIS business: its normal month, its goals, its seasons.
+    # Best-effort: '' when there is none or the table is not there yet.
+    told = interview_api.briefing(get_db(), ctx.tenant, business_id)
+    if told:
+        system_parts.append("\n" + told)
+
     tool_system = "\n\n".join(system_parts + [
         "You have TOOLS over this business's real recorded data — the source of "
         "record. ALWAYS look figures up with a tool before stating them, and "
@@ -2569,7 +2578,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 40
+EXPECTS_MIGRATION = 41
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -4599,7 +4608,88 @@ def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
         raise HTTPException(status_code=400, detail=(
             "AI-BOS opened the file but found no table of figures in it. "
             "Check the sheet has column headings and rows underneath them."))
-    return scanned, doc_ai.plan(scanned, filename, use_ai=use_ai)
+    # The AIBOS workbook's own sheets are known by their headings and filed
+    # exactly. When every table is one of them, no AI is asked at all.
+    known = starter_book.plan_tables(scanned)
+    if known and len(known) == len(scanned["tables"]):
+        return scanned, {"tables": [known[t["id"]] for t in scanned["tables"]],
+                         "ai": False, "reason": "", "workbook": True}
+    plan = doc_ai.plan(scanned, filename, use_ai=use_ai)
+    if known:
+        plan["tables"] = [known.get(p["id"], p) for p in plan["tables"]]
+        plan["workbook"] = True
+    return scanned, plan
+
+
+# Lines of the AIBOS workbook already in the books, per business, so the same
+# workbook can be added to and uploaded again without a line going in twice.
+_WORKBOOK_KEYS_MAX = 40000
+
+
+def _workbook_keys(db, ctx) -> list:
+    got = memory.recall(db, ctx.tenant, "workbook_rows", ctx.business_id or "default") or {}
+    return list(got.get("keys") or [])
+
+
+def _remember_workbook_keys(db, ctx, keys: list) -> None:
+    if not keys:
+        return
+    have = _workbook_keys(db, ctx)
+    seen = set(have)
+    merged = (have + [k for k in keys if k not in seen])[-_WORKBOOK_KEYS_MAX:]
+    memory.remember(db, ctx.tenant, "workbook_rows", ctx.business_id or "default", {"keys": merged})
+
+
+def _with_file_records(context: dict, scanned: dict, plan_by_id: dict) -> dict:
+    """The context, plus the products and workers listed in this same workbook.
+
+    A wage to a worker on the file's own Workers sheet is not a stranger: they
+    are added before any wage is filed, so asking "Who is Chanda?" about a name
+    two sheets over would only waste the owner's time."""
+    extra = {"products": [], "employees": []}
+    for t in scanned.get("tables", []):
+        p = plan_by_id.get(t["id"]) or {}
+        kind = p.get("workbook")
+        if kind not in starter_book.RECORD_KINDS:
+            continue
+        have = context["products"] if kind == "products" else context["employees"]
+        got = starter_book.records(kind, t, p.get("mapping") or {}, have)
+        target = extra["products" if kind == "products" else "employees"]
+        target.extend({"id": None, "name": r["name"]} for r in got["new"])
+    if not extra["products"] and not extra["employees"]:
+        return context
+    return {**context, "products": context["products"] + extra["products"],
+            "employees": context["employees"] + extra["employees"]}
+
+
+def _add_workbook_records(db, ctx, scanned: dict, plan_by_id: dict, picked: dict) -> dict:
+    """Put the workbook's new products and workers on file, before any line
+    that mentions them is matched. Never fails the import."""
+    made = {"employees": [], "products": [], "known": 0}
+    for t in scanned.get("tables", []):
+        p = plan_by_id.get(t["id"]) or {}
+        kind = p.get("workbook")
+        if kind not in starter_book.RECORD_KINDS or t["id"] not in picked:
+            continue
+        try:
+            have = (products_api.list_products(db, ctx.tenant, business_id=ctx.business_id)
+                    if kind == "products" else payroll_api.list_employees(db, ctx.tenant)) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.info("workbook: could not read %s (%s)", kind, exc)
+            continue
+        got = starter_book.records(kind, t, p.get("mapping") or {}, have)
+        made["known"] += len(got["known"])
+        for rec in got["new"]:
+            try:
+                if kind == "products":
+                    products_api.create_product(db, ctx.tenant, rec, business_id=ctx.business_id)
+                    made["products"].append(rec["name"])
+                else:
+                    payroll_api.create_employee(db, ctx.tenant, rec)
+                    made["employees"].append(rec["name"])
+            except Exception as exc:  # noqa: BLE001 — one odd line never stops the rest
+                logger.info("workbook: could not add %s %r (%s)", kind, rec.get("name"), exc)
+    return made
 
 
 # Columns that never say what a line was FOR. A cash book keeps the date, the
@@ -4698,13 +4788,17 @@ def documents_scan(
     filename = file.filename or "upload.xlsx"
 
     scanned, plan = _scan_and_plan(content, filename, use_ai)
-    context = _business_context(db, ctx)
+    base_context = _business_context(db, ctx)
     by_id = {p["id"]: p for p in plan["tables"]}
+    workbook = bool(plan.get("workbook"))
+    context = _with_file_records(base_context, scanned, by_id) if workbook else base_context
+    known_keys = set(_workbook_keys(db, ctx)) if workbook else set()
 
     tables, questions = [], []
     for t in scanned["tables"]:
         p = by_id.get(t["id"], {})
         mapping = p.get("mapping", {})
+        kind = p.get("workbook")
         out = {
             "id": t["id"], "sheet": t["sheet"], "title": t["title"],
             "header_row": t["header_row"], "orientation": t["orientation"],
@@ -4721,7 +4815,31 @@ def documents_scan(
             "rows": [{k: v for k, v in r.items() if not k.startswith("_")}
                      for r in t["rows"][:PREVIEW_ROWS_PER_TABLE]],
         }
-        if p.get("import") and mapping.get("amount"):
+        if kind:
+            out["workbook"] = kind
+        if kind in ("guide", "lists"):
+            # Words, not figures: "looks like an unused template" is not news here.
+            out["notes"] = []
+        if kind in starter_book.RECORD_KINDS:
+            # A list of products or workers: put on file, not booked as money.
+            have = base_context["products" if kind == "products" else "employees"]
+            got = starter_book.records(kind, t, mapping, have)
+            out["records"] = {"new": [r["name"] for r in got["new"]][:30],
+                              "new_count": len(got["new"]), "known_count": len(got["known"])}
+            out["import"] = bool(got["new"])
+            if not got["new"] and got["known"]:
+                out["reason"] = "Everything on this sheet is already on your list."
+        elif kind in starter_book.BY_KIND and p.get("import") and mapping.get("amount"):
+            res = starter_book.resolve(kind, t, mapping, context, known_keys,
+                                       starter_book.heading_for(kind))
+            out["counts"] = res["counts"]
+            out["already"] = res["already"]
+            if res["already"] and res["already"] >= t["nonzero_rows"]:
+                out["import"] = False
+                out["reason"] = "Every line on this sheet is already in your books."
+            for q in res["questions"]:
+                questions.append({**q, "table": t["id"], "sheet": t["sheet"]})
+        elif p.get("import") and mapping.get("amount"):
             res = attach.resolve_table(t["rows"], mapping, context, _text_columns(t, mapping),
                                        heading=_heading(t, mapping))
             out["counts"] = res["counts"]
@@ -4760,7 +4878,9 @@ def documents_scan(
         "questions": questions,
         "ai": plan.get("ai", False),
         "ai_note": plan.get("reason", ""),
-        "known": {"employees": len(context["employees"]),
+        # The file is (or holds sheets from) the AIBOS workbook.
+        "workbook": workbook,
+        "known": {"employees": len(base_context["employees"]),
                   "products": len(context["products"]),
                   "parties": len(context["parties"])},
         "event_types": list(nervous.EVENT_TYPES),
@@ -4806,7 +4926,6 @@ def documents_import(
     # Put any new workers and products on file FIRST, so every row that
     # mentions them matches a real record instead of only carrying a name.
     recorded = _record_from_answers(db, ctx, answers_d)
-    context = _business_context(db, ctx)
     planned = {p["id"]: p for p in plan["tables"]}
     picked = {c.get("id"): c for c in chosen if isinstance(c, dict) and c.get("id")}
     if not picked:
@@ -4815,24 +4934,44 @@ def documents_import(
         raise HTTPException(status_code=400, detail=(
             "There was nothing to import: every table in this file is either empty "
             "or holds totals worked out from another table."))
+    # The AIBOS workbook's Products and Workers sheets go on file before any
+    # sale, purchase or wage that names them is matched.
+    workbook = bool(plan.get("workbook"))
+    wb_made = _add_workbook_records(db, ctx, scanned, planned, picked) if workbook else None
+    if wb_made:
+        recorded = {"employees": (recorded.get("employees") or []) + wb_made["employees"],
+                    "products": (recorded.get("products") or []) + wb_made["products"]}
+    context = _business_context(db, ctx)
+    known_keys = set(_workbook_keys(db, ctx)) if workbook else set()
 
     events, skipped, per_table, new_workers, new_products = [], [], [], set(), set()
+    event_keys: list = []          # each event's workbook line, kept once it is saved
+    already = 0
 
     for table in scanned["tables"]:
         if table["id"] not in picked:
             continue
         choice = picked[table["id"]]
         base = planned.get(table["id"], {})
-        mapping = choice.get("mapping") or base.get("mapping") or {}
-        etype = choice.get("event_type") or base.get("event_type") or "Expense"
+        kind = base.get("workbook")
+        if kind in starter_book.RECORD_KINDS or kind in ("guide", "lists"):
+            continue
+        # A workbook sheet is what its headings say it is, whatever was sent.
+        mapping = (base.get("mapping") if kind else choice.get("mapping") or base.get("mapping")) or {}
+        etype = (base.get("event_type") if kind else choice.get("event_type") or base.get("event_type")) or "Expense"
         if not mapping.get("amount"):
             skipped.append({"table": table["id"], "why": "No column in this table holds a money figure."})
             continue
 
         ctx_for_table = {**context, "default_type": etype}
-        res = attach.resolve_table(table["rows"], mapping, ctx_for_table,
-                                   _text_columns(table, mapping),
-                                   heading=_heading(table, mapping))
+        if kind in starter_book.BY_KIND:
+            res = starter_book.resolve(kind, table, mapping, ctx_for_table, known_keys,
+                                       starter_book.heading_for(kind))
+            already += res["already"]
+        else:
+            res = attach.resolve_table(table["rows"], mapping, ctx_for_table,
+                                       _text_columns(table, mapping),
+                                       heading=_heading(table, mapping))
         rows = attach.apply_answers(res["rows"], answers_d)
 
         made = 0
@@ -4849,6 +4988,7 @@ def documents_import(
                 skipped.append({"table": table["id"], "row": row.get("_row"), "why": str(e)})
                 continue
             events.append(ev)
+            event_keys.append(row.get("_key"))
             made += 1
             extra = verdict.get("payload_extra") or {}
             if verdict.get("kind") == "wages" and not extra.get("employee_id") and extra.get("employee"):
@@ -4860,6 +5000,16 @@ def documents_import(
                           "event_type": etype, "counts": res["counts"]})
 
     if not events:
+        if wb_made and (wb_made["products"] or wb_made["employees"]):
+            # Only the lists were filled in: putting them on file IS the import.
+            return {"ok": True, "saved_count": 0, "errors": [], "error_count": 0,
+                    "tables": per_table, "skipped": skipped[:100], "event_count": 0,
+                    "workers_not_on_register": [], "products_not_on_list": [],
+                    "recorded": recorded, "already": already}
+        if already:
+            raise HTTPException(status_code=400, detail=(
+                "Every line in this workbook is already in your books from an earlier upload. "
+                "Add new lines to it and upload it again."))
         raise HTTPException(status_code=400, detail=(
             "Nothing in the tables you chose could be imported. "
             + (skipped[0]["why"] if skipped else "Every row was blank, zero, or a total.")))
@@ -4867,6 +5017,7 @@ def documents_import(
     result = nervous.ingest_batch(db, ctx.tenant, events, business_id=ctx.business_id,
                                   actor_role=ctx.role, actor_id=ctx.actor)
     result.pop("saved", None)
+    failed = {e.get("index") for e in (result.get("errors") or []) if isinstance(e, dict)}
     result["errors"] = (result.get("errors") or [])[:200]
     result["error_count"] = len(result["errors"])
 
@@ -4875,6 +5026,10 @@ def documents_import(
         memory.remember(db, ctx.tenant, "excel_import", fingerprint, {
             "at": datetime.now(timezone.utc).isoformat(), "saved": result.get("saved_count"),
             "file": filename[:120], "rows": len(events)})
+    if workbook:
+        # Only lines that really went in, so a line that failed goes in next time.
+        _remember_workbook_keys(db, ctx, [k for i, k in enumerate(event_keys)
+                                          if k and i not in failed])
 
     return {
         "ok": True, **result,
@@ -4885,8 +5040,10 @@ def documents_import(
         # discovering later that a wage went in against nobody.
         "workers_not_on_register": sorted(new_workers)[:50],
         "products_not_on_list": sorted(new_products)[:50],
-        # What the owner's answers put on file for good.
+        # What the owner's answers (and the workbook's lists) put on file for good.
         "recorded": recorded,
+        # Workbook lines left out because an earlier upload already brought them in.
+        "already": already,
     }
 
 
@@ -4956,7 +5113,10 @@ def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table:
         occurred_at=occurred,
         # What AI-BOS worked out, not what a person confirmed: below the
         # auto-confirm line these stay pending until the owner looks at them.
-        confidence=min(float(verdict.get("confidence") or 0.5), 0.98),
+        # A line of the AIBOS workbook that nothing had to be worked out for
+        # (the owner chose the sheet, the date, the amount and the category)
+        # is the owner's own entry, booked like one typed on the Record page.
+        confidence=min(float(verdict.get("confidence") or 0.5), 0.99 if verdict.get("sure") else 0.98),
     )
 
 
@@ -5372,6 +5532,189 @@ def remove_budget(budget_id: str, ctx: membership.Context = Depends(membership.r
     db = _require_db()
     budgets_api.delete_budget(db, ctx.tenant, budget_id, business_id=ctx.business_id)
     return {"ok": True}
+
+
+# ── Teach AIBOS your business: the owner interview (migration 0041) ───────────
+# One question at a time. The AI chat reads the answers on every question, the
+# money goals become monthly targets when the owner says so, and the AIBOS
+# workbook is made from them (interview.py, starter_book.py).
+
+_INTERVIEW_SETUP = ("The interview is not set up on this database yet. "
+                    "Run migration 0041_business_interviews.sql in Supabase.")
+
+
+def _interview_row(db, ctx) -> dict:
+    try:
+        return interview_api.load(db, ctx.tenant, ctx.business_id)
+    except Exception as e:  # noqa: BLE001
+        if missing_schema(e, "business_interviews"):
+            raise HTTPException(status_code=503, detail=_INTERVIEW_SETUP)
+        raise
+
+
+def _interview_state(row: dict, facts: dict, said: Optional[str] = None) -> dict:
+    answers = (row or {}).get("answers") or {}
+    industry = facts.get("industry")
+    nxt = interview_api.next_question(answers, industry)
+    return {
+        "ok": True,
+        "business": facts.get("name"), "industry": industry,
+        "currency": facts.get("currency"), "symbol": interview_api.symbol_for(facts.get("currency")),
+        "chapters": list(interview_api.CHAPTERS),
+        "questions": [interview_api.phrase(q, facts.get("name"))
+                      for q in interview_api.applicable(answers, industry)],
+        "answers": answers,
+        "next": nxt["id"] if nxt else None,
+        "progress": interview_api.progress(answers, industry),
+        "finished_at": (row or {}).get("finished_at"),
+        "plan_applied_at": (row or {}).get("plan_applied_at"),
+        # One line back about the answer just given, so the owner sees what
+        # AIBOS took from it.
+        "said": said,
+    }
+
+
+@app.get("/interview")
+def get_interview(ctx: membership.Context = Depends(membership.require_context)):
+    db = _require_db()
+    row = _interview_row(db, ctx)
+    return _interview_state(row, interview_api.business_facts(db, ctx.tenant, ctx.business_id))
+
+
+@app.post("/interview/answer")
+def answer_interview(body: Dict[str, Any] = Body(...),
+                     ctx: membership.Context = Depends(membership.require_owner)):
+    """Save, skip or clear one answer: {id, value} | {id, skip: true} | {id, clear: true}."""
+    db = _require_db()
+    business_id = ctx.business_id or businesses_api.ensure_default_business(db, ctx.tenant)
+    if not business_id:
+        raise HTTPException(status_code=503, detail="Your business is not set up yet. Try again in a minute.")
+    row = _interview_row(db, ctx)
+    facts = interview_api.business_facts(db, ctx.tenant, business_id)
+    qid = str(body.get("id") or "")
+    skip, clear = bool(body.get("skip")), bool(body.get("clear"))
+    try:
+        answers = interview_api.record(row.get("answers") or {}, qid, body.get("value"),
+                                       skip=skip, clear=clear)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finished = interview_api.progress(answers, facts["industry"])["finished"]
+    try:
+        saved = interview_api.save(db, ctx.tenant, business_id, answers, finished, existing=row)
+    except Exception as e:  # noqa: BLE001
+        if missing_schema(e, "business_interviews"):
+            raise HTTPException(status_code=503, detail=_INTERVIEW_SETUP)
+        raise
+    said = None if (skip or clear) else interview_api.reflect(
+        qid, answers, interview_api.symbol_for(facts["currency"]))
+    return _interview_state(saved, facts, said)
+
+
+def _interview_goal_plan(db, ctx, answers: dict) -> dict:
+    """The goals as monthly targets, climbing from where the books say the
+    business is (the last three whole months recorded) when there are any."""
+    from datetime import date as _date
+    start_sales = start_profit = None
+    try:
+        this_month = _date.today().strftime("%Y-%m")
+        state = twin.get_state(db, ctx.tenant, ctx.business_id)
+        done = sorted((m for m in (state.get("monthly") or [])
+                       if m.get("month") and m["month"] < this_month), key=lambda m: m["month"])[-3:]
+        if len(done) >= 2:
+            rev = [float(m.get("revenue") or 0) for m in done]
+            cost = [float(m.get("costs") or 0) for m in done]
+            if sum(rev) > 0:
+                start_sales = sum(rev) / len(rev)
+                start_profit = max((sum(rev) - sum(cost)) / len(rev), 0.0)
+    except Exception as e:  # noqa: BLE001 — the owner's own normal month stands in
+        logger.info("[interview] books unavailable for the plan (%s): %s", ctx.tenant, e)
+    return interview_api.goal_plan(answers, start_sales, start_profit)
+
+
+def _plan_existing_budgets(db, ctx, plan: dict) -> list:
+    try:
+        rows = budgets_api.list_budgets(db, ctx.tenant, business_id=ctx.business_id)
+    except Exception as e:  # noqa: BLE001
+        if missing_schema(e, "budgets"):
+            raise HTTPException(status_code=503, detail=_BUDGETS_SETUP)
+        raise
+    months = {m["month"] for m in plan.get("months") or []}
+    return [b for b in rows if b.get("month") in months]
+
+
+@app.get("/interview/plan")
+def get_interview_plan(ctx: membership.Context = Depends(membership.require_context)):
+    """What the goals would set as monthly targets, before anything is written."""
+    db = _require_db()
+    row = _interview_row(db, ctx)
+    plan = _interview_goal_plan(db, ctx, row.get("answers") or {})
+    if plan.get("ok"):
+        write, kept = interview_api.plan_budget_rows(plan, _plan_existing_budgets(db, ctx, plan))
+        plan["to_write"] = len(write)
+        plan["kept"] = kept
+        # Of those, the ones the owner set by hand (the rest this plan wrote).
+        plan["own"] = interview_api.own_targets(kept)
+    plan["applied_at"] = row.get("plan_applied_at")
+    return {**plan, "ok": bool(plan.get("ok"))}
+
+
+@app.post("/interview/plan")
+def apply_interview_plan(ctx: membership.Context = Depends(membership.require_owner)):
+    """Write the goals as monthly targets. A target the owner already set for a
+    month is kept exactly as it is."""
+    db = _require_db()
+    row = _interview_row(db, ctx)
+    plan = _interview_goal_plan(db, ctx, row.get("answers") or {})
+    if not plan.get("ok"):
+        raise HTTPException(status_code=400, detail=plan.get("reason") or "There are no goals to plan from yet.")
+    write, kept = interview_api.plan_budget_rows(plan, _plan_existing_budgets(db, ctx, plan))
+    written = 0
+    for b in write:
+        try:
+            budgets_api.set_budget(db, ctx.tenant, b["month"], b["metric"], b["target"],
+                                   business_id=ctx.business_id)
+            written += 1
+        except Exception as e:  # noqa: BLE001 — one month never stops the rest
+            logger.info("[interview] target %s %s not written: %s", b["month"], b["metric"], e)
+    if row:
+        facts = interview_api.business_facts(db, ctx.tenant, ctx.business_id)
+        answers = row.get("answers") or {}
+        try:
+            interview_api.save(db, ctx.tenant, row.get("business_id") or ctx.business_id, answers,
+                               interview_api.progress(answers, facts["industry"])["finished"],
+                               existing=row, plan_applied=True)
+        except Exception as e:  # noqa: BLE001 — the targets are in; the date is a nicety
+            logger.info("[interview] plan date not kept for %s: %s", ctx.tenant, e)
+    return {"ok": True, "written": written, "kept": interview_api.own_targets(kept),
+            "first_month": (plan.get("months") or [{}])[0].get("month")}
+
+
+@app.get("/templates/workbook.xlsx")
+def download_workbook(ctx: membership.Context = Depends(membership.require_write)):
+    """The AIBOS workbook, made for this business: its products and workers in
+    the dropdowns, its own ways of being paid and biggest costs first."""
+    db = _require_db()
+    facts = interview_api.business_facts(db, ctx.tenant, ctx.business_id)
+    try:
+        answers = (interview_api.load(db, ctx.tenant, ctx.business_id) or {}).get("answers") or {}
+    except Exception:  # noqa: BLE001 — the workbook works without the interview
+        answers = {}
+
+    def safe(fn, *a, **kw):
+        try:
+            return fn(*a, **kw) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.info("workbook: %s unavailable (%s)", getattr(fn, "__name__", fn), exc)
+            return []
+    products = safe(products_api.list_products, db, ctx.tenant, business_id=ctx.business_id)
+    workers = [e for e in safe(payroll_api.list_employees, db, ctx.tenant)
+               if (e.get("status") or "active") == "active"]
+    content = starter_book.build(facts["name"], facts["industry"], answers, products, workers)
+    stem = re.sub(r"[^A-Za-z0-9 \-]+", "", facts["name"] or "").strip()[:60]
+    filename = f"{stem} AIBOS workbook.xlsx" if stem else starter_book.FILENAME
+    return Response(content=content,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # ── Businesses: portfolios under one login (audit #16) ────────────────────────

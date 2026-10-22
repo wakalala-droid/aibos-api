@@ -290,6 +290,7 @@ _SCHEMA_PROBES = (
     (39, "employees", "allowances"),
     (39, "profiles", "payroll_sdl"),
     (40, "forecast_snapshots", "p50"),
+    (41, "business_interviews", "plan_applied_at"),
 )
 
 _schema_cache: tuple[dict, float] | None = None

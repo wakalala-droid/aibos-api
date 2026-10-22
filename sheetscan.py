@@ -422,6 +422,11 @@ def _row_stats(row: list) -> dict:
     return {
         "filled": len(filled),
         "labelish": sum(1 for v in filled if not is_number(v)),
+        # Words that are not a date, for scoring a header. A date cell counted
+        # as "labelish" AND under "dates", so a line of figures with a date and
+        # a note ("September") out-scored the real headings above it, and a
+        # wages sheet with one money column lost its header to its first payment.
+        "words": sum(1 for v in filled if not is_number(v) and not is_date_like(v)),
         "numeric": sum(1 for v in filled if is_number(v)),
         "dates": sum(1 for v in filled if is_date_like(v)),
     }
@@ -446,7 +451,7 @@ def _pick_header(grid: list, start: int, end: int) -> int:
         below_filled = sum(b["filled"] for b in below) / len(below)
         below_num = sum(b["numeric"] for b in below) / max(1, sum(b["filled"] for b in below))
         score = (
-            2.0 * (st["labelish"] + st["dates"]) / st["filled"]     # words/dates, not figures
+            2.0 * (st["words"] + st["dates"]) / st["filled"]        # words/dates, not figures
             + 1.0 * min(st["filled"], widest) / max(1, widest)       # as wide as the data
             + 2.0 * below_num                                        # figures underneath it
             + (0.7 if below_filled >= st["filled"] * 0.5 else 0.0)
