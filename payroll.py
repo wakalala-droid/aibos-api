@@ -80,6 +80,7 @@ so past runs stay truthful after a rate change (a replayable history).
 """
 
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -148,12 +149,16 @@ EMP_EDITABLE = (
     "name", "position", "employment_type", "status", "start_date", "end_date",
     "basic_pay", "allowances", "napsa_exempt", "currency", "pay_day", "napsa_number", "tpin",
     "gratuity_eligible", "gratuity_rate", "contract_end",
-    "loan_balance", "loan_monthly", "notes",
+    "loan_balance", "loan_monthly", "notes", "phone", "email",
 )
 
 # Migration 0039 adds these. Before it is run, saving one with a value is
 # refused in plain words rather than silently dropped.
 EMP_0039_COLUMNS = ("allowances", "napsa_exempt")
+# Migration 0042: where each person's payslip goes (payslip_delivery.py).
+EMP_0042_COLUMNS = ("phone", "email")
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Whether the business pays the Skills Development Levy (profiles.payroll_sdl,
 # migration 0039): worked out from its turnover, or set by the owner.
@@ -485,6 +490,23 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
         if tkey in out and out[tkey] is not None:
             out[tkey] = str(out[tkey]).strip() or None
 
+    # Where the payslip goes. Kept in the one form WhatsApp and email take, so a
+    # number typed "097 712 3456" is the same person as "+260977123456".
+    if "phone" in out:
+        typed = str(out["phone"] or "").strip()
+        if typed:
+            import notify
+            out["phone"] = notify.wa_number(typed)
+            if out["phone"] is None:
+                raise ValueError("That phone number cannot be reached on WhatsApp. Type it like 097 712 3456.")
+        else:
+            out["phone"] = None
+    if "email" in out:
+        typed = str(out["email"] or "").strip().lower()
+        if typed and not _EMAIL.match(typed):
+            raise ValueError("That email address is not complete. Type it like grace@example.com.")
+        out["email"] = typed or None
+
     return out
 
 
@@ -606,21 +628,31 @@ def compliance_text(run: dict, business_name: str | None = None, sym: str = "K")
 
 MIGRATION_0039_NOTE = ("Allowances and the NAPSA age setting need migration 0039. Run "
                        "supabase/migrations/0039_payroll_allowances_and_levy.sql in the Supabase SQL editor.")
+MIGRATION_0042_NOTE = ("A phone or email for each person needs migration 0042. Run "
+                       "supabase/migrations/0042_payslips_to_staff.sql in the Supabase SQL editor.")
 
 
 def _write_employee(write, row: dict):
-    """Write an employee, and on a database without migration 0039 still write
-    everything else, unless the change is one only 0039 can hold: a real
-    allowance or the NAPSA age setting is refused in plain words, never lost."""
-    try:
-        return write(row)
-    except Exception as e:  # noqa: BLE001
-        from db import missing_schema
-        if not any(missing_schema(e, c) for c in EMP_0039_COLUMNS):
-            raise
-        if _num(row.get("allowances")) > 0 or row.get("napsa_exempt"):
-            raise ValueError(MIGRATION_0039_NOTE) from e
-        return write({k: v for k, v in row.items() if k not in EMP_0039_COLUMNS})
+    """Write an employee, and on a database without migration 0039 or 0042
+    still write everything else, unless the change is one only the missing
+    migration can hold: a real allowance, the NAPSA age setting, a phone or an
+    email is refused in plain words, never lost."""
+    for _ in range(2):                      # each missing migration once at most
+        try:
+            return write(row)
+        except Exception as e:  # noqa: BLE001
+            from db import missing_schema
+            if any(missing_schema(e, c) for c in EMP_0039_COLUMNS):
+                if _num(row.get("allowances")) > 0 or row.get("napsa_exempt"):
+                    raise ValueError(MIGRATION_0039_NOTE) from e
+                row = {k: v for k, v in row.items() if k not in EMP_0039_COLUMNS}
+            elif any(missing_schema(e, c) for c in EMP_0042_COLUMNS):
+                if row.get("phone") or row.get("email"):
+                    raise ValueError(MIGRATION_0042_NOTE) from e
+                row = {k: v for k, v in row.items() if k not in EMP_0042_COLUMNS}
+            else:
+                raise
+    return write(row)
 
 
 def create_employee(db, user_id: str, data: dict) -> dict:

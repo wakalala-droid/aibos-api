@@ -459,6 +459,40 @@ def _long_day(dt: datetime) -> str:
     return f"{local.strftime('%A')} {local.day} {local.strftime('%B %Y')}"
 
 
+# What a plan does that Free does not, most-felt first. A plan that is ending
+# names these instead of "everything" (28 October 2026): "payroll and the
+# morning brief stop" is a thing an owner can weigh, "switch everything back
+# on" is not. Words only; the records always stay.
+_STOPS = (
+    ("payroll", "payroll"),
+    ("morning_brief", "the morning brief"),
+    ("hospitality", "Rooms & Stays"),
+    ("cash_plan", "the cash watch"),
+    ("schedule", "reminders"),
+    ("invoices", "invoices with a pay link"),
+    ("ai_chat", "the AI chat"),
+    ("multi_business", "your other businesses"),
+    ("forecast", "forecasts"),
+)
+
+
+def what_stops(plan: str, limit: int = 3) -> list[str]:
+    """The most-felt things `plan` does that Free does not. Pure."""
+    import entitlements
+    has = set(entitlements.features_for(plan)) - set(entitlements.features_for("free"))
+    return [words for flag, words in _STOPS if flag in has][:limit]
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _stops_words(plan: str, fallback: str) -> tuple[str, bool]:
+    """The things that stop, in words, and whether they are more than one."""
+    stops = what_stops(plan)
+    return (_and(stops), len(stops) > 1) if stops else (fallback, False)
+
+
 def card_status(card: dict | None, plan: str, until: datetime | None,
                 now: datetime) -> dict | None:
     """The plan in plain words when a card subscription is paying for it, or
@@ -484,10 +518,11 @@ def card_status(card: dict | None, plan: str, until: datetime | None,
             "days_left": (((cancel_at or renews).astimezone(LUSAKA).date()
                            - now.astimezone(LUSAKA).date()).days if (cancel_at or renews) else None)}
     status = card.get("status")
+    stops, many = _stops_words(plan, name)
     if status == "past_due":
         return {**base, "state": "grace",
                 "sentence": f"Your card payment of {price} for {name} did not go through. Paddle tries "
-                            f"the card again over the next few days. Update your card to keep {name} on"
+                            f"the card again over the next few days. Update your card to keep {stops} on"
                             + (f". Everything keeps working until {_long_day(off)}." if off else ".")}
     if status == "paused":
         return {**base, "state": "grace",
@@ -496,7 +531,9 @@ def card_status(card: dict | None, plan: str, until: datetime | None,
     if cancel_at:
         return {**base, "state": "active",
                 "sentence": f"Your {name} plan is paid up to {_long_day(cancel_at)} and then ends: "
-                            f"you cancelled the card renewal. Changed your mind? Keep it and your card "
+                            f"you cancelled the card renewal. On that day {stops} "
+                            f"{'stop' if many else 'stops'}; your records "
+                            f"stay. Changed your mind? Keep it and your card "
                             f"is charged {price} on {_day(cancel_at)} as before."}
     return {**base, "state": "active",
             "sentence": (f"Your {name} plan renews automatically on {_long_day(renews)}. Your card is "
@@ -543,15 +580,16 @@ def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None 
         return {**out, "state": "active", "days_left": days,
                 "sentence": f"Your {name} plan is paid up to {_long_day(until)}. To keep it on after "
                             f"that, set up card payment on or just before that day: {renews}"}
+    stops, many = _stops_words(plan, f"your {name} plan")
     if now <= off:
         return {**out, "state": "grace",
                 "sentence": f"Your {name} plan was due on {_day(until)}. Everything keeps working "
-                            f"until {_long_day(off)}. Set up card payment before then to keep it on: "
+                            f"until {_long_day(off)}. Set up card payment before then to keep {stops} on: "
                             f"{renews}"}
     return {**out, "state": "expired",
-            "sentence": f"Your {name} plan ended on {_day(off)}, so the account is on Free for now. "
-                        f"Set up card payment to switch everything back on: {renews} "
-                        f"Your records are all there."}
+            "sentence": f"Your {name} plan ended on {_day(off)}, so the account is on Free for now "
+                        f"and {stops} {'have' if many else 'has'} stopped. Your records are all there. "
+                        f"Set up card payment to switch them back on: {renews}"}
 
 
 def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=None) -> list:

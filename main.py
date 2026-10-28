@@ -2579,7 +2579,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 41
+EXPECTS_MIGRATION = 42
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -3120,6 +3120,7 @@ def my_entitlements(user_id: str = Depends(require_user),
     account = entitlements.paying_account(user_id, x_acting_as)
     detail = entitlements.tier_detail(account)
     tier = detail["tier"]
+    kept = set(entitlements.kept_features(account, tier))
     # A card plan that is still going and not cancelled renews by itself, so
     # the app must not warn that it is "ending" before each renewal (every
     # plan is paid by card since 25 September 2026).
@@ -3142,7 +3143,10 @@ def my_entitlements(user_id: str = Depends(require_user),
         "paid_tier": detail.get("paid_tier"),
         "reason": detail.get("reason", "ok"),
         "plan_readable": detail.get("reason") != "unreadable",
-        "features": entitlements.features_for(tier),
+        "features": sorted(set(entitlements.features_for(tier)) | kept),
+        # Kept from before the 22 October re-cut (payroll, on a Pro account that
+        # already ran it): the app unlocks these on top of the plan's own.
+        "kept": sorted(kept),
         "note": detail.get("note", ""),
     }
 
@@ -5355,15 +5359,41 @@ def seed_statutory_calendar(ctx: membership.Context = Depends(membership.require
     Scheduler layer — same gate."""
     entitlements.require_feature(ctx.tenant, "schedule")
     db = _require_db()
-    runs = payroll_api.list_runs(db, ctx.tenant, limit=1)
-    totals = (runs[0].get("totals") if runs else None) or None
-    candidates = compliance_api.statutory_items(totals)
-    existing = schedule_api.list_items(db, ctx.tenant, horizon_days=60, business_id=ctx.business_id)
-    created = [schedule_api.create_item(db, ctx.tenant, item, business_id=ctx.business_id)
-               for item in compliance_api.missing_items(
-                   [r.get("title") for r in existing], candidates)]
+    created, candidates = _seed_statutory(db, ctx.tenant, ctx.business_id)
     return {"ok": True, "created": created, "created_count": len(created),
             "skipped_existing": len(candidates) - len(created)}
+
+
+def _seed_statutory(db, tenant: str, business_id: Optional[str]) -> tuple[list, list]:
+    """The PAYE, NAPSA, NHIMA (and levy) reminders on the 10th that are not on
+    the Schedule yet, made, amounts from the latest payroll run."""
+    runs = payroll_api.list_runs(db, tenant, limit=1)
+    totals = (runs[0].get("totals") if runs else None) or None
+    candidates = compliance_api.statutory_items(totals)
+    existing = schedule_api.list_items(db, tenant, horizon_days=60, business_id=business_id)
+    created = [schedule_api.create_item(db, tenant, item, business_id=business_id)
+               for item in compliance_api.missing_items(
+                   [r.get("title") for r in existing], candidates)]
+    return created, candidates
+
+
+def _reminders_with_first_run(db, ctx: membership.Context) -> list:
+    """The first payroll run sets the statutory reminders by itself.
+
+    "Never miss ZRA, NAPSA or NHIMA again" was a button on the Schedule page,
+    so the owner who needed it most, the one running payroll for the first
+    time, had to find it first. Only the FIRST run does this: an owner who has
+    run payroll before and took a reminder off meant it. Never costs the run."""
+    try:
+        if not entitlements.can_access(entitlements.user_tier(ctx.tenant), "schedule"):
+            return []
+        if len(payroll_api.list_runs(db, ctx.tenant, limit=2)) != 1:
+            return []
+        created, _ = _seed_statutory(db, ctx.tenant, ctx.business_id)
+        return [c.get("title") for c in created if c]
+    except Exception as e:  # noqa: BLE001 — the run is already made and must stand
+        log.warning("[payroll] statutory reminders not set for %s: %s", ctx.tenant, e)
+        return []
 
 
 # ── Parties: customers & suppliers (audit #6) ─────────────────────────────────
@@ -7264,6 +7294,70 @@ def payslip_share_text(run_id: str, employee_id: str = Query(...),
     return {"ok": True, "text": payroll_api.payslip_text(slip, business_name)}
 
 
+# ── Payslips to the staff themselves (payslip_delivery.py, migration 0042) ────
+# Each person's payslip by email from AIBOS (PDF attached, replies to the
+# owner) or on WhatsApp from the owner's own phone, and a record of who has
+# theirs. Owner only and the payroll plan, like the payslip PDF itself.
+
+def _payslip_run(ctx: membership.Context, run_id: str):
+    entitlements.require_feature(ctx.tenant, "payroll")
+    db = _require_db()
+    try:
+        run = payroll_api.get_run(db, ctx.tenant, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    contacts = notify._owner_contacts(db, ctx.tenant)
+    return db, run, payroll_api.list_employees(db, ctx.tenant), contacts
+
+
+@app.get("/payroll/runs/{run_id}/delivery")
+def payslip_delivery_status(run_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """Everyone on the run: their email and phone, a WhatsApp link with their
+    payslip already written, and whether theirs has gone."""
+    import payslip_delivery
+    _db, run, employees, contacts = _payslip_run(ctx, run_id)
+    people = payslip_delivery.people(run, employees, contacts.get("name"))
+    return {"ok": True, "period": run.get("period"), "people": people,
+            **payslip_delivery.summary(people),
+            "email_channel": "live" if notify.email_enabled() else "not configured"}
+
+
+class SendPayslipsRequest(BaseModel):
+    again: bool = False                     # send to people who already have theirs too
+    employee_id: Optional[str] = None       # one person only
+
+
+@app.post("/payroll/runs/{run_id}/send-payslips")
+def send_payslips(run_id: str, body: SendPayslipsRequest = Body(default=None),
+                  ctx: membership.Context = Depends(membership.require_owner)):
+    """Email each person on the run their payslip, with the PDF attached."""
+    import payslip_delivery
+    db, run, employees, contacts = _payslip_run(ctx, run_id)
+    body = body or SendPayslipsRequest()
+    out = payslip_delivery.send_by_email(db, ctx.tenant, run, employees, contacts.get("name"),
+                                         contacts.get("email"), again=body.again,
+                                         employee_id=body.employee_id)
+    return {"ok": True, **out}
+
+
+class PayslipSharedRequest(BaseModel):
+    via: str = "whatsapp"
+
+
+@app.post("/payroll/runs/{run_id}/payslips/{employee_id}/shared")
+def payslip_shared(run_id: str, employee_id: str, body: PayslipSharedRequest = Body(default=None),
+                   ctx: membership.Context = Depends(membership.require_owner)):
+    """The owner opened this person's payslip in WhatsApp from AIBOS."""
+    import payslip_delivery
+    db, _run, _employees, _contacts = _payslip_run(ctx, run_id)
+    try:
+        when = payslip_delivery.mark_sent(db, ctx.tenant, run_id, employee_id,
+                                          (body.via if body else "whatsapp"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "sent_at": when}
+
+
 class PayrollRunRequest(BaseModel):
     period: str                             # 'YYYY-MM'
     pay_date: Optional[str] = None
@@ -7313,9 +7407,10 @@ def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(member
         if req.preview:
             return {"ok": True, "preview": payroll_api.preview_run(db, ctx.tenant, req.period, req.pay_date)}
         entitlements.require_feature(ctx.tenant, "payroll")
-        return {"ok": True, "run": payroll_api.run_payroll(db, ctx.tenant, req.period, req.pay_date)}
+        run = payroll_api.run_payroll(db, ctx.tenant, req.period, req.pay_date)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "run": run, "reminders_set": _reminders_with_first_run(db, ctx)}
 
 
 # ── Business identity lookup (Setup Wizard "is this you?") ───────────────────
@@ -8018,6 +8113,9 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a month: what each business's forecast says before the month
             # happens, kept so the Forecast page's track record is earned.
             ("track_record", lambda: track_record.keep(db)),
+            # Once a month, from 07:00 on the 1st: what AIBOS did for each
+            # owner in the month just gone, every line from their records.
+            ("month_note", lambda: __import__("month_note").deliver(db)),
         ):
             try:
                 out[name] = job()

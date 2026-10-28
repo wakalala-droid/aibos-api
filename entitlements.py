@@ -122,6 +122,7 @@ def _missing_column(exc: Exception) -> bool:
 def invalidate(user_id: str) -> None:
     """Drop a cached tier so the next lookup re-reads it (call after a grant)."""
     _CACHE.pop(user_id, None)
+    _KEPT_CACHE.pop(user_id, None)
 
 
 def tier_detail(user_id: str) -> dict:
@@ -231,6 +232,48 @@ def can_access(tier: str, feature: str) -> bool:
     if feature in _UNBUILT:
         return False
     return feature in _ACCESS.get(tier, set())
+
+
+# ── Kept from before the re-cut (28 October 2026) ─────────────────────────────
+# The ladder re-cut of 22 October moved payroll from Pro to Pro+. A Pro owner
+# who was already running payroll on AIBOS would have found it locked the next
+# payday: the one thing their staff and ZRA depend on, taken away from a plan
+# they were still paying for. Taking away what someone already uses pushes them
+# out, not up. So a Pro account that ran payroll before the re-cut keeps it on
+# Pro. Everyone else follows the ladder: new Pro owners need Pro+ for payroll.
+RECUT_ON = "2026-10-22"
+_KEPT_ON_PRO = ("payroll",)
+_KEPT_CACHE: dict[str, tuple[frozenset, float]] = {}
+
+
+def kept_features(user_id: str, tier: str) -> frozenset:
+    """Features this account keeps although its plan no longer includes them.
+    Only Pro keeps anything; a lapsed plan reads as Free and keeps nothing."""
+    if tier != "pro" or not user_id:
+        return frozenset()
+    hit = _KEPT_CACHE.get(user_id)
+    if hit and time.time() < hit[1]:
+        return hit[0]
+    db = get_db()
+    if db is None:
+        return frozenset()
+    try:
+        rows = (db.table("payroll_runs").select("id").eq("user_id", user_id)
+                .lt("created_at", RECUT_ON).limit(1).execute())
+        kept = frozenset(_KEPT_ON_PRO) if (getattr(rows, "data", None) or []) else frozenset()
+    except Exception as e:  # noqa: BLE001 — not established is not kept; never cached
+        log.info("[entitlements] kept features not read for %s: %s", user_id, e)
+        return frozenset()
+    if len(_KEPT_CACHE) >= _CACHE_MAX:
+        _KEPT_CACHE.clear()
+    _KEPT_CACHE[user_id] = (kept, time.time() + _TTL)
+    return kept
+
+
+def account_can(user_id: str, feature: str, tier: str | None = None) -> bool:
+    """can_access for one account: its plan, plus anything it kept."""
+    tier = tier if tier is not None else user_tier(user_id)
+    return can_access(tier, feature) or (feature not in _UNBUILT and feature in kept_features(user_id, tier))
 
 
 def _required_tier(feature: str) -> str:
@@ -386,7 +429,7 @@ def require_feature(user_id: str, feature: str) -> str:
             detail=f"{label.capitalize()} is not built yet — it is on the roadmap, "
                    "not in your plan. You have not been charged for it.",
         )
-    if not can_access(tier, feature):
+    if not can_access(tier, feature) and feature not in kept_features(user_id, tier):
         need = _required_tier(feature)
         need_label = _TIER_LABEL.get(need, need.capitalize())
         label = _sentence(_FEATURE_LABEL.get(feature, feature))

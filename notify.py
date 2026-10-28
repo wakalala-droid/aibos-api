@@ -188,6 +188,56 @@ def goal_line(db, user_id: str, business_id: str | None, state: dict, sym: str =
 BRIEF_SIGNOFF = "Any questions? Open AI-BOS and just ask."
 
 
+def money_line(state: dict, sym: str = "K") -> str:
+    """The brief's first line: the cash, and who owes whom."""
+    cash = float(state.get("cash") or 0)
+    recv = float(state.get("receivables") or 0)
+    pay = float(state.get("payables") or 0)
+    m = f"Cash: {_money(cash, sym)}."
+    if recv > 0:
+        m += f" Customers owe you {_money(recv, sym)}."
+    if pay > 0:
+        m += f" You owe suppliers {_money(pay, sym)}."
+    return m
+
+
+# ── The one-line brief (Free and Pro, 28 October 2026) ────────────────────────
+# The full brief is Pro+ (the plan ladder of 22 October). Below it an owner who
+# switched the brief on used to get nothing at all, so the plans that most
+# needed a reason to open AIBOS each morning had none. They now get the brief's
+# first line, their cash and who owes whom, from the same books and the same
+# arithmetic. The email says once what the full brief adds; the phone
+# notification never sells (the iPhone app sells nothing, and neither does a
+# lock screen).
+ONE_LINE_MORE = ("The full Morning Brief adds yesterday's sales, stock running low, deliveries due "
+                 "and one thing to do today. It comes with Pro+.")
+
+
+def compose_one_line(db, user_id: str, business_name: str | None,
+                     business_id: str | None = None) -> tuple[str, str] | None:
+    """(subject, line) of the one-line brief, or None with nothing recorded."""
+    business_id = twin_mod._books_for(db, user_id, business_id)
+    state = twin_mod.get_state(db, user_id, business_id)
+    if not state or int(state.get("event_count") or 0) == 0:
+        return None
+    name = f" for {business_name}" if business_name else ""
+    return f"Your cash this morning{name} · {brief_day()}", money_line(state, _sym(state.get("currency", "ZMW")))
+
+
+def push_one_line(db, user_id: str, line: str) -> int:
+    """The one-line brief on the phone: the cash as the title, who owes whom
+    beneath it. Never raises."""
+    try:
+        import webpush
+        title, _, rest = line.partition(". ")
+        res = webpush.send_to_user(db, user_id, title.rstrip("."), rest or "Your money this morning.",
+                                   "/dashboard", wait=True, extra={"tag": "aibos-brief"})
+        return int(res.get("sent") or 0)
+    except Exception as e:  # noqa: BLE001: nothing here may cost the email
+        log.warning("[notify] one-line push for %s failed: %s", user_id, e)
+        return 0
+
+
 def compose_brief(db, user_id: str, business_name: str | None,
                   business_id: str | None = None) -> tuple[str, str] | None:
     """
@@ -206,15 +256,8 @@ def compose_brief(db, user_id: str, business_name: str | None,
     lines: list[str] = []
 
     # Money position.
-    cash = float(state.get("cash") or 0)
     recv = float(state.get("receivables") or 0)
-    pay = float(state.get("payables") or 0)
-    m = f"Cash: {_money(cash, sym)}."
-    if recv > 0:
-        m += f" Customers owe you {_money(recv, sym)}."
-    if pay > 0:
-        m += f" You owe suppliers {_money(pay, sym)}."
-    lines.append(m)
+    lines.append(money_line(state, sym))
 
     # Growth: the cash watch, one line from the 13-week plan (cash_watch.py).
     try:
@@ -455,23 +498,36 @@ def sender() -> str:
     return f"AI-BOS <hello@{domain}>" if domain else "AI-BOS <onboarding@resend.dev>"
 
 
-def send_email(to: str, subject: str, body: str, html: str | None = None) -> bool:
+def send_email(to: str, subject: str, body: str, html: str | None = None,
+               attachments: list[tuple[str, bytes]] | None = None,
+               reply_to: str | None = None) -> bool:
     """Send as AI-BOS. Every email in the platform's own name wears its logo:
-    pass `html` to shape it, or get the plain body wrapped in the logo."""
+    pass `html` to shape it, or get the plain body wrapped in the logo.
+
+    `attachments` are (filename, bytes) pairs, a payslip PDF for one. `reply_to`
+    sends an answer somewhere other than AI-BOS: a member of staff replying to
+    their payslip reaches their employer, not us."""
     if not email_enabled():
         return False
+    import base64
     import httpx
 
+    message = {
+        "from": sender(),
+        "to": [to],
+        "subject": subject,
+        "text": body,
+        "html": html if html is not None else aibos_email_html(body),
+    }
+    if attachments:
+        message["attachments"] = [{"filename": name, "content": base64.b64encode(data).decode("ascii")}
+                                  for name, data in attachments]
+    if reply_to:
+        message["reply_to"] = reply_to
     r = httpx.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {os.environ['RESEND_API_KEY']}"},
-        json={
-            "from": sender(),
-            "to": [to],
-            "subject": subject,
-            "text": body,
-            "html": html if html is not None else aibos_email_html(body),
-        },
+        json=message,
         timeout=15,
     )
     if r.status_code >= 300:
@@ -709,10 +765,12 @@ def push_brief(db, user_id: str) -> int:
 
 def dispatch_briefs(db) -> dict:
     """
-    Send the morning brief to every opted-in, entitled user. Tier checks are
-    server-authoritative: email needs 'scheduled_brief' (Pro+),
-    WhatsApp needs 'morning_brief' (Pro+). Users with no recorded activity are
-    skipped — an empty brief teaches people to ignore the real ones.
+    Send the morning brief to every opted-in user. Tier checks are
+    server-authoritative: the full brief by email needs 'scheduled_brief'
+    (Pro+), WhatsApp needs 'morning_brief' (Pro+), and an owner below Pro+ who
+    switched it on gets the one-line brief (compose_one_line). Users with no
+    recorded activity are skipped — an empty brief teaches people to ignore the
+    real ones.
     """
     res = (
         db.table("profiles")
@@ -721,12 +779,28 @@ def dispatch_briefs(db) -> dict:
         .limit(2000)
         .execute()
     )
-    sent_email = sent_wa = sent_push = skipped = errors = 0
+    sent_email = sent_wa = sent_push = sent_one_line = skipped = errors = 0
 
     for p in res.data or []:
         uid = p["id"]
         try:
             tier = user_tier(uid)
+            to = (p.get("contact_email") or p.get("email") or "").strip()
+            # Below Pro+: the one-line brief, for an owner who switched it on.
+            if p.get("brief_email_enabled") and not can_access(tier, "scheduled_brief"):
+                one = compose_one_line(db, uid, p.get("business_name"))
+                if one is None:
+                    skipped += 1
+                    continue
+                subject, line = one
+                body = f"{line}\n\n{ONE_LINE_MORE}"
+                if to and send_email(to, subject, body,
+                                     aibos_email_html(body, ("See what Pro+ adds", f"{_app_url()}/pricing"),
+                                                      title="Morning brief")):
+                    sent_one_line += 1
+                sent_push += push_one_line(db, uid, line)
+                continue
+
             brief = compose_brief(db, uid, p.get("business_name"))
             if brief is None:
                 skipped += 1
@@ -735,7 +809,6 @@ def dispatch_briefs(db) -> dict:
 
             # The address the owner typed for the business wins, as it does for
             # booking alerts (see _owner_contacts).
-            to = (p.get("contact_email") or p.get("email") or "").strip()
             if p.get("brief_email_enabled") and to and can_access(tier, "scheduled_brief"):
                 if send_email(to, subject, body,
                               aibos_email_html(body, ("Open AI-BOS", f"{_app_url()}/dashboard"),
@@ -757,6 +830,7 @@ def dispatch_briefs(db) -> dict:
     summary = {
         "ok": True,
         "email_sent": sent_email,
+        "one_line_sent": sent_one_line,
         "whatsapp_sent": sent_wa,
         "push_sent": sent_push,
         "skipped_no_data": skipped,
