@@ -110,7 +110,8 @@ TOOLS = [
                        "fixes a shortfall. Use for 'will I have enough in December', 'can I afford X', "
                        "'when will I run short'. Growth plan; on other plans it says so.",
         "parameters": {"type": "object", "properties": {
-            "floor": {"type": "number", "description": "the least the owner wants to keep, default 0"},
+            "floor": {"type": "number", "description": "the least the owner wants to keep; leave it out to use "
+                                                       "the cash cushion they told AIBOS (zero without one)"},
         }},
     }},
     {"type": "function", "function": {
@@ -344,12 +345,15 @@ def _customer_summary(db, user_id, args, business_id=None):
 
 
 def _investigate(db, user_id, args, business_id=None):
+    import interview
     import investigate
-    events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP,
-                                 business_id=_books(db, user_id, business_id))
+    biz = _books(db, user_id, business_id)
+    events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP, business_id=biz)
     month = args.get("month")
+    # The worst month AIBOS picks by itself skips one the owner said runs busy or quiet.
     return (investigate.investigate_month(events, month)
-            if month else investigate.auto_investigation(events))
+            if month else investigate.auto_investigation(events, interview.seasons(
+                interview.answers_for(db, user_id, biz))))
 
 
 def _cash_forecast(db, user_id, business_id=None):
@@ -371,13 +375,13 @@ def _cash_plan(db, user_id, args, business_id=None):
         return {"available": False,
                 "note": "The 13-week cash plan is part of the Growth plan. cash_forecast gives the "
                         "monthly outlook on this plan."}
-    floor = max(_num(args.get("floor")), 0.0)
+    floor = max(_num(args.get("floor")), 0.0) if args.get("floor") is not None else None
     plan = cash_watch.build(db, user_id, business_id, floor=floor, paths=600)
     if not plan.get("ok"):
         return {"available": True, "ok": False, "reason": plan.get("reason"),
                 "known": plan.get("known", [])[:10]}
-    keep = ("headline", "cash_now", "floor", "chance_short_pct", "chance_words", "lowest", "close",
-            "first_risk_date", "safe_to_spend", "cash_needed", "today", "until")
+    keep = ("headline", "cash_now", "floor", "floor_from", "chance_short_pct", "chance_words", "lowest", "close",
+            "first_risk_date", "safe_to_spend", "cash_needed", "today", "until", "told_loan")
     return {
         "available": True, "ok": True, **{k: plan[k] for k in keep if k in plan},
         "weeks": [{"week": w["week"], "from": w["start"], "to": w["end"], "money_in": w["in"],

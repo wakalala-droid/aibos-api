@@ -110,6 +110,34 @@ def pace(report: dict, this_month: dict | None) -> dict:
     return report
 
 
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August",
+           "September", "October", "November", "December")
+
+
+def pace_words(line: dict, month: str, sym: str = "K") -> str | None:
+    """The morning brief's line for this month's sales target, from a line
+    pace() has read: past it already, on pace for it, or short of it and what
+    it takes a day from here. None for anything but a sales line on pace."""
+    if not line or line.get("metric") != "revenue" or "projected" not in line:
+        return None
+    try:
+        name = _MONTHS[int(str(month)[5:7]) - 1]
+    except (ValueError, IndexError):
+        return None
+    money = lambda v: f"{sym}{_num(v):,.0f}"  # noqa: E731
+    target, actual, projected = _num(line.get("target")), _num(line.get("actual")), _num(line.get("projected"))
+    if target <= 0:
+        return None
+    if actual >= target:
+        return f"Sales goal: {money(actual)} in already, past the {money(target)} target for {name}."
+    if projected >= target:
+        return f"Sales goal: on pace for {money(projected)}, above the {money(target)} target for {name}."
+    words = f"Sales goal: on pace for {money(projected)}, short of the {money(target)} target for {name}."
+    if line.get("per_day"):
+        words += f" {money(line['per_day'])} a day from here reaches it."
+    return words
+
+
 # ── DB wrappers (tenant + business scoped) ────────────────────────────────────
 
 

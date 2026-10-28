@@ -78,16 +78,38 @@ def inputs(db, owner_id: str, business_id: str | None) -> dict:
             "monthly_in": [{"month": m["month"], "in": m["trading_in"]} for m in months]}
 
 
-def build(db, owner_id: str, business_id: str | None, tz: int = 0, floor: float = 0.0,
+def told(db, owner_id: str, business_id: str | None) -> dict:
+    """What the owner told AIBOS that the plan uses: {cushion, loan_monthly},
+    each None when they did not say. Never raises."""
+    import interview
+    answers = interview.answers_for(db, owner_id, business_id)
+    return {"cushion": interview.cushion(answers), "loan_monthly": interview.loan_monthly(answers)}
+
+
+def build(db, owner_id: str, business_id: str | None, tz: int = 0, floor: float | None = None,
           scenarios: list | None = None, paths: int = cash_plan.PATHS, books: dict | None = None) -> dict:
     """The plan for one business. `books` is inputs() when the caller has
     already read them (the bank's projection uses the same read for the money
-    now, the plan and the 12 months)."""
+    now, the plan and the 12 months).
+
+    `floor` None means the owner has not typed one: the cash cushion they gave
+    AIBOS in the interview is the floor then (zero without one), so what is
+    safe to spend and the low-cash warning keep their cushion. A loan
+    repayment they told AIBOS about counts while the books show none."""
     books = books or inputs(db, owner_id, business_id)
+    said = told(db, owner_id, books["business_id"])
+    if floor is None:
+        floor = said["cushion"] or 0.0
+    # A floor typed at the cushion's own figure is still the cushion.
+    floor_from = "cushion" if said["cushion"] and abs(floor - said["cushion"]) < 0.005 else None
     today = (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
     plan = cash_plan.build(books["events"], books["pending"], books["invoices"], books["schedule"],
                            books["cash"], today=today, tz=tz, floor=floor, scenarios=scenarios,
-                           paths=paths, sym=books["sym"], monthly_in=books["monthly_in"])
+                           paths=paths, sym=books["sym"], monthly_in=books["monthly_in"],
+                           floor_from=floor_from, loan_monthly=said["loan_monthly"])
+    if said["cushion"]:
+        # Said even when the owner typed another floor, so the page can offer it back.
+        plan["cushion"] = said["cushion"]
     plan["business_id"] = books["business_id"]
     plan["sym"] = books["sym"].strip()
     if plan.get("chase"):
@@ -208,7 +230,8 @@ def compact(plan: dict) -> dict:
     coming = [it for w in plan["weeks"][:2] for it in w["items"] if it["dir"] == "out"][:4]
     first = (plan.get("chase") or [None])[0]
     out = {k: plan.get(k) for k in ("ok", "headline", "chance_short_pct", "chance_words", "first_risk_date",
-                                      "safe_to_spend", "cash_needed", "lowest", "cash_now", "sym")}
+                                      "safe_to_spend", "cash_needed", "lowest", "cash_now", "sym",
+                                      "floor", "floor_from")}
     out["coming"] = [{k: it.get(k) for k in ("day", "label", "amount", "source")} for it in coming]
     out["chase_first"] = ({k: first.get(k) for k in ("customer", "amount", "why", "phone", "message")}
                           if first else None)
@@ -277,7 +300,9 @@ def preview(plan: dict) -> dict:
         return {"ok": False, "preview": True, "reason": plan.get("reason")}
     return {"ok": True, "preview": True, "chance_short_pct": plan["chance_short_pct"],
             "chance_words": plan["chance_words"], "first_risk_date": plan.get("first_risk_date"),
-            "at_risk": plan["chance_short_pct"] >= 5}
+            "at_risk": plan["chance_short_pct"] >= 5,
+            # The line the chance is about: their cushion, when they gave AIBOS one.
+            "floor": plan.get("floor"), "floor_from": plan.get("floor_from")}
 
 
 def warning(plan: dict, sym: str = "K") -> dict | None:
@@ -291,12 +316,21 @@ def warning(plan: dict, sym: str = "K") -> dict | None:
     first = next(w for w in weeks if w["chance_short_pct"] >= 100 * WARN_AT)
     start = datetime.fromisoformat(first["start"])
     when = f"{start.day} {start.strftime('%b')}"
-    body = f"{cash_plan.chance_sentence(first['chance_short_pct'] / 100)} by then."
+    floor = float(plan.get("floor") or 0.0)
+    line = cash_plan.floor_words(floor, sym, plan.get("floor_from"))
+    money = lambda v: cash_plan._money(v, sym)  # noqa: E731
+    if plan.get("floor_from") == "cushion" and float(plan.get("cash_now") or 0.0) < floor:
+        # Already under the cushion: say so, not that it may happen.
+        title = f"Your cash is below your {money(floor)} cushion"
+        body = f"{money(plan['cash_now'])} now, against the {money(floor)} you told AIBOS to keep at all times."
+    else:
+        title = (f"Cash may run short in the week of {when}" if floor <= 0
+                 else f"Cash may go below {line} in the week of {when}")
+        body = f"{cash_plan.chance_sentence(first['chance_short_pct'] / 100, f'your money goes below {line}')} by then."
     if plan.get("levers"):
         best = plan["levers"][0]
         body += f" {best['title']}: that brings it to {best['chance_short_pct']:g}%."
-    return {"title": f"Cash may run short in the week of {when}", "body": body,
-            "week_start": first["start"]}
+    return {"title": title, "body": body, "week_start": first["start"]}
 
 
 def brief_line(db, owner_id: str, business_id: str | None) -> str | None:
@@ -309,14 +343,18 @@ def brief_line(db, owner_id: str, business_id: str | None) -> str | None:
     if not plan.get("ok"):
         return None
     sym = plan.get("sym") or "K"
+    cushion = plan.get("floor_from") == "cushion"
+    line = cash_plan.floor_words(plan.get("floor") or 0.0, sym, plan.get("floor_from"))
     if plan["chance_short_pct"] >= 5 and plan.get("first_risk_date"):
         d = datetime.fromisoformat(plan["first_risk_date"])
-        said = cash_plan.chance_sentence(plan["chance_short_pct"] / 100, "of running short")
+        said = cash_plan.chance_sentence(plan["chance_short_pct"] / 100,
+                                         f"your money goes below {line}" if cushion else "of running short")
         return (f"Cash watch: {said[0].lower()}{said[1:]}, "
                 f"first in the week of {d.day} {d.strftime('%b')}. Open the cash plan for what fixes it.")
     safe = plan.get("safe_to_spend")
     if safe is not None:
-        return f"Cash watch: clear for 13 weeks. Safe to spend today: {sym}{safe:,.0f}."
+        above = f" above {line}" if cushion else ""
+        return f"Cash watch: clear for 13 weeks{above}. Safe to spend today: {sym}{safe:,.0f}."
     return None
 
 

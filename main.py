@@ -76,6 +76,7 @@ import membership
 import businesses as businesses_api
 import budgets as budgets_api
 import interview as interview_api
+import seasons as seasons_api
 import starter_book
 import rate_limit
 import exports as exports_api
@@ -6782,9 +6783,29 @@ def forecast_outlook(tz: int = Query(0, ge=-840, le=840),
     evs = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
                               event_types=("Sale",) + outlook_api.COST_TYPES)
     now = _dt.now(_tz.utc) + _td(minutes=tz)
+    # The busy and quiet months the owner told AIBOS, so the page says where
+    # they change the reading (seasons.forecast_notes).
+    told = interview_api.seasons(interview_api.answers_for(db, ctx.tenant, biz))
     return {"ok": True, "outlook": outlook_api.outlook(state.get("monthly") or [], today=now.isoformat(),
                                                       daily=outlook_api.daily_sales(evs),
-                                                      daily_cost=outlook_api.daily_costs(evs))}
+                                                      daily_cost=outlook_api.daily_costs(evs),
+                                                      seasons=told)}
+
+
+class MonthsRequest(BaseModel):
+    rows: List[Dict[str, Any]]
+
+
+@app.post("/reports/months")
+def read_months(body: MonthsRequest, ctx: membership.Context = Depends(membership.require_context)):
+    """Unusual spending and Month by month, read with the busy and quiet
+    months the owner told AIBOS (seasons.py): the months a page shows, as
+    {month, revenue, costs} in order. Pure arithmetic on what is sent."""
+    if len(body.rows) > 240:
+        raise HTTPException(status_code=400, detail="At most 240 months.")
+    db = get_db()
+    told = interview_api.seasons(interview_api.answers_for(db, ctx.tenant, ctx.business_id))
+    return {"ok": True, **seasons_api.read(body.rows, told)}
 
 
 @app.get("/forecast/track-record")
@@ -6811,11 +6832,13 @@ def forecast_series(body: SeriesRequest, ctx: membership.Context = Depends(membe
     every row a finished period. Pure arithmetic on what is sent."""
     if len(body.rows) > 240:
         raise HTTPException(status_code=400, detail="At most 240 periods.")
-    return {"ok": True, "outlook": outlook_api.outlook(body.rows, complete=True)}
+    told = interview_api.seasons(interview_api.answers_for(get_db(), ctx.tenant, ctx.business_id))
+    return {"ok": True, "outlook": outlook_api.outlook(body.rows, complete=True, seasons=told)}
 
 
 class CashPlanRequest(BaseModel):
-    floor: float = 0.0
+    # Left out: the cash cushion the owner gave AIBOS in the interview, else zero.
+    floor: Optional[float] = None
     tz: int = 0
     scenarios: List[Dict[str, Any]] = []
 
@@ -6825,11 +6848,12 @@ def _plan_tier_ok(ctx: "membership.Context") -> bool:
 
 
 @app.get("/forecast/cash-plan")
-def cash_plan_route(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
+def cash_plan_route(floor: Optional[float] = Query(None, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
                     ctx: membership.Context = Depends(membership.require_context)):
     """The 13-week cash plan for the business being looked at. Growth sees all
     of it; any other plan sees its own headline risk, so the upgrade is argued
-    with the owner's real numbers (FeatureGate's locked-but-visible)."""
+    with the owner's real numbers (FeatureGate's locked-but-visible). With no
+    floor, the floor is the cash cushion the owner gave AIBOS (zero without)."""
     _sees_money(ctx)
     db = _require_db()
     if not _plan_tier_ok(ctx):
@@ -6852,7 +6876,8 @@ def cash_watch_route(tz: int = Query(0, ge=-840, le=840),
             return {"ok": True, "watch": {"ok": False, "preview": True, "reason": s.get("reason")}}
         return {"ok": True, "watch": {"ok": True, "preview": True, "chance_short_pct": s["chance_short_pct"],
                                       "chance_words": s["chance_words"], "first_risk_date": s.get("first_risk_date"),
-                                      "at_risk": s["chance_short_pct"] >= 5}}
+                                      "at_risk": s["chance_short_pct"] >= 5,
+                                      "floor": s.get("floor"), "floor_from": s.get("floor_from")}}
     return {"ok": True, "watch": s}
 
 
@@ -6865,7 +6890,7 @@ def cash_plan_decide(body: CashPlanRequest, ctx: membership.Context = Depends(me
     entitlements.require_feature(ctx.tenant, "cash_plan")
     if len(body.scenarios) > 10:
         raise HTTPException(status_code=400, detail="At most 10 decisions at once.")
-    if not (-840 <= body.tz <= 840) or body.floor < 0:
+    if not (-840 <= body.tz <= 840) or (body.floor is not None and body.floor < 0):
         raise HTTPException(status_code=400, detail="tz is minutes from UTC; the floor is zero or more.")
     db = _require_db()
     try:
@@ -6905,7 +6930,7 @@ def cash_plan_group(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0,
 
 
 @app.get("/forecast/cash-plan/bank.pdf")
-def cash_plan_bank_pdf(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
+def cash_plan_bank_pdf(floor: Optional[float] = Query(None, ge=0, le=1e12), tz: int = Query(0, ge=-840, le=840),
                        ctx: membership.Context = Depends(membership.require_context)):
     """The cash flow projection a bank asks for with a loan application
     (bank_pack.py): the money now, 12 months of money in, money out and
@@ -6929,7 +6954,8 @@ def cash_plan_bank_pdf(floor: float = Query(0.0, ge=0, le=1e12), tz: int = Query
     except Exception as e:  # noqa: BLE001 — the profile's name stands in
         log.info("[bank_pack] business name unreadable for %s: %s", ctx.tenant, e)
         name = None
-    doc = bank_pack.document(name or _business_name_for(db, ctx.tenant) or "The business", books, plan, year, floor)
+    doc = bank_pack.document(name or _business_name_for(db, ctx.tenant) or "The business", books, plan, year,
+                             plan.get("floor") or 0.0)
     if pdfdoc.available():
         return Response(content=pdfdoc.report(doc["title"], doc["blocks"], [doc["source"]], facts=doc["facts"]),
                         media_type="application/pdf",
@@ -6943,8 +6969,11 @@ def investigate_anomaly(month: Optional[str] = Query(None),
                               ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=ctx.business_id)
+    # A month the owner told AIBOS runs busy or quiet is not the anomaly explained
+    # for being what they said it is.
+    told = interview_api.seasons(interview_api.answers_for(db, ctx.tenant, ctx.business_id))
     result = (investigate_api.investigate_month(events, month)
-              if month else investigate_api.auto_investigation(events))
+              if month else investigate_api.auto_investigation(events, told))
     return {"ok": True, "investigation": result}
 
 

@@ -112,3 +112,14 @@ def test_money_in_and_out_follow_the_cash_figure():
     flows = investigate.monthly_flows(events)["2026-08"]
     state = digital_twin.project(events)
     assert round(flows["in"] - flows["out"], 2) == round(state["cash"], 2)
+
+
+def test_a_month_the_owner_said_runs_busy_is_not_the_one_explained():
+    """June's spending spike, in a June the owner told AIBOS runs busy: high
+    spending is what they said, so the investigation does not lead with it."""
+    events = _steady_history()
+    out = investigate.auto_investigation(events, {"busy": [6], "quiet": []})
+    assert out["ok"] is False and "you told AIBOS run busy or quiet" in out["reason"]
+    # A quiet June is not explained away: high spending is not what quiet means.
+    assert investigate.auto_investigation(events, {"busy": [], "quiet": [6]})["anomaly"]["month"] == "2026-06"
+    assert investigate.auto_investigation(events)["anomaly"]["month"] == "2026-06"

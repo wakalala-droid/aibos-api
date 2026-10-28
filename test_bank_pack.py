@@ -158,8 +158,13 @@ def test_money_owed_bills_known_and_loans_repaid_are_in_it(books, monkeypatch):
                                      occurred_at=(today + timedelta(days=10)).isoformat(),
                                      payload={"amount": 3000, "category": "generator service",
                                               "payment_method": "bank"}))
-    for k in range(5, 0, -1):                               # K2,500 to Zanaco every month
-        when = (today.replace(day=5) - timedelta(days=30 * k)).replace(day=5)
+    # K2,500 to Zanaco on the 5th of each of the last five months, the latest
+    # the most recent 5th already past (on the 28th, last month's alone would
+    # read as a repayment that has stopped).
+    latest = today.replace(day=5) if today.day > 5 else (today.replace(day=1) - timedelta(days=1)).replace(day=5)
+    for k in range(4, -1, -1):
+        idx = latest.year * 12 + latest.month - 1 - k
+        when = latest.replace(year=idx // 12, month=idx % 12 + 1)
         nervous.ingest(db, "u1", EventIn(event_type="Loan", source="manual", occurred_at=when.isoformat(),
                                          payload={"amount": 2500, "direction": "repayment", "lender": "Zanaco",
                                                   "payment_method": "bank"}))

@@ -184,12 +184,24 @@ def investigate_month(events: list, month: str, baseline_months: int = 3) -> dic
     }
 
 
-def auto_investigation(events: list) -> dict:
+def auto_investigation(events: list, seasons: dict | None = None) -> dict:
     """Detect + drill in one call: the worst recent anomaly, explained. The
-    homepage/anomaly page renders this without the owner asking anything."""
-    anomalies = detect_anomalous_months(events)
+    homepage/anomaly page renders this without the owner asking anything.
+
+    `seasons` are the busy and quiet months the owner told AIBOS
+    (interview.seasons): money in or out high in a busy month, or low in a
+    quiet one, is what they said it would be, so it is not the anomaly
+    explained (seasons.py holds the same rule for the reports)."""
+    import seasons as seasons_mod
+    found = detect_anomalous_months(events)
+    anomalies = [a for a in found
+                 if not seasons_mod.expected(seasons_mod.of(seasons or {}, a["month"]), "up" if a["z"] > 0 else "down")]
     if not anomalies:
         n = len(monthly_flows(events))
+        if found:
+            return {"ok": False,
+                    "reason": "The months that stand out are ones you told AIBOS run busy or quiet, "
+                              "so none is counted as unusual."}
         return {"ok": False,
                 "reason": (f"Only {n} month{'s' if n != 1 else ''} of recorded history — "
                            f"anomaly detection needs {MIN_MONTHS}."

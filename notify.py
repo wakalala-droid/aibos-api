@@ -151,6 +151,38 @@ def brief_day() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET)).strftime("%a %d %b")
 
 
+def goal_line(db, user_id: str, business_id: str | None, state: dict, sym: str = "K",
+              now: datetime | None = None) -> str | None:
+    """This month's sales against the target the interview's goal plan set
+    (interview.goal_plan, written when the owner pressed confirm), judged on
+    pace the way the plan card judges it (budgets.pace). None until the owner
+    has confirmed the plan, or when this month has no sales target."""
+    import budgets
+    import interview
+    import nervous_system as nervous_mod
+    import outlook
+
+    row = interview.load(db, user_id, business_id)
+    if not row or not row.get("plan_applied_at"):
+        return None
+    now = now or (datetime.now(timezone.utc) + timedelta(hours=LUSAKA_UTC_OFFSET))
+    month = now.strftime("%Y-%m")
+    monthly = state.get("monthly") or []
+    report = budgets.variance(monthly, budgets.list_budgets(db, user_id, month=month, business_id=business_id),
+                              month)
+    if not any(ln["metric"] == "revenue" for ln in report["lines"]):
+        return None
+    evs = nervous_mod.list_events(db, user_id, status="confirmed", limit=200000, business_id=business_id,
+                                  event_types=("Sale",) + outlook.COST_TYPES)
+    ol = outlook.outlook(monthly, today=now.isoformat(), daily=outlook.daily_sales(evs),
+                         daily_cost=outlook.daily_costs(evs))
+    if not ol.get("ok"):
+        return None
+    report = budgets.pace(report, ol.get("this_month"))
+    line = next(ln for ln in report["lines"] if ln["metric"] == "revenue")
+    return budgets.pace_words(line, month, sym)
+
+
 # The brief's last paragraph. The WhatsApp template carries its own copy of it,
 # so the WhatsApp send leaves this one off rather than saying it twice.
 BRIEF_SIGNOFF = "Any questions? Open AI-BOS and just ask."
@@ -193,6 +225,14 @@ def compose_brief(db, user_id: str, business_name: str | None,
                 lines.append(watch)
     except Exception as e:  # noqa: BLE001 — the brief goes out without it
         log.info("[notify] cash watch line skipped for %s: %s", user_id, e)
+
+    # The sales goal from the interview's plan: how this month is pacing.
+    try:
+        goal = goal_line(db, user_id, business_id, state, sym)
+        if goal:
+            lines.append(goal)
+    except Exception as e:  # noqa: BLE001 — the brief goes out without it
+        log.info("[notify] sales goal line skipped for %s: %s", user_id, e)
 
     # Yesterday / today sales from confirmed events.
     try:

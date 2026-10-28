@@ -31,8 +31,13 @@ positions), so a busy week is busy on both sides. Entries already confirmed
 but dated ahead are in today's money figure (books_views.money_line), so they
 are not counted again here.
 
+What the owner told AIBOS (interview.py, 28 October 2026) counts too: the
+cash cushion they want kept is the floor unless they set another; a loan
+repayment they said they make is counted on the 1st of each month while the
+books show none (so it is never counted twice). Each is marked as theirs.
+
 It answers: the chance the money goes below the floor (zero unless the owner
-sets one) week by week and overall, the lowest point, what is safe to spend
+sets one or gave a cushion) week by week and overall, the lowest point, what is safe to spend
 today, what fixes a shortfall and by how much, and what a decision does to all
 of it. A decision is run on the SAME simulated futures as the plan (common
 random numbers), so the difference is the decision and not chance.
@@ -126,6 +131,16 @@ def chance_sentence(p: float, what: str = "your money goes below zero") -> str:
 def _money(v: float, sym: str) -> str:
     v = round(float(v))
     return f"-{sym}{abs(v):,.0f}" if v < 0 else f"{sym}{v:,.0f}"
+
+
+def floor_words(floor: float, sym: str = "K", floor_from: str | None = None) -> str:
+    """The line the plan keeps above, as a sentence says it: 'zero',
+    'K5,000', or 'your K20,000 cushion' when it is the one the owner gave AIBOS."""
+    if not floor or floor <= 0:
+        return "zero"
+    if floor_from == "cushion":
+        return f"your {_money(floor, sym)} cushion"
+    return _money(floor, sym)
 
 
 # ── What each entry is, for the plan ─────────────────────────────────────────
@@ -509,6 +524,9 @@ def prepare(events: list, pending: list, invoices: list, schedule: list, cash_no
 
     regular = find_regular(outflows, today)
     regular_keys = {s["key"] for s in regular}
+    # A loan repaid in the last two months, by any route (a Loan entry, or an
+    # expense filed as a loan repayment): the books already show the loan.
+    loan_seen = any("loan" in key and (today - day).days <= 62 for day, key, _, _ in outflows)
     for day, key, label, amount in outflows:
         if key in regular_keys or key.startswith(STRUCTURAL) or key.startswith("loan:"):
             continue
@@ -570,7 +588,27 @@ def prepare(events: list, pending: list, invoices: list, schedule: list, cash_no
         },
         "paid_count": len(rec["paid"]),
         "regular": regular, "occurrences": occurrences, "known": known, "seasonal": seasonal,
+        "loan_seen": loan_seen or any("loan" in s["key"] for s in regular)
+        or any("loan" in k["key"] or "loan" in k["label"].lower() for k in known),
     }
+
+
+def told_loan(ctx: dict, monthly: float | None) -> list:
+    """The loan repayment the owner told AIBOS they make, as payments known to
+    be coming: on the 1st of each month in the plan (the day is not known, and
+    early is the cautious side). Nothing when the books already show the loan
+    being repaid: it is then in the plan from the books and never twice."""
+    if not monthly or monthly <= 0 or not ctx.get("ok") or ctx.get("loan_seen"):
+        return []
+    today = ctx["today"]
+    end = today + timedelta(days=DAYS - 1)
+    out = []
+    d = _add_months(today, 1, 1)
+    while d <= end:
+        out.append({"id": f"told:loan:{d.isoformat()}", "day": d.isoformat(), "amount": round(float(monthly), 2),
+                    "dir": "out", "key": "loan:told", "label": "Loan repayment", "source": "told"})
+        d = _add_months(d, 1, 1)
+    return out
 
 
 def known_ahead(pending: list, schedule: list, today: date, tz: int = 0) -> list:
@@ -847,7 +885,8 @@ def _risk(bal: np.ndarray, floor: float) -> dict:
             "weekly_short": weekly_short, "first_risk_week": first}
 
 
-def summarise(ctx: dict, sim: Sim, run: dict, floor: float = 0.0, sym: str = "K") -> dict:
+def summarise(ctx: dict, sim: Sim, run: dict, floor: float = 0.0, sym: str = "K",
+              floor_from: str | None = None) -> dict:
     bal = run["bal"]
     risk = _risk(bal, floor)
     q = np.quantile(bal, [0.1, 0.5, 0.9], axis=0)
@@ -879,6 +918,8 @@ def summarise(ctx: dict, sim: Sim, run: dict, floor: float = 0.0, sym: str = "K"
         "until": days[-1].isoformat(),
         "cash_now": round(sim.cash, 2),
         "floor": round(floor, 2),
+        # 'cushion' when the floor is the cash the owner told AIBOS to keep.
+        "floor_from": floor_from if floor > 0 and floor_from else None,
         "chance_short_pct": round(100 * risk["short"], 1),
         "chance_words": chance_words(risk["short"]),
         "lowest": {"p50": round(float(q[1][low_day]), 2), "day": days[low_day].isoformat(),
@@ -912,15 +953,15 @@ def _drivers(run: dict) -> dict:
 def headline(plan: dict, sym: str = "K") -> str:
     """One sentence an owner reads first."""
     p = plan["chance_short_pct"] / 100.0
-    floor = plan["floor"]
-    below = "below zero" if floor == 0 else f"below {_money(floor, sym)}"
+    line = floor_words(plan["floor"], sym, plan.get("floor_from"))
+    below = f"below {line}"
     if p >= 0.05 and plan.get("first_risk_date"):
         return (f"{chance_sentence(p, f'your money goes {below}')} in the next 13 weeks, "
                 f"first in the week of {_day_words(plan['first_risk_date'])}.")
     if p >= 0.05:
         return f"{chance_sentence(p, f'your money goes {below}')} in the next 13 weeks."
     safe = plan.get("safe_to_spend") or 0.0
-    return (f"Your money stays above {'zero' if floor == 0 else _money(floor, sym)} on 9 in 10 futures. "
+    return (f"Your money stays above {line} on 9 in 10 futures. "
             f"You could spend up to {_money(safe, sym)} today and keep it that way.")
 
 
@@ -949,8 +990,11 @@ def levers(ctx: dict, sim: Sim, base: dict, floor: float, sym: str = "K") -> lis
                   "Ask for deposits, send payment links the day you invoice.", {"faster": 7}))
     risk_end = 7 * (base["first_risk_week"] or WEEKS)
     # Never wages or ZRA, NAPSA and NHIMA: paying those late costs penalties
-    # and people, so AIBOS does not suggest it.
+    # and people, so AIBOS does not suggest it. Nor a repayment the owner told
+    # AIBOS about: its day is AIBOS's guess, so "move it" would be advice about
+    # a date nobody set.
     candidates = [k for k in sim.known if k["dir"] == "out" and not k["key"].startswith(STRUCTURAL)
+                  and k.get("source") != "told"
                   and (date.fromisoformat(k["day"]) - sim.days[0]).days < risk_end]
     candidates += [{"id": o["id"], "amount": o["amount"], "label": o["label"], "day": o["day"]}
                    for o in sim.occ if not o["key"].startswith(STRUCTURAL)
@@ -1106,14 +1150,22 @@ def hire_cost(basic: float, allowances: float, on: date) -> tuple[float, float]:
 
 def build(events: list, pending: list, invoices: list, schedule: list, cash_now: float,
           today: date | None = None, tz: int = 0, floor: float = 0.0, scenarios: list | None = None,
-          paths: int = PATHS, sym: str = "K", monthly_in: list | None = None) -> dict:
+          paths: int = PATHS, sym: str = "K", monthly_in: list | None = None,
+          floor_from: str | None = None, loan_monthly: float | None = None) -> dict:
+    """`floor_from` 'cushion' says the floor is the cash the owner told AIBOS
+    to keep; `loan_monthly` is the repayment they told AIBOS they make
+    (interview.py), counted only while the books show none."""
     today = today or (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
     ctx = prepare(events, pending, invoices, schedule, cash_now, today, tz, monthly_in)
     if not ctx["ok"]:
         return {**ctx, "known": _known_preview(pending, schedule, today, tz)}
+    told = told_loan(ctx, loan_monthly)
+    if told:
+        ctx["known"] = sorted(ctx["known"] + told, key=lambda k: (k["day"], -k["amount"]))
+        ctx["told_loan"] = told[0]["amount"]
     sim = simulate(ctx, paths)
     base_run = balances(sim)
-    plan = summarise(ctx, sim, base_run, floor, sym)
+    plan = summarise(ctx, sim, base_run, floor, sym, floor_from)
     plan["levers"] = levers(ctx, sim, plan, floor, sym)
     plan["debts"] = _debts(ctx, sim)
     plan["chase"] = chase(ctx, sim, plan, floor)
@@ -1124,11 +1176,13 @@ def build(events: list, pending: list, invoices: list, schedule: list, cash_now:
                        | {"next": s["dates"][:1]} for s in ctx["regular"]]
     plan["known"] = sim.known
     plan["accuracy"] = {name: f.accuracy() for name, f in sim.fits.items() if f is not None}
-    plan["assumptions"] = _assumptions(ctx, sim)
+    plan["assumptions"] = _assumptions(ctx, sim, sym, floor if plan["floor_from"] == "cushion" else None)
+    if ctx.get("told_loan"):
+        plan["told_loan"] = ctx["told_loan"]
     if scenarios:
         mods, words = scenario_mods(sim, scenarios, sym)
         run = balances(sim, mods)
-        after = summarise(ctx, sim, run, floor, sym)
+        after = summarise(ctx, sim, run, floor, sym, floor_from)
         plan["scenario"] = {
             "words": words,
             "plan": after,
@@ -1236,9 +1290,16 @@ def _debts(ctx: dict, sim: Sim) -> list:
     return out
 
 
-def _assumptions(ctx: dict, sim: Sim) -> list:
+def _assumptions(ctx: dict, sim: Sim, sym: str = "K", cushion: float | None = None) -> list:
     surv: PaySurvival = ctx["survival"]["credit"]
     words = [f"From your last {ctx['weeks_history']} weeks of recorded money in and out."]
+    # Said with "your" so the bank's copy reads "the business's" (bank_pack).
+    if cushion:
+        words.append(f"The line kept above is your {_money(cushion, sym)} cushion, from your answers to "
+                     "AIBOS: the cash to keep in the business at all times.")
+    if ctx.get("told_loan"):
+        words.append(f"A loan repayment of {_money(ctx['told_loan'], sym)} a month, from your answers to "
+                     "AIBOS: your books do not show it yet, so it is counted on the 1st of each month.")
     med = surv.median_days()
     if surv.observed >= PaySurvival.MIN_ITEMS:
         if med is not None:

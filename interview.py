@@ -12,6 +12,14 @@ What it does with the answers:
     good month?" is answered against the owner's own normal month and goal;
   • the money goals become a target for each coming month (goal_plan), written
     to budgets only when the owner presses confirm, never over one they set;
+    the morning brief then says how this month is pacing against its target;
+  • the cash cushion is the line the cash plan keeps above: what is safe to
+    spend and the low-cash warning are measured against it (cushion); a
+    loan repayment the books do not show yet is counted in the plan
+    (loan_monthly);
+  • the busy and quiet months stop a month that was always busy or quiet
+    being called unusual; the forecast says so where it matters
+    (seasons.py reads them through seasons());
   • the AIBOS workbook (starter_book.py) offers the owner's own payment methods
     and biggest costs first in its dropdowns.
 
@@ -173,7 +181,7 @@ QUESTIONS: tuple = (
     {"id": "loan_monthly", "chapter": "money", "kind": "money", "label": "Loan repayment a month",
      "ask": "How much do you repay each month?", "placeholder": "e.g. 4,000",
      "after": {"id": "loan", "not": ["No"]},
-     "why": "AIBOS keeps it in mind when you ask it what is safe to spend."},
+     "why": "AIBOS keeps it in mind when it talks about what is safe to spend."},
 
     # Money goals
     {"id": "sales_goal", "chapter": "money_goals", "kind": "money", "label": "Sales goal a month",
@@ -190,7 +198,7 @@ QUESTIONS: tuple = (
     {"id": "cushion", "chapter": "money_goals", "kind": "money", "label": "Cash cushion",
      "ask": "How much cash do you want to keep in the business at all times, as a cushion?",
      "placeholder": "e.g. 20,000",
-     "why": "AIBOS keeps it in mind when you ask it what is safe to spend."},
+     "why": "AIBOS keeps it in mind when it tells you what is safe to spend."},
     {"id": "saving_for", "chapter": "money_goals", "kind": "text", "label": "Saving for",
      "ask": "Are you saving for something big? Say what and roughly how much.",
      "placeholder": "e.g. A delivery van, about K150,000",
@@ -633,7 +641,7 @@ def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) 
     if qid in ("busy_months", "quiet_months"):
         names = join_words([MONTH_NAMES[m - 1] for m in v])
         word = "busy" if qid == "busy_months" else "quiet"
-        return f"AIBOS will keep in mind that {names} run {word} when it answers you."
+        return f"AIBOS will keep in mind that {names} run {word}, in its answers and in your reports."
 
     return None
 
@@ -792,6 +800,56 @@ def own_targets(kept: list) -> int:
         except (TypeError, ValueError):
             out += 1
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# For the rest of AIBOS
+# ══════════════════════════════════════════════════════════════════════════════
+# What the cash plan, the reports and the morning brief take from the answers.
+# Only what the owner actually said: a skipped question gives None, never a guess.
+
+def _positive(answers: dict, qid: str) -> float | None:
+    v = _value(answers, qid)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def cushion(answers: dict) -> float | None:
+    """The cash the owner wants kept in the business at all times."""
+    return _positive(answers, "cushion")
+
+
+def loan_monthly(answers: dict) -> float | None:
+    """What the owner repays on a loan each month, while they say there is one."""
+    if _value(answers, "loan") in (None, "No"):
+        return None
+    return _positive(answers, "loan_monthly")
+
+
+def seasons(answers: dict) -> dict:
+    """{'busy': [11, 12], 'quiet': [1]}: the months the owner named. A month
+    named both busy and quiet says nothing either way, so it is in neither."""
+    def months(qid):
+        v = _value(answers, qid)
+        return {int(m) for m in (v if isinstance(v, list) else []) if isinstance(m, int) and 1 <= m <= 12}
+    busy, quiet = months("busy_months"), months("quiet_months")
+    both = busy & quiet
+    return {"busy": sorted(busy - both), "quiet": sorted(quiet - both)}
+
+
+def answers_for(db, user_id: str, business_id: str | None) -> dict:
+    """This business's answers, or {} when there are none, the table is not
+    there yet or the read fails. Never raises: nothing breaks over the interview."""
+    if db is None:
+        return {}
+    try:
+        return (load(db, user_id, business_id) or {}).get("answers") or {}
+    except Exception as exc:  # noqa: BLE001
+        log.info("[interview] answers unavailable for %s: %s", user_id, exc)
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

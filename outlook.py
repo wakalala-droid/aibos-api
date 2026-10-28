@@ -73,9 +73,11 @@ def daily_costs(events: list) -> dict:
 
 
 def outlook(monthly: list, today: str | None = None, daily: dict | None = None,
-            complete: bool = False, daily_cost: dict | None = None) -> dict:
+            complete: bool = False, daily_cost: dict | None = None, seasons: dict | None = None) -> dict:
     """`monthly` rows {month, revenue, costs}. With `complete` (an uploaded
-    file) every row is a finished period and none is the month running now."""
+    file) every row is a finished period and none is the month running now.
+    `seasons` are the busy and quiet months the owner told AIBOS
+    (interview.seasons): the outlook then says where they change its reading."""
     today = today or datetime.now(timezone.utc).isoformat()
     current = str(today)[:7]
     keyed = all(fe.month_index(m.get("month")) is not None for m in monthly or [])
@@ -156,7 +158,17 @@ def outlook(monthly: list, today: str | None = None, daily: dict | None = None,
         first["profit"] = {k: round(v + shift, 2) for k, v in first["profit"].items()}
 
     acc = fr["accuracy"]
+    if seasons:
+        import seasons as seasons_mod
+        for a in ahead:
+            a["season"] = seasons_mod.of(seasons, a["month"])
+        said = seasons_mod.forecast_notes([a["month"] for a in ahead], fr["softened"],
+                                          fr["seasonal"] is not None, seasons)
+    else:
+        said = {"notes": [], "named": []}
     return {
+        "season_notes": said["notes"],
+        "softened_named": said["named"],
         "ok": True,
         "points": n,
         "history": [{"month": r["month"], "revenue": round(r["revenue"], 2), "costs": round(r["costs"], 2),

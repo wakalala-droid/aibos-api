@@ -200,7 +200,7 @@ def test_a_cushion_in_weeks_of_costs():
 def test_months_are_said_back_without_a_comma_before_and():
     a = _say({}, "busy_months", ["Oct", "Nov", "Dec"])
     assert iv.reflect("busy_months", a) == \
-        "AIBOS will keep in mind that October, November and December run busy when it answers you."
+        "AIBOS will keep in mind that October, November and December run busy, in its answers and in your reports."
 
 
 def test_nothing_is_said_back_about_a_skip_or_an_unknown_link():
@@ -297,6 +297,33 @@ def test_a_target_the_owner_set_is_never_overwritten():
 
 def test_plan_figures_are_round():
     assert iv._round_plan(55555) == 55600 and iv._round_plan(456) == 460
+
+
+# ── For the rest of AIBOS ─────────────────────────────────────────────────────
+
+def test_the_cushion_and_the_loan_are_only_what_the_owner_said():
+    assert iv.cushion({}) is None and iv.loan_monthly({}) is None
+    assert iv.cushion(_say({}, "cushion", "20k")) == 20000
+    assert iv.cushion(_say({}, "cushion", skip=True)) is None
+    assert iv.cushion(_say({}, "cushion", "0")) is None             # nothing to keep is no cushion
+    a = _say(_say({}, "loan", "Yes, to a bank"), "loan_monthly", "4,000")
+    assert iv.loan_monthly(a) == 4000
+    # "No loan" takes its repayment with it.
+    assert iv.loan_monthly(_say(a, "loan", "No")) is None
+
+
+def test_the_cushion_and_loan_questions_say_what_aibos_does_with_them():
+    # The cash plan keeps the cushion as its floor and counts the repayment
+    # (cash_watch.build), so the questions may say so.
+    assert "safe to spend" in iv.BY_ID["cushion"]["why"] and "tells you" in iv.BY_ID["cushion"]["why"]
+    assert "safe to spend" in iv.BY_ID["loan_monthly"]["why"]
+
+
+def test_the_answers_are_read_without_ever_breaking_what_reads_them():
+    class Broken:
+        def table(self, name):
+            raise RuntimeError("database down")
+    assert iv.answers_for(Broken(), "u1", "b1") == {} and iv.answers_for(None, "u1", "b1") == {}
 
 
 # ── The routes ────────────────────────────────────────────────────────────────

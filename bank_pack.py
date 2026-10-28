@@ -43,7 +43,7 @@ PER_MONTH = {"monthly": 1.0, "fortnightly": 26 / 12, "weekly": 52 / 12}
 CADENCE_WORDS = {"monthly": "Every month", "fortnightly": "Every two weeks", "weekly": "Every week"}
 PLACES = (("cash", "Cash"), ("mobile_money", "Mobile money"), ("bank", "Bank and card"))
 SOMETIMES = (("unsaid", "Not said how"), ("opening", "Starting balance"))
-SOURCE_WORDS = {"waiting": "Waiting in the books", "schedule": "Schedule"}
+SOURCE_WORDS = {"waiting": "Waiting in the books", "schedule": "Schedule", "told": "The owner's word"}
 KNOWN_ROWS = 30
 TITLE = "Cash flow projection"
 

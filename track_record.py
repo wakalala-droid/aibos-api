@@ -185,7 +185,8 @@ def keep(db, now: datetime | None = None) -> dict:
             if (uid, bid, CASH) in kept:
                 out["already"] += 1
                 continue
-            snap = cash_snapshot(cash_watch.build(db, uid, bid, tz=TZ))
+            # Floor zero: the chance kept beside it is the chance of going below zero.
+            snap = cash_snapshot(cash_watch.build(db, uid, bid, tz=TZ, floor=0.0))
             if snap is None:
                 out["too_new"] += 1
             else:

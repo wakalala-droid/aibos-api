@@ -335,6 +335,52 @@ def test_two_debts_from_one_customer_are_one_reminder():
         assert "invoices INV-" in msg and " and INV-" in msg
     assert "https://x/pay/a" in msg and "https://x/pay/b" in msg
 
+
+# ── What the owner told AIBOS (interview.py, 28 Oct 2026) ────────────────────
+
+def test_the_cushion_is_named_as_the_owners_own_line():
+    events, pending, invoices, schedule = shop()
+    kw = dict(today=TODAY, paths=300)
+    plain = cp.build(events, pending, invoices, schedule, 60000.0, floor=20000.0, **kw)
+    told = cp.build(events, pending, invoices, schedule, 60000.0, floor=20000.0, floor_from="cushion", **kw)
+    # The same plan: only the words say whose line it is.
+    assert told["safe_to_spend"] == plain["safe_to_spend"] and told["chance_short_pct"] == plain["chance_short_pct"]
+    assert plain["floor_from"] is None and told["floor_from"] == "cushion"
+    assert "your K20,000 cushion" in told["headline"] and "cushion" not in plain["headline"]
+    assert any("K20,000 cushion" in a and "answers to AIBOS" in a for a in told["assumptions"])
+    assert cp.floor_words(0, "K", "cushion") == "zero"            # no floor is never a cushion
+    # Almost sure to go below it still reads as a person says it.
+    assert cp.chance_sentence(1.0, "your money goes below your K20,000 cushion") == \
+        "Your money is almost certain to go below your K20,000 cushion"
+
+
+def test_a_loan_the_books_do_not_show_is_counted_from_the_owners_word():
+    events, pending, invoices, schedule = shop()
+    kw = dict(today=TODAY, paths=300)
+    without = cp.build(events, pending, invoices, schedule, 60000.0, **kw)
+    told = cp.build(events, pending, invoices, schedule, 60000.0, loan_monthly=4000.0, **kw)
+    loans = [k for k in told["known"] if k["source"] == "told"]
+    # 13 weeks from 16 Oct: the 1st of November, December and January.
+    assert [k["day"] for k in loans] == ["2026-11-01", "2026-12-01", "2027-01-01"]
+    assert all(k["amount"] == 4000.0 and k["dir"] == "out" and k["label"] == "Loan repayment" for k in loans)
+    assert told["told_loan"] == 4000.0
+    assert told["close"]["p50"] == round(without["close"]["p50"] - 12000.0, 2)
+    assert told["safe_to_spend"] < without["safe_to_spend"]
+    assert any("K4,000 a month" in a and "1st of each month" in a for a in told["assumptions"])
+    # Its day is AIBOS's guess, so moving it is never suggested.
+    burn = cp.build(*shop(burn=True), 6000.0, loan_monthly=4000.0, **kw)
+    assert not any("Loan repayment" in lv["title"] for lv in burn["levers"])
+
+
+def test_a_loan_the_books_already_show_is_never_counted_twice():
+    events, pending, invoices, schedule = shop()
+    for k in range(1, 4):                                  # repaid on the 5th of the last three months
+        events.append(_ev("Loan", cp._add_months(TODAY, -k, 5), 2500.0, direction="repayment",
+                          lender="Zanaco", payment_method="bank"))
+    plan = cp.build(events, pending, invoices, schedule, 60000.0, today=TODAY, paths=300, loan_monthly=4000.0)
+    assert not any(k["source"] == "told" for k in plan["known"]) and "told_loan" not in plan
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

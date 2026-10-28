@@ -279,3 +279,131 @@ def test_the_plan_card_judges_this_month_on_pace(books):
     line = out["lines"][0]
     assert out.get("pace") is True and line["on_pace"] is True and line["projected"] > 1
     assert 0 <= line["chance_pct"] <= 100
+
+
+# ── What the owner told AIBOS (interview.py, 28 Oct 2026) ────────────────────
+
+def _told(db, plan_applied=False, **answers):
+    """The owner's interview answers for the default business, as the
+    interview route saves them."""
+    import businesses
+    import interview
+    a = {}
+    for qid, value in answers.items():
+        a = interview.record(a, qid, value)
+    row = {"id": "iv1", "user_id": "u1", "business_id": businesses.default_business_id(db, "u1"), "answers": a}
+    if plan_applied:
+        row["plan_applied_at"] = datetime.now(timezone.utc).isoformat()
+    db.rows["business_interviews"] = [row]
+
+
+def test_the_cushion_the_owner_gave_is_the_floor_until_they_type_another(books):
+    api, db = books
+    _tier(db, "growth")
+    zero = api.get("/forecast/cash-plan").json()["plan"]
+    _told(db, cushion="20,000")
+    plan = api.get("/forecast/cash-plan").json()["plan"]
+    assert plan["floor"] == 20000 and plan["floor_from"] == "cushion" and plan["cushion"] == 20000
+    assert "your K20,000 cushion" in plan["headline"]
+    # The same futures, the cushion kept back: what is safe to spend is K20,000 less.
+    assert plan["safe_to_spend"] == round(zero["safe_to_spend"] - 20000, 2)
+    # A floor the owner types wins; the cushion is still offered back.
+    typed = api.get("/forecast/cash-plan?floor=0").json()["plan"]
+    assert typed["floor"] == 0 and typed["floor_from"] is None and typed["cushion"] == 20000
+    assert typed["safe_to_spend"] == zero["safe_to_spend"]
+    # Typed at the cushion's own figure, it is still the cushion.
+    assert api.get("/forecast/cash-plan?floor=20000").json()["plan"]["floor_from"] == "cushion"
+    # A decision is tried against the cushion too.
+    tried = api.post("/forecast/cash-plan", json={"scenarios": [
+        {"type": "one_off", "direction": "out", "amount": 1000}]}).json()["plan"]
+    assert tried["floor"] == 20000 and tried["scenario"]["plan"]["floor_from"] == "cushion"
+
+
+def test_home_and_the_morning_brief_keep_the_cushion(books):
+    import notify
+    api, db = books
+    _tier(db, "growth")
+    _told(db, cushion="20000")
+    cash_watch._SUMMARY.clear()
+    w = api.get("/forecast/cash-watch").json()["watch"]
+    assert w["floor"] == 20000 and w["floor_from"] == "cushion" and "your K20,000 cushion" in w["headline"]
+    _, body = notify.compose_brief(db, "u1", "Zoe's Kitchen")
+    assert "Cash watch: clear for 13 weeks above your K20,000 cushion." in body
+    cash_watch._SUMMARY.clear()
+
+
+def test_the_low_cash_warning_rings_below_the_cushion(books):
+    api, db = books
+    _tier(db, "growth")
+    _told(db, cushion="10,000,000")                  # more than the business has
+    sent = []
+    cash_watch._CHECKED["day"] = None
+    out = cash_watch.daily(db, lambda db_, uid, kind, title, body, link, meta: sent.append((kind, title, body)) or True,
+                           now=datetime.now(timezone.utc).replace(hour=6))
+    assert out["warned"] == 1
+    kind, title, body = next(s for s in sent if s[0] == "cash_watch")
+    assert title == "Your cash is below your K10,000,000 cushion"
+    assert "you told AIBOS to keep at all times" in body and "—" not in body
+    cash_watch._CHECKED["day"] = None
+
+
+def test_a_cushion_short_of_the_money_warns_as_a_chance_of_going_below_it():
+    plan = {"ok": True, "floor": 20000.0, "floor_from": "cushion", "cash_now": 30000.0, "levers": [],
+            "weeks": [{"start": "2026-11-02", "chance_short_pct": 40.0}] + [{"start": "2026-11-09", "chance_short_pct": 10.0}] * 3}
+    w = cash_watch.warning(plan, "K")
+    assert w["title"] == "Cash may go below your K20,000 cushion in the week of 2 Nov"
+    assert w["body"] == "1 in 2 chance your money goes below your K20,000 cushion by then."
+
+
+def test_a_loan_the_owner_told_aibos_about_is_in_the_plan_and_the_bank_pack(books, monkeypatch):
+    import pdfdoc
+    api, db = books
+    _tier(db, "growth")
+    before = api.get("/forecast/cash-plan").json()["plan"]
+    _told(db, loan="Yes, to a bank", loan_monthly="3,000")
+    plan = api.get("/forecast/cash-plan").json()["plan"]
+    told = [k for k in plan["known"] if k["source"] == "told"]
+    assert told and all(k["day"].endswith("-01") and k["amount"] == 3000 for k in told)
+    assert plan["told_loan"] == 3000 and plan["safe_to_spend"] < before["safe_to_spend"]
+    monkeypatch.setattr(pdfdoc, "available", lambda: False)        # the text copy carries the same words
+    text = api.get("/forecast/cash-plan/bank.pdf").text
+    assert "The owner's word" in text and "the business's answers to AIBOS" in text
+
+
+def test_ask_aibos_reads_the_plan_against_the_cushion(books):
+    import cfo_tools
+    api, db = books
+    _tier(db, "growth")
+    _told(db, cushion="15000")
+    out = cfo_tools.run_tool(db, "u1", "cash_plan", {})
+    assert out["floor"] == 15000 and out["floor_from"] == "cushion"
+    assert cfo_tools.run_tool(db, "u1", "cash_plan", {"floor": 0})["floor"] == 0
+
+
+def test_the_morning_brief_paces_the_sales_goal_once_the_plan_is_confirmed(books):
+    import budgets
+    import businesses
+    import notify
+    api, db = books
+    month = (datetime.now(timezone.utc) + timedelta(hours=notify.LUSAKA_UTC_OFFSET)).strftime("%Y-%m")
+    # Written for the business, as a signed-in owner's request writes it.
+    budgets.set_budget(db, "u1", month, "revenue", 1, business_id=businesses.default_business_id(db, "u1"))
+    _, body = notify.compose_brief(db, "u1", "Zoe's Kitchen")
+    assert "Sales goal:" not in body                         # a target, but not from the plan
+    _told(db, plan_applied=True, sales_goal="80000")
+    _, body = notify.compose_brief(db, "u1", "Zoe's Kitchen")
+    line = next(ln for ln in body.split("\n\n") if ln.startswith("Sales goal:"))
+    assert "K1 target for" in line and ("in already, past" in line or "above the" in line)
+
+
+def test_the_sales_goal_line_says_where_the_month_stands():
+    import budgets
+    line = {"metric": "revenue", "target": 55000, "actual": 20000, "projected": 42000, "per_day": 1450.0}
+    assert budgets.pace_words(line, "2026-11") == \
+        "Sales goal: on pace for K42,000, short of the K55,000 target for November. K1,450 a day from here reaches it."
+    assert budgets.pace_words({**line, "projected": 58000}, "2026-11") == \
+        "Sales goal: on pace for K58,000, above the K55,000 target for November."
+    assert budgets.pace_words({**line, "actual": 56000}, "2026-11") == \
+        "Sales goal: K56,000 in already, past the K55,000 target for November."
+    assert budgets.pace_words({**line, "metric": "costs"}, "2026-11") is None
+    assert budgets.pace_words({"metric": "revenue", "target": 55000, "actual": 0}, "2026-11") is None   # no pace read
