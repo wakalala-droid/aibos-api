@@ -63,8 +63,39 @@ _QR_FIELD_ALIASES = {
     "tax":      ("tax", "vat", "taxamount", "tt"),
     "date":     ("date", "datetime", "time", "invoicedate", "dt"),
     "supplier": ("supplier", "seller", "merchant", "vendor", "tpin", "tin", "bhfid", "company"),
-    "invoice":  ("invoice", "invoiceno", "receiptno", "rcptno", "ref", "fiscalcode"),
+    "invoice":  ("invoice", "invoiceno", "invoicenumber", "invcno", "receiptno", "rcptno", "ref", "fiscalcode"),
+    # What a ZRA Smart Invoice carries besides the sale: the seller's TPIN, the
+    # signature ZRA gave the invoice, the VSDC that issued it, its Mark ID.
+    "tpin":      ("tpin", "sellertpin", "suppliertpin", "tin"),
+    "signature": ("rcptsign", "receiptsignature", "signature", "sign"),
+    "sdc":       ("sdcid", "sdc"),
+    "internal":  ("intrldata", "internaldata"),
+    "mark":      ("markid", "mark"),
 }
+
+# A Zambian TPIN is ten digits.
+TPIN = re.compile(r"\d{10}")
+
+
+def zra_receipt_link(payload: str) -> dict | None:
+    """The ZRA Smart Invoice QR: a link to the receipt on ZRA's portal whose
+    Data is the seller's TPIN (10 digits), its branch (3 digits) and the
+    receipt signature ZRA gave the invoice, run together. It carries no total
+    and no VAT: those are read from the receipt or typed by the owner.
+    None when the QR is not that link."""
+    s = (payload or "").strip()
+    if not s.lower().startswith(("http://", "https://")):
+        return None
+    u = urlparse(s)
+    host = (u.hostname or "").lower()
+    if not (host == "zra.org.zm" or host.endswith(".zra.org.zm")):
+        return None
+    data = next((v[0] for k, v in parse_qs(u.query).items() if k.lower() == "data" and v), "")
+    data = re.sub(r"\s+", "", data)
+    m = re.fullmatch(r"(\d{10})(\d{3})([A-Za-z0-9]{8,})", data)
+    if not m:
+        return None
+    return {"tpin": m.group(1), "branch": m.group(2), "signature": m.group(3).upper(), "url": s[:300]}
 
 
 def _qr_to_dict(payload: str) -> dict:
@@ -137,7 +168,26 @@ def _coerce_amount(v) -> float | None:
 
 
 def parse_qr(payload: str, currency: str = "ZMW") -> dict:
-    """Decoded QR string → a proposed Purchase event (a receipt is money out)."""
+    """Decoded QR string → a proposed Purchase event (a receipt is money out).
+
+    A ZRA Smart Invoice is marked as one (smart_invoice, supplier_tpin, and
+    the receipt signature or invoice number), so its VAT counts as VAT the
+    business can claim (books_views.vat_claim)."""
+    link = zra_receipt_link(payload)
+    if link:
+        return {
+            "event_type": "Purchase",
+            "payload": {"currency": currency, "smart_invoice": True, "supplier_tpin": link["tpin"],
+                        "zra_branch": link["branch"], "zra_signature": link["signature"],
+                        "zra_verify_url": link["url"], "external_ref": link["signature"][:80],
+                        "note": "Scanned ZRA Smart Invoice (QR)"},
+            "occurred_at": None,
+            "confidence": 0.5,
+            "reasoning": (f"A ZRA Smart Invoice from TPIN {link['tpin']}. Its QR code holds no total "
+                          "or VAT: add the total and the VAT from the invoice."),
+            "source": "qr",
+        }
+
     flat = _qr_to_dict(payload)
     found: dict = {}
     for field, aliases in _QR_FIELD_ALIASES.items():
@@ -160,6 +210,24 @@ def parse_qr(payload: str, currency: str = "ZMW") -> dict:
         payload_out["invoice_ref"] = str(found["invoice"])[:80]
         payload_out["external_ref"] = str(found["invoice"])[:80]  # dedupe re-scans
     payload_out["note"] = "Scanned receipt (QR)"
+
+    # A Smart Invoice in another layout: the seller's TPIN, something that
+    # names the invoice, and a mark that ZRA issued it (its portal, the
+    # signature, the VSDC, the internal data or the Mark ID).
+    tpin = re.sub(r"\D", "", str(found.get("tpin") or ""))
+    host = (urlparse(payload.strip()).hostname or "").lower() if payload else ""
+    from_zra = host == "zra.org.zm" or host.endswith(".zra.org.zm")
+    signature = re.sub(r"\s+", "", str(found.get("signature") or "")).upper()[:120]
+    if TPIN.fullmatch(tpin) and (signature or found.get("invoice")) and (
+            from_zra or signature or found.get("sdc") or found.get("internal") or found.get("mark")):
+        payload_out.update({"smart_invoice": True, "supplier_tpin": tpin})
+        if signature:
+            payload_out["zra_signature"] = signature
+        if found.get("sdc"):
+            payload_out["zra_sdc_id"] = str(found["sdc"])[:40]
+        if found.get("mark"):
+            payload_out["zra_mark_id"] = str(found["mark"])[:80]
+        payload_out["note"] = "Scanned ZRA Smart Invoice (QR)"
 
     occurred = _parse_date(found.get("date")) if found.get("date") else None
     # Confidence scales with how much we recognised; amount is the keystone.

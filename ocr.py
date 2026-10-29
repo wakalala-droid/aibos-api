@@ -14,13 +14,14 @@ it is base64-inlined to whichever provider llm.py selects, and not persisted her
 """
 
 import os
+import re
 
 import llm
 import json
 import base64
 import logging
 
-from ingestion import register_parser, _parse_date  # reuse the date parser
+from ingestion import TPIN, register_parser, _parse_date  # reuse the date parser
 
 log = logging.getLogger("aibos.ocr")
 
@@ -34,10 +35,13 @@ PROMPT = (
     '{"event_type":"Purchase","payload":{"amount":<grand total, number>,'
     '"currency":"<code>","supplier":"<merchant name>","tax":<tax amount if shown>,'
     '"payment_method":"<cash|card|mobile_money|bank if shown>",'
-    '"items":["name", ...],"quantities":[<number>, ...]},'
+    '"items":["name", ...],"quantities":[<number>, ...],'
+    '"supplier_tpin":"<the seller\'s 10-digit TPIN if printed>","invoice_no":"<invoice or receipt number>",'
+    '"receipt_signature":"<ZRA receipt signature if printed>","sdc_id":"<SDC ID if printed>"},'
     '"occurred_at":"YYYY-MM-DD or null","confidence":<0..1>}\n'
-    "Rules: amount is the TOTAL actually paid, a positive number. Only include "
-    "fields you can actually read from the image. items[] and quantities[] must be "
+    "Rules: amount is the TOTAL actually paid, a positive number. tax is the VAT "
+    "on the receipt. Only include fields you can actually read from the image, "
+    "copied exactly. items[] and quantities[] must be "
     "equal length. If the image is not a readable receipt, return confidence 0."
 )
 
@@ -85,6 +89,25 @@ def parse_vision_json(raw: str, currency: str = "ZMW") -> dict:
         payload["items"] = [str(x)[:80] for x in items]
         payload["quantities"] = [(_coerce_amount(q) or 0) for q in qtys]
     payload["note"] = "Scanned receipt (photo)"
+
+    # A ZRA Smart Invoice prints the seller's TPIN with the signature ZRA gave
+    # it or the VSDC that issued it. Both read: its VAT is VAT the business
+    # can claim (books_views.vat_claim). A TPIN alone is any receipt.
+    tpin = re.sub(r"\D", "", str(raw_payload.get("supplier_tpin") or ""))
+    signature = re.sub(r"\s+", "", str(raw_payload.get("receipt_signature") or "")).upper()[:120]
+    sdc = str(raw_payload.get("sdc_id") or "").strip()[:40]
+    invoice = str(raw_payload.get("invoice_no") or "").strip()[:80]
+    if invoice:
+        payload["invoice_ref"] = invoice
+    if TPIN.fullmatch(tpin):
+        payload["supplier_tpin"] = tpin
+        if signature or sdc:
+            payload["smart_invoice"] = True
+            if signature:
+                payload["zra_signature"] = signature
+            if sdc:
+                payload["zra_sdc_id"] = sdc
+            payload["note"] = "Scanned ZRA Smart Invoice (photo)"
 
     proposal["payload"] = payload
     proposal["occurred_at"] = _parse_date(data.get("occurred_at")) if data.get("occurred_at") else None

@@ -8773,17 +8773,30 @@ def books_money_out(start: Optional[str] = Query(None), end: Optional[str] = Que
     ISO timestamps; everything when they are left out. Confirmed entries only,
     every one of them, by what each was for."""
     _sees_money(ctx)
-
-    def when(value):
-        if not value:
-            return None
-        parsed = books_views._parse(value)
-        if parsed is None:
-            raise HTTPException(status_code=400, detail="start and end must be dates, like 2026-10-01T00:00:00Z.")
-        return parsed
-
     books = _money_books(_require_db(), ctx)
-    return {"ok": True, **books_views.money_out(books["events"], when(start), when(end))}
+    return {"ok": True, **books_views.money_out(books["events"], _period_bound(start), _period_bound(end))}
+
+
+def _period_bound(value: Optional[str]):
+    """One end of a period asked for in a query, or None for no limit."""
+    if not value:
+        return None
+    parsed = books_views._parse(value)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="start and end must be dates, like 2026-10-01T00:00:00Z.")
+    return parsed
+
+
+@app.get("/books/vat")
+def books_vat(start: Optional[str] = Query(None), end: Optional[str] = Query(None),
+              ctx: membership.Context = Depends(membership.require_context)):
+    """The VAT on what was bought between `start` (included) and `end` (left
+    out): what the business can claim, because a ZRA Smart Invoice backs it,
+    and what it bought without one. Confirmed entries only, every one of them
+    (books_views.vat_claim)."""
+    _sees_money(ctx)
+    books = _money_books(_require_db(), ctx)
+    return {"ok": True, **books_views.vat_claim(books["events"], _period_bound(start), _period_bound(end))}
 
 
 @app.get("/books/costs")

@@ -337,3 +337,101 @@ def waiting(events: list) -> dict:
         else:
             o -= moved
     return {"count": count, "in": money.kwacha(i), "out": money.kwacha(o)}
+
+
+# ── VAT you can claim ─────────────────────────────────────────────────────────
+
+# What a business buys for itself, with VAT on it when the seller charges VAT:
+# stock, supplies, running costs and equipment. Wages, tax, loans and paying
+# off a supplier carry no VAT of their own (the purchase they settle does).
+PURCHASES = ("Purchase", "Expense", "InventoryReceipt", "AssetPurchase")
+_TPIN_DIGITS = 10
+
+
+def smart_invoice_of(payload: dict | None) -> tuple | None:
+    """The ZRA Smart Invoice an entry was recorded from, as (TPIN, invoice):
+    the seller's TPIN and the signature ZRA gave the invoice, or its number.
+    Set when its QR code or its photo was read (ingestion.parse_qr,
+    ocr.parse_vision_json); None for anything else."""
+    p = payload or {}
+    flag = p.get("smart_invoice")
+    if not (flag is True or str(flag).strip().lower() in ("true", "yes", "1")):
+        return None
+    tpin = str(p.get("supplier_tpin") or "").strip()
+    invoice = str(p.get("zra_signature") or p.get("invoice_ref") or "").strip().upper()
+    if not (len(tpin) == _TPIN_DIGITS and tpin.isdigit()) or not invoice:
+        return None
+    return tpin, invoice
+
+
+def _vat_on(payload: dict) -> int | None:
+    """The VAT recorded on an entry, in ngwee; None when none was recorded."""
+    for key in ("tax", "vat"):
+        if payload.get(key) not in (None, ""):
+            return money.ngwee(payload.get(key))
+    return None
+
+
+def vat_claim(events: list, start: datetime | None = None, end: datetime | None = None) -> dict:
+    """The VAT on what the business bought between start (included) and end
+    (left out), split by whether it can be claimed back.
+
+    Since 1 January 2025 input VAT in Zambia is claimed only against a ZRA
+    Smart Invoice. So the VAT on purchases recorded from one is VAT the
+    business can claim; what was bought without one is money whose VAT, if
+    the seller charged any, cannot be claimed. A Smart Invoice recorded twice
+    is claimed once: the first entry keeps it, wherever in the books it falls,
+    and the second is listed so it can be removed. Confirmed entries only, in
+    whole ngwee, with the money figure's own rounding."""
+    bought = [ev for ev in events or []
+              if _confirmed(ev) and ev.get("event_type") in PURCHASES]
+    bought.sort(key=lambda ev: (str(ev.get("occurred_at") or ""), str(ev.get("id") or "")))
+
+    claim, lost, twice = [], [], []
+    claim_vat = lost_spent = lost_vat = twice_vat = 0
+    no_vat_figure = 0
+    seen: set = set()
+    for ev in bought:
+        p = ev.get("payload") or {}
+        invoice = smart_invoice_of(p)
+        first = invoice is not None and invoice not in seen
+        if invoice is not None:
+            seen.add(invoice)
+        when = _parse(ev.get("occurred_at"))
+        if start and (when is None or when < start):
+            continue
+        if end and (when is None or when >= end):
+            continue
+        vat = _vat_on(p)
+        amount = money.ngwee(p.get("amount"))
+        row = {
+            "id": ev.get("id"), "event_type": ev.get("event_type"), "occurred_at": ev.get("occurred_at"),
+            "supplier": p.get("supplier") or p.get("asset_name") or p.get("category") or None,
+            "amount": money.kwacha(amount), "vat": None if vat is None else money.kwacha(vat),
+        }
+        if invoice is not None:
+            row.update({"tpin": invoice[0],
+                        "invoice": p.get("invoice_ref") or p.get("zra_signature")})
+        if invoice is None:
+            lost.append(row)
+            lost_spent += amount
+            lost_vat += vat or 0
+        elif first:
+            claim.append(row)
+            claim_vat += vat or 0
+            no_vat_figure += 1 if vat is None else 0
+        else:
+            twice.append(row)
+            twice_vat += vat or 0
+
+    claim.reverse()                                              # newest first
+    twice.reverse()
+    lost.sort(key=lambda r: (-r["amount"], str(r["occurred_at"] or "")))   # biggest first
+    K = money.kwacha
+    return {
+        "claim": {"vat": K(claim_vat), "count": len(claim), "no_vat_figure": no_vat_figure,
+                  "entries": claim},
+        "lost": {"spent": K(lost_spent), "vat_shown": K(lost_vat), "count": len(lost), "entries": lost},
+        "twice": {"vat": K(twice_vat), "count": len(twice), "entries": twice},
+        "ever": bool(bought),
+    }
