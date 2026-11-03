@@ -196,3 +196,128 @@ def test_a_scanned_smart_invoice_saved_through_the_app_is_claimable(client):
     shoprite = out["claim"]["entries"][0]
     assert shoprite["supplier"] == "Shoprite" and shoprite["tpin"] == "7007890123"
     assert shoprite["invoice"] == "QWER5678TYUI"
+
+
+# ── A Smart Invoice that comes after the purchase ─────────────────────────────
+
+def _entry(db, **match):
+    events = nervous.list_events(db, "u1", limit=1000)
+    return next(ev for ev in events
+                if all((ev.get("payload") or {}).get(k) == v or ev.get(k) == v for k, v in match.items()))
+
+
+def test_a_late_smart_invoice_moves_the_purchase_to_vat_you_can_claim(client):
+    api, db = client
+    market = _entry(db, supplier="Market")
+    r = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": ZRA_LINK, "vat": "124.14"})
+    assert r.status_code == 200, r.text
+    pl = r.json()["event"]["payload"]
+    assert (pl["smart_invoice"], pl["supplier_tpin"], pl["zra_branch"], pl["zra_signature"]) == (
+        True, "1001234567", "000", "ABCD1234EFGH5678")
+    # The purchase itself is the owner's as recorded: name, total, how it was paid.
+    assert (pl["supplier"], pl["amount"], pl["payment_method"], pl["tax"]) == ("Market", 900, "cash", 124.14)
+
+    out = _october(db)
+    assert out["claim"]["vat"] == 300.16 and out["claim"]["count"] == 4       # K176.02 + K124.14
+    assert out["claim"]["entries"][0]["id"] == market["id"]                    # newest first is by date
+    assert market["id"] not in [e["id"] for e in out["lost"]["entries"]]
+    assert out["lost"]["spent"] == 750.0
+
+    # Saved as a correction: the entry's history says what changed and who changed it.
+    saved = _entry(db, id=market["id"])
+    assert saved["audit"][-1]["action"] == "corrected" and saved["audit"][-1]["actor"] == "u1"
+    changes = next(iter(saved["corrections"].values()))
+    assert changes["payload.zra_signature"] == {"from": None, "to": "ABCD1234EFGH5678"}
+    assert changes["payload.tax"] == {"from": None, "to": 124.14}
+
+
+def test_the_vat_comes_from_the_qr_code_or_the_entry_when_the_owner_types_none(client):
+    api, db = client
+    coke = _entry(db, supplier="Coca-Cola", event_type="InventoryReceipt")      # K41.38 VAT already on it
+    assert api.post(f"/books/vat/{coke['id']}/smart-invoice", json={"qr": ZRA_LINK}).status_code == 200
+    assert _entry(db, id=coke["id"])["payload"]["tax"] == 41.38
+
+    market = _entry(db, supplier="Market")
+    on_portal = "https://zra.org.zm/verify?total=900&tpin=8008901234&invoiceNo=MK-12&vat=124.14"
+    pl = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": on_portal}).json()["event"]["payload"]
+    assert pl["tax"] == 124.14 and pl["invoice_ref"] == "MK-12" and pl["supplier"] == "Market"
+    out = _october(db)
+    assert out["claim"]["vat"] == 341.54 and out["lost"]["count"] == 1
+
+
+def test_what_is_not_a_smart_invoice_or_not_a_purchase_is_refused(client):
+    api, db = client
+    market = _entry(db, supplier="Market")
+    plain = api.post(f"/books/vat/{market['id']}/smart-invoice",
+                     json={"qr": "https://shop.example.com/r?total=50&tpin=1001234567&invoiceNo=7"})
+    assert plain.status_code == 400 and "not a ZRA Smart Invoice" in plain.json()["detail"]
+
+    wages = _entry(db, employee="Mary")
+    assert api.post(f"/books/vat/{wages['id']}/smart-invoice", json={"qr": ZRA_LINK}).status_code == 400
+
+    nervous.void(db, "u1", market["id"], reason="test")
+    gone = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": ZRA_LINK})
+    assert gone.status_code == 400 and "removed" in gone.json()["detail"]
+    assert api.post("/books/vat/nope/smart-invoice", json={"qr": ZRA_LINK}).status_code == 404
+
+    rent = _entry(db, category="rent")
+    too_much = api.post(f"/books/vat/{rent['id']}/smart-invoice", json={"qr": ZRA_LINK, "vat": 451})
+    assert too_much.status_code == 400 and "more than" in too_much.json()["detail"]
+    assert api.post(f"/books/vat/{rent['id']}/smart-invoice", json={"qr": ZRA_LINK, "vat": -1}).status_code == 400
+    # Nothing was changed by a refusal.
+    assert "smart_invoice" not in _entry(db, id=market["id"])["payload"]
+    assert _entry(db, id=rent["id"])["payload"].get("zra_signature") is None
+
+
+def test_one_smart_invoice_goes_on_one_entry(client):
+    api, db = client
+    market = _entry(db, supplier="Market")
+    september = ("https://portal.zra.org.zm/common/link/ebm/receipt/indexEbmReceiptData"
+                 "?Data=1001234567000sept0001")                 # Zambeef's, already in the books
+    r = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": september, "vat": 80})
+    assert r.status_code == 400 and "already on another entry" in r.json()["detail"]
+
+    # Attached once, the same Smart Invoice again only puts the VAT right.
+    assert api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": ZRA_LINK}).status_code == 200
+    again = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": ZRA_LINK, "vat": 124.14})
+    assert again.status_code == 200 and again.json()["event"]["payload"]["tax"] == 124.14
+    other = ZRA_LINK.replace("ABCD1234EFGH5678", "ZZZZ9999YYYY8888")
+    r = api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": other})
+    assert r.status_code == 400 and "already has the Smart Invoice ABCD1234EFGH5678" in r.json()["detail"]
+    rent = _entry(db, category="rent")
+    assert api.post(f"/books/vat/{rent['id']}/smart-invoice", json={"qr": ZRA_LINK}).status_code == 400
+
+
+def test_only_the_owner_attaches_a_smart_invoice(client):
+    api, db = client
+    market = _entry(db, supplier="Market")
+    main.app.dependency_overrides[membership.require_context] = lambda: STAFF
+    assert api.post(f"/books/vat/{market['id']}/smart-invoice", json={"qr": ZRA_LINK}).status_code == 403
+    assert "smart_invoice" not in _entry(db, id=market["id"])["payload"]
+
+
+# ── Supplier credit notes ─────────────────────────────────────────────────────
+
+def test_a_suppliers_credit_note_takes_its_vat_off_the_vat_you_can_claim():
+    db = _vat_books()
+    # Lusaka Wholesale takes back K232 of October's stock with a credit note on ZRA's system.
+    _ev(db, "Refund", 232, "2026-10-12T10:00:00+00:00", direction="from_supplier", supplier="Lusaka Wholesale",
+        supplier_tpin="2002345678", zra_signature="CRN00001", tax=32, **SI)
+    _ev(db, "Refund", 58, "2026-10-13T10:00:00+00:00", direction="from_supplier", supplier_tpin="2002345678",
+        zra_signature="CRN00002", **SI)                                  # no VAT read yet
+    # Money back with no credit note, and a refund to a customer: neither moves the VAT claimed.
+    _ev(db, "Refund", 100, "2026-10-14T10:00:00+00:00", direction="from_supplier", tax=13.79,
+        payment_method="cash")
+    _ev(db, "Refund", 50, "2026-10-15T10:00:00+00:00", direction="to_customer", payment_method="cash",
+        supplier_tpin="9009012345", zra_signature="OUT00001", tax=6.9, smart_invoice=True)
+    out = _october(db)
+    assert out["credits"]["vat"] == 32.0 and out["credits"]["count"] == 2 and out["credits"]["no_vat_figure"] == 1
+    assert [r["invoice"] for r in out["credits"]["entries"]] == ["CRN00002", "CRN00001"]
+    assert out["claim"]["on_invoices"] == 176.02 and out["claim"]["vat"] == 144.02
+    assert out["claim"]["count"] == 3 and out["lost"]["count"] == 3          # the purchases are as they were
+    # A credit note scanned twice comes off once.
+    _ev(db, "Refund", 232, "2026-10-16T10:00:00+00:00", direction="from_supplier", supplier_tpin="2002345678",
+        zra_signature="crn00001", tax=32, **SI)
+    again = _october(db)
+    assert again["claim"]["vat"] == 144.02 and again["credits"]["count"] == 2
+    assert again["twice"]["count"] == 2 and again["twice"]["entries"][0]["occurred_at"].startswith("2026-10-16")

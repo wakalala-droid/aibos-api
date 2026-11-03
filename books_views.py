@@ -372,6 +372,65 @@ def _vat_on(payload: dict) -> int | None:
     return None
 
 
+def _credit_note(ev: dict) -> bool:
+    """Money back from a supplier: with a Smart Invoice behind it, the
+    supplier's credit note, whose VAT comes off the VAT the business claims."""
+    return (ev.get("event_type") == "Refund"
+            and str((ev.get("payload") or {}).get("direction") or "").lower() == "from_supplier")
+
+
+# What a Smart Invoice's QR code says about the invoice (ingestion.parse_qr),
+# copied onto an entry already in the books when the owner attaches it. Not
+# the supplier's name (another layout puts the TPIN there), the total, or the
+# note the entry was recorded with: those stay the owner's.
+_INVOICE_FIELDS = ("smart_invoice", "supplier_tpin", "zra_branch", "zra_signature", "zra_verify_url",
+                   "zra_sdc_id", "zra_mark_id", "invoice_ref")
+
+
+def smart_invoice_patch(entry: dict, read: dict, vat=None, others: list | tuple = ()) -> dict:
+    """What attaching a scanned ZRA Smart Invoice changes on an entry already
+    in the books, so its VAT becomes VAT the business can claim without the
+    purchase being recorded twice.
+
+    `read` is the payload ingestion.parse_qr read from the QR code; `vat` the
+    VAT printed on the invoice, when the owner typed it (ZRA's own QR code
+    carries none), else the VAT the QR code carries, else the entry's own;
+    `others` the business's other entries, to keep one Smart Invoice on one
+    entry. Raises ValueError, in words for the owner, for what cannot be
+    attached."""
+    if entry.get("status") == "void":
+        raise ValueError("That entry was removed from your books.")
+    if entry.get("event_type") not in PURCHASES:
+        raise ValueError("A Smart Invoice goes on a purchase, an expense, stock or equipment bought.")
+    invoice = smart_invoice_of(read)
+    if invoice is None:
+        raise ValueError("That QR code is not a ZRA Smart Invoice. Scan the QR code printed on the "
+                         "supplier's Smart Invoice.")
+    p = entry.get("payload") or {}
+    have = smart_invoice_of(p)
+    if have is not None and have != invoice:
+        raise ValueError(f"This entry already has the Smart Invoice {have[1]} from TPIN {have[0]}.")
+    for other in others or ():
+        if other.get("id") == entry.get("id") or other.get("status") == "void":
+            continue
+        if smart_invoice_of(other.get("payload")) == invoice:
+            raise ValueError("That Smart Invoice is already on another entry in your books, so its VAT "
+                             "is claimed there.")
+
+    patch = {k: read[k] for k in _INVOICE_FIELDS if read.get(k) not in (None, "")}
+    figure = vat if vat is not None else read.get("tax")
+    if figure is not None:
+        n = money.ngwee(figure)
+        if n < 0:
+            raise ValueError("The VAT can't be less than nothing.")
+        paid = money.ngwee(p.get("amount"))
+        if n > paid:
+            raise ValueError(f"The VAT can't be more than the {money.kwacha(paid):,.2f} paid. "
+                             "Type the VAT printed on the invoice.")
+        patch["tax"] = money.kwacha(n)
+    return patch
+
+
 def vat_claim(events: list, start: datetime | None = None, end: datetime | None = None) -> dict:
     """The VAT on what the business bought between start (included) and end
     (left out), split by whether it can be claimed back.
@@ -381,15 +440,19 @@ def vat_claim(events: list, start: datetime | None = None, end: datetime | None 
     business can claim; what was bought without one is money whose VAT, if
     the seller charged any, cannot be claimed. A Smart Invoice recorded twice
     is claimed once: the first entry keeps it, wherever in the books it falls,
-    and the second is listed so it can be removed. Confirmed entries only, in
-    whole ngwee, with the money figure's own rounding."""
+    and the second is listed so it can be removed. A supplier's credit note
+    (money back from a supplier, backed by a Smart Invoice) takes its VAT off
+    the VAT claimed in its period: claim.vat is what is left, on_invoices the
+    VAT on the purchases alone. Confirmed entries only, in whole ngwee, with
+    the money figure's own rounding."""
     bought = [ev for ev in events or []
-              if _confirmed(ev) and ev.get("event_type") in PURCHASES]
+              if _confirmed(ev) and (ev.get("event_type") in PURCHASES
+                                     or (_credit_note(ev) and smart_invoice_of(ev.get("payload"))))]
     bought.sort(key=lambda ev: (str(ev.get("occurred_at") or ""), str(ev.get("id") or "")))
 
-    claim, lost, twice = [], [], []
-    claim_vat = lost_spent = lost_vat = twice_vat = 0
-    no_vat_figure = 0
+    claim, lost, twice, credits = [], [], [], []
+    claim_vat = lost_spent = lost_vat = twice_vat = credit_vat = 0
+    no_vat_figure = credit_no_vat = 0
     seen: set = set()
     for ev in bought:
         p = ev.get("payload") or {}
@@ -416,21 +479,28 @@ def vat_claim(events: list, start: datetime | None = None, end: datetime | None 
             lost.append(row)
             lost_spent += amount
             lost_vat += vat or 0
-        elif first:
+        elif not first:
+            twice.append(row)
+            twice_vat += vat or 0
+        elif _credit_note(ev):
+            credits.append(row)
+            credit_vat += vat or 0
+            credit_no_vat += 1 if vat is None else 0
+        else:
             claim.append(row)
             claim_vat += vat or 0
             no_vat_figure += 1 if vat is None else 0
-        else:
-            twice.append(row)
-            twice_vat += vat or 0
 
     claim.reverse()                                              # newest first
     twice.reverse()
+    credits.reverse()
     lost.sort(key=lambda r: (-r["amount"], str(r["occurred_at"] or "")))   # biggest first
     K = money.kwacha
     return {
-        "claim": {"vat": K(claim_vat), "count": len(claim), "no_vat_figure": no_vat_figure,
-                  "entries": claim},
+        "claim": {"vat": K(claim_vat - credit_vat), "on_invoices": K(claim_vat), "count": len(claim),
+                  "no_vat_figure": no_vat_figure, "entries": claim},
+        "credits": {"vat": K(credit_vat), "count": len(credits), "no_vat_figure": credit_no_vat,
+                    "entries": credits},
         "lost": {"spent": K(lost_spent), "vat_shown": K(lost_vat), "count": len(lost), "entries": lost},
         "twice": {"vat": K(twice_vat), "count": len(twice), "entries": twice},
         "ever": bool(bought),

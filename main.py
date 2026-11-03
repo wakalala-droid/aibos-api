@@ -8848,6 +8848,39 @@ def books_vat(start: Optional[str] = Query(None), end: Optional[str] = Query(Non
     return {"ok": True, **books_views.vat_claim(books["events"], _period_bound(start), _period_bound(end))}
 
 
+class AttachSmartInvoice(BaseModel):
+    qr: str = Field(..., max_length=2000)    # the QR code's text, as the scanner read it
+    vat: Optional[float] = None               # the VAT printed on the invoice (ZRA's QR has none)
+
+
+@app.post("/books/vat/{event_id}/smart-invoice")
+def books_attach_smart_invoice(event_id: str, body: AttachSmartInvoice,
+                               ctx: membership.Context = Depends(membership.require_owner)):
+    """Attach a ZRA Smart Invoice to a purchase already in the books, so its
+    VAT becomes VAT the business can claim without recording the purchase
+    twice: a supplier's Smart Invoice often comes after the purchase was
+    recorded. The QR code is read as on the Record page (ingestion.parse_qr);
+    what it is refused for is books_views.smart_invoice_patch. The owner's,
+    like every change to a confirmed entry, and saved as a correction, so the
+    entry's history shows what was changed and by whom."""
+    db = _require_db()
+    try:
+        ev = nervous._get_event(db, ctx.tenant, event_id)
+    except nervous.PipelineError:
+        raise HTTPException(status_code=404, detail="That entry is not in your books.")
+    read = ingestion.parse_qr(body.qr)["payload"]
+    biz = ev.get("business_id") or twin._books_for(db, ctx.tenant, ctx.business_id)
+    others = nervous.list_events(db, ctx.tenant, limit=200000, business_id=biz,
+                                 event_types=books_views.PURCHASES + ("Refund",))
+    try:
+        patch = books_views.smart_invoice_patch(ev, read, body.vat, others)
+        saved = nervous.correct(db, ctx.tenant, event_id, {"payload": patch},
+                                actor_role=ctx.role, actor_id=ctx.actor)
+    except (ValueError, nervous.PipelineError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "event": saved}
+
+
 @app.get("/books/costs")
 def books_costs(tz: int = Query(0, ge=-840, le=840),
                 ctx: membership.Context = Depends(membership.require_context)):
