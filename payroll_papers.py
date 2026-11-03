@@ -61,7 +61,7 @@ def _given(v) -> str:
 
 
 def _kind_words(emp: dict) -> str:
-    kind = "fixed-term contract" if emp.get("employment_type") == "contract" else "permanent"
+    kind = {"contract": "fixed-term contract", "casual": "casual"}.get(emp.get("employment_type"), "permanent")
     return f"{emp.get('position')}, {kind}" if emp.get("position") else kind.capitalize()
 
 
@@ -71,7 +71,22 @@ def _paye_words(s: dict) -> str:
         return f"PAYE on ZRA's cumulative tables, month {s.get('paye_month')}"
     if basis == "second job":
         return "PAYE at the top rate: a second job"
+    if basis == "daily tables":
+        return f"PAYE on ZRA's daily tables ({_num(s.get('days_worked')):g} days)"
     return "PAYE on the month 1 basis"
+
+
+def _basic_words(s: dict, k) -> str:
+    """The basic pay line with the ordinary hours it is for, as a pay
+    statement shows them (SI 50 of 2023, 12(5)(c))."""
+    if s.get("casual"):
+        rate = _num(s.get("hourly_rate"))
+        return (f"Pay for {_num(s.get('hours')):g} hours at {k(rate)} + 25% casual loading "
+                f"({k(rate * 1.25)} an hour)")
+    full, basic = _num(s.get("basic_full")), _num(s.get("basic"))
+    if full > 0 and basic < full:
+        return f"Basic pay, part month (about {basic / full * 208:.0f} of 208 hours; full month {k(full)})"
+    return "Basic pay (208 ordinary hours)" if basic > 0 else "Basic pay"
 
 
 # ── The payslip ──────────────────────────────────────────────────────────────
@@ -93,14 +108,20 @@ def payslip_doc(slip: dict, employee: dict | None = None, employer: dict | None 
     ids = "  ·  ".join(f"{label} {v}" if label else str(v) for label, v in (
         ("", e.get("position")), ("NRC", e.get("nrc")), ("TPIN", e.get("tpin")),
         ("NAPSA", e.get("napsa_number")), ("NHIMA", e.get("nhima_number"))) if v)
-    sub = [x for x in (" · ".join(y for y in (er.get("name"), f"TPIN {er['tpin']}" if er.get("tpin") else None) if y),
+    sub = [x for x in (" · ".join(y for y in (er.get("name"), er.get("address"),
+                                                f"TPIN {er['tpin']}" if er.get("tpin") else None) if y),
                        ids) if x]
     blocks: list = []
 
-    part = _num(s.get("basic_full")) > 0 and _num(s.get("basic")) < _num(s.get("basic_full"))
-    pay = [["Basic pay" + (f" (full month {k(s.get('basic_full'))})" if part else ""), k(s.get("basic"))]]
+    pay = [[_basic_words(s, k), k(s.get("basic"))]]
     if _num(s.get("allowances")) > 0:
         pay.append(["Allowances", k(s.get("allowances"))])
+    if _num(s.get("overtime_pay")) > 0:
+        pay.append([f"Overtime: {_num(s.get('overtime_hours')):g} hours at 1.5 times the hourly rate",
+                    k(s.get("overtime_pay"))])
+    if _num(s.get("holiday_pay")) > 0:
+        pay.append([f"Rest day or public holiday: {_num(s.get('holiday_hours')):g} hours at double the hourly rate",
+                    k(s.get("holiday_pay"))])
     if _num(s.get("extra_pay")) > 0:
         pay.append([f"Extra pay{': ' + str(s.get('extra_note')) if s.get('extra_note') else ''}",
                     k(s.get("extra_pay"))])
@@ -112,8 +133,9 @@ def payslip_doc(slip: dict, employee: dict | None = None, employer: dict | None 
                                         "rows": pay, "strong": [len(pay) - 1]})]
 
     paye = _num(s.get("paye"))
-    taken = [["NAPSA, 5% of gross pay", "none (aged 60 or over)" if s.get("napsa_exempt")
-              else k(s.get("napsa_employee"))],
+    taken = [["NAPSA, 5% of gross pay" + (f" (none: {s['napsa_why']})" if s.get("napsa_exempt") and
+                                          s.get("napsa_why") else ""),
+              "none" if s.get("napsa_exempt") else k(s.get("napsa_employee"))],
              ["NHIMA, 1% of basic pay", k(s.get("nhima_employee"))],
              [_paye_words(s) if paye >= 0 else f"PAYE refund ({_paye_words(s)})", k(paye)]]
     if _num(s.get("loan_deduction")) > 0:
@@ -148,6 +170,10 @@ def payslip_doc(slip: dict, employee: dict | None = None, employer: dict | None 
     grat = _num(s.get("gratuity_accrued")) > 0 or _num(s.get("gratuity_paid")) > 0
     if grat:
         so_far.append(("Gratuity owed to you", k(s.get("gratuity_balance")), True))
+    if s.get("leave_balance") is not None:
+        taken_now = _num(s.get("leave_taken"))
+        so_far.append(("Leave days owed to you" + (f" ({taken_now:g} taken this month)" if taken_now else ""),
+                       f"{_num(s.get('leave_balance')):g}", False))
     if s.get("tax_year") and s.get("ytd_pay") is not None:
         y = s.get("tax_year")
         so_far += [(f"Pay in {y}", k(s.get("ytd_pay")), False), (f"PAYE in {y}", k(s.get("ytd_paye")), False),
@@ -301,8 +327,9 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
     name = emp.get("name") or "Employee"
     end = payroll.parse_date(emp.get("end_date")) or payroll.parse_date(emp.get("contract_end"))
     start = payroll.parse_date(emp.get("start_date"))
-    # The months they worked: a gratuity paid after they left is no month of work.
-    worked = [s for s in slips if _num(s.get("gross")) > 0]
+    # The months they worked: what was paid after they left (a gratuity, leave
+    # days) is no month of work.
+    worked = [s for s in slips if _num(s.get("gross")) > 0 and s.get("kind") != "gratuity_only"]
     first = worked[0].get("period") if worked else None
     facts = [("Employee", name), ("Started", day_words(start.isoformat()) if start else
                                   (f"by {month_words(first)}" if first else "not given")),
@@ -348,11 +375,12 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
     p13 = [("TPIN", _given(emp.get("tpin")), False),
            ("Pay with this employer in the year", k(pay), False),
            ("PAYE taken in the year", k(paye), True)]
-    last = worked[-1] if worked else None
-    if last and _num(last.get("leave_pay")) > 0:
+    paid_leave = [s for s in in_year if _num(s.get("leave_pay")) > 0]
+    if paid_leave:
         # Taxed like any pay (Employer's Guide 7.2), so inside the pay above.
-        p13.append((f"Leave days paid with the final pay ({_num(last.get('leave_days')):g} days, "
-                    "full pay x days / 26)", k(last.get("leave_pay")), False))
+        days = sum(_num(s.get("leave_days")) for s in paid_leave)
+        p13.append((f"Leave days paid out ({days:g} days, full pay x days / 26)",
+                    k(money.total(s.get("leave_pay") for s in paid_leave)), False))
     blocks += [
         ("h", f"Pay and tax in {year}, for ZRA form ITF/P13"),
         ("kv", p13),
@@ -376,6 +404,15 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
                    ("note", "At least 25% of basic pay earned, prorated if it ends early (Employment Code Act s.73); "
                             "free of tax (Constitution, Art. 188(2))."
                             + (" Pay what is still owed with the next payroll run." if pos["owed"] > 0 else ""))]
+
+    # Annual leave not taken is paid when the contract ends (s.36(5)).
+    if emp.get("employment_type") != "casual":
+        lv = payroll.leave_position(emp, slips)
+        if lv["owed"] or lv["paid_out"] or lv["earned"]:
+            row = ("Annual leave still owed" if lv["owed"] > 0 else "Annual leave: all taken or paid out",
+                   f"{lv['owed']:g} days ({k(lv['value'])})" if lv["owed"] > 0 else f"{lv['paid_out']:g} days paid out",
+                   lv["owed"] > 0)
+            blocks.append(("kv", [row]))
 
     blocks.append(("p", f"Signed for the employer: _________________   Received by {name}: "
                         "_________________   Date: __________"))

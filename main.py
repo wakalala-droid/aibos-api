@@ -2579,7 +2579,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 43
+EXPECTS_MIGRATION = 44
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -7189,6 +7189,25 @@ def get_payroll_gratuity(ctx: membership.Context = Depends(membership.require_ow
     days, and the total the business owes its staff."""
     db = _require_db()
     return {"ok": True, **payroll_api.gratuity_book(db, ctx.tenant)}
+
+
+@app.get("/payroll/leave")
+def get_payroll_leave(ctx: membership.Context = Depends(membership.require_owner)):
+    """Each person's annual leave: the days owed (at least 2 a month earned,
+    less taken and paid out) and what paying them out would cost."""
+    db = _require_db()
+    return {"ok": True, **payroll_api.leave_book(db, ctx.tenant)}
+
+
+@app.get("/payroll/min-wages")
+def get_payroll_min_wages(ctx: membership.Context = Depends(membership.require_owner)):
+    """The minimum wage Orders and their categories, for choosing one per person."""
+    import min_wage
+    return {"ok": True, "orders": [
+        {"order": o, "name": v["name"], "law": v["law"], "effective_from": v["effective_from"],
+         "categories": [{**min_wage.category(o, k), "gross": min_wage.gross_minimum(min_wage.category(o, k))}
+                        for k in v["categories"]]}
+        for o, v in min_wage.ORDERS.items()]}
 
 
 @app.get("/payroll/checks")

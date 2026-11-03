@@ -97,6 +97,29 @@ so past runs stay truthful after a rate change (a replayable history).
   Leave days paid out: full pay × days ÷ 26 (Employment Code Act, Fifth
   Schedule, s.37), taxed like any pay (Employer's Guide, 7.2).
 
+── Casual workers, overtime, leave, minimum wages, NAPSA by age (3 Nov 2026) ─
+  A casual employee is paid by the hour "including casual loading", 25% of
+  the hourly rate, at the end of each day (Employment Code Act s.3). ZRA taxes
+  each day's pay on its daily tables, never cumulative, so never refunded
+  (Employer's Guide to PAYE, 4.3 and 5.2): pay for several days is divided by
+  the days, taxed, and multiplied back. The daily bands are the year's bands
+  over 365 days, kept to the ngwee below (ZRA's own worked example has K4,000
+  a month as K131.50 a day). Casual employees are employees for NAPSA (the
+  National Pension Scheme Act 2026 takes the Employment Code Act's meaning,
+  which includes them) and for the levy; they earn no gratuity (s.54(3)) and
+  no annual leave (s.36(1)).
+  Overtime past 48 hours a week is one and a half times the hourly rate (past
+  60 for a watchperson or guard); a public holiday or rest day outside the
+  normal week is double; the hourly rate is the month's basic pay over 208
+  hours (240 for a watchperson or guard) (s.75). Both are taxed like any pay.
+  Annual leave is at least 2 days a month on full pay (s.36(1)); leave not
+  taken is paid when the contract ends (s.36(5)). AIBOS earns it each month
+  worked, takes off days taken and paid out, and keeps the balance.
+  NAPSA stops at the pensionable age of 60, or 65 when the member chose it and
+  the employer agreed (NPS Act 2026, s.2 and s.29(2)(b)); a member registers
+  from 16 (s.16(1)). With a date of birth AIBOS stops it by itself.
+  Minimum wages: min_wage.py (the 2023 Orders, in force from 1 January 2024).
+
 ── Records ──────────────────────────────────────────────────────────────────
   Every payment tells the employee in writing the total pay and the total tax
   taken (Employer's Guide, 8.3); every wage and every deduction is kept with
@@ -126,6 +149,7 @@ so past runs stay truthful after a rate change (a replayable history).
 """
 
 import logging
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -188,7 +212,7 @@ STATUTORY: dict[str, list[dict]] = {
 # (rates_note) until someone checks the new year's Budget and adds its set.
 RATES_VERIFIED_THROUGH = 2026
 
-EMPLOYMENT_TYPES = ("permanent", "contract")
+EMPLOYMENT_TYPES = ("permanent", "contract", "casual")
 EMP_STATUSES = ("active", "left")
 
 EMP_EDITABLE = (
@@ -197,6 +221,8 @@ EMP_EDITABLE = (
     "gratuity_eligible", "gratuity_rate", "contract_end",
     "loan_balance", "loan_monthly", "notes", "phone", "email",
     "nrc", "nhima_number", "second_job", "gratuity_opening", "paye_prior",
+    "hourly_rate", "date_of_birth", "napsa_to_65", "leave_opening", "leave_rate",
+    "wage_order", "wage_category", "guard",
 )
 
 # Migration 0039 adds these. Before it is run, saving one with a value is
@@ -217,6 +243,24 @@ LEAVE_DAYS_DIVISOR = 26
 NEW_STARTER_REFUND_LIMIT = 3000.0
 # Where the pay and PAYE typed for earlier in the year came from.
 PRIOR_SOURCES = ("before_aibos", "p13")
+# Migration 0044: casual pay, NAPSA by age, leave, the minimum wage Order.
+EMP_0044_COLUMNS = ("hourly_rate", "date_of_birth", "napsa_to_65", "leave_opening", "leave_rate",
+                    "wage_order", "wage_category", "guard")
+
+# Casual loading: 25% of the hourly rate on top (Employment Code Act s.3).
+CASUAL_LOADING = 0.25
+# Overtime and rest-day pay, and the hours a month the hourly rate is
+# worked on (Employment Code Act s.75).
+OVERTIME_RATE = 1.5
+REST_DAY_RATE = 2.0
+HOURS_A_MONTH = 208
+GUARD_HOURS = 240
+# Annual leave earned a month, at the least (Employment Code Act s.36(1)).
+LEAVE_A_MONTH = 2.0
+# NAPSA membership starts at 16 (National Pension Scheme Act 2026, s.16(1)).
+NAPSA_FROM_AGE = 16
+WAGE_ORDERS = ("general", "shop", "domestic")
+WAGE_CATEGORIES = ("I", "II", "III", "IV", "V", "VI", "VII")
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -320,6 +364,52 @@ def cumulative_bands(bands: list, month: int) -> list:
     times the months of the year gone, the rates the same (Employer's Guide to
     PAYE, 4.2: the K5,100 a month free band is K56,100 by November)."""
     return [(None if up is None else up * month, rate) for up, rate in bands]
+
+
+def daily_bands(bands: list) -> list:
+    """ZRA's daily table for casual employees: each band's top for the year
+    over 365 days, to the ngwee below (K4,000 a month was K131.50 a day)."""
+    from decimal import ROUND_DOWN
+    return [(None if up is None else
+             float((money.dec(up) * 12 / 365).quantize(money.NGWEE, rounding=ROUND_DOWN)), rate)
+            for up, rate in bands]
+
+
+def casual_paye(pay, days, rates: dict) -> float:
+    """PAYE on a casual worker's pay for `days` days on ZRA's daily tables:
+    the pay divided by the days, taxed on the daily table, multiplied back
+    (Employer's Guide to PAYE, 4.3). Never cumulative, never a refund."""
+    d = _pos(days)
+    if d <= 0:
+        return 0.0
+    per_day = money.dec(compute_paye(_pos(pay) / d, daily_bands(rates["paye_bands"])))
+    return _f(per_day * d)
+
+
+def age_on(dob, day) -> int | None:
+    """Whole years old on `day`."""
+    born, on = parse_date(dob), parse_date(day)
+    if not born or not on:
+        return None
+    return on.year - born.year - ((on.month, on.day) < (born.month, born.day))
+
+
+def napsa_applies(emp: dict, pay_date=None, rates: dict | None = None) -> tuple[bool, str | None]:
+    """Does NAPSA come off this person's pay on this pay day, and if not why.
+    Marked by hand as not paying: no. Otherwise by the date of birth when
+    there is one: from 16 to the pensionable age of 60, or 65 when they chose
+    it and the employer agreed (National Pension Scheme Act 2026)."""
+    if emp.get("napsa_exempt"):
+        return False, "marked as no longer paying NAPSA"
+    age = age_on(emp.get("date_of_birth"), pay_date)
+    if age is None:
+        return True, None
+    stop = 65 if emp.get("napsa_to_65") else int((rates or {}).get("napsa_retirement_age") or 60)
+    if age >= stop:
+        return False, f"aged {age}, past NAPSA's retirement age of {stop}"
+    if age < NAPSA_FROM_AGE:
+        return False, f"aged {age}, under NAPSA's starting age of {NAPSA_FROM_AGE}"
+    return True, None
 
 
 def _prior_for(emp: dict, year: int) -> dict | None:
@@ -434,7 +524,7 @@ def leave_pay(emp: dict, days) -> float:
 
 def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = False,
                     change: dict | None = None, ytd: dict | None = None,
-                    gratuity_owed: float = 0.0) -> dict:
+                    gratuity_owed: float = 0.0, pay_date=None, leave_owed: float = 0.0) -> dict:
     """
     Full statutory breakdown for one employee for one month.
 
@@ -452,35 +542,83 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
     year_to_date() for PAYE's cumulative tables; `gratuity_owed` what this
     person was owed in gratuity before this month.
 
+    A casual worker's pay is the hours worked (`change['hours']`) at their
+    hourly rate with the 25% casual loading, taxed on ZRA's daily tables over
+    the days worked (`change['days']`). Overtime hours (`overtime_hours`) are
+    one and a half times the hourly rate and rest-day or public holiday hours
+    (`holiday_hours`) double it. Leave: `leave_taken` days taken on full pay
+    this month and `leave_days` paid out come off what is owed (`leave_owed`
+    before this month), and the month worked earns the person's leave rate.
+    NAPSA follows napsa_applies() on `pay_date`.
+
     What the employer pays ON TOP of the pay (their NAPSA and NHIMA halves, the
     levy and the gratuity set aside) is worked out here too, beside what comes
     OUT of the pay, so a total is never read as the whole bill when it is half
     of it. A gratuity paid is tax-free and adds to the take-home pay.
     """
     change = change or {}
-    basic_full = _pos(emp.get("basic_pay"))
+    casual = emp.get("employment_type") == "casual"
+    left_job = change.get("kind") == "gratuity_only"
+    hours = _pos(change.get("hours"))
+    days_worked = _pos(change.get("days"))
+    rate_h = _pos(emp.get("hourly_rate"))
+    loaded = rate_h * (1 + money.dec(CASUAL_LOADING))
+    if casual:
+        # Paid by the hour, the casual loading in it (Employment Code Act s.3).
+        basic_full = money.dec(money.times(loaded, hours))
+        if hours > 0 and days_worked <= 0:
+            days_worked = Decimal(max(1, math.ceil(float(hours) / 8)))   # a day is up to 8 hours
+    else:
+        basic_full = _pos(emp.get("basic_pay"))
     allowances_full = _pos(emp.get("allowances"))
     basic = basic_full if change.get("basic") is None else _pos(change["basic"])
     allowances = allowances_full if change.get("allowances") is None else _pos(change["allowances"])
     extra = _pos(change.get("extra_pay"))
     days = _pos(change.get("leave_days"))
     leave = money.dec(leave_pay(emp, days)) if days > 0 else Decimal(0)
-    gross = basic + allowances + extra + leave
-    in_napsa = not emp.get("napsa_exempt")
-    left_job = change.get("kind") == "gratuity_only"
+    # Overtime and rest-day hours on the hourly rate: the month's basic over
+    # 208 hours, 240 for a watchperson or guard (s.75(4)); a casual's own rate.
+    hourly = (loaded if casual else
+              basic_full / (GUARD_HOURS if emp.get("guard") else HOURS_A_MONTH))
+    ot_hours, rest_hours = _pos(change.get("overtime_hours")), _pos(change.get("holiday_hours"))
+    overtime = money.dec(money.times(hourly * ot_hours, OVERTIME_RATE))
+    rest_day = money.dec(money.times(hourly * rest_hours, REST_DAY_RATE))
+    gross = basic + allowances + extra + leave + overtime + rest_day
+    on_day = pay_date or f"{period}-28"
+    in_napsa, napsa_why = napsa_applies(emp, on_day, rates)
+    if left_job:
+        # Paid after they left: NAPSA contributions stop from the day the
+        # employment ends (National Pension Scheme Act 2026).
+        in_napsa, napsa_why = False, "paid after they left: NAPSA stopped when the job ended"
 
     paye_way = {"paye": 0.0, "basis": None, "month": None, "note": None}
     if rates:
         napsa = money.dec(compute_napsa(gross, rates)) if in_napsa else Decimal(0)
         nhima = money.dec(compute_nhima(basic, rates))
         taxable = gross - (napsa if rates.get("napsa_deductible_for_paye") else Decimal(0))
-        # Someone who has left and is paid only their gratuity has no pay to tax.
-        paye_way = (work_out_paye(0, rates) if left_job else
-                    work_out_paye(taxable, rates, ytd, second_job=bool(emp.get("second_job"))))
+        # Someone who has left, paid what is still owed: the gratuity has no
+        # tax; leave days paid out are taxed on their own (month 1 basis).
+        if left_job:
+            paye_way = work_out_paye(taxable, rates)
+        elif casual:
+            paye_way = {"paye": casual_paye(taxable, days_worked, rates), "basis": "daily tables",
+                        "month": None, "note": None}
+        else:
+            paye_way = work_out_paye(taxable, rates, ytd, second_job=bool(emp.get("second_job")))
         paye = money.dec(paye_way["paye"])
     else:                                   # non-ZMW payroll: register only, no statutory maths
         napsa = nhima = paye = Decimal(0)
         taxable = gross
+
+    # Annual leave: earned for the month worked (in proportion for a part
+    # month), less the days taken and paid out. None for a casual (s.36(1)).
+    earns = not casual and not left_job
+    rate_l = money.dec(LEAVE_A_MONTH if emp.get("leave_rate") in (None, "") else emp.get("leave_rate"))
+    worked = (basic / basic_full) if basic_full > 0 else Decimal(1)
+    leave_earned = (rate_l * min(worked, Decimal(1))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+        if earns else Decimal(0)
+    leave_taken = _pos(change.get("leave_taken"))
+    leave_left = money.dec(leave_owed) + leave_earned - leave_taken - days
 
     # The gratuity: this month's share of it, and all of it when it is paid.
     accrued = money.dec(compute_gratuity_accrual(emp, basic))
@@ -535,6 +673,22 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
         # 'pay' (a month's pay), 'final' (the month they left) or
         # 'gratuity_only' (left earlier, paid the gratuity still owed).
         "kind": change.get("kind") or "pay",
+        "napsa_why": napsa_why,
+        # A casual's hours and days, with the rate and its loading; anyone's
+        # overtime and rest-day hours (the pay statement shows them, SI 50 of
+        # 2023, 12(5)); and the leave earned, taken and still owed.
+        "casual": casual,
+        "hours": float(hours) if casual else None,
+        "days_worked": float(days_worked) if casual else None,
+        "hourly_rate": _f(rate_h) if casual else None,
+        "overtime_hours": float(ot_hours),
+        "overtime_pay": _f(overtime),
+        "holiday_hours": float(rest_hours),
+        "holiday_pay": _f(rest_day),
+        "leave_earned": float(leave_earned),
+        "leave_taken": float(leave_taken),
+        "leave_balance": float(leave_left.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if earns or
+        _num(leave_owed) else None,
     }
     return {
         "period": period,
@@ -573,7 +727,9 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
 _SLIP_FIGURES = ("extra_pay", "extra_note", "leave_days", "leave_pay", "basic_full",
                  "allowances_full", "gratuity_paid", "gratuity_balance", "paye_basis",
                  "paye_month", "paye_note", "paye_why", "ytd_pay", "ytd_paye", "ytd_napsa",
-                 "tax_year", "loan_balance_after", "kind")
+                 "tax_year", "loan_balance_after", "kind", "napsa_why", "casual", "hours",
+                 "days_worked", "hourly_rate", "overtime_hours", "overtime_pay", "holiday_hours",
+                 "holiday_pay", "leave_earned", "leave_taken", "leave_balance")
 
 
 def hydrate_slip(row: dict) -> dict:
@@ -604,6 +760,8 @@ def hydrate_slip(row: dict) -> dict:
     out.setdefault("gratuity_paid", 0.0)
     out.setdefault("extra_pay", 0.0)
     out.setdefault("leave_pay", 0.0)
+    out.setdefault("overtime_pay", 0.0)
+    out.setdefault("holiday_pay", 0.0)
     return out
 
 
@@ -646,7 +804,19 @@ def rules_for_ai(on_date=None) -> str:
         "and pays it with the final pay when the owner ticks it. "
         "Leave days paid out are full pay × days ÷ 26 (Employment Code Act, Fifth Schedule) and are taxed "
         "like pay. When someone leaves, the employer gives a certificate of service (s.59) and sends ITF/P13 "
-        "part 1 to ZRA within 5 days; AIBOS writes both under Leaving papers on the Staff page."
+        "part 1 to ZRA within 5 days; AIBOS writes both under Leaving papers on the Staff page. "
+        "Annual leave is at least 2 days a month (s.36); AIBOS keeps each person's balance and leave not "
+        "taken is paid when they leave. Overtime past 48 hours a week is 1.5 times the hourly rate and a "
+        "rest day or public holiday double it, the hourly rate being the month's basic pay over 208 hours "
+        "(240 for a guard) (s.75). A casual worker is paid by the hour with a 25% casual loading (s.3), "
+        "taxed on ZRA's daily tables (the year's bands over 365 days, never cumulative), pays NAPSA and "
+        "NHIMA, and earns no gratuity or annual leave; keeping a casual worker on lasting work is "
+        "casualisation, an offence (s.7). NAPSA stops at 60, or 65 when the member chose it and the "
+        "employer agreed, by itself once the date of birth is in AIBOS. Minimum wages: the General Order "
+        "(SI 48 of 2023), the Shop Workers Order (SI 50 of 2023, K1,487 to K3,142.26 basic a month) and the "
+        "Domestic Workers Order (SI 49 of 2023, K1,100 basic plus K200 transport), in force from 1 January "
+        "2024; the General and Shop Workers Orders add housing at 30% of basic unless the worker is housed, "
+        "K200 transport beyond 3 km and K180 lunch unless a free meal is given."
     )
 
 
@@ -716,16 +886,47 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
         raise ValueError(f"status must be one of {', '.join(EMP_STATUSES)}.")
 
     for key in ("basic_pay", "allowances", "loan_balance", "loan_monthly", "gratuity_rate",
-                "gratuity_opening"):
+                "gratuity_opening", "hourly_rate", "leave_opening", "leave_rate"):
         if key in out and out[key] is not None:
             val = _num(out[key], None)
             if val is None or val < 0:
                 raise ValueError(f"{key} must be a positive number.")
             # Pay and loans are money: kept to the ngwee, never a fraction of one.
-            out[key] = val if key == "gratuity_rate" else money.round_ngwee(val)
-    for key in ("allowances", "gratuity_opening"):
+            out[key] = (round(val, 2) if key in ("leave_opening", "leave_rate") else val
+                        if key == "gratuity_rate" else money.round_ngwee(val))
+    for key in ("allowances", "gratuity_opening", "leave_opening"):
         if key in out and out[key] is None:
             out[key] = 0.0
+    if out.get("leave_rate") is not None and out["leave_rate"] > 31:
+        raise ValueError("Leave is the days earned a month: at least 2, as the Employment Code Act sets.")
+    if "leave_rate" in out and out["leave_rate"] is None:
+        out["leave_rate"] = LEAVE_A_MONTH
+
+    # A casual worker earns no gratuity (Employment Code Act s.54(3)) and is
+    # paid by the hour, so their monthly basic pay is nothing.
+    if out.get("employment_type") == "casual":
+        out["gratuity_eligible"] = False
+        if "hourly_rate" in out and not out.get("hourly_rate"):
+            raise ValueError("A casual worker is paid by the hour: say their hourly rate.")
+
+    if "wage_order" in out:
+        out["wage_order"] = (str(out["wage_order"] or "").strip().lower() or None)
+        if out["wage_order"] not in (None, *WAGE_ORDERS):
+            raise ValueError("Choose the General, Shop Workers or Domestic Workers Order, or none.")
+    if "wage_category" in out:
+        out["wage_category"] = (str(out["wage_category"] or "").strip().upper() or None)
+        if out["wage_category"] not in (None, *WAGE_CATEGORIES):
+            raise ValueError("The category is I to VII, as the Order numbers them.")
+    for flag in ("napsa_to_65", "guard"):
+        if flag in out:
+            out[flag] = bool(out[flag])
+    if out.get("date_of_birth"):
+        born = parse_date(out["date_of_birth"])
+        if born is None or born.year < 1900 or born > date.today():
+            raise ValueError("The date of birth must be a real day, like 1990-05-17.")
+        out["date_of_birth"] = born.isoformat()
+    elif "date_of_birth" in out:
+        out["date_of_birth"] = None
     # A gratuity rate is a share of basic pay. Typed as a percentage (25), it
     # is kept as the share (0.25): 25 kept as it was would set aside 25 times
     # the basic pay every month.
@@ -865,11 +1066,18 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
     # Every part of the pay, so the total paid is plain (ZRA Employer's Guide
     # to PAYE, 8.3) and each deduction carries its reason (Employment Code
     # Act, s.71).
-    part = (_num(s.get("basic_full")) > 0 and _num(s.get("basic")) < _num(s.get("basic_full")))
-    extras = [(f"Extra pay{' (' + str(s.get('extra_note')) + ')' if s.get('extra_note') else ''}:",
+    part = (_num(s.get("basic_full")) > 0 and _num(s.get("basic")) < _num(s.get("basic_full"))
+            and not s.get("casual"))
+    extras = [(f"Overtime ({_num(s.get('overtime_hours')):g} h at 1.5x):", s.get("overtime_pay")),
+              (f"Rest day/holiday ({_num(s.get('holiday_hours')):g} h at 2x):", s.get("holiday_pay")),
+              (f"Extra pay{' (' + str(s.get('extra_note')) + ')' if s.get('extra_note') else ''}:",
                s.get("extra_pay")),
               (f"Leave days paid ({_num(s.get('leave_days')):g}):", s.get("leave_pay"))]
-    if _num(s.get("allowances")) > 0 or part or any(_num(v) > 0 for _, v in extras):
+    if s.get("casual"):
+        lines.append(f"Hours worked: {_num(s.get('hours')):g} at {fmt(s.get('hourly_rate'))} + 25% casual "
+                     f"loading = {fmt(s.get('basic'))}")
+        lines += [f"{label} {fmt(v)}" for label, v in extras if _num(v) > 0]
+    elif _num(s.get("allowances")) > 0 or part or any(_num(v) > 0 for _, v in extras):
         lines.append(f"Basic pay:      {fmt(s.get('basic'))}"
                      + (f" (full month {fmt(s.get('basic_full'))})" if part else ""))
         if _num(s.get("allowances")) > 0:
@@ -879,7 +1087,7 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
     lines += [
         f"Gross pay:      {fmt(s.get('gross'))}",
         f"NAPSA (5%):    −{fmt(s.get('napsa_employee'))}" if not s.get("napsa_exempt")
-        else "NAPSA:          none (aged 60 or over)",
+        else f"NAPSA:          none ({s.get('napsa_why') or 'aged 60 or over'})",
         f"NHIMA (1% of basic): −{fmt(s.get('nhima_employee'))}",
         f"PAYE:          −{fmt(paye)}" if paye >= 0 else f"PAYE refund:   +{fmt(-paye)}",
     ]
@@ -910,11 +1118,15 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
         lines.append(f"_{s.get('tax_year')} so far: pay {fmt(s.get('ytd_pay'))}, PAYE {fmt(s.get('ytd_paye'))}_")
     if _num(s.get("loan_deduction")) > 0 and s.get("loan_balance_after") is not None:
         lines.append(f"_Loan still owed: {fmt(s.get('loan_balance_after'))}_")
+    if s.get("leave_balance") is not None:
+        lines.append(f"_Leave days owed to you: {_num(s.get('leave_balance')):g}_")
     basis = s.get("paye_basis")
     if basis == "cumulative":
         lines.append(f"_PAYE on ZRA's cumulative tables, month {s.get('paye_month')}._")
     elif basis == "second job":
         lines.append("_PAYE at the top rate: this is a second job._")
+    elif basis == "daily tables":
+        lines.append(f"_PAYE on ZRA's daily tables for casual work, {_num(s.get('days_worked')):g} days._")
     lines.append("\nWorked out by AIBOS at the Zambian rates in force for this month.")
     return "\n".join(lines)
 
@@ -969,6 +1181,9 @@ MIGRATION_0042_NOTE = ("A phone or email for each person needs migration 0042. R
 MIGRATION_0043_NOTE = ("NRC and NHIMA numbers, a second job, gratuity owed from before AIBOS, pay earlier in "
                        "the year and your employer numbers need migration 0043. Run "
                        "supabase/migrations/0043_payroll_statutory.sql in the Supabase SQL editor.")
+MIGRATION_0044_NOTE = ("Casual workers, a date of birth, leave, the minimum wage Order and a guard need "
+                       "migration 0044. Run supabase/migrations/0044_payroll_whole_law.sql in the Supabase "
+                       "SQL editor (after 0043).")
 
 # Each migration's columns, its note, and whether a row says something only
 # that migration can keep (then it is refused, never silently dropped).
@@ -979,6 +1194,10 @@ _EMP_MIGRATIONS = (
     (EMP_0043_COLUMNS, MIGRATION_0043_NOTE,
      lambda r: bool(r.get("nrc") or r.get("nhima_number") or r.get("second_job") or r.get("paye_prior")
                     or _num(r.get("gratuity_opening")) > 0)),
+    (EMP_0044_COLUMNS, MIGRATION_0044_NOTE,
+     lambda r: bool(_num(r.get("hourly_rate")) > 0 or r.get("date_of_birth") or r.get("napsa_to_65")
+                    or _num(r.get("leave_opening")) > 0 or r.get("wage_order") or r.get("wage_category")
+                    or r.get("guard") or _num(r.get("leave_rate"), LEAVE_A_MONTH) != LEAVE_A_MONTH)),
 )
 
 
@@ -992,6 +1211,9 @@ def _write_employee(write, row: dict):
             return write(row)
         except Exception as e:  # noqa: BLE001
             from db import missing_schema
+            # Before 0044 the database knows only permanent and contract staff.
+            if "employees_type_chk" in str(e) and row.get("employment_type") == "casual":
+                raise ValueError(MIGRATION_0044_NOTE) from e
             for columns, note, says_something in _EMP_MIGRATIONS:
                 if any(missing_schema(e, c) for c in columns):
                     if says_something(row):
@@ -1122,14 +1344,58 @@ def gratuity_book(db, user_id: str, today: date | None = None) -> dict:
             "due_soon": money.total(p["owed"] for p in people if p["due_soon"])}
 
 
+# ── Annual leave: what each person is owed ───────────────────────────────────
+
+def leave_position(emp: dict, slips: list) -> dict:
+    """Where one person's annual leave stands, from their payslips. Pure.
+
+    Owed = the days owed before AIBOS + the days earned each month worked
+    (at least 2 a month, Employment Code Act s.36(1)) − the days taken − the
+    days paid out. Its value is what paying them out would cost: full pay ×
+    days ÷ 26 (Fifth Schedule)."""
+    slips = slips or []
+    opening = money.dec(emp.get("leave_opening"))
+    earned = sum((money.dec(s.get("leave_earned")) for s in slips), Decimal(0))
+    taken = sum((money.dec(s.get("leave_taken")) for s in slips), Decimal(0))
+    paid = sum((money.dec(s.get("leave_days")) for s in slips), Decimal(0))
+    owed = opening + earned - taken - paid
+    return {
+        "employee_id": emp.get("id"), "name": emp.get("name"), "status": emp.get("status"),
+        "rate": float(money.dec(LEAVE_A_MONTH if emp.get("leave_rate") in (None, "") else emp.get("leave_rate"))),
+        "opening": float(opening), "earned": float(earned), "taken": float(taken), "paid_out": float(paid),
+        "owed": float(owed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "value": leave_pay(emp, owed) if owed > 0 else 0.0,
+        "casual": emp.get("employment_type") == "casual",
+    }
+
+
+def leave_book(db, user_id: str) -> dict:
+    """Every person's annual leave: the days owed and what paying them out
+    would cost, and the totals."""
+    history = payslip_history(db, user_id)
+    people = [p for p in (leave_position(e, history.get(str(e.get("id"))) or [])
+                          for e in list_employees(db, user_id))
+              if not p["casual"] and (p["status"] == "active" or p["owed"] > 0)]
+    people.sort(key=lambda p: (p["status"] != "left", -p["owed"], p["name"] or ""))
+    return {"people": people, "total_days": round(sum(p["owed"] for p in people), 2),
+            "total_value": money.total(p["value"] for p in people),
+            "leavers_owed": money.total(p["value"] for p in people if p["status"] == "left")}
+
+
 # ── The statutory checks: what the law asks that the register does not show ──
 
-def statutory_checks(employees: list, positions: dict, employer: dict, today: date) -> list:
+def statutory_checks(employees: list, positions: dict, employer: dict, today: date,
+                     leave: dict | None = None, history: dict | None = None) -> list:
     """Every thing the law asks of this payroll that is not yet done, most
     urgent first, each in plain words with what to do. Pure.
 
+    `positions` are gratuity_position() by employee id, `leave` leave_position()
+    and `history` payslip_history(), both optional.
+
     level: 'act' (money owed or a legal step missed), 'warn' (a return or
     paper will be wrong or incomplete), 'info' (worth adding)."""
+    import min_wage
+    leave, history = leave or {}, history or {}
     out = []
 
     def add(level, text, emp=None, fix=None):
@@ -1149,14 +1415,61 @@ def statutory_checks(employees: list, positions: dict, employer: dict, today: da
     for e in employees:
         pos = positions.get(str(e.get("id"))) or {}
         owed = _num(pos.get("owed"))
+        days_owed = _num((leave.get(str(e.get("id"))) or {}).get("owed"))
         name = e.get("name") or "Someone"
         if e.get("status") == "left":
+            when = parse_date(e.get("end_date"))
             if owed > 0:
-                when = parse_date(e.get("end_date"))
                 add("act", f"{name} has left{' on ' + when.isoformat() if when else ''} and is still owed "
                            f"{k(owed)} gratuity. The Employment Code Act (s.73(2)) says it is paid, prorated "
                            "to the time worked: tick it in the next payroll run.", e, fix="pay_gratuity")
+            if days_owed > 0:
+                add("act", f"{name} has left and is still owed {days_owed:g} leave days "
+                           f"({k(leave_pay(e, days_owed))}). Leave not taken is paid when a contract ends "
+                           "(Employment Code Act s.36(5)): type the days in the next payroll run.", e,
+                    fix="pay_leave")
             continue
+
+        # The Order covering them, if the owner chose one: pay under it is an offence.
+        for issue in min_wage.check(e, CASUAL_LOADING):
+            add(issue["level"], issue["text"], e, fix="pay")
+        if min_wage.covers_maybe(e):
+            add("info", f"Check whether a minimum wage Order covers {name}: anyone not in management or a "
+                        "union, in a shop (SI 50 of 2023), a home (SI 49) or any other work (SI 48), has a "
+                        "minimum basic pay and allowances. Choose theirs, or None, in their details.",
+                e, fix="wage_order")
+
+        casual = e.get("employment_type") == "casual"
+        if casual:
+            if not _num(e.get("hourly_rate")):
+                add("warn", f"Add {name}'s hourly rate: a casual worker is paid by the hour.", e, fix="pay")
+            # Casual work is work that is not permanent, or can be done in under
+            # six months (s.3); keeping someone casual on lasting work is
+            # casualisation, an offence (s.7).
+            year_ago = (today - timedelta(days=365)).isoformat()[:7]
+            months = {str(s.get("period") or "")[:7] for s in history.get(str(e.get("id"))) or []
+                      if str(s.get("period") or "") >= year_ago and _num(s.get("gross")) > 0}
+            if len(months) >= 6:
+                add("warn", f"{name} has been paid as a casual worker in {len(months)} of the last 12 months. "
+                            "Work that lasts six months or more is not casual work (Employment Code Act s.3), "
+                            "and keeping someone casual on it is casualisation, an offence (s.7): offer a "
+                            "contract.", e, fix="employment_type")
+
+        stop = 65 if e.get("napsa_to_65") else 60
+        born = parse_date(e.get("date_of_birth"))
+        if born and not e.get("napsa_exempt"):
+            try:
+                birthday = born.replace(year=born.year + stop)
+            except ValueError:                                  # born on 29 February
+                birthday = date(born.year + stop, 3, 1)
+            if today <= birthday <= today + timedelta(days=60):
+                add("info", f"{name} turns {stop} on {birthday.isoformat()}: NAPSA stops from that day by itself."
+                            + ("" if stop == 65 else " If they chose to retire at 65 and you agreed, tick it "
+                               "in their details (National Pension Scheme Act 2026, s.29).") , e)
+        if days_owed > 24:
+            add("info", f"{name} is owed {days_owed:g} leave days, more than a year's. Plan when they take them "
+                        "(Employment Code Act s.36(3)): leave not taken is still owed, and paid out when "
+                        "they leave.", e)
 
         contract = e.get("employment_type") == "contract"
         end = parse_date(e.get("contract_end"))
@@ -1185,9 +1498,15 @@ def statutory_checks(employees: list, positions: dict, employer: dict, today: da
         if not e.get("napsa_number") and not e.get("napsa_exempt"):
             add("warn", f"Add {name}'s NAPSA social security number: NAPSA's monthly return lists each "
                         "member by it.", e, fix="ids")
-        if not e.get("start_date"):
-            add("info", f"Add the day {name} started: it decides how ZRA's PAYE tables are used and goes on "
-                        "their certificate of service.", e, fix="start_date")
+        no_start = not e.get("start_date")
+        no_birth = not (e.get("date_of_birth") or e.get("napsa_exempt"))
+        if no_start or no_birth:
+            what = (f"the day {name} started and their date of birth" if no_start and no_birth else
+                    f"the day {name} started" if no_start else f"{name}'s date of birth")
+            why = "; ".join(w for w, need in (
+                ("the start decides how ZRA's PAYE tables are used and goes on the certificate of service",
+                 no_start), ("the date of birth stops NAPSA at 60 by itself", no_birth)) if need)
+            add("info", f"Add {what}: {why}.", e, fix="start_date")
 
     rank = {"act": 0, "warn": 1, "info": 2}
     out.sort(key=lambda c: rank[c["level"]])
@@ -1201,7 +1520,8 @@ def checks(db, user_id: str, today: date | None = None) -> dict:
     history = payslip_history(db, user_id)
     positions = {str(e.get("id")): gratuity_position(e, history.get(str(e.get("id"))) or [])
                  for e in employees}
-    items = statutory_checks(employees, positions, get_employer(db, user_id), today)
+    leave = {str(e.get("id")): leave_position(e, history.get(str(e.get("id"))) or []) for e in employees}
+    items = statutory_checks(employees, positions, get_employer(db, user_id), today, leave, history)
     note = rates_note(today.isoformat())
     if note:
         items.insert(0, {"level": "warn", "text": note, "employee_id": None, "name": None, "fix": None})
@@ -1214,10 +1534,18 @@ def checks(db, user_id: str, today: date | None = None) -> dict:
 _CHANGE_MONEY = ("basic", "allowances", "extra_pay")
 
 
+# Counts of time in a month's changes: (key, words, most in a month).
+_CHANGE_TIME = (("leave_days", "Leave days paid out", 366), ("leave_taken", "Leave days taken", 31),
+                ("hours", "Hours worked", 744), ("days", "Days worked", 31),
+                ("overtime_hours", "Overtime hours", 400), ("holiday_hours", "Rest day and holiday hours", 400))
+
+
 def clean_changes(changes) -> dict:
     """This month's changes per person, as the Staff page sends them:
     {employee_id: {basic, allowances, extra_pay, extra_note, leave_days,
-    pay_gratuity}}. Pay is money to the ngwee and never below nothing."""
+    leave_taken, hours, days, overtime_hours, holiday_hours, pay_gratuity}}.
+    Pay is money to the ngwee and never below nothing; time is never more
+    than a month holds."""
     out: dict = {}
     for eid, c in (changes or {}).items():
         if not isinstance(c, dict):
@@ -1230,11 +1558,13 @@ def clean_changes(changes) -> dict:
             if v is None or v < 0:
                 raise ValueError(f"{k.replace('_', ' ').capitalize()} must be an amount of K0 or more.")
             row[k] = money.round_ngwee(v)
-        if c.get("leave_days") not in (None, ""):
-            days = _num(c.get("leave_days"), None)
-            if days is None or not 0 <= days <= 366:
-                raise ValueError("Leave days paid out must be between 0 and 366.")
-            row["leave_days"] = round(days, 2)
+        for k, words, most in _CHANGE_TIME:
+            if c.get(k) in (None, ""):
+                continue
+            v = _num(c.get(k), None)
+            if v is None or not 0 <= v <= most:
+                raise ValueError(f"{words} must be between 0 and {most}.")
+            row[k] = round(v, 2)
         note = str(c.get("extra_note") or "").strip()
         if note:
             row["extra_note"] = note[:120]
@@ -1247,19 +1577,22 @@ def clean_changes(changes) -> dict:
 def on_payroll(employees: list, period: str, owed: dict, changes: dict) -> list:
     """(employee, kind) for everyone a run for `period` pays: everyone active;
     someone who left this month or later ('final': their last pay); and
-    someone who left before it and is still owed gratuity, when the owner
-    ticks it ('gratuity_only')."""
+    someone who left before it and is still owed gratuity or leave days, when
+    the owner ticks the gratuity or types the leave days ('gratuity_only':
+    what is still owed, no wages)."""
     first = parse_date(f"{valid_period(period)}-01")
     out = []
     for e in employees:
         eid = str(e.get("id"))
+        mine = changes.get(eid) or {}
         if e.get("status") == "active":
             out.append((e, "pay"))
         elif e.get("status") == "left":
             end = parse_date(e.get("end_date"))
             if end and end >= first:
                 out.append((e, "final"))
-            elif _num(owed.get(eid)) > 0 and (changes.get(eid) or {}).get("pay_gratuity"):
+            elif ((_num(owed.get(eid)) > 0 and mine.get("pay_gratuity"))
+                  or _num(mine.get("leave_days")) > 0):
                 out.append((e, "gratuity_only"))
     return out
 
@@ -1280,6 +1613,8 @@ def _work_out_run(db, user_id: str, period: str, pay_iso: str, changes: dict | N
     history = payslip_history(db, user_id)
     owed = {str(e.get("id")): gratuity_position(e, history.get(str(e.get("id"))) or [])["owed"]
             for e in employees}
+    leave = {str(e.get("id")): leave_position(e, history.get(str(e.get("id"))) or [])
+             for e in employees}
     people = on_payroll(employees, period, owed, changes)
     month_end = _month_end(period)
     slips = []
@@ -1288,12 +1623,13 @@ def _work_out_run(db, user_id: str, period: str, pay_iso: str, changes: dict | N
         change = {**(changes.get(eid) or {}), "kind": kind}
         if kind == "gratuity_only":
             change.update({"basic": 0, "allowances": 0, "pay_gratuity": True})
-            change.pop("extra_pay", None)
-            change.pop("leave_days", None)
+            for k in ("extra_pay", "leave_taken", "hours", "days", "overtime_hours", "holiday_hours"):
+                change.pop(k, None)
         earlier = [s for s in history.get(eid) or [] if str(s.get("period") or "") < period]
         ytd = year_to_date(emp, earlier, period, pay_iso)
         slip = compute_payslip(emp, period, rates, sdl_due=sdl["due"], change=change, ytd=ytd,
-                               gratuity_owed=owed.get(eid, 0.0))
+                               gratuity_owed=owed.get(eid, 0.0), pay_date=pay_iso,
+                               leave_owed=leave[eid]["owed"])
         end = parse_date(emp.get("end_date") if kind != "pay" else emp.get("contract_end"))
         start = parse_date(emp.get("start_date"))
         slip.update({
@@ -1304,14 +1640,25 @@ def _work_out_run(db, user_id: str, period: str, pay_iso: str, changes: dict | N
             "ends_on": end.isoformat() if end and end <= month_end else None,
             # Started after the 1st of this month: not a full month's pay.
             "started_on": start.isoformat() if start and month_end.replace(day=1) < start <= month_end else None,
+            # Leave owed before this month, and by its end (this month earned,
+            # days taken off): on the last pay that is paid out (s.36(5)).
+            "leave_owed_before": leave[eid]["owed"],
+            "leave_to_pay": round(max(0.0, leave[eid]["owed"] + _num(slip.get("leave_earned"))
+                                      - _num(slip.get("leave_taken"))), 2),
+            "leave_due": bool(kind == "final" or (end and end <= month_end and kind == "pay"))
+            and leave[eid]["owed"] + _num(slip.get("leave_earned")) - _num(slip.get("leave_taken")) > 0,
+            # A casual worker is paid for the hours typed for the month.
+            "needs_hours": emp.get("employment_type") == "casual" and kind == "pay"
+            and not _num((changes.get(eid) or {}).get("hours")),
             "change": changes.get(eid) or {},
         })
         slips.append(slip)
     paid_ids = {str(e.get("id")) for e, _ in people}
     leavers = [{"employee_id": e.get("id"), "name": e.get("name"), "owed": owed.get(str(e.get("id")), 0.0),
+                "leave_owed": leave[str(e.get("id"))]["owed"], "leave_value": leave[str(e.get("id"))]["value"],
                 "end_date": e.get("end_date")}
                for e in employees if e.get("status") == "left" and str(e.get("id")) not in paid_ids
-               and owed.get(str(e.get("id")), 0.0) > 0]
+               and (owed.get(str(e.get("id")), 0.0) > 0 or leave[str(e.get("id"))]["owed"] > 0)]
     return people, slips, rates, sdl, leavers
 
 
@@ -1348,7 +1695,7 @@ def set_sdl_setting(db, user_id: str, value: str) -> str:
 # What every return and every person's leaving papers name the employer by:
 # the TPIN on the PAYE return, the NAPSA employer account number (Employment
 # Code Act s.59(f)) and the NHIMA employer number.
-EMPLOYER_KEYS = ("tpin", "napsa", "nhima")
+EMPLOYER_KEYS = ("tpin", "napsa", "nhima", "address")   # a pay statement names the address (SI 50 of 2023)
 
 
 def get_employer(db, user_id: str) -> dict:
@@ -1373,8 +1720,9 @@ def get_employer(db, user_id: str) -> dict:
 
 
 def set_employer(db, user_id: str, numbers: dict) -> dict:
-    """Save the employer's TPIN, NAPSA and NHIMA numbers (each optional)."""
-    clean = {k: (str(numbers.get(k) or "").strip()[:40] or None) for k in EMPLOYER_KEYS}
+    """Save the employer's TPIN, NAPSA and NHIMA numbers and address (each optional)."""
+    clean = {k: (str(numbers.get(k) or "").strip()[:120 if k == "address" else 40] or None)
+             for k in EMPLOYER_KEYS}
     try:
         db.table("profiles").update({"payroll_employer": clean}).eq("id", user_id).execute()
     except Exception as e:  # noqa: BLE001
@@ -1428,7 +1776,13 @@ def preview_run(db, user_id: str, period: str, pay_date=None, changes: dict | No
 
 def run_notes(totals: dict, slips: list) -> list:
     """What the owner must know about a run beyond its figures, in words."""
-    notes = [s["paye_note"] for s in slips if s.get("paye_note")]
+    notes = [f"Type the hours {s.get('employee_name')} worked this month: a casual worker is paid by the hour, "
+             "with the 25% casual loading." for s in slips if s.get("needs_hours")]
+    notes += [f"{s.get('employee_name')} is owed {_num(s.get('leave_to_pay')):g} leave days with this month's "
+              f"(K{leave_pay({'basic_pay': s.get('basic_full'), 'allowances': s.get('allowances_full')}, s.get('leave_to_pay')):,.2f}): "
+              "pay them out with this last pay (Employment Code Act s.36(5))."
+              for s in slips if s.get("leave_due") and not _num(s.get("leave_days"))]
+    notes += [s["paye_note"] for s in slips if s.get("paye_note")]
     if _num(totals.get("paye")) < 0:
         notes.append(f"PAYE refunds this month come to K{-_num(totals.get('paye')):,.2f} more than the PAYE "
                      "taken, so no PAYE is paid to ZRA this month. Take the difference off next month's "
@@ -1498,9 +1852,13 @@ def _as_paid(was: dict) -> tuple:
     emp = {"id": was.get("employee_id"), "name": was.get("employee_name"),
            "basic_pay": was.get("basic"), "allowances": was.get("allowances"),
            "napsa_exempt": was.get("napsa_exempt"), "loan_monthly": loan, "loan_balance": loan,
-           "second_job": basis == "second job"}
-    change = {"extra_pay": money.total([was.get("extra_pay"), was.get("leave_pay")]),
+           "second_job": basis == "second job",
+           "employment_type": "casual" if basis == "daily tables" else "permanent"}
+    change = {"extra_pay": money.total([was.get("extra_pay"), was.get("leave_pay"), was.get("overtime_pay"),
+                                        was.get("holiday_pay")]),
               "extra_note": was.get("extra_note"), "kind": was.get("kind") or "pay"}
+    if basis == "daily tables":
+        change.update({"basic": was.get("basic"), "days": was.get("days_worked")})
     if _num(was.get("gratuity_paid")) > 0:
         change["pay_gratuity"] = _num(was.get("gratuity_paid"))
     ytd = None
@@ -2098,9 +2456,9 @@ def _totals(slips: list) -> dict:
     the sum of the figures above it. napsa_total and nhima_total are both
     halves together: what NAPSA and NHIMA are actually owed."""
     slips = [hydrate_slip(s) for s in slips]
-    keys = ("basic", "allowances", "extra_pay", "leave_pay", "gross", "napsa_employee", "napsa_employer",
-            "nhima_employee", "nhima_employer", "paye", "sdl", "loan_deduction", "net",
-            "gratuity_accrued", "gratuity_paid", "employer_cost")
+    keys = ("basic", "allowances", "extra_pay", "leave_pay", "overtime_pay", "holiday_pay", "gross",
+            "napsa_employee", "napsa_employer", "nhima_employee", "nhima_employer", "paye", "sdl",
+            "loan_deduction", "net", "gratuity_accrued", "gratuity_paid", "employer_cost")
     t = {k: money.total(s.get(k) for s in slips) for k in keys}
     t["napsa_total"] = money.total([t["napsa_employee"], t["napsa_employer"]])
     t["nhima_total"] = money.total([t["nhima_employee"], t["nhima_employer"]])
