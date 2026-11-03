@@ -79,7 +79,7 @@ def people(run: dict, employees: list[dict], business_name: str | None = None,
     rows = []
     for slip in run.get("payslips") or []:
         emp = by_id.get(str(slip.get("employee_id"))) or {}
-        slip = {**slip, "period": slip.get("period") or run.get("period")}
+        slip = {**slip, "period": slip.get("period") or run.get("period"), "pay_date": run.get("pay_date")}
         text = payroll.payslip_text(slip, business_name, sym)
         email = (emp.get("email") or "").strip() or None
         rows.append({
@@ -136,12 +136,15 @@ def mark_sent(db, user_id: str, run_id: str, employee_id: str, via: str,
     return when
 
 
-def _pdf(slip: dict, business_name: str | None, sym: str) -> bytes | None:
+def _pdf(slip: dict, business_name: str | None, sym: str, employee: dict | None = None) -> bytes | None:
+    """The same payslip PDF the Staff page downloads (payroll_papers)."""
     import pdfdoc
+    import payroll_papers
     if not pdfdoc.available():
         return None
     try:
-        return pdfdoc.render(f"Payslip, {slip.get('period')}", payroll.payslip_text(slip, business_name, sym))
+        doc = payroll_papers.payslip_doc(slip, employee, {"name": business_name}, sym)
+        return pdfdoc.report(doc["title"], doc["blocks"], sub=doc["sub"], facts=doc["facts"])
     except Exception as e:  # noqa: BLE001 — the email carries the whole payslip anyway
         log.warning("[payslips] PDF for %s not made: %s", slip.get("employee_name"), e)
         return None
@@ -173,9 +176,9 @@ def send_by_email(db, user_id: str, run: dict, employees: list[dict], business_n
         if out["email_channel"] != "live":
             out["failed"].append(name)
             continue
-        slip = {**slip, "period": slip.get("period") or run.get("period")}
+        slip = {**slip, "period": slip.get("period") or run.get("period"), "pay_date": run.get("pay_date")}
         subject, body = email_message(slip, business_name, reply_to, sym)
-        pdf = _pdf(slip, business_name, sym)
+        pdf = _pdf(slip, business_name, sym, by_id.get(eid))
         files = [(f"payslip_{slip.get('period')}.pdf", pdf)] if pdf else None
         try:
             ok = notify.send_email(email, subject, body,

@@ -2579,7 +2579,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 42
+EXPECTS_MIGRATION = 43
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -7149,13 +7149,16 @@ def get_payroll_rates(ctx: membership.Context = Depends(membership.require_owner
 
 
 class PayrollSettingsIn(BaseModel):
-    sdl: str                                # 'auto' | 'pays' | 'exempt'
+    sdl: Optional[str] = None               # 'auto' | 'pays' | 'exempt'
+    # The employer's own numbers: {"tpin", "napsa", "nhima"} (migration 0043).
+    employer: Optional[Dict[str, Optional[str]]] = None
 
 
 @app.get("/payroll/settings")
 def get_payroll_settings(period: Optional[str] = Query(None),
                          ctx: membership.Context = Depends(membership.require_owner)):
-    """Whether this business pays the Skills Development Levy, and why."""
+    """Whether this business pays the Skills Development Levy, and why, and
+    the employer numbers every return and leaving paper carries."""
     db = _require_db()
     from datetime import date as _date
     month = period or _date.today().isoformat()[:7]
@@ -7163,17 +7166,55 @@ def get_payroll_settings(period: Optional[str] = Query(None),
         rates = payroll_api.current_rates(f"{payroll_api.valid_period(month)}-15", "ZMW")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"ok": True, "sdl": payroll_api.sdl_for(db, ctx.tenant, month, rates)}
+    return {"ok": True, "sdl": payroll_api.sdl_for(db, ctx.tenant, month, rates),
+            "employer": payroll_api.get_employer(db, ctx.tenant)}
 
 
 @app.put("/payroll/settings")
 def put_payroll_settings(body: PayrollSettingsIn, ctx: membership.Context = Depends(membership.require_owner)):
     db = _require_db()
     try:
-        payroll_api.set_sdl_setting(db, ctx.tenant, body.sdl)
+        if body.sdl is not None:
+            payroll_api.set_sdl_setting(db, ctx.tenant, body.sdl)
+        if body.employer is not None:
+            payroll_api.set_employer(db, ctx.tenant, body.employer)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return get_payroll_settings(None, ctx)
+
+
+@app.get("/payroll/gratuity")
+def get_payroll_gratuity(ctx: membership.Context = Depends(membership.require_owner)):
+    """What each person is owed in gratuity, what falls due in the next 60
+    days, and the total the business owes its staff."""
+    db = _require_db()
+    return {"ok": True, **payroll_api.gratuity_book(db, ctx.tenant)}
+
+
+@app.get("/payroll/checks")
+def get_payroll_checks(ctx: membership.Context = Depends(membership.require_owner)):
+    """What the law asks of this payroll that is not done yet: gratuity owed
+    or missing, contracts ending, numbers the returns need."""
+    db = _require_db()
+    return {"ok": True, **payroll_api.checks(db, ctx.tenant)}
+
+
+@app.get("/employees/{employee_id}/leaving-papers.pdf")
+def employee_leaving_papers(employee_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    """The papers someone who leaves is owed: the certificate of service
+    (Employment Code Act s.59), the pay and tax of the year for ZRA form
+    ITF/P13, and the gratuity statement."""
+    import payroll_papers
+    entitlements.require_feature(ctx.tenant, "payroll")
+    db = _require_db()
+    emp = next((e for e in payroll_api.list_employees(db, ctx.tenant) if str(e.get("id")) == employee_id), None)
+    if emp is None:
+        raise HTTPException(status_code=404, detail="That person is not on your staff list.")
+    slips = payroll_api.payslip_history(db, ctx.tenant).get(employee_id) or []
+    doc = payroll_papers.leaving_papers_doc(emp, slips, payroll_api.get_employer(db, ctx.tenant))
+    content, media, name = payroll_papers.render(doc)
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
 
 
 @app.get("/payroll/runs/{run_id}/recheck")
@@ -7234,8 +7275,11 @@ def payroll_compliance_text(run_id: str, business_name: Optional[str] = Query(No
 def payslip_pdf(run_id: str, employee_id: str = Query(...),
                       business_name: Optional[str] = Query(None),
                       ctx: membership.Context = Depends(membership.require_owner)):
-    """Printable payslip PDF (audit #26). Falls back to .txt if the PDF lib
-    isn't available in this environment."""
+    """Printable payslip PDF (audit #26): the pay, every deduction with its
+    reason, the employer's share, the gratuity and the tax year so far
+    (payroll_papers.payslip_doc). Falls back to .txt if the PDF lib isn't
+    available in this environment."""
+    import payroll_papers
     entitlements.require_feature(ctx.tenant, "payroll")
     db = _require_db()
     try:
@@ -7245,33 +7289,34 @@ def payslip_pdf(run_id: str, employee_id: str = Query(...),
     slip = next((s for s in run.get("payslips") or [] if str(s.get("employee_id")) == employee_id), None)
     if slip is None:
         raise HTTPException(status_code=404, detail="No payslip for that employee in this run.")
-    slip = {**slip, "period": slip.get("period") or run.get("period")}
-    text = payroll_api.payslip_text(slip, business_name)
-    if pdfdoc.available():
-        pdf = pdfdoc.render(f"Payslip, {slip.get('period')}", text)
-        return Response(content=pdf, media_type="application/pdf",
-                        headers={"Content-Disposition": f"attachment; filename=payslip_{slip.get('period')}.pdf"})
-    return Response(content=text, media_type="text/plain",
-                    headers={"Content-Disposition": f"attachment; filename=payslip_{slip.get('period')}.txt"})
+    slip = {**slip, "period": slip.get("period") or run.get("period"), "pay_date": run.get("pay_date")}
+    employer = payroll_api.get_employer(db, ctx.tenant)
+    employer["name"] = business_name or employer.get("name")
+    employee = next((e for e in payroll_api.list_employees(db, ctx.tenant)
+                     if str(e.get("id")) == employee_id), None)
+    content, media, name = payroll_papers.render(payroll_papers.payslip_doc(slip, employee, employer))
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
 
 
 @app.get("/payroll/runs/{run_id}/compliance.pdf")
 def compliance_pdf(run_id: str, business_name: Optional[str] = Query(None),
                          ctx: membership.Context = Depends(membership.require_owner)):
-    """Printable statutory compliance pack PDF (audit #66)."""
+    """Printable statutory tax pack PDF (audit #66): what goes to ZRA, NAPSA
+    and NHIMA by the 10th, and each person as each monthly return lists them."""
+    import payroll_papers
     entitlements.require_feature(ctx.tenant, "payroll")
     db = _require_db()
     try:
         run = payroll_api.get_run(db, ctx.tenant, run_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    text = payroll_api.compliance_text(run, business_name)
-    if pdfdoc.available():
-        pdf = pdfdoc.render(f"Statutory summary, {run.get('period')}", text)
-        return Response(content=pdf, media_type="application/pdf",
-                        headers={"Content-Disposition": f"attachment; filename=statutory_{run.get('period')}.pdf"})
-    return Response(content=text, media_type="text/plain",
-                    headers={"Content-Disposition": f"attachment; filename=statutory_{run.get('period')}.txt"})
+    employer = payroll_api.get_employer(db, ctx.tenant)
+    employer["name"] = business_name or employer.get("name")
+    doc = payroll_papers.tax_pack_doc(run, payroll_api.list_employees(db, ctx.tenant), employer)
+    content, media, name = payroll_papers.render(doc)
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
 
 
 @app.get("/payroll/runs/{run_id}/payslip-text")
@@ -7290,7 +7335,7 @@ def payslip_share_text(run_id: str, employee_id: str = Query(...),
                  if str(s.get("employee_id")) == employee_id), None)
     if slip is None:
         raise HTTPException(status_code=404, detail="No payslip for that employee in this run.")
-    slip = {**slip, "period": slip.get("period") or run.get("period")}
+    slip = {**slip, "period": slip.get("period") or run.get("period"), "pay_date": run.get("pay_date")}
     return {"ok": True, "text": payroll_api.payslip_text(slip, business_name)}
 
 
@@ -7362,6 +7407,9 @@ class PayrollRunRequest(BaseModel):
     period: str                             # 'YYYY-MM'
     pay_date: Optional[str] = None
     preview: bool = False                   # compute-only, no persistence, no events
+    # This month's own, per employee id: basic / allowances actually earned,
+    # extra_pay + extra_note, leave_days paid out, pay_gratuity (payroll.clean_changes).
+    changes: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @app.delete("/payroll/runs/{run_id}")
@@ -7405,9 +7453,10 @@ def run_payroll(req: PayrollRunRequest, ctx: membership.Context = Depends(member
     db = _require_db()
     try:
         if req.preview:
-            return {"ok": True, "preview": payroll_api.preview_run(db, ctx.tenant, req.period, req.pay_date)}
+            return {"ok": True, "preview": payroll_api.preview_run(db, ctx.tenant, req.period, req.pay_date,
+                                                                   req.changes)}
         entitlements.require_feature(ctx.tenant, "payroll")
-        run = payroll_api.run_payroll(db, ctx.tenant, req.period, req.pay_date)
+        run = payroll_api.run_payroll(db, ctx.tenant, req.period, req.pay_date, req.changes)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "run": run, "reminders_set": _reminders_with_first_run(db, ctx)}

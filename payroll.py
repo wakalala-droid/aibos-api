@@ -58,13 +58,59 @@ so past runs stay truthful after a rate change (a replayable history).
   All of PAYE, SDL, NAPSA and NHIMA are due by the 10th of the next month.
   ZRA charges 5% a month of PAYE paid late, plus interest, and the employer is
   "wholly liable" for PAYE it under-deducted (Employer's Guide, 1.3 and 1.4).
-  Gratuity: fixed-term contracts only, ≥25% of basic pay (Employment Code Act
-            No.3 of 2019, s.54/73) — contractual, hence a per-employee rate.
+  NAPSA paid late costs 10% of the unpaid amount for each month (National
+  Pension Scheme Act No. 72 of 2026, s.24(8)), and its "earnings" are "a wage,
+  salary, allowance, bonus, commission, incentive" (s.2).
+
+── How PAYE is worked out (checked 3 November 2026) ─────────────────────────
+  ZRA's cumulative tables (Employer's Guide to PAYE, 4.2 and 5.1): the tax on
+  all the pay of the charge year so far, on the bands times the income tax
+  month of the pay day, less the PAYE already taken this year. The rest is
+  taken, or refunded when it is less than nothing. The charge year and its
+  month go by the day the pay is paid (8.2). Used when the whole year so far
+  is on record: every month from January has a payslip worked out this way
+  (or the owner typed the figures from before AIBOS or from a previous
+  employer's ITF/P13), and the person was employed from 1 January or brought
+  that ITF/P13. Anyone else is on the "month 1 basis", each month on its own
+  (5.3), which is what AIBOS did for everyone until now: payslips made before
+  this change are not counted as on record, so a shortfall from the old rules
+  is never taken from anyone's later pay (see draft_corrections).
+  A second job is taxed at the top rate on every kwacha, without the bands
+  (5.6). A refund over K3,000 on a new employee's first payday needs ZRA's
+  authority first (6.1). Refunds that come to more than the month's PAYE are
+  set against the next month's (8.5).
+
+── Gratuity (checked 3 November 2026) ───────────────────────────────────────
+  At the end of a long-term contract (over 12 months, or a set task) the
+  employee is paid at least 25% of the basic pay EARNED over the contract
+  (Employment Code Act No. 3 of 2019, s.73(1)), prorated when it ends early
+  (s.73(2), s.53(6)); a fixed-duration contract's severance pay is the same
+  gratuity (s.54(1)(b),(c)). SI 48 of 2020 lifts s.73 for expatriates,
+  management with a written gratuity contract, and domestic and farm workers.
+  AIBOS sets it aside every month on the basic pay of that month and keeps
+  what each person is owed; it is paid with a payroll run (the final pay).
+  It is a pension benefit and so free of tax (Constitution of Zambia, Art.
+  188(2); ZRA Employer's Guide to PAYE, 7.2): no PAYE. NAPSA's earnings do not
+  name it: no NAPSA. NHIMA is on basic pay: none. The Skills Development Levy
+  is on gross emoluments, and a payment on leaving employment is one (ZRA
+  Employer's Guide, 2.1): the levy is added on it.
+  Leave days paid out: full pay × days ÷ 26 (Employment Code Act, Fifth
+  Schedule, s.37), taxed like any pay (Employer's Guide, 7.2).
+
+── Records ──────────────────────────────────────────────────────────────────
+  Every payment tells the employee in writing the total pay and the total tax
+  taken (Employer's Guide, 8.3); every wage and every deduction is kept with
+  its reason (Employment Code Act, s.71), for 6 years (Employer's Guide, 10.1).
+  Someone who leaves gets a certificate of service with the statutory
+  contributions paid (Employment Code Act, s.59), and ITF/P13: part 1 to ZRA
+  within 5 days, part 2 to them (Employer's Guide, 6.2). payroll_papers.py
+  writes those, the payslip and the monthly tax pack.
+
   Sources: ZRA Employer's Guide to PAYE (2020) and Practice Note 2018; 2026
   Budget Speech (Ministry of Finance, October 2025); PwC Worldwide Tax
-  Summaries, Zambia (reviewed 24 July 2026); NAPSA FAQ on the National Pension
-  Scheme Act 2026 and the 2026 ceiling notices; Skills Development Levy Act
-  2016; SI 63 of 2019; Employment Code Act 2019.
+  Summaries, Zambia (reviewed 24 July 2026); the National Pension Scheme Act
+  No. 72 of 2026 and NAPSA's 2026 ceiling notice; Skills Development Levy Act
+  2016; SI 63 of 2019; Employment Code Act 2019 and SI 48 of 2020.
 
   What this file got wrong, and when it was put right (13 October 2026):
   - the PAYE table was 25% / 30% to K9,900 / 37.5%, which ZRA never published;
@@ -150,6 +196,7 @@ EMP_EDITABLE = (
     "basic_pay", "allowances", "napsa_exempt", "currency", "pay_day", "napsa_number", "tpin",
     "gratuity_eligible", "gratuity_rate", "contract_end",
     "loan_balance", "loan_monthly", "notes", "phone", "email",
+    "nrc", "nhima_number", "second_job", "gratuity_opening", "paye_prior",
 )
 
 # Migration 0039 adds these. Before it is run, saving one with a value is
@@ -157,6 +204,19 @@ EMP_EDITABLE = (
 EMP_0039_COLUMNS = ("allowances", "napsa_exempt")
 # Migration 0042: where each person's payslip goes (payslip_delivery.py).
 EMP_0042_COLUMNS = ("phone", "email")
+# Migration 0043: what the returns and leaving papers need, a second job, the
+# gratuity owed from before AIBOS and the pay and PAYE earlier in the year.
+EMP_0043_COLUMNS = ("nrc", "nhima_number", "second_job", "gratuity_opening", "paye_prior")
+
+# The Employment Code Act's lowest gratuity: 25% of basic pay earned (s.73(1)).
+GRATUITY_MINIMUM = 0.25
+# Leave days paid out: full pay × days ÷ 26 (Employment Code Act, Fifth Schedule).
+LEAVE_DAYS_DIVISOR = 26
+# A refund larger than this on a new employee's first payday waits for ZRA's
+# authority (Employer's Guide to PAYE, 6.1).
+NEW_STARTER_REFUND_LIMIT = 3000.0
+# Where the pay and PAYE typed for earlier in the year came from.
+PRIOR_SOURCES = ("before_aibos", "p13")
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -255,15 +315,126 @@ def compute_paye(taxable: float, bands: list) -> float:
     return _f(tax)
 
 
-def compute_gratuity_accrual(emp: dict) -> float:
-    """Monthly gratuity provision for fixed-term staff: rate × basic pay."""
+def cumulative_bands(bands: list, month: int) -> list:
+    """ZRA's cumulative table for income tax month `month`: each band's top
+    times the months of the year gone, the rates the same (Employer's Guide to
+    PAYE, 4.2: the K5,100 a month free band is K56,100 by November)."""
+    return [(None if up is None else up * month, rate) for up, rate in bands]
+
+
+def _prior_for(emp: dict, year: int) -> dict | None:
+    """The pay and PAYE the owner typed for earlier in `year` (from their
+    payroll before AIBOS, or a previous employer's ITF/P13), or None."""
+    p = emp.get("paye_prior")
+    if not isinstance(p, dict):
+        return None
+    try:
+        return p if int(p.get("year")) == year and str(p.get("through") or "")[:4] == str(year) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _paid_on(slip: dict) -> date | None:
+    """The day a payslip's pay was paid: its run's pay date, else the 28th."""
+    return parse_date(slip.get("pay_date")) or parse_date(f"{str(slip.get('period') or '')[:7]}-28")
+
+
+def year_to_date(emp: dict, earlier: list, period: str, pay_date=None) -> dict:
+    """What this person was paid and taxed earlier in the charge year of this
+    pay day, and so how ZRA's tables are used for them. Pure.
+
+    `earlier` is their payslips from the runs before this one (hydrated, each
+    with its run's pay_date). The charge year and its month are the pay day's
+    (Employer's Guide to PAYE, 8.2). The cumulative tables are used when the
+    year so far is on record: every month from January, or from the month
+    after the figures typed for earlier in the year, has a payslip worked out
+    on the tables, and the person was employed from 1 January or brought a
+    previous employer's ITF/P13 (5.1 and 5.3). Otherwise: the month 1 basis.
+    A payslip made before AIBOS used the tables (no paye_basis in it) does not
+    count as on record, so an old shortfall is never taken from later pay."""
+    period = valid_period(period)
+    day = parse_date(pay_date) or parse_date(f"{period}-28")
+    year, month = day.year, day.month
+    mine = [s for s in earlier or [] if str(s.get("period") or "") < period
+            and (_paid_on(s) or day).year == year]
+    prior = _prior_for(emp, year)
+    pay = money.total([*(s.get("gross") for s in mine), (prior or {}).get("pay")])
+    paye = money.total([*(s.get("paye") for s in mine), (prior or {}).get("paye")])
+    napsa = money.total(s.get("napsa_employee") for s in mine)
+
+    through = str((prior or {}).get("through") or f"{year}-00")[:7]
+    upto = int(period[5:7]) if period[:4] == str(year) else 1
+    needed = [m for m in (f"{year}-{k:02d}" for k in range(1, upto)) if m > through]
+    on_tables = {str(s.get("period") or "")[:7] for s in earlier or []
+                 if (s.get("breakdown") or {}).get("paye_basis") or s.get("paye_basis")}
+    missing = [m for m in needed if m not in on_tables]
+    start = parse_date(emp.get("start_date"))
+    brought_p13 = bool(prior and prior.get("source") == "p13")
+
+    why = None
+    if start and start > date(year, 1, 1) and not brought_p13 and start.year == year:
+        why = (f"started on {start.isoformat()}, part-way through {year}, with no ITF/P13 from a "
+               "previous employer")
+    elif missing:
+        why = (f"{len(missing)} earlier month{'s' if len(missing) != 1 else ''} of {year} "
+               f"{'are' if len(missing) != 1 else 'is'} not on record in AIBOS")
+    return {"basis": "month 1" if why else "cumulative", "year": year, "month": month,
+            "pay": pay, "paye": paye, "napsa": napsa, "first_pay": not (earlier or []),
+            "prior": bool(prior), "why": why}
+
+
+def work_out_paye(taxable, rates: dict, ytd: dict | None = None, second_job: bool = False) -> dict:
+    """PAYE on one payment as ZRA's tables work it out. Pure.
+
+    With `ytd` (year_to_date()) on the cumulative basis: the tax due on the
+    year's pay so far, this payment included, on the bands times the month,
+    less the PAYE already taken this year; less than nothing is a refund.
+    Without it, or on the month 1 basis: this payment on its own. A second
+    job: the top rate on every kwacha, no bands, no cumulative (5.6)."""
+    bands = rates["paye_bands"]
+    t = _pos(taxable)
+    if second_job:
+        return {"paye": _f(t * money.dec(bands[-1][1])), "basis": "second job", "month": None,
+                "note": None}
+    ytd = ytd or {}
+    if ytd.get("basis") != "cumulative":
+        return {"paye": compute_paye(t, bands), "basis": "month 1", "month": 1, "note": None}
+    n = int(ytd.get("month") or 1)
+    due = money.dec(compute_paye(money.dec(ytd.get("pay")) + t, cumulative_bands(bands, n)))
+    paye = due - money.dec(ytd.get("paye"))
+    note = None
+    if paye < 0 and ytd.get("first_pay") and -paye > money.dec(NEW_STARTER_REFUND_LIMIT):
+        note = (f"ZRA's tables give a refund of K{-paye:,.2f} on this first payday. A refund over "
+                "K3,000 to a new employee needs ZRA's authority first (Employer's Guide to PAYE, "
+                "6.1), so none is paid until ZRA agrees.")
+        paye = Decimal(0)
+    return {"paye": _f(paye), "basis": "cumulative", "month": n, "due_to_date": _f(due), "note": note}
+
+
+def _gratuity_rate(emp: dict) -> Decimal:
+    rate = emp.get("gratuity_rate")
+    return money.dec(GRATUITY_MINIMUM if rate in (None, "") else rate)
+
+
+def compute_gratuity_accrual(emp: dict, basic=None) -> float:
+    """The gratuity set aside for one month: the rate × the basic pay EARNED
+    that month (Employment Code Act s.73: "basic pay earned during the
+    contract period"), the month's own basic when one is given."""
     if not emp.get("gratuity_eligible"):
         return 0.0
-    rate = emp.get("gratuity_rate")
-    return money.times(_pos(emp.get("basic_pay")), 0.25 if rate in (None, "") else rate)
+    return money.times(_pos(emp.get("basic_pay") if basic is None else basic), _gratuity_rate(emp))
 
 
-def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = False) -> dict:
+def leave_pay(emp: dict, days) -> float:
+    """Leave days paid out: full pay × days ÷ 26 (Employment Code Act, Fifth
+    Schedule). Full pay is the month's basic and allowances."""
+    full = _pos(emp.get("basic_pay")) + _pos(emp.get("allowances"))
+    return _f(full * _pos(days) / LEAVE_DAYS_DIVISOR)
+
+
+def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = False,
+                    change: dict | None = None, ytd: dict | None = None,
+                    gratuity_owed: float = 0.0) -> dict:
     """
     Full statutory breakdown for one employee for one month.
 
@@ -273,42 +444,97 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
     napsa_exempt (aged 60 or over) has no NAPSA either side. `sdl_due` says
     whether this employer pays the Skills Development Levy (sdl_status()).
 
-    What the employer pays ON TOP of the pay (their NAPSA and NHIMA halves and
-    the levy) is worked out here too, beside what comes OUT of the pay, so a
-    total is never read as the whole bill when it is half of it.
-    """
-    basic = _pos(emp.get("basic_pay"))
-    allowances = _pos(emp.get("allowances"))
-    gross = basic + allowances
-    in_napsa = not emp.get("napsa_exempt")
+    `change` is this month's own: the basic and allowances actually earned
+    when not the full month (a start, a leaving, unpaid leave), extra pay
+    (overtime, a bonus, commission: taxed, in NAPSA, not in NHIMA or the
+    gratuity), leave days paid out, and whether to pay the gratuity owed
+    (`pay_gratuity`: True for all of it, or an amount). `ytd` is
+    year_to_date() for PAYE's cumulative tables; `gratuity_owed` what this
+    person was owed in gratuity before this month.
 
+    What the employer pays ON TOP of the pay (their NAPSA and NHIMA halves, the
+    levy and the gratuity set aside) is worked out here too, beside what comes
+    OUT of the pay, so a total is never read as the whole bill when it is half
+    of it. A gratuity paid is tax-free and adds to the take-home pay.
+    """
+    change = change or {}
+    basic_full = _pos(emp.get("basic_pay"))
+    allowances_full = _pos(emp.get("allowances"))
+    basic = basic_full if change.get("basic") is None else _pos(change["basic"])
+    allowances = allowances_full if change.get("allowances") is None else _pos(change["allowances"])
+    extra = _pos(change.get("extra_pay"))
+    days = _pos(change.get("leave_days"))
+    leave = money.dec(leave_pay(emp, days)) if days > 0 else Decimal(0)
+    gross = basic + allowances + extra + leave
+    in_napsa = not emp.get("napsa_exempt")
+    left_job = change.get("kind") == "gratuity_only"
+
+    paye_way = {"paye": 0.0, "basis": None, "month": None, "note": None}
     if rates:
         napsa = money.dec(compute_napsa(gross, rates)) if in_napsa else Decimal(0)
         nhima = money.dec(compute_nhima(basic, rates))
         taxable = gross - (napsa if rates.get("napsa_deductible_for_paye") else Decimal(0))
-        paye = money.dec(compute_paye(taxable, rates["paye_bands"]))
-        sdl = money.dec(compute_sdl(gross, rates)) if sdl_due else Decimal(0)
+        # Someone who has left and is paid only their gratuity has no pay to tax.
+        paye_way = (work_out_paye(0, rates) if left_job else
+                    work_out_paye(taxable, rates, ytd, second_job=bool(emp.get("second_job"))))
+        paye = money.dec(paye_way["paye"])
     else:                                   # non-ZMW payroll: register only, no statutory maths
-        napsa = nhima = paye = sdl = Decimal(0)
+        napsa = nhima = paye = Decimal(0)
         taxable = gross
 
+    # The gratuity: this month's share of it, and all of it when it is paid.
+    accrued = money.dec(compute_gratuity_accrual(emp, basic))
+    owed_before = _pos(gratuity_owed)
+    wanted = change.get("pay_gratuity")
+    if wanted is True:
+        paid = owed_before + accrued
+    elif wanted not in (None, False) and _num(wanted) > 0:
+        paid = min(_pos(wanted), owed_before + accrued)
+    else:
+        paid = Decimal(0)
+    sdl = (money.dec(compute_sdl(gross + paid, rates)) if rates and sdl_due else Decimal(0))
+
     # A loan instalment never takes the pay below nothing: what is left after
-    # the statutory deductions is the most it can take this month.
+    # the statutory deductions is the most it can take this month. It comes
+    # out of the wages, never the gratuity.
     left = gross - napsa - nhima - paye
     loan_deduction = min(_pos(emp.get("loan_monthly")), _pos(emp.get("loan_balance")),
                          left if left > 0 else Decimal(0))
     other = Decimal(0)
-    net = gross - napsa - nhima - paye - loan_deduction - other
-    gratuity = compute_gratuity_accrual(emp)
-    employer_cost = gross + napsa + nhima + sdl
+    net = gross - napsa - nhima - paye - loan_deduction - other + paid
+    employer_cost = gross + napsa + nhima + sdl + accrued
+    ytd = ytd or {}
 
     figures = {
         "basic": _f(basic),
         "allowances": _f(allowances),
+        "extra_pay": _f(extra),
+        "extra_note": (str(change.get("extra_note") or "").strip()[:120] or None) if extra > 0 else None,
+        "leave_days": float(days) if days > 0 else 0.0,
+        "leave_pay": _f(leave),
+        "basic_full": _f(basic_full),
+        "allowances_full": _f(allowances_full),
         "nhima_employer": _f(nhima),
         "sdl": _f(sdl),
         "employer_cost": _f(employer_cost),
+        # Every slip from 3 November 2026 counts the gratuity set aside in
+        # what the employer pays; hydrate_slip adds it to older ones.
+        "cost_has_gratuity": True,
         "napsa_exempt": not in_napsa,
+        "gratuity_paid": _f(paid),
+        "gratuity_balance": _f(owed_before + accrued - paid),
+        "paye_basis": paye_way.get("basis"),
+        "paye_month": paye_way.get("month"),
+        "paye_note": paye_way.get("note"),
+        "ytd_pay": _f(money.dec(ytd.get("pay")) + gross),
+        "ytd_paye": _f(money.dec(ytd.get("paye")) + paye),
+        "ytd_napsa": _f(money.dec(ytd.get("napsa")) + napsa),
+        "tax_year": ytd.get("year"),
+        "paye_why": ytd.get("why") if paye_way.get("basis") == "month 1" else None,
+        "loan_balance_after": _f(_pos(emp.get("loan_balance")) - loan_deduction),
+        # 'pay' (a month's pay), 'final' (the month they left) or
+        # 'gratuity_only' (left earlier, paid the gratuity still owed).
+        "kind": change.get("kind") or "pay",
     }
     return {
         "period": period,
@@ -323,7 +549,7 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
         "loan_deduction": _f(loan_deduction),
         "other_deductions": _f(other),
         "net": _f(net),
-        "gratuity_accrued": gratuity,
+        "gratuity_accrued": _f(accrued),
         **figures,
         "breakdown": {
             "currency": emp.get("currency") or "ZMW",
@@ -334,7 +560,8 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
             "nhima_rate": (rates or {}).get("nhima_rate"),
             "sdl_rate": (rates or {}).get("sdl_rate") if sdl_due else 0,
             "paye_on": "gross pay" if not (rates or {}).get("napsa_deductible_for_paye") else "gross less NAPSA",
-            "paye_method": "month 1 basis",
+            "paye_method": ("cumulative tables" if paye_way.get("basis") == "cumulative"
+                            else paye_way.get("basis") or "month 1 basis"),
             # Kept in the payslip's breakdown (jsonb), so a past run can show
             # them without a column for each.
             **figures,
@@ -342,23 +569,41 @@ def compute_payslip(emp: dict, period: str, rates: dict | None, sdl_due: bool = 
     }
 
 
+# Figures a payslip keeps in its breakdown, lifted to the top when read back.
+_SLIP_FIGURES = ("extra_pay", "extra_note", "leave_days", "leave_pay", "basic_full",
+                 "allowances_full", "gratuity_paid", "gratuity_balance", "paye_basis",
+                 "paye_month", "paye_note", "paye_why", "ytd_pay", "ytd_paye", "ytd_napsa",
+                 "tax_year", "loan_balance_after", "kind")
+
+
 def hydrate_slip(row: dict) -> dict:
     """A payslip as read back from the database, with the figures kept in its
     breakdown lifted to the top. A payslip saved before 13 October 2026 has no
-    breakdown figures: basic is its gross, and the employer matched NHIMA."""
+    breakdown figures: basic is its gross, and the employer matched NHIMA.
+    One saved before 3 November 2026 left the gratuity set aside out of what
+    the employer pays: it is counted in now."""
     b = row.get("breakdown") or {}
     gross = _num(row.get("gross"))
     napsa_r = _num(row.get("napsa_employer"), _num(row.get("napsa_employee")))
     nhima_r = _num(b.get("nhima_employer"), _num(row.get("nhima_employee")))
     sdl = _num(b.get("sdl"))
+    accrued = _num(row.get("gratuity_accrued"))
     out = dict(row)
     out.setdefault("basic", _num(b.get("basic"), gross))
     out.setdefault("allowances", _num(b.get("allowances")))
     out.setdefault("nhima_employer", nhima_r)
     out.setdefault("sdl", sdl)
     out.setdefault("napsa_exempt", bool(b.get("napsa_exempt")))
-    out.setdefault("employer_cost", _num(b.get("employer_cost"),
-                                         money.total([gross, napsa_r, nhima_r, sdl])))
+    cost = _num(b.get("employer_cost"), money.total([gross, napsa_r, nhima_r, sdl]))
+    if not b.get("cost_has_gratuity"):
+        cost = money.total([cost, accrued])
+    out.setdefault("employer_cost", cost)
+    for k in _SLIP_FIGURES:
+        if k in b:
+            out.setdefault(k, b[k])
+    out.setdefault("gratuity_paid", 0.0)
+    out.setdefault("extra_pay", 0.0)
+    out.setdefault("leave_pay", 0.0)
     return out
 
 
@@ -387,7 +632,21 @@ def rules_for_ai(on_date=None) -> str:
         f"Skills Development Levy is {r.get('sdl_rate', 0) * 100:g}% of gross pay, paid by the employer only, on "
         f"the PAYE return; an employer with turnover under K{_num(r.get('sdl_turnover_threshold')):,.0f} a year "
         "does not pay it. PAYE, the levy, NAPSA and NHIMA are all due by the 10th of the next month, and ZRA "
-        "charges 5% a month on PAYE paid late."
+        "charges 5% a month on PAYE paid late; NAPSA charges 10% a month on contributions paid late "
+        "(National Pension Scheme Act 2026). "
+        "PAYE uses ZRA's cumulative tables: the tax on the year's pay so far, on the bands times the month, "
+        "less the PAYE already taken, so a bonus or a raise is taxed fairly over the year. Someone who started "
+        "part-way through the year without an ITF/P13 from a previous employer is taxed on the month 1 basis "
+        "(each month on its own). A second job is taxed at the top rate on all of it. "
+        "Gratuity: a fixed-term or long-term contract earns at least 25% of the basic pay earned over the "
+        "contract (Employment Code Act 2019, s.54 and s.73), paid when it ends or prorated if it ends early; "
+        "SI 48 of 2020 exempts expatriates, management with a written gratuity contract, and domestic and farm "
+        "workers. Gratuity is tax-free (a pension benefit, Constitution Art. 188(2); ZRA Employer's Guide 7.2), "
+        "has no NAPSA or NHIMA, but the Skills Development Levy is added on it. AIBOS sets it aside every month "
+        "and pays it with the final pay when the owner ticks it. "
+        "Leave days paid out are full pay × days ÷ 26 (Employment Code Act, Fifth Schedule) and are taxed "
+        "like pay. When someone leaves, the employer gives a certificate of service (s.59) and sends ITF/P13 "
+        "part 1 to ZRA within 5 days; AIBOS writes both under Leaving papers on the Staff page."
     )
 
 
@@ -456,15 +715,27 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
     if "status" in out and out["status"] not in EMP_STATUSES:
         raise ValueError(f"status must be one of {', '.join(EMP_STATUSES)}.")
 
-    for key in ("basic_pay", "allowances", "loan_balance", "loan_monthly", "gratuity_rate"):
+    for key in ("basic_pay", "allowances", "loan_balance", "loan_monthly", "gratuity_rate",
+                "gratuity_opening"):
         if key in out and out[key] is not None:
             val = _num(out[key], None)
             if val is None or val < 0:
                 raise ValueError(f"{key} must be a positive number.")
             # Pay and loans are money: kept to the ngwee, never a fraction of one.
             out[key] = val if key == "gratuity_rate" else money.round_ngwee(val)
-    if out.get("allowances") is None and "allowances" in out:
-        out["allowances"] = 0.0
+    for key in ("allowances", "gratuity_opening"):
+        if key in out and out[key] is None:
+            out[key] = 0.0
+    # A gratuity rate is a share of basic pay. Typed as a percentage (25), it
+    # is kept as the share (0.25): 25 kept as it was would set aside 25 times
+    # the basic pay every month.
+    if out.get("gratuity_rate") is not None:
+        rate = out["gratuity_rate"]
+        if rate > 1:
+            if rate > 100:
+                raise ValueError("The gratuity rate is a percentage of basic pay, like 25.")
+            rate = rate / 100
+        out["gratuity_rate"] = round(rate, 4)
 
     if "pay_day" in out and out["pay_day"] is not None:
         try:
@@ -475,7 +746,7 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
             raise ValueError("pay_day must be between 1 and 28.")
         out["pay_day"] = day
 
-    for flag in ("gratuity_eligible", "napsa_exempt"):
+    for flag in ("gratuity_eligible", "napsa_exempt", "second_job"):
         if flag in out:
             out[flag] = bool(out[flag])
 
@@ -485,10 +756,23 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
             if d is None:
                 raise ValueError(f"{dkey} must be a date (YYYY-MM-DD).")
             out[dkey] = d.isoformat()
+        elif dkey in out:
+            out[dkey] = None
 
-    for tkey in ("position", "currency", "napsa_number", "tpin", "notes"):
+    for tkey in ("position", "currency", "napsa_number", "tpin", "notes", "nhima_number"):
         if tkey in out and out[tkey] is not None:
             out[tkey] = str(out[tkey]).strip() or None
+
+    # An NRC is written 123456/78/9; nine digits typed without the slashes are
+    # the same number. Anything else (a passport) is kept as typed.
+    if "nrc" in out:
+        typed = str(out["nrc"] or "").strip().upper()
+        digits = re.sub(r"[\s/\-]", "", typed)
+        out["nrc"] = (f"{digits[:6]}/{digits[6:8]}/{digits[8]}" if re.fullmatch(r"\d{9}", digits)
+                      else typed[:30] or None)
+
+    if "paye_prior" in out:
+        out["paye_prior"] = _clean_prior(out["paye_prior"])
 
     # Where the payslip goes. Kept in the one form WhatsApp and email take, so a
     # number typed "097 712 3456" is the same person as "+260977123456".
@@ -508,6 +792,28 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
         out["email"] = typed or None
 
     return out
+
+
+def _clean_prior(value) -> dict | None:
+    """The pay and PAYE of earlier in a year, typed by the owner: from their
+    payroll before AIBOS ('before_aibos') or a previous employer's ITF/P13
+    part 2 ('p13'). With it, PAYE can use ZRA's cumulative tables from the
+    month after `through`. Empty clears it."""
+    if not value:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Pay earlier in the year needs the year, the last month it covers, the pay and the PAYE.")
+    through = str(value.get("through") or "").strip()[:7]
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", through):
+        raise ValueError("Say the last month the earlier pay covers, like 2026-06.")
+    pay, paye = _num(value.get("pay"), None), _num(value.get("paye"), None)
+    if pay is None or pay < 0 or paye is None or paye < 0:
+        raise ValueError("The earlier pay and PAYE must be amounts of K0 or more.")
+    if paye > pay:
+        raise ValueError("The PAYE taken cannot be more than the pay it was taken from.")
+    source = value.get("source") if value.get("source") in PRIOR_SOURCES else "before_aibos"
+    return {"year": int(through[:4]), "through": through, "pay": money.round_ngwee(pay),
+            "paye": money.round_ngwee(paye), "source": source}
 
 
 def valid_period(period: str) -> str:
@@ -552,22 +858,35 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
     lines = [
         f"*Payslip, {s.get('period')}*" + (f"\n{business_name}" if business_name else ""),
         f"Employee: {s.get('employee_name')}",
-        "",
     ]
-    if _num(s.get("allowances")) > 0:
-        lines += [
-            f"Basic pay:      {fmt(s.get('basic'))}",
-            f"Allowances:     {fmt(s.get('allowances'))}",
-        ]
+    if s.get("pay_date"):
+        lines.append(f"Paid on: {str(s.get('pay_date'))[:10]}")
+    lines.append("")
+    # Every part of the pay, so the total paid is plain (ZRA Employer's Guide
+    # to PAYE, 8.3) and each deduction carries its reason (Employment Code
+    # Act, s.71).
+    part = (_num(s.get("basic_full")) > 0 and _num(s.get("basic")) < _num(s.get("basic_full")))
+    extras = [(f"Extra pay{' (' + str(s.get('extra_note')) + ')' if s.get('extra_note') else ''}:",
+               s.get("extra_pay")),
+              (f"Leave days paid ({_num(s.get('leave_days')):g}):", s.get("leave_pay"))]
+    if _num(s.get("allowances")) > 0 or part or any(_num(v) > 0 for _, v in extras):
+        lines.append(f"Basic pay:      {fmt(s.get('basic'))}"
+                     + (f" (full month {fmt(s.get('basic_full'))})" if part else ""))
+        if _num(s.get("allowances")) > 0:
+            lines.append(f"Allowances:     {fmt(s.get('allowances'))}")
+        lines += [f"{label} {fmt(v)}" for label, v in extras if _num(v) > 0]
+    paye = _num(s.get("paye"))
     lines += [
         f"Gross pay:      {fmt(s.get('gross'))}",
         f"NAPSA (5%):    −{fmt(s.get('napsa_employee'))}" if not s.get("napsa_exempt")
         else "NAPSA:          none (aged 60 or over)",
         f"NHIMA (1% of basic): −{fmt(s.get('nhima_employee'))}",
-        f"PAYE:          −{fmt(s.get('paye'))}",
+        f"PAYE:          −{fmt(paye)}" if paye >= 0 else f"PAYE refund:   +{fmt(-paye)}",
     ]
     if _num(s.get("loan_deduction")) > 0:
         lines.append(f"Loan repayment: −{fmt(s.get('loan_deduction'))}")
+    if _num(s.get("gratuity_paid")) > 0:
+        lines.append(f"Gratuity paid, tax-free: +{fmt(s.get('gratuity_paid'))}")
     lines += [
         "",
         f"*Take-home pay:  {fmt(s.get('net'))}*",
@@ -584,6 +903,18 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
             lines.append(f"_NAPSA receives {fmt(both)} for you this month: your 5% and your employer's 5%._")
     if _num(s.get("gratuity_accrued")) > 0:
         lines.append(f"_Gratuity set aside for you this period: {fmt(s.get('gratuity_accrued'))}_")
+    if s.get("gratuity_balance") is not None and (_num(s.get("gratuity_accrued")) > 0
+                                                   or _num(s.get("gratuity_paid")) > 0):
+        lines.append(f"_Gratuity owed to you so far: {fmt(s.get('gratuity_balance'))}_")
+    if s.get("ytd_pay") is not None and s.get("tax_year"):
+        lines.append(f"_{s.get('tax_year')} so far: pay {fmt(s.get('ytd_pay'))}, PAYE {fmt(s.get('ytd_paye'))}_")
+    if _num(s.get("loan_deduction")) > 0 and s.get("loan_balance_after") is not None:
+        lines.append(f"_Loan still owed: {fmt(s.get('loan_balance_after'))}_")
+    basis = s.get("paye_basis")
+    if basis == "cumulative":
+        lines.append(f"_PAYE on ZRA's cumulative tables, month {s.get('paye_month')}._")
+    elif basis == "second job":
+        lines.append("_PAYE at the top rate: this is a second job._")
     lines.append("\nWorked out by AIBOS at the Zambian rates in force for this month.")
     return "\n".join(lines)
 
@@ -596,7 +927,7 @@ def compliance_text(run: dict, business_name: str | None = None, sym: str = "K")
     fmt = _fmt(sym)
     totals = run.get("totals") or {}
     period = run.get("period") or "?"
-    drafts = {d["tax_type"]: d for d in remittance_drafts(totals, period)}
+    drafts = {d["tax_type"]: d for d in remittance_drafts(totals, period, pay_date=run.get("pay_date"))}
     due = _due_date(period)
 
     lines = [
@@ -615,13 +946,18 @@ def compliance_text(run: dict, business_name: str | None = None, sym: str = "K")
         split = (f" (staff {fmt(d['employee_share'])} + employer {fmt(d['employer_share'])})"
                  if d["employee_share"] > 0 and d["employer_share"] > 0 else
                  " (paid by the employer)" if kind == "SDL" else "")
-        lines.append(f"  {names[kind]}: {fmt(d['amount'])}{split}")
+        # Pay paid in a later month than it is for: ZRA's money is due later.
+        later = f", by {d['due_date']}" if d["due_date"] != due.isoformat() else ""
+        lines.append(f"  {names[kind]}: {fmt(d['amount'])}{split}{later}")
     lines += [
         "",
         f"*Total: {fmt(money.total(d['amount'] for d in drafts.values()))}*, due {due.isoformat()}.",
     ]
     if "SDL" in drafts:
         lines.append("PAYE and the Skills Development Levy go on the same ZRA return.")
+    if _num(totals.get("gratuity_paid")) > 0:
+        lines.append(f"Gratuity paid to staff with this run: {fmt(totals.get('gratuity_paid'))}, tax-free.")
+    lines.append("Paid late: ZRA adds 5% of the PAYE a month plus interest; NAPSA adds 10% a month.")
     lines.append("\nWorked out by AIBOS at the Zambian rates in force for this month.")
     return "\n".join(lines)
 
@@ -630,26 +966,38 @@ MIGRATION_0039_NOTE = ("Allowances and the NAPSA age setting need migration 0039
                        "supabase/migrations/0039_payroll_allowances_and_levy.sql in the Supabase SQL editor.")
 MIGRATION_0042_NOTE = ("A phone or email for each person needs migration 0042. Run "
                        "supabase/migrations/0042_payslips_to_staff.sql in the Supabase SQL editor.")
+MIGRATION_0043_NOTE = ("NRC and NHIMA numbers, a second job, gratuity owed from before AIBOS, pay earlier in "
+                       "the year and your employer numbers need migration 0043. Run "
+                       "supabase/migrations/0043_payroll_statutory.sql in the Supabase SQL editor.")
+
+# Each migration's columns, its note, and whether a row says something only
+# that migration can keep (then it is refused, never silently dropped).
+_EMP_MIGRATIONS = (
+    (EMP_0039_COLUMNS, MIGRATION_0039_NOTE,
+     lambda r: _num(r.get("allowances")) > 0 or bool(r.get("napsa_exempt"))),
+    (EMP_0042_COLUMNS, MIGRATION_0042_NOTE, lambda r: bool(r.get("phone") or r.get("email"))),
+    (EMP_0043_COLUMNS, MIGRATION_0043_NOTE,
+     lambda r: bool(r.get("nrc") or r.get("nhima_number") or r.get("second_job") or r.get("paye_prior")
+                    or _num(r.get("gratuity_opening")) > 0)),
+)
 
 
 def _write_employee(write, row: dict):
-    """Write an employee, and on a database without migration 0039 or 0042
-    still write everything else, unless the change is one only the missing
-    migration can hold: a real allowance, the NAPSA age setting, a phone or an
-    email is refused in plain words, never lost."""
-    for _ in range(2):                      # each missing migration once at most
+    """Write an employee, and on a database without migration 0039, 0042 or
+    0043 still write everything else, unless the change is one only the
+    missing migration can hold: a real allowance, the NAPSA age setting, a
+    phone, an email, an NRC and the like is refused in plain words, never lost."""
+    for _ in range(len(_EMP_MIGRATIONS)):   # each missing migration once at most
         try:
             return write(row)
         except Exception as e:  # noqa: BLE001
             from db import missing_schema
-            if any(missing_schema(e, c) for c in EMP_0039_COLUMNS):
-                if _num(row.get("allowances")) > 0 or row.get("napsa_exempt"):
-                    raise ValueError(MIGRATION_0039_NOTE) from e
-                row = {k: v for k, v in row.items() if k not in EMP_0039_COLUMNS}
-            elif any(missing_schema(e, c) for c in EMP_0042_COLUMNS):
-                if row.get("phone") or row.get("email"):
-                    raise ValueError(MIGRATION_0042_NOTE) from e
-                row = {k: v for k, v in row.items() if k not in EMP_0042_COLUMNS}
+            for columns, note, says_something in _EMP_MIGRATIONS:
+                if any(missing_schema(e, c) for c in columns):
+                    if says_something(row):
+                        raise ValueError(note) from e
+                    row = {k: v for k, v in row.items() if k not in columns}
+                    break
             else:
                 raise
     return write(row)
@@ -699,6 +1047,274 @@ def get_run(db, user_id: str, run_id: str) -> dict:
     return run
 
 
+def payslip_history(db, user_id: str) -> dict:
+    """Every payslip the business has, read back with its run's pay date, by
+    employee id, oldest first. Read a thousand at a time: Supabase returns at
+    most that many in one go, and a business keeps its payslips for years."""
+    runs = {r.get("id"): r for r in list_runs(db, user_id, limit=1000)}
+    rows, start = [], 0
+    while True:
+        res = (db.table("payslips").select("*").eq("user_id", user_id)
+               .order("period").range(start, start + 999).execute())
+        page = getattr(res, "data", None) or []
+        rows += page
+        if len(page) < 1000:
+            break
+        start += 1000
+    out: dict = {}
+    for row in rows:
+        s = hydrate_slip(row)
+        run = runs.get(s.get("run_id")) or {}
+        s["pay_date"] = str(run.get("pay_date") or f"{str(s.get('period') or '')[:7]}-28")[:10]
+        out.setdefault(str(s.get("employee_id")), []).append(s)
+    for slips in out.values():
+        slips.sort(key=lambda s: (str(s.get("period") or ""), s["pay_date"]))
+    return out
+
+
+# ── Gratuity: what each person is owed ────────────────────────────────────────
+
+def gratuity_position(emp: dict, slips: list) -> dict:
+    """Where one person's gratuity stands, from their payslips. Pure.
+
+    Owed = what was owed before AIBOS + every month's gratuity set aside −
+    every gratuity paid. The basic pay earned since it was last paid is what
+    the Employment Code Act counts it on (s.73: 25% of "basic pay earned
+    during the contract period"), so it is shown beside it."""
+    slips = slips or []
+    opening = _pos(emp.get("gratuity_opening"))
+    accrued = money.total(s.get("gratuity_accrued") for s in slips)
+    paid = money.total(s.get("gratuity_paid") for s in slips)
+    last = next((s for s in reversed(slips) if _num(s.get("gratuity_paid")) > 0), None)
+    since = [s for s in slips if last is None or str(s.get("period") or "") > str(last.get("period") or "")]
+    owed = money.total([opening, accrued, -money.dec(paid)])
+    return {
+        "employee_id": emp.get("id"), "name": emp.get("name"), "status": emp.get("status"),
+        "eligible": bool(emp.get("gratuity_eligible")), "rate": float(_gratuity_rate(emp)),
+        "opening": _f(opening), "accrued": accrued, "paid": paid, "owed": max(0.0, owed),
+        "basic_earned_since": money.total(s.get("basic") for s in since if _num(s.get("gratuity_accrued")) > 0),
+        "accrued_since": money.total(s.get("gratuity_accrued") for s in since),
+        "months_since": sum(1 for s in since if _num(s.get("gratuity_accrued")) > 0),
+        "last_paid_on": (last or {}).get("pay_date"), "last_paid": _num((last or {}).get("gratuity_paid")),
+        "start_date": emp.get("start_date"), "contract_end": emp.get("contract_end"),
+        "end_date": emp.get("end_date"),
+    }
+
+
+def gratuity_book(db, user_id: str, today: date | None = None) -> dict:
+    """Every person's gratuity: what each is owed, what is due soon, and the
+    total the business owes its staff."""
+    today = today or (datetime.now(timezone.utc) + timedelta(hours=2)).date()
+    history = payslip_history(db, user_id)
+    people = []
+    for emp in list_employees(db, user_id):
+        pos = gratuity_position(emp, history.get(str(emp.get("id"))) or [])
+        if not (pos["eligible"] or pos["owed"] > 0 or pos["paid"] > 0):
+            continue
+        end = parse_date(emp.get("end_date") if emp.get("status") == "left" else emp.get("contract_end"))
+        pos["due_on"] = end.isoformat() if end else None
+        pos["overdue"] = bool(pos["owed"] > 0 and end and end < today)
+        pos["due_soon"] = bool(pos["owed"] > 0 and end and today <= end <= today + timedelta(days=60))
+        people.append(pos)
+    people.sort(key=lambda p: (not p["overdue"], not p["due_soon"], p["due_on"] or "9999", p["name"] or ""))
+    return {"people": people, "total_owed": money.total(p["owed"] for p in people),
+            "overdue": money.total(p["owed"] for p in people if p["overdue"]),
+            "due_soon": money.total(p["owed"] for p in people if p["due_soon"])}
+
+
+# ── The statutory checks: what the law asks that the register does not show ──
+
+def statutory_checks(employees: list, positions: dict, employer: dict, today: date) -> list:
+    """Every thing the law asks of this payroll that is not yet done, most
+    urgent first, each in plain words with what to do. Pure.
+
+    level: 'act' (money owed or a legal step missed), 'warn' (a return or
+    paper will be wrong or incomplete), 'info' (worth adding)."""
+    out = []
+
+    def add(level, text, emp=None, fix=None):
+        out.append({"level": level, "text": text, "employee_id": (emp or {}).get("id"),
+                    "name": (emp or {}).get("name"), "fix": fix})
+
+    def k(v):
+        return f"K{_num(v):,.2f}"
+
+    missing = [label for key, label in (("tpin", "TPIN"), ("napsa", "NAPSA employer account number"),
+                                        ("nhima", "NHIMA employer number")) if not (employer or {}).get(key)]
+    if missing and employees:
+        add("warn", f"Add your {', '.join(missing[:-1]) + ' and ' + missing[-1] if len(missing) > 1 else missing[0]}. "
+                    "They head every monthly return, and the certificate of service each leaver is given "
+                    "must show your NAPSA account number (Employment Code Act s.59).", fix="employer")
+
+    for e in employees:
+        pos = positions.get(str(e.get("id"))) or {}
+        owed = _num(pos.get("owed"))
+        name = e.get("name") or "Someone"
+        if e.get("status") == "left":
+            if owed > 0:
+                when = parse_date(e.get("end_date"))
+                add("act", f"{name} has left{' on ' + when.isoformat() if when else ''} and is still owed "
+                           f"{k(owed)} gratuity. The Employment Code Act (s.73(2)) says it is paid, prorated "
+                           "to the time worked: tick it in the next payroll run.", e, fix="pay_gratuity")
+            continue
+
+        contract = e.get("employment_type") == "contract"
+        end = parse_date(e.get("contract_end"))
+        if contract and not e.get("gratuity_eligible"):
+            add("warn", f"{name} is on a fixed-term contract and earns no gratuity. The Employment Code Act "
+                        "(s.54 and s.73) gives at least 25% of the basic pay earned over the contract. Turn "
+                        "it on, unless SI 48 of 2020 exempts them (an expatriate, management with a written "
+                        "gratuity contract, a domestic or farm worker).", e, fix="gratuity")
+        elif e.get("gratuity_eligible") and float(_gratuity_rate(e)) < GRATUITY_MINIMUM:
+            add("warn", f"{name}'s gratuity is {float(_gratuity_rate(e)) * 100:g}% of basic pay, under the 25% "
+                        "the Employment Code Act sets (s.73). Only staff SI 48 of 2020 exempts may get less.",
+                e, fix="gratuity")
+        if contract and not end:
+            add("info", f"Add when {name}'s contract ends, so the gratuity is paid with their final pay "
+                        "on time.", e, fix="contract_end")
+        if end and owed > 0 and end < today:
+            add("act", f"{name}'s contract ended on {end.isoformat()} and {k(owed)} gratuity is unpaid. "
+                       "Pay it with the next payroll run, or, if the contract was renewed, set the new "
+                       "end date (the gratuity of the first contract is still due).", e, fix="pay_gratuity")
+        elif end and today <= end <= today + timedelta(days=60) and owed > 0:
+            add("info", f"{name}'s contract ends on {end.isoformat()}. {k(owed)} gratuity is owed so far, "
+                        "tax-free: tick Pay gratuity when you run that month's payroll.", e)
+        if not e.get("tpin") and not e.get("nrc"):
+            add("warn", f"Add {name}'s TPIN or NRC number: ZRA's monthly PAYE return names each person by it.",
+                e, fix="ids")
+        if not e.get("napsa_number") and not e.get("napsa_exempt"):
+            add("warn", f"Add {name}'s NAPSA social security number: NAPSA's monthly return lists each "
+                        "member by it.", e, fix="ids")
+        if not e.get("start_date"):
+            add("info", f"Add the day {name} started: it decides how ZRA's PAYE tables are used and goes on "
+                        "their certificate of service.", e, fix="start_date")
+
+    rank = {"act": 0, "warn": 1, "info": 2}
+    out.sort(key=lambda c: rank[c["level"]])
+    return out
+
+
+def checks(db, user_id: str, today: date | None = None) -> dict:
+    """The statutory checks for this business, with the gratuity owed."""
+    today = today or (datetime.now(timezone.utc) + timedelta(hours=2)).date()
+    employees = list_employees(db, user_id)
+    history = payslip_history(db, user_id)
+    positions = {str(e.get("id")): gratuity_position(e, history.get(str(e.get("id"))) or [])
+                 for e in employees}
+    items = statutory_checks(employees, positions, get_employer(db, user_id), today)
+    note = rates_note(today.isoformat())
+    if note:
+        items.insert(0, {"level": "warn", "text": note, "employee_id": None, "name": None, "fix": None})
+    return {"items": items, "act": sum(1 for c in items if c["level"] == "act"),
+            "warn": sum(1 for c in items if c["level"] == "warn")}
+
+
+# ── Who is on a run, and the month's own changes ─────────────────────────────
+
+_CHANGE_MONEY = ("basic", "allowances", "extra_pay")
+
+
+def clean_changes(changes) -> dict:
+    """This month's changes per person, as the Staff page sends them:
+    {employee_id: {basic, allowances, extra_pay, extra_note, leave_days,
+    pay_gratuity}}. Pay is money to the ngwee and never below nothing."""
+    out: dict = {}
+    for eid, c in (changes or {}).items():
+        if not isinstance(c, dict):
+            continue
+        row: dict = {}
+        for k in _CHANGE_MONEY:
+            if c.get(k) in (None, ""):
+                continue
+            v = _num(c.get(k), None)
+            if v is None or v < 0:
+                raise ValueError(f"{k.replace('_', ' ').capitalize()} must be an amount of K0 or more.")
+            row[k] = money.round_ngwee(v)
+        if c.get("leave_days") not in (None, ""):
+            days = _num(c.get("leave_days"), None)
+            if days is None or not 0 <= days <= 366:
+                raise ValueError("Leave days paid out must be between 0 and 366.")
+            row["leave_days"] = round(days, 2)
+        note = str(c.get("extra_note") or "").strip()
+        if note:
+            row["extra_note"] = note[:120]
+        if c.get("pay_gratuity"):
+            row["pay_gratuity"] = True
+        out[str(eid)] = row
+    return out
+
+
+def on_payroll(employees: list, period: str, owed: dict, changes: dict) -> list:
+    """(employee, kind) for everyone a run for `period` pays: everyone active;
+    someone who left this month or later ('final': their last pay); and
+    someone who left before it and is still owed gratuity, when the owner
+    ticks it ('gratuity_only')."""
+    first = parse_date(f"{valid_period(period)}-01")
+    out = []
+    for e in employees:
+        eid = str(e.get("id"))
+        if e.get("status") == "active":
+            out.append((e, "pay"))
+        elif e.get("status") == "left":
+            end = parse_date(e.get("end_date"))
+            if end and end >= first:
+                out.append((e, "final"))
+            elif _num(owed.get(eid)) > 0 and (changes.get(eid) or {}).get("pay_gratuity"):
+                out.append((e, "gratuity_only"))
+    return out
+
+
+def _month_end(period: str) -> date:
+    d = parse_date(f"{period}-01")
+    nxt = date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+    return nxt - timedelta(days=1)
+
+
+def _work_out_run(db, user_id: str, period: str, pay_iso: str, changes: dict | None):
+    """Everyone's payslip for a run, worked out but not saved: (people, slips,
+    rates, sdl, leavers still owed gratuity and not on this run)."""
+    rates = current_rates(pay_iso, "ZMW")
+    sdl = sdl_for(db, user_id, period, rates)
+    changes = clean_changes(changes)
+    employees = list_employees(db, user_id)
+    history = payslip_history(db, user_id)
+    owed = {str(e.get("id")): gratuity_position(e, history.get(str(e.get("id"))) or [])["owed"]
+            for e in employees}
+    people = on_payroll(employees, period, owed, changes)
+    month_end = _month_end(period)
+    slips = []
+    for emp, kind in people:
+        eid = str(emp.get("id"))
+        change = {**(changes.get(eid) or {}), "kind": kind}
+        if kind == "gratuity_only":
+            change.update({"basic": 0, "allowances": 0, "pay_gratuity": True})
+            change.pop("extra_pay", None)
+            change.pop("leave_days", None)
+        earlier = [s for s in history.get(eid) or [] if str(s.get("period") or "") < period]
+        ytd = year_to_date(emp, earlier, period, pay_iso)
+        slip = compute_payslip(emp, period, rates, sdl_due=sdl["due"], change=change, ytd=ytd,
+                               gratuity_owed=owed.get(eid, 0.0))
+        end = parse_date(emp.get("end_date") if kind != "pay" else emp.get("contract_end"))
+        start = parse_date(emp.get("start_date"))
+        slip.update({
+            "gratuity_owed_before": owed.get(eid, 0.0),
+            # The contract ends, or they left, by the end of this month: the
+            # gratuity is due with this pay (s.73).
+            "gratuity_due": bool(owed.get(eid, 0.0) + slip["gratuity_accrued"] > 0 and end and end <= month_end),
+            "ends_on": end.isoformat() if end and end <= month_end else None,
+            # Started after the 1st of this month: not a full month's pay.
+            "started_on": start.isoformat() if start and month_end.replace(day=1) < start <= month_end else None,
+            "change": changes.get(eid) or {},
+        })
+        slips.append(slip)
+    paid_ids = {str(e.get("id")) for e, _ in people}
+    leavers = [{"employee_id": e.get("id"), "name": e.get("name"), "owed": owed.get(str(e.get("id")), 0.0),
+                "end_date": e.get("end_date")}
+               for e in employees if e.get("status") == "left" and str(e.get("id")) not in paid_ids
+               and owed.get(str(e.get("id")), 0.0) > 0]
+    return people, slips, rates, sdl, leavers
+
+
 # ── The Skills Development Levy setting (profiles.payroll_sdl, migration 0039) ──
 
 def get_sdl_setting(db, user_id: str) -> str:
@@ -726,6 +1342,47 @@ def set_sdl_setting(db, user_id: str, value: str) -> str:
                              "supabase/migrations/0039_payroll_allowances_and_levy.sql in Supabase.") from e
         raise
     return value
+
+
+# ── The employer's own numbers (profiles.payroll_employer, migration 0043) ───
+# What every return and every person's leaving papers name the employer by:
+# the TPIN on the PAYE return, the NAPSA employer account number (Employment
+# Code Act s.59(f)) and the NHIMA employer number.
+EMPLOYER_KEYS = ("tpin", "napsa", "nhima")
+
+
+def get_employer(db, user_id: str) -> dict:
+    """The employer's numbers and business name. Empty before migration 0043."""
+    out = {k: None for k in EMPLOYER_KEYS}
+    out["name"] = None
+    try:
+        res = db.table("profiles").select("business_name, payroll_employer").eq("id", user_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+    except Exception as e:  # noqa: BLE001 — pre-0043
+        log.info("[payroll] employer numbers not read for %s: %s", user_id, e)
+        try:
+            res = db.table("profiles").select("business_name").eq("id", user_id).limit(1).execute()
+            rows = getattr(res, "data", None) or []
+        except Exception:  # noqa: BLE001
+            rows = []
+    row = rows[0] if rows else {}
+    saved = row.get("payroll_employer") if isinstance(row.get("payroll_employer"), dict) else {}
+    out.update({k: (str(saved.get(k)).strip() or None) if saved.get(k) else None for k in EMPLOYER_KEYS})
+    out["name"] = row.get("business_name") or None
+    return out
+
+
+def set_employer(db, user_id: str, numbers: dict) -> dict:
+    """Save the employer's TPIN, NAPSA and NHIMA numbers (each optional)."""
+    clean = {k: (str(numbers.get(k) or "").strip()[:40] or None) for k in EMPLOYER_KEYS}
+    try:
+        db.table("profiles").update({"payroll_employer": clean}).eq("id", user_id).execute()
+    except Exception as e:  # noqa: BLE001
+        from db import missing_schema
+        if missing_schema(e, "payroll_employer"):
+            raise ValueError(MIGRATION_0043_NOTE) from e
+        raise
+    return get_employer(db, user_id)
 
 
 def turnover_12m(db, user_id: str, period: str) -> float | None:
@@ -756,18 +1413,33 @@ def sdl_for(db, user_id: str, period: str, rates: dict | None) -> dict:
     return sdl_status(get_sdl_setting(db, user_id), turnover_12m(db, user_id, period), rates)
 
 
-def preview_run(db, user_id: str, period: str, pay_date=None) -> dict:
-    """Compute (but do NOT persist) the payslips for a period — the on-screen table."""
+def preview_run(db, user_id: str, period: str, pay_date=None, changes: dict | None = None) -> dict:
+    """Compute (but do NOT persist) the payslips for a period — the on-screen
+    table — with this month's changes, exactly as running it would."""
     period = valid_period(period)
-    emps = [e for e in list_employees(db, user_id) if e.get("status") == "active"]
-    on = pay_date or f"{period}-15"
-    rates = current_rates(on, "ZMW")
-    sdl = sdl_for(db, user_id, period, rates)
-    slips = [compute_payslip(e, period, rates, sdl_due=sdl["due"]) for e in emps]
+    pay_iso = (parse_date(pay_date) or parse_date(f"{period}-28")).isoformat()
+    _people, slips, rates, sdl, leavers = _work_out_run(db, user_id, period, pay_iso, changes)
     totals = _totals(slips)
-    return {"period": period, "payslips": slips, "totals": totals,
-            "remittances": remittance_drafts(totals, period, "ZMW"),
-            "rates": public_rates(rates), "sdl": sdl, "rates_note": rates_note(on)}
+    return {"period": period, "pay_date": pay_iso, "payslips": slips, "totals": totals,
+            "remittances": remittance_drafts(totals, period, "ZMW", pay_iso),
+            "rates": public_rates(rates), "sdl": sdl, "rates_note": rates_note(pay_iso),
+            "gratuity_leavers": leavers, "notes": run_notes(totals, slips)}
+
+
+def run_notes(totals: dict, slips: list) -> list:
+    """What the owner must know about a run beyond its figures, in words."""
+    notes = [s["paye_note"] for s in slips if s.get("paye_note")]
+    if _num(totals.get("paye")) < 0:
+        notes.append(f"PAYE refunds this month come to K{-_num(totals.get('paye')):,.2f} more than the PAYE "
+                     "taken, so no PAYE is paid to ZRA this month. Take the difference off next month's "
+                     "PAYE (ZRA Employer's Guide to PAYE, 8.5).")
+    paid = [s for s in slips if _num(s.get("gratuity_paid")) > 0]
+    if paid:
+        notes.append("Gratuity paid with this run: " + ", ".join(
+            f"{s.get('employee_name')} K{_num(s.get('gratuity_paid')):,.2f}" for s in paid)
+            + ". It is tax-free (no PAYE, NAPSA or NHIMA); the Skills Development Levy is added on it "
+              "when your business pays the levy.")
+    return notes
 
 
 def recheck_run(db, user_id: str, run_id: str) -> dict:
@@ -785,12 +1457,9 @@ def recheck_run(db, user_id: str, run_id: str) -> dict:
     sdl = sdl_for(db, user_id, period, rates)
     people = []
     for was in run.get("payslips") or []:
-        loan = _num(was.get("loan_deduction"))
-        now = compute_payslip({
-            "id": was.get("employee_id"), "name": was.get("employee_name"),
-            "basic_pay": was.get("basic"), "allowances": was.get("allowances"),
-            "napsa_exempt": was.get("napsa_exempt"), "loan_monthly": loan, "loan_balance": loan,
-        }, period, rates, sdl_due=sdl["due"])
+        emp, change, ytd = _as_paid(was)
+        now = compute_payslip(emp, period, rates, sdl_due=sdl["due"], change=change, ytd=ytd,
+                              gratuity_owed=_num(was.get("gratuity_paid")))
         diff = {k: money.total([now.get(k), -_num(was.get(k))])
                 for k in ("paye", "napsa_employee", "napsa_employer", "nhima_employee",
                           "nhima_employer", "sdl", "net")}
@@ -816,6 +1485,30 @@ def recheck_run(db, user_id: str, run_id: str) -> dict:
                          "draft_status": (live.get(row["tax_type"]) or {}).get("status")}
                         for row in correction_rows(out)]
     return out
+
+
+def _as_paid(was: dict) -> tuple:
+    """A saved payslip as the person, the month's changes and the PAYE year it
+    was worked out with, so it can be worked out again with today's rates.
+    The way PAYE was worked out stays the one the run used: a run is never
+    rechecked on a method it could not have used, and the cumulative tables
+    put a past month right in the next one by themselves."""
+    loan = _num(was.get("loan_deduction"))
+    basis = was.get("paye_basis")
+    emp = {"id": was.get("employee_id"), "name": was.get("employee_name"),
+           "basic_pay": was.get("basic"), "allowances": was.get("allowances"),
+           "napsa_exempt": was.get("napsa_exempt"), "loan_monthly": loan, "loan_balance": loan,
+           "second_job": basis == "second job"}
+    change = {"extra_pay": money.total([was.get("extra_pay"), was.get("leave_pay")]),
+              "extra_note": was.get("extra_note"), "kind": was.get("kind") or "pay"}
+    if _num(was.get("gratuity_paid")) > 0:
+        change["pay_gratuity"] = _num(was.get("gratuity_paid"))
+    ytd = None
+    if basis == "cumulative":
+        ytd = {"basis": "cumulative", "month": was.get("paye_month") or 1, "first_pay": False,
+               "pay": money.total([was.get("ytd_pay"), -money.dec(was.get("gross"))]),
+               "paye": money.total([was.get("ytd_paye"), -money.dec(was.get("paye"))])}
+    return emp, change, ytd
 
 
 def _recheck_summary(d: dict, owed_to_staff: float, short: float) -> str:
@@ -1060,12 +1753,14 @@ def post_missing_salaries(db, user_id: str) -> dict:
     return out
 
 
-def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
+def run_payroll(db, user_id: str, period: str, pay_date=None, changes: dict | None = None) -> dict:
     """
-    Compute + persist a pay period: writes the run + a payslip per active employee,
-    posts one confirmed Salary event each (amount = gross), and decrements staff
-    loans. Idempotent per (user_id, period) — a second run for the same month is
-    refused rather than double-posting.
+    Compute + persist a pay period: writes the run + a payslip per person paid
+    (everyone active, anyone who left this month, and anyone owed gratuity the
+    owner ticked), posts one Salary event each (amount = net, the gratuity
+    paid included), and decrements staff loans. `changes` are this month's own
+    (see compute_payslip). Idempotent per (user_id, period) — a second run for
+    the same month is refused rather than double-posting.
     """
     if db is None:
         raise RuntimeError("Supabase not configured — payroll is unavailable.")
@@ -1076,14 +1771,11 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     if getattr(existing, "data", None):
         raise ValueError(f"Payroll for {period} has already been run.")
 
-    emps = [e for e in list_employees(db, user_id) if e.get("status") == "active"]
-    if not emps:
-        raise ValueError("No active employees to pay. Add someone to the register first.")
-
     pay_iso = (parse_date(pay_date) or parse_date(f"{period}-28")).isoformat()
-    rates = current_rates(pay_iso, "ZMW")
-    sdl = sdl_for(db, user_id, period, rates)
-    slips = [compute_payslip(e, period, rates, sdl_due=sdl["due"]) for e in emps]
+    people, slips, rates, sdl, _leavers = _work_out_run(db, user_id, period, pay_iso, changes)
+    if not people:
+        raise ValueError("No active employees to pay. Add someone to the register first.")
+    emps = [e for e, _kind in people]
     totals = _totals(slips)
 
     run_res = db.table("payroll_runs").insert({
@@ -1124,6 +1816,12 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
                     "napsa_employer": slip["napsa_employer"], "nhima_employer": slip["nhima_employer"],
                     "sdl": slip["sdl"],
                     "loan_deduction": slip["loan_deduction"],
+                    # One-offs ride along so the cash plan can tell them from
+                    # the wage that comes every month.
+                    **({"extra_pay": slip["extra_pay"]} if slip["extra_pay"] > 0 else {}),
+                    **({"leave_pay": slip["leave_pay"]} if slip["leave_pay"] > 0 else {}),
+                    **({"gratuity_paid": slip["gratuity_paid"]} if slip["gratuity_paid"] > 0 else {}),
+                    **({"final_pay": True} if slip["kind"] != "pay" else {}),
                     # Where this wage came from: one payroll run, one person.
                     "payroll_run_id": run_id, "employee_id": emp.get("id"),
                     **({"client_ref": f"payroll:{run_id}:{emp.get('id')}"[:64]} if run_id else {}),
@@ -1159,7 +1857,7 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     # owner confirms each when they actually pay, so the cash leaves in the right
     # month and nothing double-counts the net salaries already posted.
     remittances = []
-    for draft in remittance_drafts(totals, period, "ZMW"):
+    for draft in remittance_drafts(totals, period, "ZMW", pay_iso):
         rid = None
         try:
             rev = nervous.ingest(db, user_id, nervous.EventIn(
@@ -1197,6 +1895,7 @@ def run_payroll(db, user_id: str, period: str, pay_date=None) -> dict:
     run["remittances"] = remittances
     run["sdl"] = sdl
     run["rates_note"] = rates_note(pay_iso)
+    run["notes"] = run_notes(totals, slips)
     return run
 
 
@@ -1399,9 +2098,9 @@ def _totals(slips: list) -> dict:
     the sum of the figures above it. napsa_total and nhima_total are both
     halves together: what NAPSA and NHIMA are actually owed."""
     slips = [hydrate_slip(s) for s in slips]
-    keys = ("basic", "allowances", "gross", "napsa_employee", "napsa_employer", "nhima_employee",
-            "nhima_employer", "paye", "sdl", "loan_deduction", "net", "gratuity_accrued",
-            "employer_cost")
+    keys = ("basic", "allowances", "extra_pay", "leave_pay", "gross", "napsa_employee", "napsa_employer",
+            "nhima_employee", "nhima_employer", "paye", "sdl", "loan_deduction", "net",
+            "gratuity_accrued", "gratuity_paid", "employer_cost")
     t = {k: money.total(s.get(k) for s in slips) for k in keys}
     t["napsa_total"] = money.total([t["napsa_employee"], t["napsa_employer"]])
     t["nhima_total"] = money.total([t["nhima_employee"], t["nhima_employer"]])
@@ -1417,7 +2116,7 @@ def _due_date(period: str) -> date:
     return date(year, month, 10)
 
 
-def remittance_drafts(totals: dict, period: str, currency: str = "ZMW") -> list:
+def remittance_drafts(totals: dict, period: str, currency: str = "ZMW", pay_date=None) -> list:
     """
     The statutory money withheld/owed on a pay run, as remittance entries payable
     next month. Pure — run_payroll turns each into a PENDING TaxPayment (a draft
@@ -1430,8 +2129,16 @@ def remittance_drafts(totals: dict, period: str, currency: str = "ZMW") -> list:
     Each says how much of it came out of the pay and how much the employer adds.
     A run saved before the employer halves were kept takes the employer's half
     as equal to the staff half, which is what the rates make it.
+
+    PAYE and the levy are due 10 days after the end of the income tax month the
+    pay was PAID in (ZRA Employer's Guide to PAYE, 8.2 and 8.4); NAPSA and
+    NHIMA by the 10th after the month the pay is for. With pay in its own
+    month, the same day. A month whose PAYE refunds outweigh the PAYE taken
+    drafts no PAYE (run_notes() says to set it against the next month).
     """
     due = _due_date(period).isoformat()
+    paid = parse_date(pay_date)
+    tax_due = _due_date(paid.isoformat()[:7]).isoformat() if paid else due
     napsa_e = money.round_ngwee(totals.get("napsa_employee"))
     napsa_r = money.round_ngwee(totals.get("napsa_employer"), napsa_e)
     nhima_e = money.round_ngwee(totals.get("nhima_employee"))
@@ -1444,9 +2151,12 @@ def remittance_drafts(totals: dict, period: str, currency: str = "ZMW") -> list:
         {"tax_type": "NAPSA", "authority": "NAPSA", "employee_share": napsa_e, "employer_share": napsa_r},
         {"tax_type": "NHIMA", "authority": "NHIMA", "employee_share": nhima_e, "employer_share": nhima_r},
     ]
+    def due_of(r):
+        return tax_due if r["authority"] == "ZRA" else due
+
     return [
         {**r, "amount": money.total([r["employee_share"], r["employer_share"]]), "period": period,
-         "currency": currency, "occurred_at": f"{due}T00:00:00+00:00", "due_date": due}
+         "currency": currency, "occurred_at": f"{due_of(r)}T00:00:00+00:00", "due_date": due_of(r)}
         for r in rows if r["employee_share"] + r["employer_share"] > 0
     ]
 
