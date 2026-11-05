@@ -141,6 +141,7 @@ def test_value_climbs_with_price():
         "invoices": "pro", "team": "pro",
         "payroll": "proplus", "scheduled_brief": "proplus", "schedule": "proplus",
         "hospitality": "growth", "cash_plan": "growth", "multi_business": "growth",
+        "find_clients": "growth",
     }
     for feature, tier in lowest.items():
         assert entitlements._required_tier(feature) == tier, (

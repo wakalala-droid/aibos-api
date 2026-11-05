@@ -76,6 +76,7 @@ import membership
 import businesses as businesses_api
 import budgets as budgets_api
 import interview as interview_api
+import find_clients_routes
 import seasons as seasons_api
 import starter_book
 import rate_limit
@@ -2579,7 +2580,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 44
+EXPECTS_MIGRATION = 45
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -8945,3 +8946,8 @@ def twin_financials(ctx: membership.Context = Depends(membership.require_context
         "analysis": analysis,
         "currencySymbol": "K" if state.get("currency") == "ZMW" else state.get("currency", "K"),
     }
+
+
+# ── Find clients (Growth, 5 Nov 2026; migration 0045) ─────────────────────────
+# The routes live in find_clients_routes.py, the work in find_clients.py.
+app.include_router(find_clients_routes.router)

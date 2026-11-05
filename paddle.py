@@ -64,7 +64,7 @@ PLAN_BLURBS = {
     "proplus": "Everything in Pro, plus payroll, the morning brief, reminders, "
                "recording by chat and deliveries.",
     "growth": "Everything in Pro+, plus several businesses under one login, the "
-              "13-week cash plan, Rooms & Stays and the cross-engine view.",
+              "13-week cash plan, Find clients, Rooms & Stays and the cross-engine view.",
 }
 
 INTERVAL = {"monthly": "month", "annual": "year"}

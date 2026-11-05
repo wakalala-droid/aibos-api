@@ -364,7 +364,11 @@ def test_a_loan_the_owner_told_aibos_about_is_in_the_plan_and_the_bank_pack(book
     plan = api.get("/forecast/cash-plan").json()["plan"]
     told = [k for k in plan["known"] if k["source"] == "told"]
     assert told and all(k["day"].endswith("-01") and k["amount"] == 3000 for k in told)
-    assert plan["told_loan"] == 3000 and plan["safe_to_spend"] < before["safe_to_spend"]
+    # Safe to spend is the plan's lowest point, which may come before the first
+    # repayment on the 1st (it did on 5 Nov 2026, when this read "<"): it can
+    # only fall, and the 13 weeks always close lower by the repayments.
+    assert plan["told_loan"] == 3000 and plan["safe_to_spend"] <= before["safe_to_spend"]
+    assert plan["close"]["p50"] <= before["close"]["p50"] - 2 * 3000
     monkeypatch.setattr(pdfdoc, "available", lambda: False)        # the text copy carries the same words
     text = api.get("/forecast/cash-plan/bank.pdf").text
     assert "The owner's word" in text and "the business's answers to AIBOS" in text

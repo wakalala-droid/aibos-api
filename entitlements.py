@@ -56,6 +56,11 @@ _GROWTH: set[str] = _PROPLUS | {
     # chance of running short, what fixes it, decisions tried on it, the group
     # view across businesses and the cash watch that warns ahead (16 Oct 2026).
     "cash_plan",
+    # Find clients (find_clients.py, 5 Nov 2026): businesses found on the map or
+    # from a list, their websites read, the fit judged and the first message,
+    # follow-ups and answers written for the owner to send from their own email
+    # or WhatsApp. RESEARCH_PER_MONTH a month (find_clients.ALLOWANCE).
+    "find_clients",
     # PROVISIONAL: the Hospitality (short-let PMS) vertical. When it becomes its
     # own add-on SKU, MOVE this out of _GROWTH into a dedicated grant path — a
     # one-line change. See lib/tiers.ts.
@@ -306,6 +311,7 @@ _FEATURE_LABEL = {
     "schedule":       "recurring schedules & reminders",
     "payroll":        "payroll (PAYE, NAPSA & net pay)",
     "hospitality":    "the Hospitality property-management module",
+    "find_clients":   "Find clients",
     "morning_brief":  "the Morning Brief",
     "chat_actions":   "recording from the chat",
     "deliveries":     "expected-delivery tracking",
