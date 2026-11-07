@@ -1,10 +1,12 @@
 """
 The Find clients page's API (find_clients.py, migration 0045).
 
-Growth, per business, like the cash plan: the plan that counts is the
-business's, so staff an owner invites use it on the owner's plan. Below Growth
-GET /clients answers with a preview the page shows locked but visible, and
-every other route answers 402 with the plan that unlocks it.
+Every plan since 7 November 2026 (Growth only before), per business, like the
+cash plan: the plan that counts is the business's, so staff an owner invites
+use it on the owner's plan. The plans differ in how many businesses a month
+are researched (find_clients.ALLOWANCE). An account the plan check turns away
+(a feature flag taken off, say) gets a preview from GET /clients that the page
+shows locked but visible, and 402 from every other route.
 
 Staff can find, research, write and mark messages sent; the accountant reads
 only. The settings (who signs, the booking link, the do not contact list) and
@@ -81,7 +83,8 @@ def clients_home(ctx: membership.Context = Depends(membership.require_context)):
     follow-ups due, the campaigns, the settings and the month's allowance."""
     detail = entitlements.tier_detail(ctx.tenant)
     tier = detail["tier"]
-    base = {"ok": True, "kinds": _kinds(), "towns": list(fc.TOWNS), "allowance": fc.ALLOWANCE.get("growth", 0),
+    base = {"ok": True, "kinds": _kinds(), "towns": list(fc.TOWNS), "allowance": fc.ALLOWANCE.get(tier, 0),
+            "allowances": dict(fc.ALLOWANCE), "demo_research": fc.DEMO_RESEARCH,
             "labels": fc.LABEL_WORDS, "write_from": fc.WRITE_FROM,
             "can_write": ctx.can_write, "is_owner": ctx.is_owner}
     if not entitlements.account_can(ctx.tenant, fc.FEATURE, tier):
@@ -205,18 +208,24 @@ def clients_prospect_delete(pid: str, ctx: membership.Context = Depends(membersh
 @router.post("/clients/find")
 def clients_find(body: Dict[str, Any] = Body(...),
                  ctx: membership.Context = Depends(membership.require_write)):
-    """Search the map for one kind of business around one town."""
-    _gate(ctx)
+    """Search the map for one kind of business around one town. The public
+    map servers can take most of a minute, and the proxy in front of the API
+    gives up at 60 seconds (that was the 504 of 7 Nov 2026), so the search
+    runs on after the answer, like research; GET /clients reports it. With
+    "research": true the first few new ones are researched and written to as
+    well (the first-time demo)."""
+    tier = _gate(ctx)
     db = _db()
     bid = _bid(db, ctx)
     try:
         radius = float(body.get("radius_km") or 8)
     except (TypeError, ValueError):
         radius = 8.0
-    rows = _run(fc.search_map, str(body.get("kind") or ""), str(body.get("town") or ""), radius)
-    settings = _run(fc.load_settings, db, ctx.tenant, bid)
-    got = _run(fc.add_prospects, db, ctx.tenant, bid, rows, body.get("campaign_id") or None, settings)
-    return {"ok": True, "found": len(rows), **got}
+    _run(fc.load_settings, db, ctx.tenant, bid)          # says what to run when the migration is missing
+    job = _run(fc.start_find, get_db, ctx.tenant, bid, tier, _business(db, ctx, bid),
+               str(body.get("kind") or ""), str(body.get("town") or ""), radius,
+               body.get("campaign_id") or None, bool(body.get("research")))
+    return {"ok": True, "job": job}
 
 
 @router.post("/clients/import")

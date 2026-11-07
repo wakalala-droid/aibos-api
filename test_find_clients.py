@@ -1,9 +1,11 @@
 """
-Find clients (find_clients.py, find_clients_routes.py): Growth only, nothing
-ever sent by AIBOS, a "stop" honoured for good, and the month's allowance kept.
+Find clients (find_clients.py, find_clients_routes.py): on every plan with its
+own monthly allowance, nothing ever sent by AIBOS, a "stop" honoured for good,
+the month's allowance kept, and a slow map never left to time out the page.
 No network, no AI: the website reader, the map and the AI are stood in for.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -43,6 +45,7 @@ def api(monkeypatch):
     monkeypatch.setattr(fc, "mail_domain_ok", lambda email: True)
     monkeypatch.setattr(fc, "INLINE", True)
     fc._JOBS.clear()
+    fc._MAP_CACHE.clear()
     _tier(db, "growth")
     _as(OWNER)
     yield TestClient(main.app), db
@@ -50,6 +53,7 @@ def api(monkeypatch):
         main.app.dependency_overrides.pop(dep, None)
     entitlements.invalidate("u1")
     fc._JOBS.clear()
+    fc._MAP_CACHE.clear()
 
 
 def _as(ctx):
@@ -83,14 +87,25 @@ def _campaign(api):
 
 # ── The plan ──────────────────────────────────────────────────────────────────
 
-def test_below_growth_the_page_is_a_preview_and_nothing_else_answers(api):
+def test_every_plan_gets_the_page_with_its_own_allowance(api):
     client, db = api
-    for tier in ("free", "pro", "proplus"):
+    for tier, allowed in (("free", 20), ("pro", 50), ("proplus", 100), ("growth", 300)):
         _tier(db, tier)
         home = client.get("/clients").json()
-        assert home["preview"] is True and home["allowance"] == 300
-        r = client.post("/clients/import", json={"text": LIST})
-        assert r.status_code == 402 and "Growth" in r.json()["detail"]
+        assert home["preview"] is False, tier
+        assert home["allowance"] == allowed and home["usage"]["allowed"] == allowed, tier
+        assert home["allowances"] == {"free": 20, "pro": 50, "proplus": 100, "growth": 300}
+        assert client.post("/clients/import", json={"text": LIST}).status_code == 200, tier
+
+
+def test_an_account_the_plan_turns_away_sees_a_preview_and_nothing_else_answers(api, monkeypatch):
+    client, db = api
+    monkeypatch.setitem(entitlements._ACCESS, "free", set())
+    _tier(db, "free")
+    home = client.get("/clients").json()
+    assert home["preview"] is True and home["allowance"] == 20
+    r = client.post("/clients/import", json={"text": LIST})
+    assert r.status_code == 402 and "Pro" in r.json()["detail"]
     assert not db.rows.get("client_prospects")
 
 
@@ -103,10 +118,11 @@ def test_growth_gets_the_whole_page(api):
     assert "Lusaka" in home["towns"] and home["kinds"]["hardware"] == "Hardware and building"
 
 
-def test_the_ladder_puts_find_clients_on_growth():
-    assert entitlements._required_tier("find_clients") == "growth"
-    assert not entitlements.can_access("proplus", "find_clients")
-    assert entitlements.can_access("growth", "find_clients")
+def test_the_ladder_puts_find_clients_on_every_plan():
+    for tier in ("free", "pro", "proplus", "growth"):
+        assert entitlements.can_access(tier, "find_clients"), tier
+    allowed = [fc.ALLOWANCE[t] for t in ("free", "pro", "proplus", "growth")]
+    assert allowed == [20, 50, 100, 300]
 
 
 # ── Finding ───────────────────────────────────────────────────────────────────
@@ -150,21 +166,192 @@ def test_the_map_search_adds_named_places(api, monkeypatch):
         seen.update(kind=kind, town=town)
         return fc.parse_overpass(data, kind, town)
     monkeypatch.setattr(fc, "search_map", fake_search)
-    got = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"}).json()
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"}).json()["job"]
     assert seen == {"kind": "hardware", "town": "Lusaka"}
-    assert (got["found"], got["added"]) == (1, 1)
+    assert (job["phase"], job["found"], job["added"], job["running"], job["error"]) == ("map", 1, 1, False, None)
     p = db.rows["client_prospects"][0]
     assert p["source"] == "map" and p["source_ref"] == "node/1" and p["address"] == "Chilenje Road"
+    # Finding costs nothing from the month's allowance.
+    assert client.get("/clients").json()["usage"]["used"] == 0
 
 
-def test_a_busy_map_is_said_plainly(api, monkeypatch):
+def test_a_busy_map_is_said_plainly_and_the_page_never_waits_on_it(api, monkeypatch):
     client, _ = api
 
     def busy(*a):
-        raise fc.Busy("The map is busy just now. Try again in a minute.")
+        raise fc.Busy(fc.MAP_BUSY)
     monkeypatch.setattr(fc, "search_map", busy)
     r = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"})
-    assert r.status_code == 503 and "busy" in r.json()["detail"]
+    # The answer comes at once; the search reports on the job, as research does.
+    assert r.status_code == 200
+    job = r.json()["job"]
+    assert job["running"] is False and "busy" in job["error"]
+    assert client.get("/clients").json()["job"]["error"] == fc.MAP_BUSY
+
+
+def test_a_kind_or_town_it_does_not_know_is_said_at_once(api):
+    client, _ = api
+    r = client.post("/clients/find", json={"kind": "spaceships", "town": "Lusaka"})
+    assert r.status_code == 400 and "kind" in r.json()["detail"]
+    r = client.post("/clients/find", json={"kind": "hardware", "town": "Atlantis"})
+    assert r.status_code == 400 and "town" in r.json()["detail"]
+    assert not fc._JOBS
+
+
+def _map_rows(n_site=1, n_phone=6, n_none=5):
+    rows = [{"name": "Mwape Hardware", "kind": "hardware", "town": "Lusaka", "website": "mwapehardware.co.zm",
+             "source": "map", "source_ref": "node/100"}][:n_site]
+    rows += [{"name": f"Phone Shop {i}", "kind": "hardware", "town": "Lusaka", "phone": f"0977 10000{i}",
+              "source": "map", "source_ref": f"node/{200 + i}"} for i in range(n_phone)]
+    rows += [{"name": f"Quiet Shop {i}", "kind": "hardware", "town": "Lusaka",
+              "source": "map", "source_ref": f"node/{300 + i}"} for i in range(n_none)]
+    return rows
+
+
+def test_the_first_time_demo_finds_then_researches_a_few_and_writes_to_them(api, monkeypatch):
+    client, db = api
+    _tier(db, "free")
+    camp = _campaign(client)
+    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius: _map_rows())
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "campaign_id": camp["id"],
+                                             "research": True}).json()["job"]
+    assert (job["phase"], job["found"], job["added"]) == ("research", 12, 12)
+    assert job["total"] == fc.DEMO_RESEARCH == job["done"] and job["running"] is False
+    assert job["written"] >= 1
+    by = {p["name"]: p for p in db.rows["client_prospects"]}
+    # The one with a website is read first, then the ones that can be reached.
+    assert by["Mwape Hardware"]["stage"] == "ready" and by["Mwape Hardware"]["email"] == "sales@mwapehardware.co.zm"
+    assert all(by[f"Phone Shop {i}"]["stage"] != "new" for i in range(6))
+    assert sum(1 for p in by.values() if p["stage"] == "new") == 2
+    home = client.get("/clients").json()
+    assert home["usage"] == {"used": 10, "allowed": 20, "left": 10}
+    assert any(d["prospect"]["name"] == "Mwape Hardware" for d in home["drafts"])
+    assert all(m["status"] == "draft" for m in db.rows["client_messages"])     # still nothing sent
+
+
+def test_the_demo_researches_no_more_than_the_month_has_left(api, monkeypatch):
+    client, db = api
+    _tier(db, "free")
+    monkeypatch.setitem(fc.ALLOWANCE, "free", 3)
+    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius: _map_rows())
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "research": True}).json()["job"]
+    assert (job["total"], job["done"]) == (3, 3)
+    again = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "research": True}).json()["job"]
+    # Nothing left this month: it still finds, and researches none.
+    assert (again["phase"], again["found"], again["added"], again["known"], again["total"]) == ("map", 12, 0, 12, 0)
+
+
+def test_one_job_at_a_time_per_business(api, monkeypatch):
+    client, _ = api
+    monkeypatch.setattr(fc, "search_map", lambda *a: [])
+    client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"})
+    (job,) = fc._JOBS.values()
+    job["running"] = True                                   # as if still on the map
+    called = []
+    monkeypatch.setattr(fc, "search_map", lambda *a: called.append(a) or [])
+    again = client.post("/clients/find", json={"kind": "shops", "town": "Kitwe"}).json()["job"]
+    assert again["already"] is True and again["kind"] == "hardware" and not called
+    assert client.post("/clients/research", json={}).json()["job"]["already"] is True
+
+
+# ── The map: raced, kept, and never a timeout taken for "nothing here" ────────
+
+class _Answer:
+    def __init__(self, status, data):
+        self.status_code, self._data = status, data
+
+    def json(self):
+        if isinstance(self._data, Exception):
+            raise self._data
+        return self._data
+
+
+def test_a_timed_out_answer_is_never_taken_for_an_empty_map(monkeypatch):
+    answers = {
+        "timed-out": _Answer(200, {"remark": 'runtime error: Query timed out in "query" at line 1 after 26 seconds.',
+                                   "elements": []}),
+        "too-many": _Answer(429, {}),
+        "not-json": _Answer(200, ValueError("Expecting value")),
+        "good": _Answer(200, {"elements": [{"type": "node", "id": 9, "tags": {"name": "Chanda Stores"}}]}),
+        "empty": _Answer(200, {"elements": []}),
+    }
+    monkeypatch.setattr(fc.httpx, "post", lambda url, **k: answers[url])
+    for url in ("timed-out", "too-many", "not-json"):
+        with pytest.raises(fc.Busy):
+            fc._ask_overpass(url, "q", 5)
+    assert fc._ask_overpass("good", "q", 5)["elements"][0]["id"] == 9
+    assert fc._ask_overpass("empty", "q", 5) == {"elements": []}       # a real "nothing here"
+
+
+def _servers(monkeypatch, behaviour, hedge=0.05, deadline=3.0):
+    asked = []
+
+    def ask(url, q, timeout):
+        asked.append(url)
+        wait, result = behaviour[url]
+        time.sleep(wait)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setattr(fc, "OVERPASS_SERVERS", tuple(behaviour))
+    monkeypatch.setattr(fc, "_ask_overpass", ask)
+    monkeypatch.setattr(fc, "MAP_HEDGE", hedge)
+    monkeypatch.setattr(fc, "MAP_DEADLINE", deadline)
+    return asked
+
+
+def test_the_map_race_takes_the_first_good_answer(monkeypatch):
+    asked = _servers(monkeypatch, {"a": (0.4, {"elements": ["slow"]}), "b": (0, fc.Busy("b: runtime error")),
+                                   "c": (0, {"elements": ["fast"]}), "d": (0, {"elements": ["unasked"]})},
+                     hedge=5)
+    started = time.monotonic()
+    assert fc._race("q") == {"elements": ["fast"]}
+    # Two asked at once; one failed, so the next was asked straight away (the
+    # hedge is five seconds off), and the fourth never.
+    assert sorted(asked) == ["a", "b", "c"]
+    assert time.monotonic() - started < 0.35
+
+
+def test_slow_servers_bring_in_the_rest(monkeypatch):
+    asked = _servers(monkeypatch, {"a": (0.5, {"elements": ["a"]}), "b": (0.5, {"elements": ["b"]}),
+                                   "c": (0, {"elements": ["c"]})}, hedge=0.05)
+    started = time.monotonic()
+    assert fc._race("q") == {"elements": ["c"]}
+    assert set(asked) == {"a", "b", "c"} and time.monotonic() - started < 0.45
+
+
+def test_when_no_server_answers_the_map_is_busy(monkeypatch):
+    _servers(monkeypatch, {"a": (0, fc.Busy("a answered 504")), "b": (0, fc.Busy("b answered 429")),
+                           "c": (0.3, {"elements": []})}, deadline=0.1)
+    with pytest.raises(fc.Busy) as e:
+        fc._race("q")
+    assert str(e.value) == fc.MAP_BUSY
+
+
+def test_a_found_list_is_kept_and_used_when_the_map_is_busy(monkeypatch):
+    fc._MAP_CACHE.clear()
+    calls = []
+    data = {"elements": [{"type": "node", "id": 7, "tags": {"name": "Kabwe Lodge"}}]}
+
+    def race(q):
+        calls.append(q)
+        return data
+    monkeypatch.setattr(fc, "_race", race)
+    first = fc.search_map("lodges", "Kabwe")
+    again = fc.search_map("lodges", "Kabwe", 8.2)        # the same whole km: asked once
+    assert first == again and first[0]["name"] == "Kabwe Lodge" and len(calls) == 1
+    # A week on, the map is asked again; when it is busy, last week's list is used.
+    key = next(iter(fc._MAP_CACHE))
+    fc._MAP_CACHE[key] = (fc._now() - timedelta(days=8), fc._MAP_CACHE[key][1])
+
+    def busy(q):
+        raise fc.Busy(fc.MAP_BUSY)
+    monkeypatch.setattr(fc, "_race", busy)
+    assert fc.search_map("lodges", "Kabwe")[0]["name"] == "Kabwe Lodge"
+    # Never found before and busy now: said plainly.
+    with pytest.raises(fc.Busy):
+        fc.search_map("lodges", "Choma")
+    fc._MAP_CACHE.clear()
 
 
 def test_long_lists_are_read_past_the_databases_page_of_1000(api):
@@ -209,10 +396,25 @@ def test_the_months_allowance_is_kept(api, monkeypatch):
     monkeypatch.setitem(fc.ALLOWANCE, "growth", 2)
     client.post("/clients/import", json={"text": LIST})
     job = client.post("/clients/research", json={}).json()["job"]
-    assert job["total"] == 2
+    assert job["total"] == 2 and job["phase"] == "research"
     r = client.post("/clients/research", json={})
     assert r.status_code == 409 and "used" in r.json()["detail"]
+    assert "move up" not in r.json()["detail"]                 # Growth is the top
     assert sum(1 for p in db.rows["client_prospects"] if p["stage"] == "new") == 1
+
+
+def test_used_up_names_the_plan_with_more(api, monkeypatch):
+    client, db = api
+    _tier(db, "free")
+    monkeypatch.setitem(fc.ALLOWANCE, "free", 1)
+    client.post("/clients/import", json={"text": LIST})
+    client.post("/clients/research", json={})
+    r = client.post("/clients/research", json={})
+    assert r.status_code == 409
+    assert r.json()["detail"] == ("This month's 1 businesses are used. More can be researched from the 1st, "
+                                  "or move up to Pro for 50 a month.")
+    assert fc.used_up("pro").endswith("move up to Pro+ for 100 a month.")
+    assert fc.used_up("proplus").endswith("move up to Growth for 300 a month.")
 
 
 def test_sent_by_the_owner_then_followed_up_then_left_alone(api):

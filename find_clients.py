@@ -1,11 +1,13 @@
 """
-AIBOS: Find clients (Growth, 5 November 2026).
+AIBOS: Find clients (every plan since 7 November 2026; Growth only from 5 November).
 
 An agent that finds businesses that could buy from the owner, reads their
 websites, says how well each one fits and why, and writes the first message,
 the follow-ups and the answer to a reply. It is the owner's own outreach tool
 (aibos-prospect, built that day from how Explee works), made into a part of
-AIBOS that every Growth business can use for its own sales.
+AIBOS that every business can use for its own sales. The plans differ only in
+how many businesses a month it researches (ALLOWANCE): finding new customers
+is the reason a Free owner has to come back, and the reason to move up.
 
 IT NEVER SENDS ANYTHING ITSELF. Every message is a draft until the owner
 presses Send by email or Send on WhatsApp, which opens their own email or
@@ -16,14 +18,18 @@ stranger. Every first message ends with a way to say no, and a "stop" puts
 the address on the do not contact list for good.
 
 WHAT IT COSTS TO RUN. One business researched and written to is two AI calls
-on the Flash model, about one US cent. Growth includes RESEARCH_PER_MONTH of
-them a month; follow-ups and answers are written from the owner's own words
-and do not count. Without an AI key everything still works on rules and
-templates.
+on the Flash model, about one US cent. Each plan includes ALLOWANCE[plan] of
+them a month. Finding costs nothing, and follow-ups and answers are written
+from the owner's own words, so neither counts. Without an AI key everything
+still works on rules and templates.
 
 Finding: OpenStreetMap through the Overpass API (free, no key) around 16
-Zambian towns, and any list the owner pastes or uploads. Website reads go to
-public addresses only, checked at every redirect.
+Zambian towns, and any list the owner pastes or uploads. The public map
+servers are often slow or busy (7 Nov 2026: one took 39 seconds, two did not
+answer in 45), so a search asks two at once, brings in the others when those
+are slow, keeps what it found for a week, and runs on after the answer, like
+research: the proxy in front of the API gives up on a request after 60
+seconds. Website reads go to public addresses only, checked at every redirect.
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ import logging
 import re
 import socket
 import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urljoin, urlparse
 
@@ -47,13 +55,18 @@ FEATURE = "find_clients"
 SETUP = ("Find clients is not set up on this database yet. "
          "Run migration 0045_find_clients.sql in Supabase.")
 
-# Businesses researched (and written to) a month, by plan. A plan that is not
+# Businesses researched (and written to) a month, by plan: the one thing the
+# plans differ in here (owner's decision, 7 Nov 2026). A plan that is not
 # listed has none. Counted in usage_events, so a busy month cannot run up a
-# bill the plan does not cover.
-ALLOWANCE = {"growth": 300}
+# bill the plan does not cover. Lock-step with tier_contract.json "allowance"
+# and lib/tiers.ts FIND_CLIENTS_PER_MONTH.
+ALLOWANCE = {"free": 20, "pro": 50, "proplus": 100, "growth": 300}
 USAGE_EVENT = "find_clients_research"
+PLAN_NAMES = {"free": "Free", "pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
+NEXT_PLAN = {"free": "pro", "pro": "proplus", "proplus": "growth"}
 
 JOB_MAX = 25          # businesses one press of Research looks at
+DEMO_RESEARCH = 10    # businesses the first-time "show me" researches after finding
 WRITE_FROM = 60       # the fit at which the first message is written
 IMPORT_MAX = 2000     # rows one pasted list may add
 MAP_LIMIT = 120       # places one map search may add
@@ -100,11 +113,21 @@ KINDS = {
     "workshops": {"label": "Workshops and makers", "osm": ['["craft"]']},
 }
 
+# The public Overpass servers, the two asked first at the front. Timed from
+# here on 7 Nov 2026 for lodges around Lusaka: maps.mail.ru 15 to 17 seconds,
+# overpass-api.de 39 seconds or no answer, the other two no answer in 45.
 OVERPASS_SERVERS = (
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )
+MAP_FIRST = 2         # servers asked at once
+MAP_HEDGE = 8.0       # seconds before the rest are asked too
+MAP_DEADLINE = 60.0   # seconds a search may take in all (it runs on after the answer)
+MAP_KEEP = timedelta(days=7)          # how long a found list is used again
+MAP_KEEP_EMPTY = timedelta(hours=6)   # "nothing here" is asked again sooner
+MAP_CACHE_MAX = 400
 USER_AGENT = "AIBOS Find clients (+https://ai-bos.website)"
 
 
@@ -711,8 +734,9 @@ def parse_list(text: str) -> list:
 
 
 def _overpass_query(kind: str, lat: float, lon: float, radius_m: int, limit: int) -> str:
+    # A short server timeout: a busy server turns away long ones first.
     parts = "".join(f'nwr{f}["name"](around:{radius_m},{lat},{lon});' for f in KINDS[kind]["osm"])
-    return f"[out:json][timeout:30];({parts});out center tags {limit};"
+    return f"[out:json][timeout:25];({parts});out center tags {limit};"
 
 
 def _tag(t: dict, *names):
@@ -741,26 +765,107 @@ def parse_overpass(data: dict, kind: str, town: str) -> list:
     return out
 
 
+MAP_BUSY = "The map is busy just now. Try again in a minute."
+
+
+def _ask_overpass(url: str, q: str, timeout: float) -> dict:
+    """One server's answer, or Busy. A server that ran out of time still
+    answers 200, with a "runtime error" remark and some or none of the places:
+    that is a failed answer, never "there is nothing here"."""
+    try:
+        r = httpx.post(url, data={"data": q}, timeout=timeout, headers={"User-Agent": USER_AGENT})
+    except httpx.HTTPError as e:
+        raise Busy(f"{url}: {type(e).__name__}") from e
+    if r.status_code != 200:
+        raise Busy(f"{url} answered {r.status_code}")
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise Busy(f"{url} did not answer in JSON") from e
+    remark = str((data or {}).get("remark") or "")
+    if "error" in remark.lower():
+        raise Busy(f"{url}: {_text(remark, 160)}")
+    if not isinstance((data or {}).get("elements"), list):
+        raise Busy(f"{url} sent no places")
+    return data
+
+
+def _race(q: str) -> dict:
+    """The first good answer from the public map servers. MAP_FIRST are asked
+    at once; the rest join after MAP_HEDGE seconds, or straight away when one
+    fails. Raises Busy when none answers well by MAP_DEADLINE."""
+    deadline = time.monotonic() + MAP_DEADLINE
+    hedge_at = time.monotonic() + MAP_HEDGE
+    queue = list(OVERPASS_SERVERS)
+    asking: dict = {}
+    last = "no server was asked"
+    pool = ThreadPoolExecutor(max_workers=len(queue), thread_name_prefix="find-clients-map")
+
+    def ask(n: int) -> None:
+        for _ in range(min(n, len(queue))):
+            url = queue.pop(0)
+            asking[pool.submit(_ask_overpass, url, q, max(5.0, deadline - time.monotonic()))] = url
+
+    try:
+        ask(MAP_FIRST)
+        while asking:
+            now = time.monotonic()
+            if now >= deadline:
+                last = "no answer in time"
+                break
+            until = min(hedge_at, deadline) if queue else deadline
+            done, _ = wait(list(asking), timeout=max(0.01, until - now), return_when=FIRST_COMPLETED)
+            if not done:
+                if queue and time.monotonic() >= hedge_at:
+                    ask(len(queue))          # the first ones are slow: ask the rest too
+                continue
+            for f in done:
+                url = asking.pop(f)
+                try:
+                    return f.result()
+                except Exception as e:  # noqa: BLE001 — Busy, or anything the thread hit
+                    last = str(e) or f"{url}: {type(e).__name__}"
+                    ask(1)                   # one failed: ask the next now
+    finally:
+        # Never wait for the slow ones: their own timeouts end them.
+        pool.shutdown(wait=False, cancel_futures=True)
+    log.warning("[find_clients] map search failed: %s", last)
+    raise Busy(MAP_BUSY)
+
+
+# (kind, town, radius_m) -> (when, rows). Places on the map change slowly, so a
+# list found this week is used again rather than asking a busy server.
+_MAP_CACHE: dict = {}
+_MAP_LOCK = threading.Lock()
+
+
 def search_map(kind: str, town: str, radius_km: float = 8) -> list:
     """Named places of one kind around a town, from OpenStreetMap. Raises
-    Busy when every public server is busy."""
+    Busy when every public server is busy and nothing was found before."""
     if kind not in KINDS:
         raise ValueError("Pick a kind of business to look for.")
     if town not in TOWNS:
         raise ValueError("Pick a town.")
     lat, lon = TOWNS[town]
-    q = _overpass_query(kind, lat, lon, int(max(1.0, min(25.0, radius_km)) * 1000), MAP_LIMIT)
-    last = None
-    for url in OVERPASS_SERVERS:            # the public servers are often busy: try the next
-        try:
-            r = httpx.post(url, data={"data": q}, timeout=40, headers={"User-Agent": USER_AGENT})
-            if r.status_code == 200:
-                return parse_overpass(r.json(), kind, town)
-            last = f"{url} answered {r.status_code}"
-        except (httpx.HTTPError, ValueError) as e:
-            last = f"{url}: {type(e).__name__}"
-    log.warning("[find_clients] map search failed: %s", last)
-    raise Busy("The map is busy just now. Try again in a minute.")
+    radius_m = int(round(max(1.0, min(25.0, float(radius_km))))) * 1000   # whole km: a small cache
+    key = (kind, town, radius_m)
+    with _MAP_LOCK:
+        hit = _MAP_CACHE.get(key)
+    if hit and _now() - hit[0] < (MAP_KEEP if hit[1] else MAP_KEEP_EMPTY):
+        return [dict(r) for r in hit[1]]
+    try:
+        data = _race(_overpass_query(kind, lat, lon, radius_m, MAP_LIMIT))
+    except Busy:
+        if hit and hit[1]:                   # older than a week, but better than nothing
+            log.info("[find_clients] the map is busy: using what was found on %s", hit[0])
+            return [dict(r) for r in hit[1]]
+        raise
+    rows = parse_overpass(data, kind, town)
+    with _MAP_LOCK:
+        if len(_MAP_CACHE) >= MAP_CACHE_MAX:
+            _MAP_CACHE.pop(min(_MAP_CACHE, key=lambda k: _MAP_CACHE[k][0]), None)
+        _MAP_CACHE[key] = (_now(), rows)
+    return [dict(r) for r in rows]
 
 
 # ── Reading a website ─────────────────────────────────────────────────────────
@@ -1477,13 +1582,26 @@ def usage(db, uid: str, tier: str) -> dict:
     return {"used": used, "allowed": allowed, "left": max(0, allowed - used)}
 
 
+def used_up(tier: str) -> str:
+    """What to say when the month's businesses are used: when more come, and
+    the plan that has more."""
+    text = f"This month's {ALLOWANCE.get(tier, 0)} businesses are used. More can be researched from the 1st"
+    nxt = NEXT_PLAN.get(tier)
+    if nxt:
+        text += f", or move up to {PLAN_NAMES[nxt]} for {ALLOWANCE[nxt]} a month"
+    return text + "."
+
+
 def _count_one(db, uid: str, pid: str) -> None:
     db.table("usage_events").insert({"user_id": uid, "event": USAGE_EVENT, "meta": {"prospect": pid}}).execute()
 
 
-# ── Research, one press at a time ─────────────────────────────────────────────
+# ── Finding and research, one press at a time ─────────────────────────────────
 
-# key "user|business" -> {"total", "done", "written", "running", "error", "started_at"}
+# key "user|business" -> one job at a time per business, finding or research:
+# {"phase": "map" | "research", "total", "done", "written", "running", "error",
+#  "started_at", "finished_at"}, and for a search also "kind", "town", "found",
+#  "added", "known" and "blocked".
 _JOBS: dict = {}
 _JOBS_LOCK = threading.Lock()
 # Tests run the job inside the request instead of on a thread.
@@ -1525,6 +1643,25 @@ def research_and_write(db, uid: str, bid: str, p: dict, campaign: dict | None, s
     return False
 
 
+def _research_each(db, uid: str, bid: str, picked: list, settings: dict, business: dict, status: dict) -> None:
+    """Research each picked business in turn, counting on the job as it goes."""
+    camps = {c["id"]: c for c in list_campaigns(db, uid, bid)}
+    for p in picked:
+        try:
+            if research_and_write(db, uid, bid, p, camps.get(p.get("campaign_id")), settings, business):
+                status["written"] += 1
+        except Exception as e:  # noqa: BLE001 — one business must not stop the rest
+            log.warning("[find_clients] research of %s failed: %s", p.get("id"), e)
+        status["done"] += 1
+
+
+def _launch(run, name: str) -> None:
+    if INLINE:
+        run()
+    else:
+        threading.Thread(target=run, name=name, daemon=True).start()
+
+
 def start_research(get_db, uid: str, bid: str, tier: str, business: dict,
                    campaign_id: str | None = None, limit: int = JOB_MAX) -> dict:
     """Research the next businesses waiting (new ones first, the oldest
@@ -1537,29 +1674,20 @@ def start_research(get_db, uid: str, bid: str, tier: str, business: dict,
             return {**running, "already": True}
         left = usage(db, uid, tier)["left"]
         if left <= 0:
-            raise Refused(f"This month's {ALLOWANCE.get(tier, 0)} businesses are used. "
-                                  "More can be researched from the 1st.")
+            raise Refused(used_up(tier))
         waiting = sorted(list_prospects(db, uid, bid, campaign_id=campaign_id, stage="new"),
                          key=lambda r: str(r.get("created_at") or ""))
         picked = waiting[:max(1, min(limit, JOB_MAX, left))]
         if not picked:
             raise Refused("There are no new businesses to research. Find some first.")
-        status = {"total": len(picked), "done": 0, "written": 0, "running": True, "error": None,
-                  "started_at": _iso()}
+        status = {"phase": "research", "total": len(picked), "done": 0, "written": 0, "running": True,
+                  "error": None, "started_at": _iso(), "finished_at": None}
         _JOBS[key] = status
 
     def run():
         try:
             jdb = get_db()
-            settings = load_settings(jdb, uid, bid)
-            camps = {c["id"]: c for c in list_campaigns(jdb, uid, bid)}
-            for p in picked:
-                try:
-                    if research_and_write(jdb, uid, bid, p, camps.get(p.get("campaign_id")), settings, business):
-                        status["written"] += 1
-                except Exception as e:  # noqa: BLE001 — one business must not stop the rest
-                    log.warning("[find_clients] research of %s failed: %s", p.get("id"), e)
-                status["done"] += 1
+            _research_each(jdb, uid, bid, picked, load_settings(jdb, uid, bid), business, status)
         except Exception as e:  # noqa: BLE001
             status["error"] = "Research stopped part way. Press Research again to carry on."
             log.warning("[find_clients] research job crashed: %s", e)
@@ -1567,10 +1695,67 @@ def start_research(get_db, uid: str, bid: str, tier: str, business: dict,
             status["running"] = False
             status["finished_at"] = _iso()
 
-    if INLINE:
-        run()
-    else:
-        threading.Thread(target=run, name="find-clients-research", daemon=True).start()
+    _launch(run, "find-clients-research")
+    return dict(status)
+
+
+def _demo_pick(prospects: list, n: int) -> list:
+    """The first few to research for someone trying Find clients: the ones
+    with a website first (their fit can be read), then the ones that can be
+    reached at all, newest first within each."""
+    def rank(p):
+        return (0 if p.get("website") else 1, 0 if (p.get("email") or p.get("phone")) else 1)
+    return sorted(prospects, key=rank)[:max(0, n)]
+
+
+def start_find(get_db, uid: str, bid: str, tier: str, business: dict, kind: str, town: str,
+               radius_km: float = 8, campaign_id: str | None = None, research: bool = False) -> dict:
+    """Search the map for one kind of business around one town and add what
+    it finds, on after the answer (the map can take most of a minute, longer
+    than the proxy waits). With research, the first DEMO_RESEARCH new ones are
+    researched and written to as well: the first-time "show me who could buy
+    from me", which ends with real messages to read, not an empty list."""
+    if kind not in KINDS:
+        raise ValueError("Pick a kind of business to look for.")
+    if town not in TOWNS:
+        raise ValueError("Pick a town.")
+    key = f"{uid}|{bid}"
+    with _JOBS_LOCK:
+        running = _JOBS.get(key)
+        if running and running.get("running"):
+            return {**running, "already": True}
+        status = {"phase": "map", "kind": kind, "town": town, "found": 0, "added": 0, "known": 0, "blocked": 0,
+                  "total": 0, "done": 0, "written": 0, "running": True, "error": None, "started_at": _iso(),
+                  "finished_at": None}
+        _JOBS[key] = status
+
+    def run():
+        try:
+            rows = search_map(kind, town, radius_km)
+            status["found"] = len(rows)
+            jdb = get_db()
+            settings = load_settings(jdb, uid, bid)
+            status.update(add_prospects(jdb, uid, bid, rows, campaign_id, settings))
+            if research and rows:
+                left = usage(jdb, uid, tier)["left"]
+                refs = {r.get("source_ref") for r in rows if r.get("source_ref")}
+                fresh = [p for p in list_prospects(jdb, uid, bid, stage="new") if p.get("source_ref") in refs]
+                picked = _demo_pick(fresh, min(DEMO_RESEARCH, left))
+                if picked:
+                    status.update(phase="research", total=len(picked))
+                    _research_each(jdb, uid, bid, picked, settings, business, status)
+        except Busy as e:
+            status["error"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            status["error"] = ("Research stopped part way. Press Research to carry on."
+                               if status["phase"] == "research" else
+                               "The search stopped part way. Try again in a minute.")
+            log.warning("[find_clients] find job crashed: %s", e)
+        finally:
+            status["running"] = False
+            status["finished_at"] = _iso()
+
+    _launch(run, "find-clients-map")
     return dict(status)
 
 

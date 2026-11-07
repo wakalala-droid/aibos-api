@@ -35,7 +35,19 @@ log = logging.getLogger("aibos.entitlements")
 # price: payroll, the scheduled brief and reminders moved Pro -> Pro+,
 # Hospitality moved Pro -> Growth, and sending invoices and inviting the team
 # moved Free -> Pro.
-_PRO: set[str] = {
+#
+# Free since 7 Nov 2026 (owner's decision): Find clients is on every plan, and
+# the plans differ only in how many businesses a month it researches
+# (find_clients.ALLOWANCE: 20, 50, 100 and 300). Finding customers is the one
+# thing a new owner gets paid back for at once, so it leads the Free plan.
+_FREE: set[str] = {
+    # Find clients (find_clients.py, 5 Nov 2026): businesses found on the map or
+    # from a list, their websites read, the fit judged and the first message,
+    # follow-ups and answers written for the owner to send from their own email
+    # or WhatsApp.
+    "find_clients",
+}
+_PRO: set[str] = _FREE | {
     "forecast", "anomaly", "variance", "breakeven",
     "ai_chat", "full_history", "engine2", "engine3",
     # Creating and sending invoices with a payment link. Reading, settling and
@@ -56,11 +68,6 @@ _GROWTH: set[str] = _PROPLUS | {
     # chance of running short, what fixes it, decisions tried on it, the group
     # view across businesses and the cash watch that warns ahead (16 Oct 2026).
     "cash_plan",
-    # Find clients (find_clients.py, 5 Nov 2026): businesses found on the map or
-    # from a list, their websites read, the fit judged and the first message,
-    # follow-ups and answers written for the owner to send from their own email
-    # or WhatsApp. RESEARCH_PER_MONTH a month (find_clients.ALLOWANCE).
-    "find_clients",
     # PROVISIONAL: the Hospitality (short-let PMS) vertical. When it becomes its
     # own add-on SKU, MOVE this out of _GROWTH into a dedicated grant path — a
     # one-line change. See lib/tiers.ts.
@@ -68,7 +75,7 @@ _GROWTH: set[str] = _PROPLUS | {
 }
 
 _ACCESS: dict[str, set[str]] = {
-    "free": set(),
+    "free": _FREE,
     "pro": _PRO,
     "proplus": _PROPLUS,
     "growth": _GROWTH,

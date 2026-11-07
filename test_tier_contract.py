@@ -24,7 +24,9 @@ def test_contract_file_is_not_vacuous():
     # A guard that silently parses nothing would pass forever while drift ships.
     # Pin the shape so an empty or half-written contract fails loudly instead.
     assert set(CONTRACT["access"]) == {"free", "pro", "proplus", "growth"}
-    assert CONTRACT["access"]["free"] == []
+    # Free has exactly one feature since 7 Nov 2026: Find clients, in a small
+    # monthly amount. Anything else appearing on Free is a slip, not a plan.
+    assert CONTRACT["access"]["free"] == ["find_clients"]
     assert len(CONTRACT["access"]["pro"]) >= 10
     assert CONTRACT["taster"]["ai_chat"] >= 1
     assert set(CONTRACT["prices"]) == {"pro", "proplus", "growth"}
@@ -41,13 +43,25 @@ def test_access_map_matches_entitlements():
 
 
 def test_paid_tiers_are_supersets():
-    # PRO ⊂ PROPLUS ⊂ GROWTH is the ladder's promise: upgrading must never take a
-    # feature away. entitlements.py builds these by union so it holds by
+    # FREE ⊂ PRO ⊂ PROPLUS ⊂ GROWTH is the ladder's promise: upgrading must never
+    # take a feature away. entitlements.py builds these by union so it holds by
     # construction — the contract file is hand-editable, so check it here.
+    free = set(CONTRACT["access"]["free"])
     pro = set(CONTRACT["access"]["pro"])
     proplus = set(CONTRACT["access"]["proplus"])
     growth = set(CONTRACT["access"]["growth"])
-    assert pro <= proplus <= growth
+    assert free <= pro <= proplus <= growth
+
+
+def test_allowances_match_and_climb_with_price():
+    # Find clients is on every plan; what climbs is how many businesses a month
+    # it researches. The page and the pricing table quote these numbers.
+    import find_clients
+    allowance = CONTRACT["allowance"]["find_clients"]
+    assert allowance == find_clients.ALLOWANCE
+    order = ["free", "pro", "proplus", "growth"]
+    assert [allowance[t] for t in order] == sorted(allowance[t] for t in order)
+    assert len(set(allowance.values())) == len(order)
 
 
 def test_taster_matches_entitlements():
@@ -141,12 +155,14 @@ def test_value_climbs_with_price():
         "invoices": "pro", "team": "pro",
         "payroll": "proplus", "scheduled_brief": "proplus", "schedule": "proplus",
         "hospitality": "growth", "cash_plan": "growth", "multi_business": "growth",
-        "find_clients": "growth",
     }
     for feature, tier in lowest.items():
         assert entitlements._required_tier(feature) == tier, (
             f"{feature} is first unlocked on {entitlements._required_tier(feature)}, not {tier}"
         )
+    # Find clients is on every plan, Free included (7 Nov 2026).
+    for tier in ("free", "pro", "proplus", "growth"):
+        assert entitlements.can_access(tier, "find_clients"), tier
 
 
 def test_free_cannot_send_invoices_or_invite():

@@ -27,17 +27,25 @@
     "",
     "'prices' are in US dollars (since 25 September 2026 every plan is paid by",
     "card through Paddle and renews automatically). They equal paddle.py",
-    "CARD_PRICES_USD, main.py PLAN_PRICES and lib/tiers.ts priceMonthly/Annual."
+    "CARD_PRICES_USD, main.py PLAN_PRICES and lib/tiers.ts priceMonthly/Annual.",
+    "",
+    "'allowance' is how much of a feature each plan gets a month where the plans",
+    "share the feature and differ in how much (7 November 2026: Find clients on",
+    "every plan, businesses researched a month). It equals find_clients.ALLOWANCE",
+    "and lib/tiers.ts FIND_CLIENTS_PER_MONTH."
   ],
 
   "access": {
-    "free": [],
+    "free": [
+      "find_clients"
+    ],
     "pro": [
       "ai_chat",
       "anomaly",
       "breakeven",
       "engine2",
       "engine3",
+      "find_clients",
       "forecast",
       "full_history",
       "invoices",
@@ -53,6 +61,7 @@
       "deliveries",
       "engine2",
       "engine3",
+      "find_clients",
       "forecast",
       "full_history",
       "invoices",
@@ -98,6 +107,10 @@
 
   "taster": {
     "ai_chat": 3
+  },
+
+  "allowance": {
+    "find_clients": { "free": 20, "pro": 50, "proplus": 100, "growth": 300 }
   },
 
   "prices": {
