@@ -30,15 +30,22 @@
     "CARD_PRICES_USD, main.py PLAN_PRICES and lib/tiers.ts priceMonthly/Annual.",
     "",
     "'allowance' is how much of a feature each plan gets a month where the plans",
-    "share the feature and differ in how much (7 November 2026: Find clients on",
-    "every plan, businesses researched a month). It equals find_clients.ALLOWANCE",
-    "and lib/tiers.ts FIND_CLIENTS_PER_MONTH."
+    "share the feature and differ in how much: Find clients credits (businesses",
+    "researched and written to) a month. It equals find_clients.ALLOWANCE and",
+    "lib/tiers.ts FIND_CLIENTS_PER_MONTH. Free has 0 since 9 November 2026.",
+    "",
+    "'find_clients_trial' is Free's one free day of Find clients (9 November",
+    "2026, priced the way Explee prices it): hours from the first search, and",
+    "credits in that day. It equals find_clients.TRIAL_HOURS / TRIAL_RESEARCH and",
+    "lib/tiers.ts FIND_CLIENTS_TRIAL.",
+    "",
+    "'find_clients_topups' are the credit packs any plan can buy by card, once:",
+    "credits to whole US dollars. They equal find_clients.TOPUPS (which paddle.py",
+    "sells) and lib/tiers.ts FIND_CLIENTS_TOPUPS."
   ],
 
   "access": {
-    "free": [
-      "find_clients"
-    ],
+    "free": [],
     "pro": [
       "ai_chat",
       "anomaly",
@@ -110,8 +117,12 @@
   },
 
   "allowance": {
-    "find_clients": { "free": 20, "pro": 50, "proplus": 100, "growth": 300 }
+    "find_clients": { "free": 0, "pro": 50, "proplus": 100, "growth": 300 }
   },
+
+  "find_clients_trial": { "hours": 24, "research": 10 },
+
+  "find_clients_topups": { "100": 5, "300": 12, "1000": 35 },
 
   "prices": {
     "pro": { "monthly": 25, "annual": 250 },

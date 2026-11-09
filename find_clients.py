@@ -1,13 +1,22 @@
 """
-AIBOS: Find clients (every plan since 7 November 2026; Growth only from 5 November).
+AIBOS: Find clients (Growth from 5 November 2026, every plan from 7 November,
+priced the way Explee prices it from 9 November).
 
 An agent that finds businesses that could buy from the owner, reads their
 websites, says how well each one fits and why, and writes the first message,
 the follow-ups and the answer to a reply. It is the owner's own outreach tool
 (aibos-prospect, built that day from how Explee works), made into a part of
-AIBOS that every business can use for its own sales. The plans differ only in
-how many businesses a month it researches (ALLOWANCE): finding new customers
-is the reason a Free owner has to come back, and the reason to move up.
+AIBOS that every business can use for its own sales.
+
+HOW IT IS PAID FOR (owner's decision, 9 Nov 2026, after Explee: search its
+directory free, pay for the work, top up when you run out, try it free for a
+day). One credit is one business researched and written to.
+  - Free: one free day (TRIAL_HOURS) from the first search, with TRIAL_RESEARCH
+    credits. After the day it is locked unless the account has bought credits.
+  - Pro, Pro+ and Growth: ALLOWANCE credits a month, from the 1st.
+  - Any plan: top-ups (TOPUPS), bought by card, that never run out.
+Credits are spent free day first, then the month, then top-ups (what runs out
+soonest goes first), each spend recorded in usage_events with its pool.
 
 IT NEVER SENDS ANYTHING ITSELF. Every message is a draft until the owner
 presses Send by email or Send on WhatsApp, which opens their own email or
@@ -18,18 +27,19 @@ stranger. Every first message ends with a way to say no, and a "stop" puts
 the address on the do not contact list for good.
 
 WHAT IT COSTS TO RUN. One business researched and written to is two AI calls
-on the Flash model, about one US cent. Each plan includes ALLOWANCE[plan] of
-them a month. Finding costs nothing, and follow-ups and answers are written
-from the owner's own words, so neither counts. Without an AI key everything
-still works on rules and templates.
+on the Flash model, about 1.5 US cents. Finding costs nothing, and follow-ups
+and answers are written from the owner's own words, so neither counts. Without
+an AI key everything still works on rules and templates.
 
-Finding: OpenStreetMap through the Overpass API (free, no key) around 16
-Zambian towns, and any list the owner pastes or uploads. The public map
-servers are often slow or busy (7 Nov 2026: one took 39 seconds, two did not
-answer in 45), so a search asks two at once, brings in the others when those
-are slow, keeps what it found for a week, and runs on after the answer, like
-research: the proxy in front of the API gives up on a request after 60
-seconds. Website reads go to public addresses only, checked at every redirect.
+Finding: AIBOS's own directory of named places, by kind and town, taken from
+OpenStreetMap (free, no key) and kept in Supabase Storage, so a search answers
+from what is held, like Explee's own database, instead of waiting on a public
+map server. On 9 Nov 2026 every public Overpass server but one was down or
+turned searches away, and the search said "timed out". The directory is
+filled in the background every hour (harvest), and a pair nobody has
+searched yet is fetched live the first time, waiting patiently when the map
+is busy. Pasted or uploaded lists work as before. Website reads go to public
+addresses only, checked at every redirect.
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import re
 import socket
 import threading
@@ -55,15 +66,33 @@ FEATURE = "find_clients"
 SETUP = ("Find clients is not set up on this database yet. "
          "Run migration 0045_find_clients.sql in Supabase.")
 
-# Businesses researched (and written to) a month, by plan: the one thing the
-# plans differ in here (owner's decision, 7 Nov 2026). A plan that is not
-# listed has none. Counted in usage_events, so a busy month cannot run up a
-# bill the plan does not cover. Lock-step with tier_contract.json "allowance"
-# and lib/tiers.ts FIND_CLIENTS_PER_MONTH.
-ALLOWANCE = {"free": 20, "pro": 50, "proplus": 100, "growth": 300}
+# Credits (businesses researched and written to) a month, by plan. Free has
+# none since 9 Nov 2026: it has the free day instead. Counted in usage_events,
+# so a busy month cannot run up a bill the plan does not cover. Lock-step with
+# tier_contract.json "allowance" and lib/tiers.ts FIND_CLIENTS_PER_MONTH.
+ALLOWANCE = {"free": 0, "pro": 50, "proplus": 100, "growth": 300}
 USAGE_EVENT = "find_clients_research"
 PLAN_NAMES = {"free": "Free", "pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 NEXT_PLAN = {"free": "pro", "pro": "proplus", "proplus": "growth"}
+
+# Free's one free day (Explee: "1 to 3 hot leads in 24 hours free"). It starts
+# at the first search, list or research, not at sign-up, so an owner who
+# joined weeks ago still gets the whole day. At most TRIAL_RESEARCH x 1.5
+# cents, once per account: 15 cents. Lock-step with tier_contract.json
+# "find_clients_trial" and lib/tiers.ts FIND_CLIENTS_TRIAL.
+TRIAL_HOURS = 24
+TRIAL_RESEARCH = 10
+TRIAL_EVENT = "find_clients_trial"
+
+# Top-ups: credits bought by card on any plan, Explee's pay as you go. They
+# never run out and are spent after the free day and the month. {credits:
+# whole US dollars}. Our cost for 100 is $1.50 in AI and $0.75 to Paddle (5%
+# and 50 cents), so $2.75 is left of $5; $6.40 of $12; $17.75 of $35.
+# Lock-step with tier_contract.json "find_clients_topups", paddle.py (which
+# sells them) and lib/tiers.ts FIND_CLIENTS_TOPUPS.
+TOPUPS = {100: 5, 300: 12, 1000: 35}
+TOPUP_EVENT = "find_clients_topup"
+POOLS = ("trial", "month", "topup")      # the order credits are spent in
 
 JOB_MAX = 25          # businesses one press of Research looks at
 DEMO_RESEARCH = 10    # businesses the first-time "show me" researches after finding
@@ -114,9 +143,11 @@ KINDS = {
 }
 
 # The public Overpass servers, the two asked first at the front. Timed from
-# here on 7 Nov 2026 for lodges around Lusaka: maps.mail.ru 15 to 17 seconds,
-# overpass-api.de 39 seconds or no answer, the other two no answer in 45.
+# here on 9 Nov 2026: overpass.openstreetmap.fr answered in 3 to 7 seconds
+# (120 offices around Lusaka in 4), maps.mail.ru answered 504 in 4 seconds,
+# overpass-api.de 502 "at capacity", the other two nothing in 45.
 OVERPASS_SERVERS = (
+    "https://overpass.openstreetmap.fr/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -125,10 +156,25 @@ OVERPASS_SERVERS = (
 MAP_FIRST = 2         # servers asked at once
 MAP_HEDGE = 8.0       # seconds before the rest are asked too
 MAP_DEADLINE = 60.0   # seconds a search may take in all (it runs on after the answer)
-MAP_KEEP = timedelta(days=7)          # how long a found list is used again
-MAP_KEEP_EMPTY = timedelta(hours=6)   # "nothing here" is asked again sooner
-MAP_CACHE_MAX = 400
+MAP_CACHE_MAX = 60     # pairs held in memory (Lusaka's shops are about 700 places)
 USER_AGENT = "AIBOS Find clients (+https://ai-bos.website)"
+
+# AIBOS's own directory: every named place of one kind within DIR_RADIUS_KM of
+# a town, kept in Storage. A search reads it and takes the nearest places the
+# owner does not have yet, so it answers at once and each press brings new ones.
+DIR_BUCKET = "map-directory"
+DIR_RADIUS_KM = 25                    # the widest search the page offers
+DIR_LIMIT = 4000                      # places one kind around one town may hold
+DIR_FRESH = timedelta(days=30)        # used without asking the map
+DIR_REFRESH = timedelta(days=25)      # the hourly harvest renews it from here
+DIR_EMPTY_FRESH = timedelta(hours=12)  # "nothing of this kind here" is asked again sooner
+HARVEST_EACH_HOUR = 24                # pairs the hourly harvest fetches (192 in all: 8 hours)
+HARVEST_PAUSE = 5.0                   # seconds between its searches, to be kind to the servers
+# When a pair is not held yet and every server is busy, the search keeps
+# trying every MAP_RETRY_EVERY seconds, MAP_TRIES times (ten minutes), and says
+# so on the page, instead of giving up after one minute.
+MAP_TRIES = 20
+MAP_RETRY_EVERY = 30.0
 
 
 class NotHere(LookupError):
@@ -565,12 +611,15 @@ def clean_prospect(p: dict) -> dict:
     return row
 
 
-def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, settings: dict) -> dict:
+def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, settings: dict,
+                  cap: int | None = None) -> dict:
     """Add found or listed businesses. Ones already here, and ones on the do
-    not contact list, are counted and left out."""
+    not contact list, are counted and left out. With a cap, only the first
+    `cap` new ones are added (the rows come nearest first) and the new ones
+    left over are counted as "more", for the next press."""
     existing = {p.get("dedupe_key") for p in list_prospects(db, uid, bid, limit=100000, cols="id,dedupe_key")}
     dnc = settings.get("do_not_contact") or []
-    added, known, stopped, fresh = 0, 0, 0, []
+    added, known, stopped, more, fresh = 0, 0, 0, 0, []
     for raw in rows:
         row = clean_prospect(raw)
         if not row["name"]:
@@ -583,6 +632,9 @@ def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, s
             stopped += 1
             continue
         existing.add(key)
+        if cap is not None and len(fresh) >= cap:
+            more += 1
+            continue
         fresh.append({**row, "user_id": uid, "business_id": bid, "campaign_id": campaign_id,
                       "dedupe_key": key, "stage": "new", "fit_reasons": []})
     for i in range(0, len(fresh), 200):
@@ -601,7 +653,7 @@ def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, s
                     if not _dup(e2):
                         raise
                     known += 1
-    return {"added": added, "known": known, "blocked": stopped}
+    return {"added": added, "known": known, "blocked": stopped, "more": more}
 
 
 def update_prospect(db, uid: str, pid: str, patch: dict) -> dict:
@@ -733,10 +785,12 @@ def parse_list(text: str) -> list:
     return out
 
 
-def _overpass_query(kind: str, lat: float, lon: float, radius_m: int, limit: int) -> str:
-    # A short server timeout: a busy server turns away long ones first.
+def _overpass_query(kind: str, lat: float, lon: float, radius_m: int, limit: int,
+                    server_timeout: int = 25) -> str:
+    # A short server timeout for a search someone is waiting on: a busy server
+    # turns long ones away first. The hourly harvest can afford to wait.
     parts = "".join(f'nwr{f}["name"](around:{radius_m},{lat},{lon});' for f in KINDS[kind]["osm"])
-    return f"[out:json][timeout:25];({parts});out center tags {limit};"
+    return f"[out:json][timeout:{server_timeout}];({parts});out center tags {limit};"
 
 
 def _tag(t: dict, *names):
@@ -745,6 +799,17 @@ def _tag(t: dict, *names):
         if v:
             return str(v).split(";")[0].strip()
     return None
+
+
+def _coord(el: dict, key: str) -> float | None:
+    """A node carries its own position; a way or an area carries its centre."""
+    v = el.get(key)
+    if v is None:
+        v = (el.get("center") or {}).get(key)
+    try:
+        return round(float(v), 5)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_overpass(data: dict, kind: str, town: str) -> list:
@@ -761,11 +826,42 @@ def parse_overpass(data: dict, kind: str, town: str) -> list:
             "email": _tag(t, "email", "contact:email"),
             "website": _tag(t, "website", "contact:website", "url"),
             "source": "map", "source_ref": f"{el.get('type')}/{el.get('id')}",
+            "lat": _coord(el, "lat"), "lon": _coord(el, "lon"),
         })
     return out
 
 
+def _km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """The distance over the ground between two points, in km (haversine)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((p2 - p1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def nearest(rows: list, town: str, radius_km: float | None = None) -> list:
+    """The places within radius_km of the town's centre, nearest first. A
+    place with no position is kept, after the rest: the map put it in this
+    town without saying where."""
+    lat0, lon0 = TOWNS[town]
+    cap = float(DIR_RADIUS_KM) if radius_km is None else max(1.0, min(float(DIR_RADIUS_KM), float(radius_km)))
+    ranked = []
+    for r in rows:
+        if r.get("lat") is None or r.get("lon") is None:
+            ranked.append((cap + 1.0, r))
+            continue
+        d = _km(lat0, lon0, r["lat"], r["lon"])
+        if d <= cap:
+            ranked.append((d, r))
+    ranked.sort(key=lambda x: x[0])
+    return [dict(r) for _, r in ranked]
+
+
 MAP_BUSY = "The map is busy just now. Try again in a minute."
+MAP_WAITING = ("Every public map server is busy just now. AIBOS keeps asking every 30 seconds for up to "
+               "ten minutes. You can leave this page; it carries on.")
+MAP_GAVE_UP = ("The public map servers were busy for ten minutes. AIBOS will fetch these places in the "
+               "background within the hour, so try again then, or paste a list of businesses.")
 
 
 def _ask_overpass(url: str, q: str, timeout: float) -> dict:
@@ -790,11 +886,12 @@ def _ask_overpass(url: str, q: str, timeout: float) -> dict:
     return data
 
 
-def _race(q: str) -> dict:
-    """The first good answer from the public map servers. MAP_FIRST are asked
-    at once; the rest join after MAP_HEDGE seconds, or straight away when one
-    fails. Raises Busy when none answers well by MAP_DEADLINE."""
-    deadline = time.monotonic() + MAP_DEADLINE
+def _race(q: str, first: int | None = None, deadline_s: float | None = None) -> dict:
+    """The first good answer from the public map servers. MAP_FIRST (or
+    `first`) are asked at once; the rest join after MAP_HEDGE seconds, or
+    straight away when one fails. Raises Busy when none answers well by
+    MAP_DEADLINE (or `deadline_s`)."""
+    deadline = time.monotonic() + (MAP_DEADLINE if deadline_s is None else deadline_s)
     hedge_at = time.monotonic() + MAP_HEDGE
     queue = list(OVERPASS_SERVERS)
     asking: dict = {}
@@ -807,7 +904,7 @@ def _race(q: str) -> dict:
             asking[pool.submit(_ask_overpass, url, q, max(5.0, deadline - time.monotonic()))] = url
 
     try:
-        ask(MAP_FIRST)
+        ask(MAP_FIRST if first is None else first)
         while asking:
             now = time.monotonic()
             if now >= deadline:
@@ -833,39 +930,242 @@ def _race(q: str) -> dict:
     raise Busy(MAP_BUSY)
 
 
-# (kind, town, radius_m) -> (when, rows). Places on the map change slowly, so a
-# list found this week is used again rather than asking a busy server.
+# ── AIBOS's own directory ─────────────────────────────────────────────────────
+# One snapshot per kind and town, {"kind", "town", "radius_km", "fetched_at",
+# "rows"}, in a private Storage bucket made on first use, plus index.json
+# saying when each was fetched (for the harvest). It holds only what
+# OpenStreetMap publishes for anyone (ODbL): names, phones, websites and where
+# a place is. Nothing about anyone's customers or campaigns goes in it.
+
+# (kind, town) -> snapshot, the most recently used last. A busy afternoon of
+# searches reads Storage once a pair.
 _MAP_CACHE: dict = {}
 _MAP_LOCK = threading.Lock()
+_WANTED: set = set()      # pairs someone searched that the map could not give: harvested first
+_DIR = {"bucket": False, "index": None}
+_HARVEST = {"running": False, "last": None, "result": None}
+INDEX_PATH = "index.json"
+# Tests stand in for the wait between tries.
+_sleep = time.sleep
 
 
-def search_map(kind: str, town: str, radius_km: float = 8) -> list:
-    """Named places of one kind around a town, from OpenStreetMap. Raises
-    Busy when every public server is busy and nothing was found before."""
+def _dir_path(kind: str, town: str) -> str:
+    return f"{kind}/{re.sub(r'[^a-z0-9]+', '-', town.lower()).strip('-')}.json"
+
+
+def _has_storage(db) -> bool:
+    return db is not None and getattr(db, "storage", None) is not None
+
+
+def _ensure_bucket(db) -> None:
+    """Make the private bucket the first time, with the server's own key, so
+    nobody has to make it by hand in Supabase."""
+    if _DIR["bucket"]:
+        return
+    try:
+        db.storage.get_bucket(DIR_BUCKET)
+    except Exception:  # noqa: BLE001 — not there yet
+        try:
+            db.storage.create_bucket(DIR_BUCKET, options={"public": False})
+            log.info("[find_clients] made the %s bucket", DIR_BUCKET)
+        except Exception as e:  # noqa: BLE001 — another worker made it a moment ago, or no right to
+            log.info("[find_clients] could not make the %s bucket: %s", DIR_BUCKET, e)
+    _DIR["bucket"] = True
+
+
+def _put(db, path: str, obj) -> bool:
+    if not _has_storage(db):
+        return False
+    blob = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        _ensure_bucket(db)
+        store = db.storage.from_(DIR_BUCKET)
+        try:
+            store.upload(path, blob, {"content-type": "application/json", "x-upsert": "true"})
+        except Exception:  # noqa: BLE001 — older storage versions refuse to overwrite
+            try:
+                store.remove([path])
+            except Exception:  # noqa: BLE001
+                pass
+            store.upload(path, blob, {"content-type": "application/json"})
+        return True
+    except Exception as e:  # noqa: BLE001 — the directory helps a search, it never fails one
+        log.warning("[find_clients] the directory could not keep %s: %s", path, e)
+        return False
+
+
+def _get(db, path: str):
+    if not _has_storage(db):
+        return None
+    try:
+        return json.loads(db.storage.from_(DIR_BUCKET).download(path).decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — not held yet, or Storage is unwell
+        log.debug("[find_clients] the directory has no %s: %s", path, e)
+        return None
+
+
+def dir_index(db, fresh: bool = False) -> dict:
+    """{"kind|town": {"fetched_at", "count"}} for every pair held."""
+    if _DIR["index"] is None or fresh:
+        got = _get(db, INDEX_PATH)
+        _DIR["index"] = got if isinstance(got, dict) else {}
+    return dict(_DIR["index"])
+
+
+def _index_note(db, kind: str, town: str, fetched_at: str, count: int) -> None:
+    idx = dir_index(db, fresh=True)          # another worker may have added pairs since
+    idx[f"{kind}|{town}"] = {"fetched_at": fetched_at, "count": count}
+    _DIR["index"] = idx
+    _put(db, INDEX_PATH, idx)
+
+
+def _remember(snap: dict) -> None:
+    key = (snap["kind"], snap["town"])
+    with _MAP_LOCK:
+        _MAP_CACHE.pop(key, None)
+        _MAP_CACHE[key] = snap
+        while len(_MAP_CACHE) > MAP_CACHE_MAX:
+            _MAP_CACHE.pop(next(iter(_MAP_CACHE)))
+
+
+def _held(db, kind: str, town: str) -> dict | None:
+    """The snapshot held for a pair: in memory, else in Storage."""
+    with _MAP_LOCK:
+        snap = _MAP_CACHE.get((kind, town))
+    if snap is None:
+        got = _get(db, _dir_path(kind, town))
+        if (isinstance(got, dict) and got.get("kind") == kind and got.get("town") == town
+                and isinstance(got.get("rows"), list)):
+            snap = got
+    if snap is not None:
+        _remember(snap)
+    return snap
+
+
+def _fresh(snap: dict | None, now: datetime | None = None) -> bool:
+    at = _parse((snap or {}).get("fetched_at"))
+    if at is None:
+        return False
+    return (now or _now()) - at < (DIR_FRESH if snap.get("rows") else DIR_EMPTY_FRESH)
+
+
+def fetch_pair(db, kind: str, town: str, first: int | None = None, server_timeout: int = 25,
+               deadline_s: float | None = None) -> dict:
+    """Ask the map for every named place of one kind within DIR_RADIUS_KM of a
+    town, and keep the answer in the directory. Raises Busy."""
+    lat, lon = TOWNS[town]
+    data = _race(_overpass_query(kind, lat, lon, DIR_RADIUS_KM * 1000, DIR_LIMIT, server_timeout),
+                 first, deadline_s)
+    snap = {"kind": kind, "town": town, "radius_km": DIR_RADIUS_KM, "fetched_at": _iso(),
+            "rows": parse_overpass(data, kind, town)}
+    _remember(snap)
+    with _MAP_LOCK:
+        _WANTED.discard((kind, town))
+    if _put(db, _dir_path(kind, town), snap):
+        _index_note(db, kind, town, snap["fetched_at"], len(snap["rows"]))
+    return snap
+
+
+def search_map(kind: str, town: str, radius_km: float | None = None, db=None) -> list:
+    """Named places of one kind around a town, nearest first, from AIBOS's
+    directory. The map is asked only for a pair not held, or held too long;
+    when it is busy then, what is held is used. Raises Busy when the map is
+    busy and nothing is held."""
     if kind not in KINDS:
         raise ValueError("Pick a kind of business to look for.")
     if town not in TOWNS:
         raise ValueError("Pick a town.")
-    lat, lon = TOWNS[town]
-    radius_m = int(round(max(1.0, min(25.0, float(radius_km))))) * 1000   # whole km: a small cache
-    key = (kind, town, radius_m)
+    snap = _held(db, kind, town)
+    if not _fresh(snap):
+        try:
+            snap = fetch_pair(db, kind, town)
+        except Busy:
+            if not snap or not snap.get("rows"):
+                with _MAP_LOCK:
+                    _WANTED.add((kind, town))
+                raise
+            log.info("[find_clients] the map is busy: %s around %s from %s", kind, town, snap.get("fetched_at"))
+    return nearest(snap["rows"], town, radius_km)
+
+
+def harvest_order(index: dict, wanted=(), now: datetime | None = None) -> list:
+    """The pairs to fetch next: the ones someone searched for and could not
+    get, then the ones never fetched (the biggest towns first), then the
+    oldest past DIR_REFRESH. Pure."""
+    now = now or _now()
+    want, missing, old = [], [], []
+    for town in TOWNS:
+        for kind in KINDS:
+            held = index.get(f"{kind}|{town}")
+            at = _parse((held or {}).get("fetched_at"))
+            if (kind, town) in wanted:
+                want.append((kind, town))
+            elif at is None:
+                missing.append((kind, town))
+            elif now - at >= DIR_REFRESH:
+                old.append((at, (kind, town)))
+    old.sort(key=lambda x: x[0])
+    return want + missing + [p for _, p in old]
+
+
+def harvest(get_db, limit: int = HARVEST_EACH_HOUR) -> dict:
+    """Fill and renew the directory a few pairs at a time (the hourly job).
+    One server is asked at a time, with a pause between searches: the public
+    servers are shared by everyone. Stops early when the map is down."""
     with _MAP_LOCK:
-        hit = _MAP_CACHE.get(key)
-    if hit and _now() - hit[0] < (MAP_KEEP if hit[1] else MAP_KEEP_EMPTY):
-        return [dict(r) for r in hit[1]]
+        if _HARVEST["running"]:
+            return {"skipped": "already running"}
+        _HARVEST["running"] = True
+    fetched, failed, misses = 0, 0, 0
     try:
-        data = _race(_overpass_query(kind, lat, lon, radius_m, MAP_LIMIT))
-    except Busy:
-        if hit and hit[1]:                   # older than a week, but better than nothing
-            log.info("[find_clients] the map is busy: using what was found on %s", hit[0])
-            return [dict(r) for r in hit[1]]
-        raise
-    rows = parse_overpass(data, kind, town)
-    with _MAP_LOCK:
-        if len(_MAP_CACHE) >= MAP_CACHE_MAX:
-            _MAP_CACHE.pop(min(_MAP_CACHE, key=lambda k: _MAP_CACHE[k][0]), None)
-        _MAP_CACHE[key] = (_now(), rows)
-    return [dict(r) for r in rows]
+        db = get_db()
+        if not _has_storage(db):
+            return {"skipped": "no storage"}
+        with _MAP_LOCK:
+            wanted = set(_WANTED)
+        order = harvest_order(dir_index(db, fresh=True), wanted)
+        for i, (kind, town) in enumerate(order[:limit]):
+            if i:
+                _sleep(HARVEST_PAUSE)
+            try:
+                fetch_pair(db, kind, town, first=1, server_timeout=90, deadline_s=120.0)
+                fetched += 1
+                misses = 0
+            except Exception as e:  # noqa: BLE001 — Busy, or one bad answer: the next pair still runs
+                failed += 1
+                misses += 1
+                log.info("[find_clients] harvest of %s around %s failed: %s", kind, town, e)
+                if misses >= 3:
+                    break
+        return {"fetched": fetched, "failed": failed, "waiting": max(0, len(order) - fetched)}
+    finally:
+        with _MAP_LOCK:
+            _HARVEST.update(running=False, last=_iso())
+
+
+def directory_status() -> dict:
+    """For /health: the pairs this server knows are held, and the last
+    harvest. Reads nothing from Storage."""
+    return {"pairs_held": len(_DIR["index"] or {}), "pairs_in_all": len(TOWNS) * len(KINDS),
+            "harvest_running": _HARVEST["running"], "last_harvest": _HARVEST["last"],
+            "last_result": _HARVEST["result"],
+            "waiting": sorted(f"{k} around {t}" for k, t in list(_WANTED))[:20]}
+
+
+def start_harvest(get_db) -> dict:
+    """The hourly job's call: the harvest runs on a thread of its own, so the
+    other hourly jobs never wait on the map."""
+    if _HARVEST["running"]:
+        return {"skipped": "already running", "last": _HARVEST["last"]}
+
+    def run():
+        try:
+            _HARVEST["result"] = harvest(get_db)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[find_clients] harvest crashed: %s", e)
+
+    _launch(run, "find-clients-harvest")
+    return {"started": True, "last": _HARVEST["last"], "result": _HARVEST["result"]}
 
 
 # ── Reading a website ─────────────────────────────────────────────────────────
@@ -1563,37 +1863,173 @@ def write_due_followups(db, uid: str, bid: str, settings: dict, business: dict, 
     return n
 
 
-# ── The month's allowance ─────────────────────────────────────────────────────
+# ── Credits: the free day, the month and top-ups ──────────────────────────────
 
 def month_start(now: datetime | None = None) -> str:
     now = now or _now()
     return now.strftime("%Y-%m-01T00:00:00+00:00")
 
 
+def _events(db, uid: str, event: str, since: str | None = None, pool: str | None = None) -> list:
+    def make():
+        q = db.table("usage_events").select("id,meta,created_at").eq("user_id", uid).eq("event", event)
+        if since:
+            q = q.gte("created_at", since)
+        if pool:
+            q = q.eq("meta->>pool", pool)
+        return q.order("created_at").order("id")
+    return _rows(make, 200000)
+
+
+def _pool(ev: dict) -> str:
+    """Which credits one research spent. Before 9 Nov 2026 every one came
+    from the month."""
+    pool = (ev.get("meta") or {}).get("pool")
+    return pool if pool in POOLS else "month"
+
+
 def used_this_month(db, uid: str, now: datetime | None = None) -> int:
-    rows = db.table("usage_events").select("id").eq("user_id", uid).eq("event", USAGE_EVENT) \
-        .gte("created_at", month_start(now)).limit(5000).execute().data or []
-    return len(rows)
+    """This month's research paid for by the month's credits."""
+    return sum(1 for ev in _events(db, uid, USAGE_EVENT, month_start(now)) if _pool(ev) == "month")
+
+
+def trial_start(db, uid: str) -> datetime | None:
+    """When this account's free day started, or None when it has not."""
+    rows = db.table("usage_events").select("id,meta,created_at").eq("user_id", uid).eq("event", TRIAL_EVENT) \
+        .order("created_at").limit(1).execute().data or []
+    if not rows:
+        return None
+    return _parse((rows[0].get("meta") or {}).get("started_at")) or _parse(rows[0].get("created_at"))
+
+
+def start_trial(db, uid: str) -> datetime:
+    """Start the free day now, once: at the first search, list or research.
+    Raises when it cannot be written, so a day that cannot be counted is
+    never given (the plan check stands, as for the chat taster)."""
+    started = trial_start(db, uid)
+    if started:
+        return started
+    now = _now()
+    db.table("usage_events").insert({"user_id": uid, "event": TRIAL_EVENT,
+                                     "meta": {"started_at": _iso(now)}}).execute()
+    return now
+
+
+def balance(db, uid: str, tier: str, now: datetime | None = None) -> dict:
+    """What this account can research now and why, the way Explee shows a
+    balance: each pool's credits, what is spent and the free day. `left` is
+    what can be researched now; `open` is whether the page works at all (a
+    plan that has Find clients, a free day not over, or credits bought)."""
+    now = now or _now()
+    month_allowed = ALLOWANCE.get(tier, 0)
+    month_used = used_this_month(db, uid, now)
+    bought = 0
+    for ev in _events(db, uid, TOPUP_EVENT):
+        try:
+            bought += int((ev.get("meta") or {}).get("credits") or 0)
+        except (TypeError, ValueError):
+            continue
+    topup_used = len(_events(db, uid, USAGE_EVENT, pool="topup"))
+    trial = None
+    if not month_allowed:
+        started = trial_start(db, uid)
+        ends = started + timedelta(hours=TRIAL_HOURS) if started else None
+        active = ends is None or now < ends
+        used = len(_events(db, uid, USAGE_EVENT, pool="trial"))
+        trial = {"hours": TRIAL_HOURS, "allowed": TRIAL_RESEARCH, "used": used,
+                 "left": max(0, TRIAL_RESEARCH - used) if active else 0,
+                 "started_at": _iso(started) if started else None, "ends_at": _iso(ends) if ends else None,
+                 "active": active, "ended": not active}
+    month = {"allowed": month_allowed, "used": month_used, "left": max(0, month_allowed - month_used)}
+    topup = {"bought": bought, "used": topup_used, "left": max(0, bought - topup_used)}
+    return {
+        "left": (trial["left"] if trial else 0) + month["left"] + topup["left"],
+        # The month's numbers, as the page read them before 9 Nov 2026.
+        "used": month_used, "allowed": month_allowed,
+        "trial": trial, "month": month, "topup": topup,
+        "open": bool(month_allowed or (trial and trial["active"]) or topup["left"] > 0),
+        "topups": [{"credits": c, "usd": u} for c, u in sorted(TOPUPS.items())],
+    }
 
 
 def usage(db, uid: str, tier: str) -> dict:
-    allowed = ALLOWANCE.get(tier, 0)
-    used = used_this_month(db, uid)
-    return {"used": used, "allowed": allowed, "left": max(0, allowed - used)}
+    return balance(db, uid, tier)
 
 
-def used_up(tier: str) -> str:
-    """What to say when the month's businesses are used: when more come, and
-    the plan that has more."""
-    text = f"This month's {ALLOWANCE.get(tier, 0)} businesses are used. More can be researched from the 1st"
+def spend_order(bal: dict, n: int) -> list:
+    """The pool each of the next n credits comes from: the free day first,
+    then the month, then top-ups (what runs out soonest goes first). Shorter
+    than n when the credits run out."""
+    out: list = []
+    for pool in POOLS:
+        out += [pool] * max(0, int((bal.get(pool) or {}).get("left") or 0))
+        if len(out) >= n:
+            break
+    return out[:max(0, n)]
+
+
+def _or(ways: list) -> str:
+    ways = [w for w in ways if w]
+    return ways[0] if len(ways) == 1 else ", ".join(ways[:-1]) + " or " + ways[-1]
+
+
+def used_up(tier: str, bal: dict | None = None) -> str:
+    """What to say when no credits are left: top up, the plan that has more,
+    or (on a plan) wait for the 1st."""
+    low = min(TOPUPS)
+    top = f"Top up {low} businesses for ${TOPUPS[low]}"
     nxt = NEXT_PLAN.get(tier)
-    if nxt:
-        text += f", or move up to {PLAN_NAMES[nxt]} for {ALLOWANCE[nxt]} a month"
-    return text + "."
+    up = f"move up to {PLAN_NAMES[nxt]} for {ALLOWANCE[nxt]} a month" if nxt else None
+    if ALLOWANCE.get(tier, 0):
+        return f"This month's {ALLOWANCE[tier]} businesses are used. {_or([top, up, 'wait for the 1st'])}."
+    trial = (bal or {}).get("trial") or {}
+    head = "Your free day has ended." if trial.get("ended") else \
+        f"Your free day's {TRIAL_RESEARCH} businesses are used."
+    return f"{head} {_or([top, up])}."
 
 
-def _count_one(db, uid: str, pid: str) -> None:
-    db.table("usage_events").insert({"user_id": uid, "event": USAGE_EVENT, "meta": {"prospect": pid}}).execute()
+def free_day_over() -> str:
+    return used_up("free", {"trial": {"ended": True}})
+
+
+def _count_one(db, uid: str, pid: str, pool: str = "month") -> None:
+    db.table("usage_events").insert({"user_id": uid, "event": USAGE_EVENT,
+                                     "meta": {"prospect": pid, "pool": pool if pool in POOLS else "month"}}).execute()
+
+
+def topup_of(db, transaction_id: str, kind: str = "bought") -> dict | None:
+    if not transaction_id:
+        return None
+    rows = db.table("usage_events").select("id,user_id,meta,created_at").eq("event", TOPUP_EVENT) \
+        .eq("meta->>transaction_id", str(transaction_id)).eq("meta->>kind", kind).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def add_topup(db, uid: str, credits: int, transaction_id: str, amount: float | None = None,
+              currency: str | None = None) -> bool:
+    """Credits bought by card, once per payment: Paddle may deliver the same
+    payment twice. Returns False when it was credited already."""
+    if topup_of(db, transaction_id):
+        return False
+    db.table("usage_events").insert({"user_id": uid, "event": TOPUP_EVENT, "meta": {
+        "kind": "bought", "credits": int(credits), "transaction_id": str(transaction_id),
+        "amount": amount, "currency": currency}}).execute()
+    return True
+
+
+def refund_topup(db, transaction_id: str) -> dict | None:
+    """A refunded top-up takes its credits back, once. Credits already spent
+    stay spent, so what is left can come to nothing. None when the payment
+    was not a top-up."""
+    bought = topup_of(db, transaction_id)
+    if not bought:
+        return None
+    credits = int((bought.get("meta") or {}).get("credits") or 0)
+    if topup_of(db, transaction_id, "refunded"):
+        return {"user_id": bought["user_id"], "credits": credits, "already": True}
+    db.table("usage_events").insert({"user_id": bought["user_id"], "event": TOPUP_EVENT, "meta": {
+        "kind": "refunded", "credits": -credits, "transaction_id": str(transaction_id)}}).execute()
+    return {"user_id": bought["user_id"], "credits": credits, "already": False}
 
 
 # ── Finding and research, one press at a time ─────────────────────────────────
@@ -1614,9 +2050,9 @@ def job_status(uid: str, bid: str | None) -> dict | None:
 
 
 def research_and_write(db, uid: str, bid: str, p: dict, campaign: dict | None, settings: dict,
-                       business: dict) -> bool:
-    """Research one business and, when it fits, write its first message.
-    Returns True when a draft was written."""
+                       business: dict, pool: str = "month") -> bool:
+    """Research one business and, when it fits, write its first message,
+    spending one credit from `pool`. Returns True when a draft was written."""
     got = research_one(p, campaign, business)
     found = got.get("found") or {}
     row = {"fit": got["fit"], "fit_reasons": got["reasons"], "summary": got.get("summary"), "hook": got.get("hook"),
@@ -1632,7 +2068,7 @@ def research_and_write(db, uid: str, bid: str, p: dict, campaign: dict | None, s
     if blocked(merged, settings.get("do_not_contact") or []):
         row["stage"] = "skipped"
     db.table("client_prospects").update(row).eq("user_id", uid).eq("id", p["id"]).execute()
-    _count_one(db, uid, p["id"])
+    _count_one(db, uid, p["id"], pool)
     if row["stage"] == "researched" and got["fit"] >= WRITE_FROM:
         p2 = get_prospect(db, uid, p["id"]) or merged
         if found.get("email_dead"):
@@ -1643,12 +2079,15 @@ def research_and_write(db, uid: str, bid: str, p: dict, campaign: dict | None, s
     return False
 
 
-def _research_each(db, uid: str, bid: str, picked: list, settings: dict, business: dict, status: dict) -> None:
-    """Research each picked business in turn, counting on the job as it goes."""
+def _research_each(db, uid: str, bid: str, picked: list, settings: dict, business: dict, status: dict,
+                   pools: list | None = None) -> None:
+    """Research each picked business in turn, counting on the job as it goes.
+    `pools` says which credits each one spends (spend_order)."""
     camps = {c["id"]: c for c in list_campaigns(db, uid, bid)}
-    for p in picked:
+    for i, p in enumerate(picked):
+        pool = pools[i] if pools and i < len(pools) else "month"
         try:
-            if research_and_write(db, uid, bid, p, camps.get(p.get("campaign_id")), settings, business):
+            if research_and_write(db, uid, bid, p, camps.get(p.get("campaign_id")), settings, business, pool):
                 status["written"] += 1
         except Exception as e:  # noqa: BLE001 — one business must not stop the rest
             log.warning("[find_clients] research of %s failed: %s", p.get("id"), e)
@@ -1665,21 +2104,23 @@ def _launch(run, name: str) -> None:
 def start_research(get_db, uid: str, bid: str, tier: str, business: dict,
                    campaign_id: str | None = None, limit: int = JOB_MAX) -> dict:
     """Research the next businesses waiting (new ones first, the oldest
-    first), up to what the month's allowance has left."""
+    first), up to the credits left: the free day's, the month's, then the
+    top-ups'."""
     key = f"{uid}|{bid}"
     db = get_db()
     with _JOBS_LOCK:
         running = _JOBS.get(key)
         if running and running.get("running"):
             return {**running, "already": True}
-        left = usage(db, uid, tier)["left"]
-        if left <= 0:
-            raise Refused(used_up(tier))
+        bal = balance(db, uid, tier)
+        if bal["left"] <= 0:
+            raise Refused(used_up(tier, bal))
         waiting = sorted(list_prospects(db, uid, bid, campaign_id=campaign_id, stage="new"),
                          key=lambda r: str(r.get("created_at") or ""))
-        picked = waiting[:max(1, min(limit, JOB_MAX, left))]
+        picked = waiting[:max(1, min(limit, JOB_MAX, bal["left"]))]
         if not picked:
             raise Refused("There are no new businesses to research. Find some first.")
+        pools = spend_order(bal, len(picked))
         status = {"phase": "research", "total": len(picked), "done": 0, "written": 0, "running": True,
                   "error": None, "started_at": _iso(), "finished_at": None}
         _JOBS[key] = status
@@ -1687,7 +2128,7 @@ def start_research(get_db, uid: str, bid: str, tier: str, business: dict,
     def run():
         try:
             jdb = get_db()
-            _research_each(jdb, uid, bid, picked, load_settings(jdb, uid, bid), business, status)
+            _research_each(jdb, uid, bid, picked, load_settings(jdb, uid, bid), business, status, pools)
         except Exception as e:  # noqa: BLE001
             status["error"] = "Research stopped part way. Press Research again to carry on."
             log.warning("[find_clients] research job crashed: %s", e)
@@ -1708,13 +2149,33 @@ def _demo_pick(prospects: list, n: int) -> list:
     return sorted(prospects, key=rank)[:max(0, n)]
 
 
+def _search_patiently(kind: str, town: str, radius_km: float | None, db, status: dict) -> list:
+    """The directory's answer, or the map's. When the map is busy and nothing
+    is held for this pair, keep asking every MAP_RETRY_EVERY seconds for up to
+    ten minutes, saying so on the job, rather than give up after one."""
+    started = time.monotonic()
+    for attempt in range(MAP_TRIES):
+        try:
+            rows = search_map(kind, town, radius_km, db=db)
+            status.update(waiting=False, note=None)
+            return rows
+        except Busy:
+            if attempt == MAP_TRIES - 1 or time.monotonic() - started > MAP_TRIES * MAP_RETRY_EVERY:
+                break
+            status.update(waiting=True, note=MAP_WAITING, tries=attempt + 1)
+            _sleep(MAP_RETRY_EVERY)
+    status.update(waiting=False, note=None)
+    raise Busy(MAP_GAVE_UP)
+
+
 def start_find(get_db, uid: str, bid: str, tier: str, business: dict, kind: str, town: str,
-               radius_km: float = 8, campaign_id: str | None = None, research: bool = False) -> dict:
-    """Search the map for one kind of business around one town and add what
-    it finds, on after the answer (the map can take most of a minute, longer
-    than the proxy waits). With research, the first DEMO_RESEARCH new ones are
-    researched and written to as well: the first-time "show me who could buy
-    from me", which ends with real messages to read, not an empty list."""
+               radius_km: float | None = None, campaign_id: str | None = None, research: bool = False) -> dict:
+    """Find one kind of business around one town and add the nearest
+    MAP_LIMIT the owner does not have yet, so each press brings new ones.
+    Runs on after the answer, like research: a pair the directory does not
+    hold yet waits on the public map. With research, the first DEMO_RESEARCH
+    new ones are researched and written to as well: the first-time "show me
+    who could buy from me", which ends with real messages to read."""
     if kind not in KINDS:
         raise ValueError("Pick a kind of business to look for.")
     if town not in TOWNS:
@@ -1725,25 +2186,26 @@ def start_find(get_db, uid: str, bid: str, tier: str, business: dict, kind: str,
         if running and running.get("running"):
             return {**running, "already": True}
         status = {"phase": "map", "kind": kind, "town": town, "found": 0, "added": 0, "known": 0, "blocked": 0,
-                  "total": 0, "done": 0, "written": 0, "running": True, "error": None, "started_at": _iso(),
-                  "finished_at": None}
+                  "more": 0, "total": 0, "done": 0, "written": 0, "running": True, "waiting": False,
+                  "note": None, "error": None, "started_at": _iso(), "finished_at": None}
         _JOBS[key] = status
 
     def run():
         try:
-            rows = search_map(kind, town, radius_km)
-            status["found"] = len(rows)
             jdb = get_db()
+            rows = _search_patiently(kind, town, radius_km, jdb, status)
+            status["found"] = len(rows)
             settings = load_settings(jdb, uid, bid)
-            status.update(add_prospects(jdb, uid, bid, rows, campaign_id, settings))
+            status.update(add_prospects(jdb, uid, bid, rows, campaign_id, settings, cap=MAP_LIMIT))
             if research and rows:
-                left = usage(jdb, uid, tier)["left"]
+                bal = balance(jdb, uid, tier)
                 refs = {r.get("source_ref") for r in rows if r.get("source_ref")}
                 fresh = [p for p in list_prospects(jdb, uid, bid, stage="new") if p.get("source_ref") in refs]
-                picked = _demo_pick(fresh, min(DEMO_RESEARCH, left))
+                pools = spend_order(bal, min(DEMO_RESEARCH, len(fresh)))
+                picked = _demo_pick(fresh, len(pools))
                 if picked:
                     status.update(phase="research", total=len(picked))
-                    _research_each(jdb, uid, bid, picked, settings, business, status)
+                    _research_each(jdb, uid, bid, picked, settings, business, status, pools)
         except Busy as e:
             status["error"] = str(e)
         except Exception as e:  # noqa: BLE001
@@ -1812,6 +2274,13 @@ def overview(db, uid: str, bid: str | None, settings: dict, now: datetime | None
         "total": len(prospects),
         "campaigns": list_campaigns(db, uid, bid, prospects),
     }
+
+
+def kept(db, uid: str, bid: str | None) -> dict:
+    """What a Free account found and wrote on its free day, kept for when it
+    carries on."""
+    return {"businesses": len(list_prospects(db, uid, bid, cols="id")),
+            "drafts": len(_drafts(db, uid, bid, "id"))}
 
 
 def history(db, uid: str, pid: str) -> list:

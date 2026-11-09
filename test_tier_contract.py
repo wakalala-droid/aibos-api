@@ -24,9 +24,10 @@ def test_contract_file_is_not_vacuous():
     # A guard that silently parses nothing would pass forever while drift ships.
     # Pin the shape so an empty or half-written contract fails loudly instead.
     assert set(CONTRACT["access"]) == {"free", "pro", "proplus", "growth"}
-    # Free has exactly one feature since 7 Nov 2026: Find clients, in a small
-    # monthly amount. Anything else appearing on Free is a slip, not a plan.
-    assert CONTRACT["access"]["free"] == ["find_clients"]
+    # Free has no paid feature on its ladder. Since 9 Nov 2026 Find clients
+    # reaches Free only as one free day (find_clients_trial), granted by
+    # find_clients.balance, never by the ladder: anything on Free is a slip.
+    assert CONTRACT["access"]["free"] == []
     assert len(CONTRACT["access"]["pro"]) >= 10
     assert CONTRACT["taster"]["ai_chat"] >= 1
     assert set(CONTRACT["prices"]) == {"pro", "proplus", "growth"}
@@ -54,14 +55,29 @@ def test_paid_tiers_are_supersets():
 
 
 def test_allowances_match_and_climb_with_price():
-    # Find clients is on every plan; what climbs is how many businesses a month
-    # it researches. The page and the pricing table quote these numbers.
+    # Find clients credits a month: none on Free (it has the free day), then
+    # climbing with price. The page and the pricing table quote these numbers.
     import find_clients
     allowance = CONTRACT["allowance"]["find_clients"]
     assert allowance == find_clients.ALLOWANCE
     order = ["free", "pro", "proplus", "growth"]
     assert [allowance[t] for t in order] == sorted(allowance[t] for t in order)
     assert len(set(allowance.values())) == len(order)
+    assert allowance["free"] == 0
+
+
+def test_find_clients_trial_and_topups_match():
+    # Explee's pricing (9 Nov 2026): Free's one free day, and the credit packs
+    # any plan buys once. The page, the pricing table, Paddle and the server
+    # all quote these.
+    import find_clients
+    trial = CONTRACT["find_clients_trial"]
+    assert trial == {"hours": find_clients.TRIAL_HOURS, "research": find_clients.TRIAL_RESEARCH}
+    topups = {int(k): v for k, v in CONTRACT["find_clients_topups"].items()}
+    assert topups == find_clients.TOPUPS
+    # A bigger pack never costs more per business than a smaller one.
+    per = [usd / credits for credits, usd in sorted(topups.items())]
+    assert per == sorted(per, reverse=True)
 
 
 def test_taster_matches_entitlements():
@@ -160,8 +176,11 @@ def test_value_climbs_with_price():
         assert entitlements._required_tier(feature) == tier, (
             f"{feature} is first unlocked on {entitlements._required_tier(feature)}, not {tier}"
         )
-    # Find clients is on every plan, Free included (7 Nov 2026).
-    for tier in ("free", "pro", "proplus", "growth"):
+    # Find clients is on every paid plan; Free has one free day of it instead
+    # (9 Nov 2026), so the ladder itself does not give it to Free.
+    assert entitlements._required_tier("find_clients") == "pro"
+    assert not entitlements.can_access("free", "find_clients")
+    for tier in ("pro", "proplus", "growth"):
         assert entitlements.can_access(tier, "find_clients"), tier
 
 

@@ -1,10 +1,13 @@
 """
-Find clients (find_clients.py, find_clients_routes.py): on every plan with its
-own monthly allowance, nothing ever sent by AIBOS, a "stop" honoured for good,
-the month's allowance kept, and a slow map never left to time out the page.
-No network, no AI: the website reader, the map and the AI are stood in for.
+Find clients (find_clients.py, find_clients_routes.py): priced the way Explee
+prices it (credits a month on Pro and up, top-ups on any plan, one free day on
+Free), nothing ever sent by AIBOS, a "stop" honoured for good, the credits
+kept, and searches answered from AIBOS's own directory so a busy public map
+never times out the page. No network, no AI: the website reader, the map,
+Storage and the AI are stood in for.
 """
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -44,8 +47,9 @@ def api(monkeypatch):
     monkeypatch.setattr(fc, "ask_json", lambda *a, **k: None)
     monkeypatch.setattr(fc, "mail_domain_ok", lambda email: True)
     monkeypatch.setattr(fc, "INLINE", True)
+    monkeypatch.setattr(fc, "_sleep", lambda s: None)
     fc._JOBS.clear()
-    fc._MAP_CACHE.clear()
+    _reset_map()
     _tier(db, "growth")
     _as(OWNER)
     yield TestClient(main.app), db
@@ -53,7 +57,14 @@ def api(monkeypatch):
         main.app.dependency_overrides.pop(dep, None)
     entitlements.invalidate("u1")
     fc._JOBS.clear()
+    _reset_map()
+
+
+def _reset_map():
     fc._MAP_CACHE.clear()
+    fc._WANTED.clear()
+    fc._DIR.update(bucket=False, index=None)
+    fc._HARVEST.update(running=False, last=None, result=None)
 
 
 def _as(ctx):
@@ -87,42 +98,119 @@ def _campaign(api):
 
 # ── The plan ──────────────────────────────────────────────────────────────────
 
-def test_every_plan_gets_the_page_with_its_own_allowance(api):
+def test_paid_plans_get_the_page_with_their_own_credits_a_month(api):
     client, db = api
-    for tier, allowed in (("free", 20), ("pro", 50), ("proplus", 100), ("growth", 300)):
+    for tier, allowed in (("pro", 50), ("proplus", 100), ("growth", 300)):
         _tier(db, tier)
         home = client.get("/clients").json()
-        assert home["preview"] is False, tier
-        assert home["allowance"] == allowed and home["usage"]["allowed"] == allowed, tier
-        assert home["allowances"] == {"free": 20, "pro": 50, "proplus": 100, "growth": 300}
+        assert home["preview"] is False and home["via"] == "plan", tier
+        assert home["allowance"] == allowed and home["usage"]["month"]["allowed"] == allowed, tier
+        assert home["usage"]["trial"] is None and home["usage"]["left"] == allowed, tier
+        assert home["allowances"] == {"free": 0, "pro": 50, "proplus": 100, "growth": 300}
+        assert home["topups"] == [{"credits": 100, "usd": 5}, {"credits": 300, "usd": 12},
+                                  {"credits": 1000, "usd": 35}]
         assert client.post("/clients/import", json={"text": LIST}).status_code == 200, tier
+    # A paid plan never starts a free day.
+    assert not [e for e in db.rows.get("usage_events", []) if e["event"] == fc.TRIAL_EVENT]
 
 
-def test_an_account_the_plan_turns_away_sees_a_preview_and_nothing_else_answers(api, monkeypatch):
+def _free_day_started(db, hours_ago):
+    ev = next(e for e in db.rows["usage_events"] if e["event"] == fc.TRIAL_EVENT)
+    ev["meta"]["started_at"] = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def test_free_gets_one_free_day_from_its_first_search(api):
     client, db = api
-    monkeypatch.setitem(entitlements._ACCESS, "free", set())
     _tier(db, "free")
     home = client.get("/clients").json()
-    assert home["preview"] is True and home["allowance"] == 20
+    trial = home["usage"]["trial"]
+    assert home["preview"] is False and home["via"] == "trial"
+    assert (trial["started_at"], trial["left"], trial["active"]) == (None, fc.TRIAL_RESEARCH, True)
+    # Opening the page or making a campaign does not start the day ...
+    _campaign(client)
+    assert not [e for e in db.rows.get("usage_events", []) if e["event"] == fc.TRIAL_EVENT]
+    # ... the first list (or search, or research) does, once.
+    client.post("/clients/import", json={"text": LIST})
+    client.post("/clients/import", json={"text": LIST})
+    days = [e for e in db.rows["usage_events"] if e["event"] == fc.TRIAL_EVENT]
+    assert len(days) == 1
+    trial = client.get("/clients").json()["usage"]["trial"]
+    assert trial["started_at"] and trial["ends_at"] and trial["active"] is True
+    # A day later it is over: the page shows what was kept and how to carry on.
+    _free_day_started(db, 25)
+    home = client.get("/clients").json()
+    assert home["preview"] is True and home["reason"] == "free_day_over"
+    assert home["kept"] == {"businesses": 3, "drafts": 0}
+    assert home["message"] == ("Your free day has ended. Top up 100 businesses for $5 or move up to Pro "
+                               "for 50 a month.")
     r = client.post("/clients/import", json={"text": LIST})
-    assert r.status_code == 402 and "Pro" in r.json()["detail"]
-    assert not db.rows.get("client_prospects")
+    assert r.status_code == 402 and r.json()["detail"] == home["message"]
+    assert client.post("/clients/research", json={}).status_code == 402
+    assert client.get("/clients/prospects").status_code == 402
+
+
+def test_credits_bought_carry_a_free_account_on_after_its_day(api):
+    client, db = api
+    _tier(db, "free")
+    client.post("/clients/import", json={"text": LIST})
+    _free_day_started(db, 30)
+    assert client.get("/clients").json()["preview"] is True
+    assert fc.add_topup(db, "u1", 100, "txn_1", 5.0, "USD") is True
+    assert fc.add_topup(db, "u1", 100, "txn_1", 5.0, "USD") is False        # the same payment again
+    home = client.get("/clients").json()
+    assert home["preview"] is False and home["via"] == "credits"
+    assert home["usage"]["topup"] == {"bought": 100, "used": 0, "left": 100} and home["usage"]["left"] == 100
+    job = client.post("/clients/research", json={}).json()["job"]
+    assert job["total"] == 3
+    spent = [e["meta"]["pool"] for e in db.rows["usage_events"] if e["event"] == fc.USAGE_EVENT]
+    assert spent == ["topup"] * 3
+    assert client.get("/clients").json()["usage"]["topup"]["left"] == 97
+
+
+def test_credits_go_free_day_first_then_the_month_then_top_ups(api, monkeypatch):
+    client, db = api
+    bal = {"trial": {"left": 2}, "month": {"left": 1}, "topup": {"left": 5}}
+    assert fc.spend_order(bal, 4) == ["trial", "trial", "month", "topup"]
+    assert fc.spend_order(bal, 20) == ["trial"] * 2 + ["month"] + ["topup"] * 5
+    assert fc.spend_order({"trial": None, "month": {"left": 0}, "topup": {"left": 0}}, 3) == []
+    # On Pro with one credit left this month and a top-up: the month goes first.
+    _tier(db, "pro")
+    monkeypatch.setitem(fc.ALLOWANCE, "pro", 1)
+    fc.add_topup(db, "u1", 100, "txn_2")
+    client.post("/clients/import", json={"text": LIST})
+    client.post("/clients/research", json={})
+    spent = [e["meta"]["pool"] for e in db.rows["usage_events"] if e["event"] == fc.USAGE_EVENT]
+    assert spent == ["month", "topup", "topup"]
+    home = client.get("/clients").json()["usage"]
+    assert (home["month"]["left"], home["topup"]["left"], home["left"]) == (0, 98, 98)
+
+
+def test_research_from_before_the_pools_counts_against_the_month(api):
+    _, db = api
+    db.table("usage_events").insert({"user_id": "u1", "event": fc.USAGE_EVENT, "meta": {"prospect": "p0"}}).execute()
+    bal = fc.balance(db, "u1", "growth")
+    assert (bal["month"]["used"], bal["month"]["left"]) == (1, 299)
 
 
 def test_growth_gets_the_whole_page(api):
     client, _ = api
     home = client.get("/clients").json()
     assert home["preview"] is False
-    assert home["usage"] == {"used": 0, "allowed": 300, "left": 300}
+    usage = home["usage"]
+    assert (usage["used"], usage["allowed"], usage["left"]) == (0, 300, 300)
+    assert usage["month"] == {"allowed": 300, "used": 0, "left": 300}
+    assert usage["topup"] == {"bought": 0, "used": 0, "left": 0}
     assert home["drafts"] == [] and home["needs_you"] == [] and home["total"] == 0
     assert "Lusaka" in home["towns"] and home["kinds"]["hardware"] == "Hardware and building"
 
 
-def test_the_ladder_puts_find_clients_on_every_plan():
-    for tier in ("free", "pro", "proplus", "growth"):
+def test_the_ladder_puts_find_clients_on_the_paid_plans_and_a_free_day_on_free():
+    assert not entitlements.can_access("free", "find_clients")
+    for tier in ("pro", "proplus", "growth"):
         assert entitlements.can_access(tier, "find_clients"), tier
     allowed = [fc.ALLOWANCE[t] for t in ("free", "pro", "proplus", "growth")]
-    assert allowed == [20, 50, 100, 300]
+    assert allowed == [0, 50, 100, 300]
+    assert (fc.TRIAL_HOURS, fc.TRIAL_RESEARCH) == (24, 10)
 
 
 # ── Finding ───────────────────────────────────────────────────────────────────
@@ -162,7 +250,7 @@ def test_the_map_search_adds_named_places(api, monkeypatch):
     ]}
     seen = {}
 
-    def fake_search(kind, town, radius):
+    def fake_search(kind, town, radius, **k):
         seen.update(kind=kind, town=town)
         return fc.parse_overpass(data, kind, town)
     monkeypatch.setattr(fc, "search_map", fake_search)
@@ -175,18 +263,38 @@ def test_the_map_search_adds_named_places(api, monkeypatch):
     assert client.get("/clients").json()["usage"]["used"] == 0
 
 
-def test_a_busy_map_is_said_plainly_and_the_page_never_waits_on_it(api, monkeypatch):
+def test_a_busy_map_is_waited_on_then_said_plainly_and_the_page_never_waits(api, monkeypatch):
     client, _ = api
+    seen, slept = [], []
+    monkeypatch.setattr(fc, "_sleep", lambda s: slept.append(s))
 
-    def busy(*a):
+    def busy(*a, **k):
+        seen.append(dict(next(iter(fc._JOBS.values()))))      # what the page reads while it waits
         raise fc.Busy(fc.MAP_BUSY)
     monkeypatch.setattr(fc, "search_map", busy)
     r = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"})
     # The answer comes at once; the search reports on the job, as research does.
     assert r.status_code == 200
     job = r.json()["job"]
-    assert job["running"] is False and "busy" in job["error"]
-    assert client.get("/clients").json()["job"]["error"] == fc.MAP_BUSY
+    assert job["running"] is False and job["error"] == fc.MAP_GAVE_UP and job["waiting"] is False
+    # It kept asking every 30 seconds, ten minutes in all, saying so as it went.
+    assert len(seen) == fc.MAP_TRIES and slept == [fc.MAP_RETRY_EVERY] * (fc.MAP_TRIES - 1)
+    assert seen[1]["waiting"] is True and seen[1]["note"] == fc.MAP_WAITING
+    assert client.get("/clients").json()["job"]["error"] == fc.MAP_GAVE_UP
+
+
+def test_a_map_that_answers_on_a_later_try_still_finds_them(api, monkeypatch):
+    client, db = api
+    tries = []
+
+    def later(kind, town, radius, **k):
+        tries.append(1)
+        if len(tries) < 3:
+            raise fc.Busy(fc.MAP_BUSY)
+        return _map_rows()
+    monkeypatch.setattr(fc, "search_map", later)
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"}).json()["job"]
+    assert len(tries) == 3 and job["error"] is None and job["added"] == 12 and job["waiting"] is False
 
 
 def test_a_kind_or_town_it_does_not_know_is_said_at_once(api):
@@ -212,7 +320,7 @@ def test_the_first_time_demo_finds_then_researches_a_few_and_writes_to_them(api,
     client, db = api
     _tier(db, "free")
     camp = _campaign(client)
-    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius: _map_rows())
+    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius, **k: _map_rows())
     job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "campaign_id": camp["id"],
                                              "research": True}).json()["job"]
     assert (job["phase"], job["found"], job["added"]) == ("research", 12, 12)
@@ -224,31 +332,34 @@ def test_the_first_time_demo_finds_then_researches_a_few_and_writes_to_them(api,
     assert all(by[f"Phone Shop {i}"]["stage"] != "new" for i in range(6))
     assert sum(1 for p in by.values() if p["stage"] == "new") == 2
     home = client.get("/clients").json()
-    assert home["usage"] == {"used": 10, "allowed": 20, "left": 10}
+    # Free's first try is its free day: the ten came from the day, not a month.
+    trial = home["usage"]["trial"]
+    assert (trial["used"], trial["left"], home["usage"]["left"]) == (10, 0, 0)
+    assert all(e["meta"]["pool"] == "trial" for e in db.rows["usage_events"] if e["event"] == fc.USAGE_EVENT)
     assert any(d["prospect"]["name"] == "Mwape Hardware" for d in home["drafts"])
     assert all(m["status"] == "draft" for m in db.rows["client_messages"])     # still nothing sent
 
 
-def test_the_demo_researches_no_more_than_the_month_has_left(api, monkeypatch):
+def test_the_demo_researches_no_more_than_the_credits_left(api, monkeypatch):
     client, db = api
     _tier(db, "free")
-    monkeypatch.setitem(fc.ALLOWANCE, "free", 3)
-    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius: _map_rows())
+    monkeypatch.setattr(fc, "TRIAL_RESEARCH", 3)
+    monkeypatch.setattr(fc, "search_map", lambda kind, town, radius, **k: _map_rows())
     job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "research": True}).json()["job"]
     assert (job["total"], job["done"]) == (3, 3)
     again = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka", "research": True}).json()["job"]
-    # Nothing left this month: it still finds, and researches none.
+    # No credits left: it still finds on the free day, and researches none.
     assert (again["phase"], again["found"], again["added"], again["known"], again["total"]) == ("map", 12, 0, 12, 0)
 
 
 def test_one_job_at_a_time_per_business(api, monkeypatch):
     client, _ = api
-    monkeypatch.setattr(fc, "search_map", lambda *a: [])
+    monkeypatch.setattr(fc, "search_map", lambda *a, **k: [])
     client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"})
     (job,) = fc._JOBS.values()
     job["running"] = True                                   # as if still on the map
     called = []
-    monkeypatch.setattr(fc, "search_map", lambda *a: called.append(a) or [])
+    monkeypatch.setattr(fc, "search_map", lambda *a, **k: called.append(a) or [])
     again = client.post("/clients/find", json={"kind": "shops", "town": "Kitwe"}).json()["job"]
     assert again["already"] is True and again["kind"] == "hardware" and not called
     assert client.post("/clients/research", json={}).json()["job"]["already"] is True
@@ -328,30 +439,198 @@ def test_when_no_server_answers_the_map_is_busy(monkeypatch):
     assert str(e.value) == fc.MAP_BUSY
 
 
-def test_a_found_list_is_kept_and_used_when_the_map_is_busy(monkeypatch):
-    fc._MAP_CACHE.clear()
-    calls = []
-    data = {"elements": [{"type": "node", "id": 7, "tags": {"name": "Kabwe Lodge"}}]}
+# ── AIBOS's own directory: a search answers from what is held ─────────────────
 
-    def race(q):
+class _Store:
+    """Supabase Storage, in memory: one private bucket's files."""
+
+    def __init__(self, bucket=True):
+        self.files, self.buckets, self.made = {}, ({fc.DIR_BUCKET} if bucket else set()), []
+
+    def get_bucket(self, name):
+        if name not in self.buckets:
+            raise Exception("Bucket not found")
+        return {"id": name}
+
+    def create_bucket(self, name, options=None):
+        self.buckets.add(name)
+        self.made.append((name, options))
+
+    def from_(self, name):
+        store = self
+
+        class _Bucket:
+            def upload(self, path, blob, opts=None):
+                if name not in store.buckets:
+                    raise Exception("Bucket not found")
+                if path in store.files and (opts or {}).get("x-upsert") != "true":
+                    raise Exception("409 The resource already exists")
+                store.files[path] = bytes(blob)
+
+            def download(self, path):
+                if path not in store.files:
+                    raise Exception("404 Object not found")
+                return store.files[path]
+
+            def remove(self, paths):
+                for path in paths:
+                    store.files.pop(path, None)
+        return _Bucket()
+
+
+class _StoreDB:
+    def __init__(self, bucket=True):
+        self.storage = _Store(bucket)
+
+
+def _around(town, n, step_km=0.5, kind_tag=("shop", "hardware")):
+    """n named places due north of a town's centre, step_km apart."""
+    lat0, lon0 = fc.TOWNS[town]
+    return {"elements": [{"type": "node", "id": i, "lat": lat0 + i * step_km / 111.2, "lon": lon0,
+                          "tags": {"name": f"Place {i}", kind_tag[0]: kind_tag[1]}} for i in range(1, n + 1)]}
+
+
+def _counting_race(monkeypatch, data):
+    calls = []
+
+    def race(q, first=None, deadline_s=None):
         calls.append(q)
+        if isinstance(data, Exception):
+            raise data
         return data
     monkeypatch.setattr(fc, "_race", race)
-    first = fc.search_map("lodges", "Kabwe")
-    again = fc.search_map("lodges", "Kabwe", 8.2)        # the same whole km: asked once
-    assert first == again and first[0]["name"] == "Kabwe Lodge" and len(calls) == 1
-    # A week on, the map is asked again; when it is busy, last week's list is used.
-    key = next(iter(fc._MAP_CACHE))
-    fc._MAP_CACHE[key] = (fc._now() - timedelta(days=8), fc._MAP_CACHE[key][1])
+    return calls
 
-    def busy(q):
-        raise fc.Busy(fc.MAP_BUSY)
-    monkeypatch.setattr(fc, "_race", busy)
-    assert fc.search_map("lodges", "Kabwe")[0]["name"] == "Kabwe Lodge"
-    # Never found before and busy now: said plainly.
+
+def test_places_keep_where_they_are_and_come_nearest_first_within_the_radius():
+    lat0, lon0 = fc.TOWNS["Lusaka"]
+    rows = fc.parse_overpass({"elements": [
+        {"type": "node", "id": 1, "lat": lat0 + 0.1, "lon": lon0, "tags": {"name": "Far"}},
+        {"type": "way", "id": 2, "center": {"lat": lat0 + 0.01, "lon": lon0}, "tags": {"name": "Near"}},
+        {"type": "relation", "id": 3, "tags": {"name": "Somewhere"}},
+        {"type": "node", "id": 4, "lat": lat0 + 0.5, "lon": lon0, "tags": {"name": "Beyond"}},
+    ]}, "shops", "Lusaka")
+    assert rows[1]["lat"] == round(lat0 + 0.01, 5) and rows[2]["lat"] is None
+    near = fc.nearest(rows, "Lusaka")
+    # 1 km, 11 km, then the one the map did not place; 55 km is past the directory's 25.
+    assert [r["name"] for r in near] == ["Near", "Far", "Somewhere"]
+    assert [r["name"] for r in fc.nearest(rows, "Lusaka", 5)] == ["Near", "Somewhere"]
+
+
+def test_the_directory_answers_a_search_without_the_map(monkeypatch):
+    _reset_map()
+    db = _StoreDB()
+    calls = _counting_race(monkeypatch, _around("Lusaka", 60))
+    first = fc.search_map("hardware", "Lusaka", db=db)
+    # 60 places, 0.5 km apart: the 50 within 25 km, nearest first.
+    assert len(first) == 50 and first[0]["name"] == "Place 1" and first[-1]["name"] == "Place 50"
+    assert len(calls) == 1 and fc.DIR_RADIUS_KM * 1000 == 25000 and "around:25000" in calls[0]
+    held = json.loads(db.storage.files["hardware/lusaka.json"])
+    assert held["kind"] == "hardware" and len(held["rows"]) == 60
+    assert json.loads(db.storage.files["index.json"])["hardware|Lusaka"]["count"] == 60
+    # Another server (or this one after a restart) reads Storage, not the map.
+    _reset_map()
+    assert fc.search_map("hardware", "Lusaka", db=db) == first and len(calls) == 1
+    # In memory it does not even read Storage.
+    db.storage.files.clear()
+    assert fc.search_map("hardware", "Lusaka", db=db) == first and len(calls) == 1
+    _reset_map()
+
+
+def test_the_bucket_is_made_on_first_use(monkeypatch):
+    _reset_map()
+    db = _StoreDB(bucket=False)
+    _counting_race(monkeypatch, _around("Kitwe", 3))
+    fc.search_map("hardware", "Kitwe", db=db)
+    assert db.storage.made == [(fc.DIR_BUCKET, {"public": False})]
+    assert "hardware/kitwe.json" in db.storage.files
+    _reset_map()
+
+
+def test_an_old_list_is_asked_again_and_used_when_the_map_is_busy(monkeypatch):
+    _reset_map()
+    db = _StoreDB()
+    _counting_race(monkeypatch, _around("Kabwe", 2))
+    fc.search_map("lodges", "Kabwe", db=db)
+    # A month on, the map is asked again; when it is busy, last month's list is used.
+    snap = fc._MAP_CACHE[("lodges", "Kabwe")]
+    snap["fetched_at"] = (fc._now() - timedelta(days=31)).isoformat()
+    calls = _counting_race(monkeypatch, fc.Busy(fc.MAP_BUSY))
+    assert [r["name"] for r in fc.search_map("lodges", "Kabwe", db=db)] == ["Place 1", "Place 2"]
+    assert len(calls) == 1
+    # Never found before and busy now: said plainly, and fetched first by the next harvest.
     with pytest.raises(fc.Busy):
-        fc.search_map("lodges", "Choma")
-    fc._MAP_CACHE.clear()
+        fc.search_map("lodges", "Choma", db=db)
+    assert ("lodges", "Choma") in fc._WANTED
+    assert fc.harvest_order(fc.dir_index(db), fc._WANTED)[0] == ("lodges", "Choma")
+    _reset_map()
+
+
+def test_nothing_of_a_kind_is_asked_again_sooner_than_a_full_list(monkeypatch):
+    _reset_map()
+    db = _StoreDB()
+    calls = _counting_race(monkeypatch, {"elements": []})
+    assert fc.search_map("farming", "Siavonga", db=db) == []
+    assert fc.search_map("farming", "Siavonga", db=db) == [] and len(calls) == 1
+    fc._MAP_CACHE[("farming", "Siavonga")]["fetched_at"] = (fc._now() - timedelta(hours=13)).isoformat()
+    fc.search_map("farming", "Siavonga", db=db)
+    assert len(calls) == 2
+    _reset_map()
+
+
+def test_each_press_brings_the_next_nearest_new_ones(api, monkeypatch):
+    client, db = api
+    db.storage = _Store()
+    monkeypatch.setattr(fc, "MAP_LIMIT", 20)
+    calls = _counting_race(monkeypatch, _around("Lusaka", 60))
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"}).json()["job"]
+    assert (job["found"], job["added"], job["known"], job["more"]) == (50, 20, 0, 30)
+    names = {p["name"] for p in db.rows["client_prospects"]}
+    assert names == {f"Place {i}" for i in range(1, 21)}
+    job = client.post("/clients/find", json={"kind": "hardware", "town": "Lusaka"}).json()["job"]
+    assert (job["added"], job["known"], job["more"]) == (20, 20, 10)
+    assert {p["name"] for p in db.rows["client_prospects"]} == {f"Place {i}" for i in range(1, 41)}
+    assert len(calls) == 1                                  # the map was asked once in all
+
+
+def test_the_harvest_fills_the_directory_wanted_then_missing_then_oldest(monkeypatch):
+    _reset_map()
+    now = fc._now()
+    old = (now - timedelta(days=26)).isoformat()
+    index = {f"{k}|{t}": {"fetched_at": now.isoformat(), "count": 1} for t in fc.TOWNS for k in fc.KINDS}
+    index["offices|Kitwe"] = {"fetched_at": old, "count": 4}
+    del index["schools|Ndola"]
+    order = fc.harvest_order(index, {("beauty", "Mongu")}, now)
+    assert order == [("beauty", "Mongu"), ("schools", "Ndola"), ("offices", "Kitwe")]
+    # Nothing held yet: the biggest town first, every kind of business.
+    assert fc.harvest_order({})[:len(fc.KINDS)] == [(k, "Lusaka") for k in fc.KINDS]
+    # A run fetches a few pairs, one server at a time, and keeps them.
+    db = _StoreDB()
+    asked = []
+    monkeypatch.setattr(fc, "_sleep", lambda s: None)
+
+    def race(q, first=None, deadline_s=None):
+        asked.append((first, deadline_s))
+        return _around("Lusaka", 2)
+    monkeypatch.setattr(fc, "_race", race)
+    got = fc.harvest(lambda: db, limit=3)
+    assert got["fetched"] == 3 and set(asked) == {(1, 120.0)}
+    assert set(fc.dir_index(db)) == {"offices|Lusaka", "shops|Lusaka", "hardware|Lusaka"}
+    # When the map is down it stops after three misses rather than wait on all.
+    monkeypatch.setattr(fc, "_race", lambda q, first=None, deadline_s=None: (_ for _ in ()).throw(fc.Busy("x")))
+    assert fc.harvest(lambda: db, limit=10)["failed"] == 3
+    _reset_map()
+
+
+def test_the_hourly_job_starts_the_harvest_once(monkeypatch):
+    _reset_map()
+    monkeypatch.setattr(fc, "INLINE", True)
+    runs = []
+    monkeypatch.setattr(fc, "harvest", lambda get_db: runs.append(1) or {"fetched": 0})
+    assert fc.start_harvest(lambda: None)["started"] is True and runs == [1]
+    fc._HARVEST["running"] = True
+    assert fc.start_harvest(lambda: None)["skipped"] == "already running" and runs == [1]
+    _reset_map()
 
 
 def test_long_lists_are_read_past_the_databases_page_of_1000(api):
@@ -403,18 +682,21 @@ def test_the_months_allowance_is_kept(api, monkeypatch):
     assert sum(1 for p in db.rows["client_prospects"] if p["stage"] == "new") == 1
 
 
-def test_used_up_names_the_plan_with_more(api, monkeypatch):
+def test_used_up_says_top_up_or_the_plan_with_more(api, monkeypatch):
     client, db = api
     _tier(db, "free")
-    monkeypatch.setitem(fc.ALLOWANCE, "free", 1)
+    monkeypatch.setattr(fc, "TRIAL_RESEARCH", 1)
     client.post("/clients/import", json={"text": LIST})
     client.post("/clients/research", json={})
     r = client.post("/clients/research", json={})
     assert r.status_code == 409
-    assert r.json()["detail"] == ("This month's 1 businesses are used. More can be researched from the 1st, "
-                                  "or move up to Pro for 50 a month.")
-    assert fc.used_up("pro").endswith("move up to Pro+ for 100 a month.")
-    assert fc.used_up("proplus").endswith("move up to Growth for 300 a month.")
+    assert r.json()["detail"] == ("Your free day's 1 businesses are used. Top up 100 businesses for $5 or move "
+                                  "up to Pro for 50 a month.")
+    assert fc.used_up("pro") == ("This month's 50 businesses are used. Top up 100 businesses for $5, move up "
+                                 "to Pro+ for 100 a month or wait for the 1st.")
+    assert "move up to Growth for 300 a month" in fc.used_up("proplus")
+    assert fc.used_up("growth") == ("This month's 300 businesses are used. Top up 100 businesses for $5 or "
+                                    "wait for the 1st.")
 
 
 def test_sent_by_the_owner_then_followed_up_then_left_alone(api):

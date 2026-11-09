@@ -1,12 +1,12 @@
 """
 The Find clients page's API (find_clients.py, migration 0045).
 
-Every plan since 7 November 2026 (Growth only before), per business, like the
-cash plan: the plan that counts is the business's, so staff an owner invites
-use it on the owner's plan. The plans differ in how many businesses a month
-are researched (find_clients.ALLOWANCE). An account the plan check turns away
-(a feature flag taken off, say) gets a preview from GET /clients that the page
-shows locked but visible, and 402 from every other route.
+Per business, like the cash plan: the plan that counts is the business's, so
+staff an owner invites use it on the owner's plan. Since 9 November 2026 it is
+paid for the way Explee is: Pro, Pro+ and Growth include credits a month, any
+plan can top up, and Free has one free day from its first search. A Free
+account whose day is over and has no credits bought gets a preview from GET
+/clients (what was kept, and how to carry on) and 402 from every other route.
 
 Staff can find, research, write and mark messages sent; the accountant reads
 only. The settings (who signs, the booking link, the do not contact list) and
@@ -15,6 +15,7 @@ deleting a business's details are the owner's.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -27,6 +28,7 @@ import membership
 from db import get_db, missing_schema
 
 router = APIRouter()
+log = logging.getLogger("aibos.find_clients")
 
 
 def _db():
@@ -43,9 +45,31 @@ def _bid(db, ctx: membership.Context) -> str:
     return bid
 
 
-def _gate(ctx: membership.Context) -> str:
-    """The plan's answer for this business, or 402 naming the plan that has it."""
-    return entitlements.require_feature(ctx.tenant, fc.FEATURE)
+def _gate(ctx: membership.Context, start: bool = False) -> str:
+    """The plan this business is on, when it may use Find clients: a plan
+    that has it, or a Free account on its free day or with credits bought.
+    Otherwise 402 saying how to carry on. `start` begins the free day (a
+    search, a list or research); opening the page never does."""
+    detail = entitlements.tier_detail(ctx.tenant)
+    tier = detail["tier"]
+    if entitlements.account_can(ctx.tenant, fc.FEATURE, tier):
+        return tier
+    if detail.get("reason") == "unreadable":
+        # Not a Free account's day to count: the plan could not be read.
+        return entitlements.require_feature(ctx.tenant, fc.FEATURE)
+    db = _db()
+    bal = _run(fc.balance, db, ctx.tenant, tier)
+    if not bal["open"]:
+        raise HTTPException(status_code=402, detail=fc.free_day_over())
+    trial = bal.get("trial") or {}
+    if start and trial.get("active") and not trial.get("started_at"):
+        try:
+            fc.start_trial(db, ctx.tenant)
+        except Exception as e:  # noqa: BLE001 — a day that cannot be counted is not given
+            log.warning("[find_clients] the free day of %s could not start: %s", ctx.tenant, e)
+            raise HTTPException(status_code=503, detail="Your free day could not be started just now. "
+                                                        "Try again in a minute.")
+    return tier
 
 
 def _run(fn, *args, **kwargs):
@@ -80,28 +104,39 @@ def _kinds() -> dict:
 @router.get("/clients")
 def clients_home(ctx: membership.Context = Depends(membership.require_context)):
     """Everything the page draws: today's drafts, replies that need the owner,
-    follow-ups due, the campaigns, the settings and the month's allowance."""
+    follow-ups due, the campaigns, the settings and the balance (the free
+    day, the month's credits and top-ups)."""
     detail = entitlements.tier_detail(ctx.tenant)
     tier = detail["tier"]
     base = {"ok": True, "kinds": _kinds(), "towns": list(fc.TOWNS), "allowance": fc.ALLOWANCE.get(tier, 0),
             "allowances": dict(fc.ALLOWANCE), "demo_research": fc.DEMO_RESEARCH,
+            "trial_hours": fc.TRIAL_HOURS, "trial_research": fc.TRIAL_RESEARCH,
+            "topups": [{"credits": c, "usd": u} for c, u in sorted(fc.TOPUPS.items())],
             "labels": fc.LABEL_WORDS, "write_from": fc.WRITE_FROM,
             "can_write": ctx.can_write, "is_owner": ctx.is_owner}
-    if not entitlements.account_can(ctx.tenant, fc.FEATURE, tier):
-        return {**base, "preview": True, "plan": tier, "reason": detail.get("reason")}
+    plan_has = entitlements.account_can(ctx.tenant, fc.FEATURE, tier)
+    if not plan_has and detail.get("reason") == "unreadable":
+        return {**base, "preview": True, "plan": tier, "reason": "unreadable"}
     db = _db()
     bid = _bid(db, ctx)
 
     def build():
+        bal = fc.balance(db, ctx.tenant, tier)
+        if not plan_has and not bal["open"]:
+            # The free day is over and no credits are left: what it found and
+            # wrote is kept, and the page says how to carry on.
+            return {**base, "preview": True, "plan": tier, "reason": "free_day_over",
+                    "message": fc.free_day_over(), "usage": bal, "kept": fc.kept(db, ctx.tenant, bid)}
         settings = fc.load_settings(db, ctx.tenant, bid)
         try:
             import llm
             ai = llm.configured()
         except Exception:  # noqa: BLE001
             ai = False
-        return {**base, "preview": False, "plan": tier, "settings": settings,
+        via = "plan" if plan_has else ("trial" if (bal.get("trial") or {}).get("active") else "credits")
+        return {**base, "preview": False, "plan": tier, "via": via, "settings": settings,
                 **fc.overview(db, ctx.tenant, bid, settings),
-                "usage": fc.usage(db, ctx.tenant, tier), "job": fc.job_status(ctx.tenant, bid), "ai": ai,
+                "usage": bal, "job": fc.job_status(ctx.tenant, bid), "ai": ai,
                 "business": _business(db, ctx, bid).get("name")}
     return _run(build)
 
@@ -208,19 +243,20 @@ def clients_prospect_delete(pid: str, ctx: membership.Context = Depends(membersh
 @router.post("/clients/find")
 def clients_find(body: Dict[str, Any] = Body(...),
                  ctx: membership.Context = Depends(membership.require_write)):
-    """Search the map for one kind of business around one town. The public
-    map servers can take most of a minute, and the proxy in front of the API
-    gives up at 60 seconds (that was the 504 of 7 Nov 2026), so the search
-    runs on after the answer, like research; GET /clients reports it. With
-    "research": true the first few new ones are researched and written to as
-    well (the first-time demo)."""
-    tier = _gate(ctx)
+    """Find one kind of business around one town: the nearest ones not in the
+    list yet, from AIBOS's own directory. A pair the directory does not hold
+    yet waits on the public map, and the proxy in front of the API gives up
+    at 60 seconds (the 504 of 7 Nov 2026), so the search runs on after the
+    answer, like research; GET /clients reports it. With "research": true the
+    first few new ones are researched and written to as well (the first-time
+    demo)."""
+    tier = _gate(ctx, start=True)
     db = _db()
     bid = _bid(db, ctx)
     try:
-        radius = float(body.get("radius_km") or 8)
+        radius = float(body["radius_km"]) if body.get("radius_km") else None
     except (TypeError, ValueError):
-        radius = 8.0
+        radius = None
     _run(fc.load_settings, db, ctx.tenant, bid)          # says what to run when the migration is missing
     job = _run(fc.start_find, get_db, ctx.tenant, bid, tier, _business(db, ctx, bid),
                str(body.get("kind") or ""), str(body.get("town") or ""), radius,
@@ -232,7 +268,7 @@ def clients_find(body: Dict[str, Any] = Body(...),
 def clients_import(body: Dict[str, Any] = Body(...),
                    ctx: membership.Context = Depends(membership.require_write)):
     """A pasted or uploaded list (CSV with headings, or one business a line)."""
-    _gate(ctx)
+    _gate(ctx, start=True)
     db = _db()
     bid = _bid(db, ctx)
     text = str(body.get("text") or "")
@@ -251,7 +287,7 @@ def clients_research(body: Dict[str, Any] = Body(default={}),
                      ctx: membership.Context = Depends(membership.require_write)):
     """Research the next businesses waiting and write to the ones that fit.
     Runs on after the answer; GET /clients reports how far it has got."""
-    tier = _gate(ctx)
+    tier = _gate(ctx, start=True)
     db = _db()
     bid = _bid(db, ctx)
     job = _run(fc.start_research, get_db, ctx.tenant, bid, tier, _business(db, ctx, bid),

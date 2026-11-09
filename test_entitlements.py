@@ -193,7 +193,7 @@ def test_features_for_hides_unbuilt_flags():
     growth = entitlements.features_for("growth")
     assert "cross_engine" in growth and "hospitality" in growth
     assert not (set(growth) & entitlements._UNBUILT)
-    assert entitlements.features_for("free") == ["find_clients"]
+    assert entitlements.features_for("free") == []   # Find clients left Free for a one-day trial, 9 Nov 2026
 
 
 def test_staff_inherit_the_owners_plan():

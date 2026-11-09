@@ -22,6 +22,7 @@ first use this module makes sure Paddle has everything AIBOS needs, creating
 only what is missing:
 
   - the three plans, each with a monthly and a yearly price
+  - the Find clients credits, one price a pack, bought once (9 Nov 2026)
   - the webhook that tells us a payment went through (its secret is read
     back from Paddle, so nobody copies it by hand)
   - the public token the website's checkout opens with
@@ -224,7 +225,32 @@ def plan_of_items(items, by_product: dict | None = None) -> tuple[str, str] | No
     return None
 
 
-def transaction_fact(data: dict, by_product: dict | None = None) -> dict:
+def topup_of_price(price: dict | None, topup_by_price: dict | None = None) -> int:
+    """How many Find clients credits a Paddle price sells, or 0. Pure. Prices
+    AIBOS made say so in their custom_data; failing that, the price id."""
+    if not isinstance(price, dict):
+        return 0
+    try:
+        n = int((price.get("custom_data") or {}).get("aibos_credits") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return n if n > 0 else int((topup_by_price or {}).get(price.get("id")) or 0)
+
+
+def topup_of_items(items, topup_by_price: dict | None = None) -> int:
+    """The Find clients credits a transaction's lines buy, in all. Pure."""
+    total = 0
+    for item in items or []:
+        n = topup_of_price((item or {}).get("price"), topup_by_price)
+        if n:
+            try:
+                total += n * max(1, int((item or {}).get("quantity") or 1))
+            except (TypeError, ValueError):
+                total += n
+    return total
+
+
+def transaction_fact(data: dict, by_product: dict | None = None, topup_by_price: dict | None = None) -> dict:
     """What a completed transaction means for AIBOS. Pure."""
     details = data.get("details") or {}
     totals = details.get("totals") or {}
@@ -241,6 +267,7 @@ def transaction_fact(data: dict, by_product: dict | None = None) -> dict:
         "customer_id": data.get("customer_id"),
         "plan": hit[0] if hit else None,
         "billing": hit[1] if hit else None,
+        "topup": topup_of_items(data.get("items"), topup_by_price),
         "amount": to_major(totals.get("grand_total") or totals.get("total"), currency),
         "currency": currency,
         "period_end": parse_time(period.get("ends_at")),
@@ -368,7 +395,7 @@ LINK_FIX = ("Set the default payment link in Paddle (Checkout, Checkout settings
 
 _STATE: dict = {
     "checked_at": 0.0, "ready": False, "environment": None, "blocked": None,
-    "catalog": {}, "by_price": {}, "by_product": {},
+    "catalog": {}, "by_price": {}, "by_product": {}, "topups": {}, "topup_by_price": {},
     "webhook_secret": None, "webhook_id": None, "webhook_url": None,
     "client_token": None, "notes": [], "error": None,
 }
@@ -378,8 +405,11 @@ RETRY_AFTER = 120           # and this often while something is missing
 
 
 def _create_product(plan: str) -> dict:
-    body = {"name": f"AIBOS {PLAN_NAMES[plan]}", "tax_category": "saas",
-            "description": PLAN_BLURBS[plan], "custom_data": {"aibos_plan": plan}}
+    return _post_product({"name": f"AIBOS {PLAN_NAMES[plan]}", "tax_category": "saas",
+                          "description": PLAN_BLURBS[plan], "custom_data": {"aibos_plan": plan}})
+
+
+def _post_product(body: dict) -> dict:
     try:
         return api("POST", "/products", body)["data"]
     except PaddleError as e:
@@ -443,6 +473,59 @@ def _ensure_catalog(notes: list) -> tuple[dict, dict, dict]:
             catalog[plan][billing] = {"price_id": price["id"], "currency": currency,
                                       "amount": to_major(unit.get("amount"), currency)}
     return catalog, by_price, by_product
+
+
+# Find clients credits (find_clients.TOPUPS), sold once and never renewed: the
+# pay as you go that Explee sells (owner's decision, 9 Nov 2026). One product,
+# one price a pack, each price saying in its custom_data how many credits it is.
+TOPUP_PRODUCT = "AIBOS Find clients credits"
+
+
+def _create_topup_price(product_id: str, credits: int, usd: float) -> dict:
+    return api("POST", "/prices", {
+        "product_id": product_id,
+        "name": f"{credits:,} businesses",
+        "description": f"Find clients: {credits:,} businesses researched and written to. Bought once, in USD.",
+        "unit_price": {"amount": to_minor(usd), "currency_code": "USD"},
+        "tax_mode": "account_setting",
+        "quantity": {"minimum": 1, "maximum": 1},
+        "custom_data": {"aibos_credits": credits},
+    })["data"]
+
+
+def _ensure_topups(notes: list) -> tuple[dict, dict]:
+    """The credit packs, made in Paddle when missing. Returns ({credits:
+    {price_id, amount, currency}}, {price_id: credits}). A price changed in
+    the dashboard is honoured: the newest active price for a pack is sold."""
+    from find_clients import TOPUPS   # the packs are the feature's own
+    products = _list("/products", {"per_page": 200, "status": "active", "include": "prices"})
+    product = next((p for p in products if (p.get("custom_data") or {}).get("aibos_topup")), None)
+    if product is None:
+        product = dict(_post_product({
+            "name": TOPUP_PRODUCT, "tax_category": "saas",
+            "description": "Businesses researched and written to by Find clients in AIBOS. Bought once; "
+                           "they never run out.",
+            "custom_data": {"aibos_topup": "find_clients"}}), prices=[])
+        notes.append("Created the Find clients credits in Paddle.")
+    prices = [p for p in product.get("prices") or []
+              if p.get("status", "active") == "active" and not p.get("billing_cycle")]
+    prices.sort(key=lambda p: str(p.get("created_at") or ""), reverse=True)
+    packs, by_price = {}, {}
+    for p in prices:
+        n = topup_of_price(p)
+        if n:
+            by_price[p["id"]] = n
+    for credits, usd in sorted(TOPUPS.items()):
+        price = next((p for p in prices if topup_of_price(p) == credits), None)
+        if price is None:
+            price = _create_topup_price(product["id"], credits, usd)
+            by_price[price["id"]] = credits
+            notes.append(f"Created the {credits:,} businesses top-up (${usd}).")
+        unit = price.get("unit_price") or {}
+        currency = (unit.get("currency_code") or "USD").upper()
+        packs[credits] = {"price_id": price["id"], "currency": currency,
+                          "amount": to_major(unit.get("amount"), currency)}
+    return packs, by_price
 
 
 def _event_names(setting: dict) -> set:
@@ -528,6 +611,11 @@ def ensure_setup(force: bool = False) -> dict:
             _STATE.update(catalog=catalog, by_price=by_price, by_product=by_product)
         except PaddleError as e:
             error = f"The plans could not be set up in Paddle: {e}"
+        try:
+            packs, topup_by = _ensure_topups(notes)
+            _STATE.update(topups=packs, topup_by_price=topup_by)
+        except Exception as e:  # noqa: BLE001 — the top-ups never stop the plans
+            notes.append(f"The Find clients top-ups could not be set up in Paddle: {e}")
         try:
             secret, hook_id, hook_url = _ensure_webhook(notes)
             _STATE.update(webhook_secret=secret, webhook_id=hook_id, webhook_url=hook_url)
@@ -727,6 +815,28 @@ def card_prices() -> dict:
             for plan, by in (_STATE["catalog"] or {}).items()}
 
 
+def topup_by_price() -> dict:
+    return dict(_STATE.get("topup_by_price") or {})
+
+
+def topup_price(credits: int) -> dict | None:
+    """The price a credit pack sells at now; set up first if it is missing."""
+    if credits not in (_STATE.get("topups") or {}) and configured():
+        with _LOCK:
+            try:
+                packs, by = _ensure_topups([])
+                _STATE.update(topups=packs, topup_by_price=by)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[paddle] the top-ups could not be set up: %s", e)
+    return (_STATE.get("topups") or {}).get(credits)
+
+
+def topup_prices() -> dict:
+    """{credits: {amount, currency}} as sold right now."""
+    return {c: {"amount": v["amount"], "currency": v["currency"]}
+            for c, v in (_STATE.get("topups") or {}).items()}
+
+
 # ── Customers, checkouts and plan changes ───────────────────────────────────
 
 def find_or_create_customer(email: str, user_id: str) -> str | None:
@@ -767,6 +877,30 @@ def create_checkout(user_id: str, plan: str, billing: str, customer_id: str | No
         raise
     _STATE["blocked"] = None
     return {"transaction_id": data["id"], "amount": price["amount"], "currency": price["currency"]}
+
+
+def create_topup_checkout(user_id: str, credits: int, customer_id: str | None) -> dict:
+    """A one-time transaction for a pack of Find clients credits, made on the
+    server like a plan's: the price and the account are ours to decide."""
+    price = topup_price(credits)
+    if not price:
+        raise PaddleError("Top-ups are not set up for card payments yet.")
+    body: dict = {
+        "items": [{"price_id": price["price_id"], "quantity": 1}],
+        "custom_data": {"user_id": user_id, "topup": credits},
+        "collection_mode": "automatic",
+    }
+    if customer_id:
+        body["customer_id"] = customer_id
+    try:
+        data = api("POST", "/transactions", body)["data"]
+    except PaddleError as e:
+        if is_payment_link_problem(e):
+            checkout_refused(e)
+        raise
+    _STATE["blocked"] = None
+    return {"transaction_id": data["id"], "amount": price["amount"], "currency": price["currency"],
+            "credits": credits}
 
 
 def get_subscription(subscription_id: str) -> dict:

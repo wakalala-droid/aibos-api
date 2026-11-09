@@ -145,8 +145,10 @@ def test_the_cash_watch_warns_a_growth_owner_once_a_week(books):
     assert cash_watch.daily(db, record, now=night) == {"skipped": "waits for the morning"}
     morning = datetime.now(timezone.utc).replace(hour=6)
     out = cash_watch.daily(db, record, now=morning)
-    assert out == {"watched": 1, "warned": 1}
-    uid, kind, title, body, link, meta = sent[0]
+    # On a Monday the week ahead comes as well (test_monday_brings_the_week_ahead_once).
+    assert {k: out[k] for k in ("watched", "warned")} == {"watched": 1, "warned": 1}
+    warns = [s for s in sent if s[1] == "cash_watch"]
+    uid, kind, title, body, link, meta = warns[0]
     assert kind == "cash_watch" and link == "/dashboard/cash-plan"
     assert title.startswith("Cash may run short in the week of") and "below zero by then." in body
     assert meta["booking_id"].startswith("cashwatch-")
@@ -154,7 +156,7 @@ def test_the_cash_watch_warns_a_growth_owner_once_a_week(books):
     assert cash_watch.daily(db, record, now=morning) == {"skipped": "already watched today"}
     cash_watch._CHECKED["day"] = None
     cash_watch.daily(db, record, now=morning)
-    assert len(sent) == 1
+    assert len([s for s in sent if s[1] == "cash_watch"]) == 1
     cash_watch._CHECKED["day"] = None
 
 

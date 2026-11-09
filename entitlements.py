@@ -36,18 +36,16 @@ log = logging.getLogger("aibos.entitlements")
 # Hospitality moved Pro -> Growth, and sending invoices and inviting the team
 # moved Free -> Pro.
 #
-# Free since 7 Nov 2026 (owner's decision): Find clients is on every plan, and
-# the plans differ only in how many businesses a month it researches
-# (find_clients.ALLOWANCE: 20, 50, 100 and 300). Finding customers is the one
-# thing a new owner gets paid back for at once, so it leads the Free plan.
-_FREE: set[str] = {
-    # Find clients (find_clients.py, 5 Nov 2026): businesses found on the map or
-    # from a list, their websites read, the fit judged and the first message,
-    # follow-ups and answers written for the owner to send from their own email
-    # or WhatsApp.
-    "find_clients",
-}
+# Find clients (find_clients.py): businesses found on the map or from a list,
+# their websites read, the fit judged and the first message, follow-ups and
+# answers written for the owner to send from their own email or WhatsApp. On
+# Free from 7 to 9 Nov 2026. Since 9 Nov (owner's decision: it costs too much
+# to give away for good) it is priced the way Explee prices it: Pro and up
+# include credits a month, any plan can top up, and Free gets one free day
+# from its first search, granted by find_clients.balance, not by this ladder.
+_FREE: set[str] = set()
 _PRO: set[str] = _FREE | {
+    "find_clients",
     "forecast", "anomaly", "variance", "breakeven",
     "ai_chat", "full_history", "engine2", "engine3",
     # Creating and sending invoices with a payment link. Reading, settling and

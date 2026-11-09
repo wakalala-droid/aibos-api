@@ -76,6 +76,7 @@ import membership
 import businesses as businesses_api
 import budgets as budgets_api
 import interview as interview_api
+import find_clients
 import find_clients_routes
 import seasons as seasons_api
 import starter_book
@@ -2653,6 +2654,9 @@ def health():
         "schema_note": _schema["note"],
         # When renewals, payday wages and guest reminders last ran (upgrade 15).
         "hourly_jobs_last_run": HOURLY.get("last_run"),
+        # How much of Find clients' own map directory this server knows is
+        # held, and its last harvest (no Storage read here).
+        "find_clients_directory": find_clients.directory_status(),
     }
 
 
@@ -3606,10 +3610,43 @@ def _end_card_plan(db, user_id: str, fact: Dict[str, Any]) -> None:
     log.info("[paddle] card plan of %s ended early on %s", user_id, canceled.isoformat())
 
 
+def _paddle_topup(db, fact: Dict[str, Any]) -> Dict[str, Any]:
+    """Find clients credits bought by card (find_clients.TOPUPS): added once,
+    by the payment's id, however often Paddle delivers it."""
+    user_id = fact["user_id"] or _card_owner(db, fact["subscription_id"], fact["customer_id"])
+    if not fact["transaction_id"] or not user_id:
+        paddle.note_unmatched("top-up", fact["transaction_id"], f"account={user_id or 'unknown'}")
+        return {"ok": True, "ignored": "unmatched"}
+    if not _paddle_may_grant(db, user_id):
+        log.warning("[paddle] sandbox top-up %s by %s not credited: not a tester",
+                    fact["transaction_id"], user_id)
+        return {"ok": True, "ignored": "a test payment by someone who is not testing"}
+    try:
+        added = find_clients.add_topup(db, user_id, fact["topup"], fact["transaction_id"],
+                                       fact["amount"], fact["currency"])
+    except Exception as e:  # noqa: BLE001 — paid and not credited: Paddle retries a 5xx
+        log.error("[paddle] top-up %s for %s not credited: %s", fact["transaction_id"], user_id, e)
+        raise HTTPException(status_code=500, detail="The credits could not be added; Paddle will retry.")
+    if added:
+        log.info("[paddle] %s bought %s Find clients credits (%s)", user_id, fact["topup"], fact["transaction_id"])
+        try:
+            amount = billing_api.money(float(fact["amount"] or 0), fact["currency"] or "USD")
+            notify.record_notification(
+                db, user_id, "find_clients_topup", f"{fact['topup']:,} businesses added",
+                f"Your top-up of {amount} went through. Find clients can research and write to "
+                f"{fact['topup']:,} more businesses, and they never run out.",
+                "/dashboard/clients", {"payment": f"t-{fact['transaction_id']}"})
+        except Exception as e:  # noqa: BLE001 — the credits stand either way
+            log.info("[paddle] top-up note for %s not recorded: %s", user_id, e)
+    return {"ok": True, "credited": fact["topup"], "already": not added}
+
+
 def _paddle_payment(db, data: Dict[str, Any]) -> Dict[str, Any]:
-    fact = paddle.transaction_fact(data, paddle.by_product())
+    fact = paddle.transaction_fact(data, paddle.by_product(), paddle.topup_by_price())
     if fact["origin"] == "subscription_payment_method_change":
         return {"ok": True, "ignored": "a card change, not a payment"}
+    if fact["topup"] and not fact["plan"]:
+        return _paddle_topup(db, fact)
     if fact["subscription_id"] and fact["origin"] == "subscription_update":
         # A plan change was charged: what the subscription holds NOW is the
         # plan paid for, whatever lines the prorated bill carries.
@@ -3691,6 +3728,19 @@ def _paddle_adjustment(db, data: Dict[str, Any]) -> Dict[str, Any]:
             or not fact["full"] or not fact["transaction_id"]):
         return {"ok": True, "ignored": f"{fact['action']} {fact['status']}"}
     txn = fact["transaction_id"]
+    back = find_clients.refund_topup(db, txn)
+    if back is not None:
+        if not back["already"]:
+            try:
+                notify.record_notification(
+                    db, back["user_id"], "find_clients_topup_refunded",
+                    f"Refund made: {back['credits']:,} businesses",
+                    f"Paddle has sent back your top-up of {back['credits']:,} businesses for Find clients, "
+                    "so those credits are taken off what you have left.",
+                    "/dashboard/clients", {"payment": f"t-{txn}"})
+            except Exception as e:  # noqa: BLE001
+                log.info("[paddle] top-up refund note not recorded: %s", e)
+        return {"ok": True, "refunded": txn, "topup": back["credits"]}
     rec = _load_subscription_payment(txn)
     user_id = (rec or {}).get("user_id") or _card_owner(db, fact["subscription_id"], fact["customer_id"])
     if not user_id:
@@ -3930,6 +3980,44 @@ def paddle_checkout(body: CardPlanRequest, user_id: str = Depends(require_user))
                                                     "now. Please try again in a minute.")
     return {"ok": True, **out, "plan": plan, "billing": billing,
             "client_token": paddle.client_token(), "environment": paddle.environment()}
+
+
+class TopupRequest(BaseModel):
+    credits: int
+
+
+@app.post("/payments/paddle/topup")
+def paddle_topup(body: TopupRequest, ctx: membership.Context = Depends(membership.require_owner)):
+    """Buy Find clients credits by card, once, on any plan: Explee's top-up.
+    They go to the business's account (the owner's), whoever is signed in
+    to it. The transaction is made here, so the price and the account it
+    pays for are the server's to decide; the browser only opens it."""
+    credits = int(body.credits or 0)
+    if credits not in find_clients.TOPUPS:
+        raise HTTPException(status_code=400, detail="Choose one of the top-ups: "
+                            + ", ".join(f"{c:,} businesses" for c in sorted(find_clients.TOPUPS)) + ".")
+    st = paddle.ensure_setup()
+    if not st["ready"]:
+        raise HTTPException(status_code=503, detail="Card payments are not switched on yet. "
+                                                    "Try again later.")
+    db = _require_db()
+    user_id = ctx.tenant
+    if not _paddle_may_grant(db, user_id):
+        raise HTTPException(status_code=403, detail="Card payments are still being tested and are "
+                                                    "not open yet.")
+    prof = (db.table("profiles").select("email,contact_email").eq("id", user_id)
+            .limit(1).execute())
+    row = (getattr(prof, "data", None) or [{}])[0]
+    held = billing_api.card_plan_of(db, user_id, paddle.environment()) or {}
+    customer_id = held.get("customer_id") or paddle.find_or_create_customer(
+        row.get("contact_email") or row.get("email") or "", user_id)
+    try:
+        out = paddle.create_topup_checkout(user_id, credits, customer_id)
+    except paddle.PaddleError as e:
+        log.warning("[paddle] top-up checkout for %s failed: %s", user_id, e)
+        raise HTTPException(status_code=502, detail="Paddle could not start the card checkout just "
+                                                    "now. Please try again in a minute.")
+    return {"ok": True, **out, "client_token": paddle.client_token(), "environment": paddle.environment()}
 
 
 @app.post("/payments/paddle/change")
@@ -8185,6 +8273,10 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a month, from 07:00 on the 1st: what AIBOS did for each
             # owner in the month just gone, every line from their records.
             ("month_note", lambda: __import__("month_note").deliver(db)),
+            # Find clients' own directory of places, filled and renewed a
+            # few towns at a time on a thread of its own, so a search reads
+            # it instead of waiting on a busy public map server.
+            ("find_clients_map", lambda: find_clients.start_harvest(get_db)),
         ):
             try:
                 out[name] = job()

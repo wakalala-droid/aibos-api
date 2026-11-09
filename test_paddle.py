@@ -221,9 +221,10 @@ def fake_paddle(monkeypatch):
 def test_a_new_account_gets_three_plans_six_prices_a_webhook_and_a_token(fake_paddle):
     st = paddle.ensure_setup()
     assert st["ready"], st
-    assert len(fake_paddle.products) == 3
+    plans = [p for p in fake_paddle.products if p["custom_data"].get("aibos_plan")]
+    assert len(plans) == 3 and len(fake_paddle.products) == 4
     prices = {(p["custom_data"]["aibos_plan"], p["custom_data"]["aibos_billing"]): p["unit_price"]["amount"]
-              for prod in fake_paddle.products for p in prod["prices"]}
+              for prod in plans for p in prod["prices"]}
     assert prices == {("pro", "monthly"): "2500", ("pro", "annual"): "25000",
                       ("proplus", "monthly"): "3900", ("proplus", "annual"): "39000",
                       ("growth", "monthly"): "7900", ("growth", "annual"): "79000"}
@@ -234,12 +235,26 @@ def test_a_new_account_gets_three_plans_six_prices_a_webhook_and_a_token(fake_pa
     assert paddle.card_prices()["growth"]["annual"] == {"amount": 790.0, "currency": "USD"}
 
 
+def test_find_clients_credits_are_sold_once_never_renewed(fake_paddle):
+    # Explee's pay as you go (9 Nov 2026): one product, one price a pack,
+    # with no billing cycle, so Paddle charges once and never again.
+    paddle.ensure_setup()
+    (credits,) = [p for p in fake_paddle.products if p["custom_data"].get("aibos_topup")]
+    packs = {p["custom_data"]["aibos_credits"]: p["unit_price"]["amount"] for p in credits["prices"]}
+    assert packs == {100: "500", 300: "1200", 1000: "3500"}
+    assert not any(p.get("billing_cycle") for p in credits["prices"])
+    assert paddle.topup_prices() == {100: {"amount": 5.0, "currency": "USD"},
+                                     300: {"amount": 12.0, "currency": "USD"},
+                                     1000: {"amount": 35.0, "currency": "USD"}}
+    assert paddle.topup_price(300)["price_id"] in paddle.topup_by_price()
+
+
 def test_setting_up_again_creates_nothing_new(fake_paddle):
     paddle.ensure_setup()
     fake_paddle.calls.clear()
     paddle.ensure_setup(force=True)
     assert not [c for c in fake_paddle.calls if c[0] != "GET"]
-    assert len(fake_paddle.products) == 3 and len(fake_paddle.settings) == 1
+    assert len(fake_paddle.products) == 4 and len(fake_paddle.settings) == 1
 
 
 def test_a_price_changed_in_the_dashboard_is_the_one_sold(fake_paddle):
@@ -642,6 +657,72 @@ def test_the_card_routes_are_wired():
 
 
 # ── Refunds: the 30-day money-back guarantee ─────────────────────────────────
+
+def _topup(**over):
+    """A pack of 100 Find clients credits, paid once by card."""
+    data = {
+        "id": "txn_t1", "status": "completed", "origin": "web", "customer_id": "ctm_1",
+        "subscription_id": None, "custom_data": {"user_id": "u1", "topup": 100}, "currency_code": "USD",
+        "items": [{"quantity": 1, "price": {"id": "pri_t100", "product_id": "pro_t",
+                                            "unit_price": {"amount": "500", "currency_code": "USD"},
+                                            "custom_data": {"aibos_credits": 100}}}],
+        "details": {"totals": {"total": "500", "grand_total": "500", "currency_code": "USD"}},
+    }
+    data.update(over)
+    return data
+
+
+def test_a_topup_is_credits_not_a_plan():
+    fact = paddle.transaction_fact(_topup())
+    assert (fact["plan"], fact["topup"], fact["amount"]) == (None, 100, 5.0)
+    assert paddle.transaction_fact(_transaction())["topup"] == 0
+
+
+def test_a_paid_topup_is_credited_once_and_switches_no_plan_on(api):
+    client, db = api
+    for _ in range(2):                                  # Paddle delivers it twice
+        r = _post(client, "transaction.completed", _topup())
+        assert r.status_code == 200 and r.json()["credited"] == 100
+    rows = [e for e in db.rows.get("usage_events", []) if e["event"] == "find_clients_topup"]
+    assert len(rows) == 1 and rows[0]["meta"]["credits"] == 100 and rows[0]["user_id"] == "u1"
+    assert db.rows["profiles"][0]["tier"] == "free" and db.rows["subscription_payments"] == []
+    import find_clients
+    assert find_clients.balance(db, "u1", "free")["topup"] == {"bought": 100, "used": 0, "left": 100}
+    assert any("100 businesses added" in n.get("title", "") for n in db.rows["notifications"])
+
+
+def test_a_refunded_topup_takes_its_credits_back_once(api):
+    client, db = api
+    _post(client, "transaction.completed", _topup())
+    for _ in range(2):
+        r = _post(client, "adjustment.updated", _refund(transaction_id="txn_t1", subscription_id=None))
+        assert r.status_code == 200 and r.json()["topup"] == 100
+    import find_clients
+    assert find_clients.balance(db, "u1", "free")["topup"]["left"] == 0
+    rows = [e["meta"]["credits"] for e in db.rows["usage_events"] if e["event"] == "find_clients_topup"]
+    assert sorted(rows) == [-100, 100]
+
+
+def test_the_topup_checkout_is_made_on_the_server_for_the_owner(api, monkeypatch):
+    membership = main.membership   # the module main's route was built with (other tests swap sys.modules)
+    client, db = api
+    made = []
+    monkeypatch.setattr(paddle, "ensure_setup", lambda force=False: {"ready": True})
+    monkeypatch.setattr(paddle, "find_or_create_customer", lambda email, uid: "ctm_9")
+    monkeypatch.setattr(paddle, "create_topup_checkout", lambda uid, credits, cust: made.append(
+        (uid, credits, cust)) or {"transaction_id": "txn_new", "amount": 12.0, "currency": "USD", "credits": credits})
+    monkeypatch.setattr(paddle, "client_token", lambda: "live_tok")
+    owner = membership.Context(tenant="u1", actor="u1", role="owner")
+    main.app.dependency_overrides[membership.require_owner] = lambda: owner
+    try:
+        r = client.post("/payments/paddle/topup", json={"credits": 300})
+        assert r.status_code == 200, r.text
+        assert r.json()["transaction_id"] == "txn_new" and r.json()["client_token"] == "live_tok"
+        assert made == [("u1", 300, "ctm_9")]
+        assert client.post("/payments/paddle/topup", json={"credits": 50}).status_code == 400
+    finally:
+        main.app.dependency_overrides.pop(membership.require_owner, None)
+
 
 def _refund(**over):
     data = {"id": "adj_1", "action": "refund", "status": "approved", "type": "full",
