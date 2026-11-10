@@ -1008,6 +1008,28 @@ def test_a_business_on_linkedin_only_is_written_to_and_sent_from_the_owners_own_
     assert all(m["status"] in ("draft", "sent", "discarded") for m in db.rows["client_messages"])
 
 
+def test_a_way_in_found_by_hand_takes_away_no_way_to_reach_them(api):
+    client, db = api
+    camp = _campaign(client)
+    client.post("/clients/import", json={"text": LINKEDIN_LIST + "Phiri Traders,,Ndola\n"})
+    client.post("/clients/research", json={})
+    by = {p["name"]: dict(p) for p in db.rows["client_prospects"]}
+    chanda, phiri = by["Chanda Stores"], by["Phiri Traders"]
+    assert fc.NO_WAY in chanda["fit_reasons"] and fc.NO_WAY in phiri["fit_reasons"]
+    # The LinkedIn the owner found: scored as research would score it now.
+    li = "linkedin.com/in/chanda-mulenga"
+    got = client.patch(f"/clients/prospects/{chanda['id']}", json={"linkedin": li}).json()["prospect"]
+    assert fc.NO_WAY not in got["fit_reasons"] and "is on LinkedIn" in got["fit_reasons"]
+    assert got["fit"] == fc.rules_fit({**chanda, "linkedin": li}, {"ok": False}, camp)["fit"] > chanda["fit"]
+    # Other edits change nothing; an email works the same way.
+    got = client.patch(f"/clients/prospects/{phiri['id']}", json={"notes": "Met at the show"}).json()["prospect"]
+    assert fc.NO_WAY in got["fit_reasons"] and got["fit"] == phiri["fit"]
+    got = client.patch(f"/clients/prospects/{phiri['id']}", json={"email": "sales@phiritraders.co.zm"}).json()
+    assert got["prospect"]["fit_reasons"] == ["has an email address"]
+    assert got["prospect"]["fit"] == fc.rules_fit({**phiri, "email": "sales@phiritraders.co.zm"}, {"ok": False},
+                                                  camp)["fit"]
+
+
 def test_research_keeps_the_linkedin_page_a_website_links_to(api, monkeypatch):
     client, db = api
     _campaign(client)
@@ -1097,6 +1119,12 @@ def test_before_migration_0046_everything_else_works_and_linkedin_says_what_to_r
                                                              "linkedin": "linkedin.com/in/mary-mwape"})
     assert r.status_code == 409 and "0046_find_clients_linkedin.sql" in r.json()["detail"]
     assert next(x for x in db.rows["client_prospects"] if x["id"] == p["id"])["contact_role"] == "Owner"
+    # Nor does an address it cannot keep count as a way to reach them.
+    banda = next(x for x in db.rows["client_prospects"] if x["name"] == "Banda Logistics")
+    assert fc.NO_WAY in banda["fit_reasons"]
+    r = client.patch(f"/clients/prospects/{banda['id']}", json={"linkedin": "linkedin.com/company/banda"})
+    assert r.status_code == 409 and r.json()["detail"].startswith("LinkedIn needs one more step")
+    assert fc.NO_WAY in next(x for x in db.rows["client_prospects"] if x["id"] == banda["id"])["fit_reasons"]
     # A LinkedIn address that is not one is said plainly.
     r = client.patch(f"/clients/prospects/{p['id']}", json={"linkedin": "mary on linkedin"})
     assert r.status_code == 400 and "not a LinkedIn address" in r.json()["detail"]

@@ -812,8 +812,15 @@ def update_prospect(db, uid: str, pid: str, patch: dict) -> dict:
     if not row:
         return p
     row["updated_at"] = _iso()
-    _, kept_li = _li_write(lambda r: db.table("client_prospects").update(r).eq("user_id", uid).eq("id", pid).execute(),
-                           row)
+
+    def save(r):
+        # Worked out on what is written, so a LinkedIn address the database
+        # cannot keep yet (migration 0046) is no way to reach them.
+        r = {**r, **_reached(p, r)}
+        db.table("client_prospects").update(r).eq("user_id", uid).eq("id", pid).execute()
+        return r
+
+    _, kept_li = _li_write(save, row)
     if row.get("stage") in ("won", "lost", "skipped"):
         _discard_drafts(db, uid, pid)
     if not kept_li and row.get("linkedin"):
@@ -1482,6 +1489,13 @@ SENIOR = re.compile(r"\b(owner|founder|co-?founder|proprietor|managing director|
 JUNIOR = re.compile(r"\b(assistant|intern|clerk|receptionist|trainee|volunteer|student|cashier|driver)\b", re.I)
 
 
+NO_WAY = "no way to reach them yet"
+# What rules_fit takes when there is no way to reach them, and what each way
+# adds: keep these in step with it.
+_NO_WAY_COST = 30
+_WAYS = (("email", 8, "has an email address"), ("phone", 5, "has a phone number"), ("linkedin", 4, "is on LinkedIn"))
+
+
 def rules_fit(p: dict, site: dict, campaign: dict | None) -> dict:
     """The fit without AI: what the facts on hand say."""
     c = campaign or {}
@@ -1527,10 +1541,30 @@ def rules_fit(p: dict, site: dict, campaign: dict | None) -> dict:
             reasons.append(f"you know who to write to: {p['contact_name']}")
     if not (p.get("email") or p.get("phone") or site.get("emails") or site.get("phones")
             or p.get("linkedin") or site.get("linkedin")):
-        score -= 30
-        reasons.append("no way to reach them yet")
+        score -= _NO_WAY_COST
+        reasons.append(NO_WAY)
     return {"fit": max(0, min(100, score)), "reasons": reasons[:4],
             "summary": site.get("title") or None, "hook": None, "by": "rules"}
+
+
+def _reached(p: dict, patch: dict) -> dict:
+    """Found with no way to reach them, then given one by hand (an email, a
+    phone or the LinkedIn the owner found): the fit and reasons the rules give
+    now, without reading their website again. Empty when nothing changes."""
+    reasons = list(p.get("fit_reasons") or [])
+    if NO_WAY not in reasons:
+        return {}
+    merged = {**p, **patch}
+    ways = [w for w in _WAYS if merged.get(w[0])]
+    if not ways:
+        return {}
+    reasons.remove(NO_WAY)
+    fit = (p.get("fit") or 0) + _NO_WAY_COST
+    for _key, points, said in ways:
+        if said not in reasons:
+            reasons.append(said)
+            fit += points
+    return {"fit": max(0, min(100, fit)), "fit_reasons": reasons[:4]}
 
 
 def research_one(p: dict, campaign: dict | None, business: dict) -> dict:
