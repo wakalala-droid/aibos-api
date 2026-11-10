@@ -2581,7 +2581,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 45
+EXPECTS_MIGRATION = 46
 
 
 # The commit each host injects, in the order we are likely to be on them.

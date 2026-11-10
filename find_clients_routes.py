@@ -1,5 +1,5 @@
 """
-The Find clients page's API (find_clients.py, migration 0045).
+The Find clients page's API (find_clients.py, migrations 0045 and 0046).
 
 Per business, like the cash plan: the plan that counts is the business's, so
 staff an owner invites use it on the owner's plan. Since 9 November 2026 it is
@@ -349,7 +349,7 @@ def clients_message_edit(mid: str, body: Dict[str, Any] = Body(...),
 @router.post("/clients/messages/{mid}/sent")
 def clients_message_sent(mid: str, body: Dict[str, Any] = Body(default={}),
                          ctx: membership.Context = Depends(membership.require_write)):
-    """The owner pressed send in their own email or WhatsApp."""
+    """The owner pressed send in their own email, WhatsApp or LinkedIn."""
     _gate(ctx)
     db = _db()
     settings = _run(fc.load_settings, db, ctx.tenant, _bid(db, ctx))

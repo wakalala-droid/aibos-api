@@ -902,3 +902,203 @@ def test_a_campaign_filled_without_the_ai_has_a_proper_name(monkeypatch):
     assert fc._whole_words("Bookkeeping help for anyone starting out on their own", 40) == \
         "Bookkeeping help for anyone starting out"
     assert fc._whole_words("Short line.", 40) == "Short line"
+
+
+# ── LinkedIn, the safe way (10 Nov 2026) ──────────────────────────────────────
+# AIBOS never opens LinkedIn: it keeps the address, gives a search the owner
+# opens, writes the note, and the owner pastes and sends it themselves.
+
+def test_linkedin_addresses_are_kept_one_way_and_compared_that_way():
+    assert fc._linkedin("linkedin.com/company/Mwape-Hardware/") == "https://www.linkedin.com/company/mwape-hardware"
+    assert fc._linkedin("https://zm.linkedin.com/in/mary-mwape-123?trk=public") == \
+        "https://www.linkedin.com/in/mary-mwape-123"
+    assert fc._linkedin("https://m.linkedin.com/company/banda") == "https://www.linkedin.com/company/banda"
+    for not_one in ("https://mwapehardware.co.zm", "linkedin.com/feed/", "https://www.linkedin.com/", None, ""):
+        assert fc._linkedin(not_one) is None, not_one
+    assert fc.dedupe_key({"name": "Banda", "linkedin": "linkedin.com/company/banda"}) == \
+        "l:www.linkedin.com/company/banda"
+    # The do not contact list stops a LinkedIn address however it was written.
+    assert fc.blocked({"linkedin": "https://www.linkedin.com/in/mary"}, ["LinkedIn.com/in/Mary/"]) is True
+    assert fc.blocked({"linkedin": "https://www.linkedin.com/in/mary"}, ["linkedin.com/in/john"]) is False
+    # The search opens in the owner's own LinkedIn: the person when known, else the business.
+    assert fc.linkedin_search({"name": "Mwape Hardware"}) == \
+        "https://www.linkedin.com/search/results/all/?keywords=Mwape%20Hardware"
+    assert fc.linkedin_search({"name": "Mwape Hardware", "contact_name": "Mary Mwape"}) == \
+        "https://www.linkedin.com/search/results/people/?keywords=Mary%20Mwape%20Mwape%20Hardware"
+
+
+def test_aibos_never_opens_linkedin_and_keeps_the_page_a_website_links_to(monkeypatch):
+    def no_network(*a, **k):
+        raise AssertionError("AIBOS opened a web page")
+    monkeypatch.setattr(fc.httpx, "Client", no_network)
+    got = fc.read_site("https://www.linkedin.com/company/mwape-hardware")
+    assert got["ok"] is False and got["linkedin"] == "https://www.linkedin.com/company/mwape-hardware"
+    html = ('<a href="https://www.linkedin.com/shareArticle?url=x">Share</a>'
+            '<a href="https://www.linkedin.com/in/web-designer">Site by</a>'
+            '<a href="https://zm.linkedin.com/company/Mwape-Hardware/">LinkedIn</a>')
+    assert fc._site_linkedin(html) == "https://www.linkedin.com/company/mwape-hardware"
+    assert fc._site_linkedin('<a href="https://www.linkedin.com/in/mary-mwape">Me</a>') == \
+        "https://www.linkedin.com/in/mary-mwape"
+    assert fc._site_linkedin("<p>No links here</p>") is None
+    # A business that gave its LinkedIn page as its website keeps it as LinkedIn.
+    row = fc.clean_prospect({"name": "Banda", "website": "linkedin.com/company/banda"})
+    assert row["website"] is None and row["linkedin"] == "https://www.linkedin.com/company/banda"
+
+
+def test_the_note_fits_a_free_linkedin_account_and_always_asks_to_connect(monkeypatch):
+    monkeypatch.setattr(fc, "ask_json", lambda *a, **k: None)
+    camp = {"offer": "Deliver cement and roofing sheets within a day"}
+    note = fc.linkedin_note({**SHOP, "contact_name": "Mary Chanda"}, camp, SETTINGS, BUSINESS)
+    assert note == ("Hello Mary, I'm Mwape Banda from Mwape Systems. We deliver cement and roofing sheets within "
+                    "a day. I came across Chanda Stores. I would be glad to connect.")
+    assert len(note) <= fc.LINKEDIN_NOTE_MAX
+    # An offer too long to fit is left out; the greeting, the name and the ask stay.
+    long_offer = {"offer": "Deliver " + "cement, sand, quarry stones, roofing sheets and paint " * 4}
+    note = fc.linkedin_note(SHOP, long_offer, SETTINGS, BUSINESS)
+    assert len(note) <= fc.LINKEDIN_NOTE_MAX and note.startswith("Hello Mary,")
+    assert note.endswith("I would be glad to connect.") and "quarry" not in note
+    # The AI's note is used when it fits, and the rules' note when it does not.
+    ai = {"subject": "Hello", "body": "Hello Mary, a message long enough to be the email body here.",
+          "whatsapp": "Hello Mary, short.", "linkedin": "Hello Mary, I'm Mwape from Mwape Systems. Glad to connect."}
+    monkeypatch.setattr(fc, "ask_json", lambda *a, **k: ai)
+    assert fc.write_first(SHOP, camp, SETTINGS, BUSINESS)["linkedin"] == ai["linkedin"]
+    monkeypatch.setattr(fc, "ask_json", lambda *a, **k: {**ai, "linkedin": "Hello Mary, " + "x" * 300})
+    written = fc.write_first(SHOP, camp, SETTINGS, BUSINESS)
+    assert written["linkedin"] == fc.linkedin_note(SHOP, camp, SETTINGS, BUSINESS)
+
+
+LINKEDIN_LIST = """Company,LinkedIn,City
+Banda Logistics,https://www.linkedin.com/company/banda-logistics,Lusaka
+Chanda Stores,,Kitwe
+"""
+
+
+def test_a_business_on_linkedin_only_is_written_to_and_sent_from_the_owners_own_linkedin(api):
+    client, db = api
+    _campaign(client)
+    got = client.post("/clients/import", json={"text": LINKEDIN_LIST}).json()
+    assert got["added"] == 2
+    by = {p["name"]: p for p in db.rows["client_prospects"]}
+    assert by["Banda Logistics"]["linkedin"] == "https://www.linkedin.com/company/banda-logistics"
+    assert "linkedin" in by["Chanda Stores"] and by["Chanda Stores"]["linkedin"] is None   # one insert, same fields
+    client.post("/clients/research", json={})
+    banda = next(p for p in db.rows["client_prospects"] if p["name"] == "Banda Logistics")
+    assert banda["stage"] == "researched" and "is on LinkedIn" in banda["fit_reasons"]
+    chanda = next(p for p in db.rows["client_prospects"] if p["name"] == "Chanda Stores")
+    assert chanda["stage"] == "skipped"                                   # no way to reach them yet
+    # A business with no way in is told to find them on LinkedIn.
+    r = client.post(f"/clients/prospects/{chanda['id']}/write")
+    assert r.status_code == 400 and "Find them on LinkedIn" in r.json()["detail"]
+    one = client.get(f"/clients/prospects/{chanda['id']}").json()["prospect"]
+    assert one["linkedin"] is None and one["linkedin_search"].endswith("keywords=Chanda%20Stores")
+    draft = client.post(f"/clients/prospects/{banda['id']}/write").json()["draft"]
+    assert draft["channel"] == "linkedin" and len(draft["linkedin"]) <= fc.LINKEDIN_NOTE_MAX
+    home = client.get("/clients").json()
+    d = next(x for x in home["drafts"] if x["id"] == draft["id"])
+    assert d["links"]["linkedin"] == "https://www.linkedin.com/company/banda-logistics"
+    assert "mailto" not in d["links"] and "whatsapp" not in d["links"]
+    # The owner can change the note before they paste it.
+    edited = client.patch(f"/clients/messages/{draft['id']}", json={"linkedin": "Hello, I would be glad to connect."})
+    assert edited.json()["message"]["linkedin"] == "Hello, I would be glad to connect."
+    p = client.post(f"/clients/messages/{draft['id']}/sent", json={"channel": "linkedin"}).json()["prospect"]
+    assert p["stage"] == "contacted" and p["next_followup_at"]
+    sent = next(m for m in db.rows["client_messages"] if m["id"] == draft["id"])
+    assert sent["status"] == "sent" and sent["channel"] == "linkedin"
+    # Nothing was sent by AIBOS, and LinkedIn was never opened: no client was made.
+    assert all(m["status"] in ("draft", "sent", "discarded") for m in db.rows["client_messages"])
+
+
+def test_research_keeps_the_linkedin_page_a_website_links_to(api, monkeypatch):
+    client, db = api
+    _campaign(client)
+    site = {**SITES["https://mwapehardware.co.zm"], "linkedin": "https://www.linkedin.com/company/mwape-hardware"}
+    monkeypatch.setattr(fc, "read_site", lambda url: site if url == "https://mwapehardware.co.zm" else _site(url))
+    client.post("/clients/import", json={"text": LIST})
+    client.post("/clients/research", json={})
+    mwape = next(p for p in db.rows["client_prospects"] if p["name"] == "Mwape Hardware")
+    assert mwape["linkedin"] == "https://www.linkedin.com/company/mwape-hardware"
+    draft = next(d for d in client.get("/clients").json()["drafts"] if d["prospect"]["name"] == "Mwape Hardware")
+    assert draft["channel"] == "email"                                    # email first when there is one
+    assert draft["linkedin"].startswith("Hello Mary,") and draft["links"]["linkedin"].endswith("/mwape-hardware")
+
+
+def test_stop_on_linkedin_means_stop_for_good(api):
+    client, db = api
+    client.post("/clients/import", json={"text": LINKEDIN_LIST})
+    banda = next(p for p in db.rows["client_prospects"] if p["name"] == "Banda Logistics")
+    draft = client.post(f"/clients/prospects/{banda['id']}/write").json()["draft"]
+    client.post(f"/clients/messages/{draft['id']}/sent", json={"channel": "linkedin"})
+    got = client.post(f"/clients/prospects/{banda['id']}/reply", json={"text": "Please stop messaging me."}).json()
+    assert got["label"] == "unsubscribe"
+    assert "https://www.linkedin.com/company/banda-logistics" in client.get("/clients").json()["settings"]["do_not_contact"]
+    db.rows["client_prospects"].clear()
+    again = client.post("/clients/import", json={"text": LINKEDIN_LIST}).json()
+    assert again["blocked"] == 1 and again["added"] == 1
+
+
+class _ChannelCheck:
+    """A database with migration 0045 only: client_messages refuses
+    'linkedin' as a channel, the way its check constraint does."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, k):
+        return getattr(self._db, k)
+
+    def table(self, name):
+        t = self._db.table(name)
+        if name != "client_messages":
+            return t
+
+        def refuse(p):
+            for r in (p if isinstance(p, list) else [p]):
+                if r.get("channel") == "linkedin":
+                    raise Exception('23514: new row for relation "client_messages" violates check constraint '
+                                    '"client_messages_channel_check"')
+
+        class _T:
+            def __getattr__(self, k):
+                return getattr(t, k)
+
+            def insert(self, p):
+                refuse(p)
+                return t.insert(p)
+
+            def update(self, p):
+                refuse(p)
+                return t.update(p)
+        return _T()
+
+
+def test_before_migration_0046_everything_else_works_and_linkedin_says_what_to_run(api, monkeypatch):
+    client, db = api
+    db.missing_columns |= {("client_prospects", "linkedin"), ("client_messages", "linkedin")}
+    checked = _ChannelCheck(db)
+    monkeypatch.setattr(find_clients_routes, "get_db", lambda: checked)
+    _campaign(client)
+    site = {**SITES["https://mwapehardware.co.zm"], "linkedin": "https://www.linkedin.com/company/mwape-hardware"}
+    monkeypatch.setattr(fc, "read_site", lambda url: site if url == "https://mwapehardware.co.zm" else _site(url))
+    got = client.post("/clients/import",
+                      json={"text": LIST + "Banda Logistics,,,,,linkedin.com/company/banda,Lusaka\n"}).json()
+    assert got["added"] == 4
+    assert all("linkedin" not in p for p in db.rows["client_prospects"])
+    client.post("/clients/research", json={})
+    home = client.get("/clients")
+    assert home.status_code == 200
+    draft = next(d for d in home.json()["drafts"] if d["prospect"]["name"] == "Mwape Hardware")
+    assert draft["channel"] == "email" and "linkedin" not in draft and draft["links"]["mailto"]
+    # Sent on LinkedIn still counts as sent, so the follow-ups come.
+    p = client.post(f"/clients/messages/{draft['id']}/sent", json={"channel": "linkedin"}).json()["prospect"]
+    assert p["stage"] == "contacted"
+    assert next(m for m in db.rows["client_messages"] if m["id"] == draft["id"])["channel"] == "email"
+    # Keeping a LinkedIn address says what to run; the rest of the edit is kept.
+    r = client.patch(f"/clients/prospects/{p['id']}", json={"contact_role": "Owner",
+                                                             "linkedin": "linkedin.com/in/mary-mwape"})
+    assert r.status_code == 409 and "0046_find_clients_linkedin.sql" in r.json()["detail"]
+    assert next(x for x in db.rows["client_prospects"] if x["id"] == p["id"])["contact_role"] == "Owner"
+    # A LinkedIn address that is not one is said plainly.
+    r = client.patch(f"/clients/prospects/{p['id']}", json={"linkedin": "mary on linkedin"})
+    assert r.status_code == 400 and "not a LinkedIn address" in r.json()["detail"]
+    assert fc._li_missing(Exception("PGRST204: Could not find the 'linkedin' column of 'client_prospects'"))
+    assert not fc._li_missing(Exception("23505: duplicate key value violates unique constraint"))

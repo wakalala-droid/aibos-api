@@ -19,12 +19,23 @@ Credits are spent free day first, then the month, then top-ups (what runs out
 soonest goes first), each spend recorded in usage_events with its pool.
 
 IT NEVER SENDS ANYTHING ITSELF. Every message is a draft until the owner
-presses Send by email or Send on WhatsApp, which opens their own email or
-WhatsApp with the message ready. So each message goes out in the owner's own
-name, from their own address, and AIBOS's mail domain (the one that carries
-payslips, briefs and receipts) never carries anyone's first message to a
-stranger. Every first message ends with a way to say no, and a "stop" puts
-the address on the do not contact list for good.
+presses Send by email, on WhatsApp or on LinkedIn, which opens their own
+email, WhatsApp or LinkedIn with the message ready. So each message goes out
+in the owner's own name, from their own address, and AIBOS's mail domain (the
+one that carries payslips, briefs and receipts) never carries anyone's first
+message to a stranger. Every first message ends with a way to say no, and a
+"stop" puts the address on the do not contact list for good.
+
+LINKEDIN, THE SAFE WAY (owner's decision, 10 Nov 2026). Explee sends from a
+LinkedIn account connected to it. LinkedIn's User Agreement (section 8.2)
+bars bots that add contacts or send messages, and its open API gives apps no
+search and no messaging, so AIBOS never opens LinkedIn itself, not even one
+page. It keeps the LinkedIn address a business links to from its own website
+(or one the owner pastes or imports), gives a LinkedIn search that opens in
+the owner's own LinkedIn, and writes a connection note short enough for a
+free account. The owner pastes it and presses send. Migration 0046 holds the
+address, the note and "linkedin" as a way a message went; until it is run,
+everything else works as before and LinkedIn waits.
 
 WHAT IT COSTS TO RUN. One business researched and written to is two AI calls
 on the Flash model, about 1.5 US cents. Finding costs nothing, and follow-ups
@@ -229,6 +240,39 @@ def _dup(exc: Exception) -> bool:
     return "23505" in text or "duplicate key" in text
 
 
+def _li_missing(exc: Exception) -> bool:
+    """Migration 0046 is not run yet: no LinkedIn columns (PGRST204 or 42703
+    naming one), or "linkedin" not yet allowed as a way a message went
+    (the channel check)."""
+    text = str(exc)
+    return ("linkedin" in text and any(t in text for t in ("PGRST204", "42703", "schema cache", "does not exist"))) \
+        or "channel_check" in text
+
+
+def _li_drop(payload, channel: str = "email"):
+    """The same write without what migration 0046 adds."""
+    def one(r: dict) -> dict:
+        r = {k: v for k, v in r.items() if k != "linkedin"}
+        if r.get("channel") == "linkedin":
+            r["channel"] = channel
+        return r
+    return [one(r) for r in payload] if isinstance(payload, list) else one(payload)
+
+
+def _li_write(run, payload, channel: str = "email"):
+    """run(payload), or, on a database without migration 0046 yet, run it
+    again without the LinkedIn parts, so everything else works before the
+    migration is pasted. Returns (what run returned, whether LinkedIn was
+    kept)."""
+    try:
+        return run(payload), True
+    except Exception as e:  # noqa: BLE001
+        if not _li_missing(e):
+            raise
+        log.info("[find_clients] LinkedIn waits for migration 0046: %s", str(e)[:160])
+    return run(_li_drop(payload, channel)), False
+
+
 def _text(v, limit: int = 500) -> str:
     return re.sub(r"\s+", " ", str(v or "")).strip()[:limit]
 
@@ -280,6 +324,45 @@ def _host(url) -> str:
     return h[4:] if h.startswith("www.") else h
 
 
+# LinkedIn (migration 0046). A note sent with an invitation may be 200
+# characters on a free account (300 on Premium), so the note is written to 200.
+LINKEDIN_NOTE_MAX = 200
+LINKEDIN_SETUP = ("LinkedIn needs one more step on this database: run migration "
+                  "0046_find_clients_linkedin.sql in Supabase.")
+LINKEDIN_RE = re.compile(r"^(?:https?://)?(?:[a-z]{1,3}\.)?linkedin\.com/(company|in|school|showcase)/([^/?#\s\"'<>]+)",
+                         re.I)
+
+
+def _linkedin(v) -> str | None:
+    """A LinkedIn page or profile as one address, the way it is kept and
+    compared (https://www.linkedin.com/company/mwape-hardware), or None when
+    it is not one."""
+    m = LINKEDIN_RE.match(str(v or "").strip())
+    if not m:
+        return None
+    slug = m.group(2).rstrip(".,;:)").lower()
+    return f"https://www.linkedin.com/{m.group(1).lower()}/{slug}" if slug else None
+
+
+def _linkedin_host(url) -> bool:
+    """A LinkedIn address of any kind, which AIBOS never opens itself."""
+    h = _host(url)
+    return h in ("linkedin.com", "lnkd.in") or h.endswith(".linkedin.com")
+
+
+def linkedin_search(p: dict) -> str | None:
+    """A LinkedIn search for them that opens in the owner's own LinkedIn, to
+    find the person who decides: by name when it is known, else the
+    business."""
+    name = _text(p.get("name"), 120)
+    if not name:
+        return None
+    who = _text(p.get("contact_name"), 80)
+    if who:
+        return "https://www.linkedin.com/search/results/people/?keywords=" + quote(f"{who} {name}")
+    return "https://www.linkedin.com/search/results/all/?keywords=" + quote(name)
+
+
 def _digits9(v) -> str:
     """The last nine digits: the part of a Zambian number that does not change
     with how it is written (097..., +260 97..., 00260 97...)."""
@@ -312,7 +395,8 @@ def first_name(p: dict) -> str | None:
 
 def dedupe_key(p: dict) -> str:
     """One prospect per address: the email, else the website, else the map
-    place, else the phone, else the name in its town."""
+    place, else the phone, else the LinkedIn address, else the name in its
+    town."""
     email = _email(p.get("email"))
     if email:
         return "e:" + email
@@ -324,13 +408,16 @@ def dedupe_key(p: dict) -> str:
     phone = _digits9(p.get("phone"))
     if phone:
         return "p:" + phone
+    li = _linkedin(p.get("linkedin"))
+    if li:
+        return "l:" + li.split("://", 1)[-1]
     name = re.sub(r"\W+", " ", _text(p.get("name"), 160).lower()).strip()
     return f"n:{name}|{_text(p.get('town'), 60).lower()}"
 
 
 def blocked(p: dict, dnc: list) -> bool:
-    """On the do not contact list: the email, its whole domain, the website or
-    the phone number."""
+    """On the do not contact list: the email, its whole domain, the website,
+    the phone number or the LinkedIn address."""
     if not dnc:
         return False
     items = {str(x).strip().lower().lstrip("@") for x in dnc if str(x or "").strip()}
@@ -339,13 +426,17 @@ def blocked(p: dict, dnc: list) -> bool:
     host = _host(p.get("website"))
     phone = _digits9(p.get("phone"))
     phones = {_digits9(x) for x in items if re.search(r"\d{7,}", x)}
+    li = _linkedin(p.get("linkedin"))
+    lis = {_linkedin(x) for x in items if "linkedin.com/" in x}
     return bool((email and email in items) or (domain and domain in items)
-                or (host and host in items) or (phone and phone in phones))
+                or (host and host in items) or (phone and phone in phones) or (li and li in lis))
 
 
 def links(prospect: dict, msg: dict) -> dict:
-    """Where Send opens: the owner's own email app, Gmail, or WhatsApp, with
-    the message filled in. Nothing is sent until they press send there."""
+    """Where Send opens: the owner's own email app, Gmail, WhatsApp or
+    LinkedIn. Email and WhatsApp open with the message filled in; LinkedIn
+    opens their page (or a search for them) and the page copies the note to
+    paste. Nothing is sent until the owner presses send there."""
     out = {}
     subject, body = msg.get("subject") or "", msg.get("body") or ""
     email = _email(prospect.get("email"))
@@ -356,6 +447,12 @@ def links(prospect: dict, msg: dict) -> dict:
     wa = whatsapp_number(prospect.get("phone"))
     if wa:
         out["whatsapp"] = f"https://wa.me/{wa}?text={quote(msg.get('whatsapp') or body)}"
+    li = _linkedin(prospect.get("linkedin"))
+    if li:
+        out["linkedin"] = li
+    search = linkedin_search(prospect)
+    if search:
+        out["linkedin_search"] = search
     return out
 
 
@@ -567,8 +664,8 @@ def fill_campaign(line: str, business: dict, told: str = "") -> dict:
 
 # ── Prospects ─────────────────────────────────────────────────────────────────
 
-PROSPECT_EDIT = ("name", "email", "phone", "website", "town", "address", "contact_name", "contact_role",
-                 "notes", "stage", "hot", "campaign_id", "kind")
+PROSPECT_EDIT = ("name", "email", "phone", "website", "linkedin", "town", "address", "contact_name",
+                 "contact_role", "notes", "stage", "hot", "campaign_id", "kind")
 
 
 def list_prospects(db, uid: str, bid: str | None, campaign_id: str | None = None,
@@ -606,6 +703,14 @@ def clean_prospect(p: dict) -> dict:
         "source": p.get("source") if p.get("source") in ("map", "list", "typed") else "typed",
         "source_ref": _text(p.get("source_ref"), 80) or None,
     }
+    # A LinkedIn address is kept as their LinkedIn, never as a website to read:
+    # small businesses often give their LinkedIn or Facebook page as their site.
+    li = _linkedin(p.get("linkedin"))
+    if row["website"] and _linkedin_host(row["website"]):
+        li = li or _linkedin(row["website"])
+        row["website"] = None
+    if li:
+        row["linkedin"] = li
     if not row["name"]:
         row["name"] = (row["email"] or row["website"] or "").split("@")[-1] or ""
     return row
@@ -637,10 +742,17 @@ def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, s
             continue
         fresh.append({**row, "user_id": uid, "business_id": bid, "campaign_id": campaign_id,
                       "dedupe_key": key, "stage": "new", "fit_reasons": []})
+    def insert(rows):
+        return db.table("client_prospects").insert(rows).execute().data or []
+
     for i in range(0, len(fresh), 200):
         chunk = fresh[i:i + 200]
+        # One insert of many rows needs the same fields in each: only some
+        # have a LinkedIn address.
+        if any("linkedin" in r for r in chunk):
+            chunk = [{"linkedin": None, **r} for r in chunk]
         try:
-            added += len(db.table("client_prospects").insert(chunk).execute().data or [])
+            added += len(_li_write(insert, chunk)[0])
         except Exception as e:  # noqa: BLE001
             # Another press added one of these a moment ago: add the rest one
             # by one and count the clash as already here.
@@ -648,7 +760,7 @@ def add_prospects(db, uid: str, bid: str, rows: list, campaign_id: str | None, s
                 raise
             for row in chunk:
                 try:
-                    added += len(db.table("client_prospects").insert(row).execute().data or [])
+                    added += len(_li_write(insert, row)[0])
                 except Exception as e2:  # noqa: BLE001
                     if not _dup(e2):
                         raise
@@ -677,6 +789,18 @@ def update_prospect(db, uid: str, pid: str, patch: dict) -> dict:
             row["email"] = _email(v)
         elif k == "website":
             row["website"] = _website(v)
+            if row["website"] and _linkedin_host(row["website"]):
+                # Their LinkedIn page given as their website: kept as LinkedIn.
+                row["linkedin"] = _linkedin(row["website"]) or row.get("linkedin")
+                row["website"] = None
+        elif k == "linkedin":
+            said = _text(v, 300)
+            li = _linkedin(said)
+            if said and not li:
+                raise ValueError("That is not a LinkedIn address. Paste one like linkedin.com/company/their-name "
+                                 "or linkedin.com/in/their-name.")
+            if li or not row.get("linkedin"):
+                row["linkedin"] = li
         elif k == "notes":
             row["notes"] = _para(v, 1000) or None
         elif k == "campaign_id":
@@ -688,9 +812,12 @@ def update_prospect(db, uid: str, pid: str, patch: dict) -> dict:
     if not row:
         return p
     row["updated_at"] = _iso()
-    db.table("client_prospects").update(row).eq("user_id", uid).eq("id", pid).execute()
+    _, kept_li = _li_write(lambda r: db.table("client_prospects").update(r).eq("user_id", uid).eq("id", pid).execute(),
+                           row)
     if row.get("stage") in ("won", "lost", "skipped"):
         _discard_drafts(db, uid, pid)
+    if not kept_li and row.get("linkedin"):
+        raise Refused(("The other details are saved. " if len(row) > 2 else "") + LINKEDIN_SETUP)
     return get_prospect(db, uid, pid) or p
 
 
@@ -708,6 +835,9 @@ _COLS = {
     "email": ("email", "e-mail", "email address", "work email", "contact email"),
     "phone": ("phone", "phone number", "mobile", "cell", "whatsapp", "tel", "telephone", "contact number"),
     "website": ("website", "web", "url", "site", "company website", "domain"),
+    # Explee's "LinkedIn", Apollo's "Person Linkedin Url" and the like.
+    "linkedin": ("linkedin", "linkedin url", "linkedin profile", "linkedin page", "person linkedin url",
+                 "linkedin profile url", "company linkedin url", "company linkedin"),
     "town": ("town", "city", "location", "district", "province"),
     "address": ("address", "street", "physical address"),
     "contact_name": ("contact", "contact name", "full name", "person", "owner"),
@@ -754,9 +884,9 @@ def parse_list(text: str) -> list:
             if "name" in pick and pick["name"] == pick.get("contact_name"):
                 name = ""
             out.append({"name": name or contact, "email": cell("email"), "phone": cell("phone"),
-                        "website": cell("website"), "town": cell("town"), "address": cell("address"),
-                        "contact_name": contact or None, "contact_role": cell("contact_role"),
-                        "notes": cell("notes"), "source": "list"})
+                        "website": cell("website"), "linkedin": cell("linkedin"), "town": cell("town"),
+                        "address": cell("address"), "contact_name": contact or None,
+                        "contact_role": cell("contact_role"), "notes": cell("notes"), "source": "list"})
         return out
     # No headings: read each line's cells by what they look like. Each line is
     # split on its own separator, since a list typed by hand mixes them.
@@ -770,6 +900,8 @@ def parse_list(text: str) -> list:
                 continue
             if not item.get("email") and _email(c):
                 item["email"] = c
+            elif not item.get("linkedin") and _linkedin(c):
+                item["linkedin"] = c
             elif not item.get("website") and _website(c) and "." in c and " " not in c:
                 item["website"] = c
             elif not item.get("phone") and re.fullmatch(r"[+\d][\d\s()-]{6,}", c):
@@ -1235,14 +1367,31 @@ SPAM = re.compile(r"\b(slot ?\d*|slot gacor|togel|judi|casino online|poker onlin
                   re.I)
 
 
+_LI_HREF = re.compile(r"https?://(?:[a-z]{1,3}\.)?linkedin\.com/(?:company|in|school|showcase)/[^\s\"'<>?#]+", re.I)
+
+
+def _site_linkedin(html: str) -> str | None:
+    """The business's own LinkedIn, from the links on its own website: its
+    company page first, else a person's profile."""
+    found = [li for li in (_linkedin(m.group(0)) for m in _LI_HREF.finditer(html or "")) if li]
+    return next((li for li in found if "/company/" in li), found[0] if found else None)
+
+
 def read_site(url: str) -> dict:
-    """A website's front page: {ok, title, text, emails, phones} or {ok: False, error}."""
+    """A website's front page: {ok, title, text, emails, phones, linkedin} or
+    {ok: False, error}. Never LinkedIn itself (its User Agreement bars bots):
+    a LinkedIn address is handed back to be kept, not read."""
     url = _website(url) or ""
     if not url:
         return {"ok": False, "error": "no website"}
+    if _linkedin_host(url):
+        return {"ok": False, "error": "its web address is its LinkedIn page", "linkedin": _linkedin(url)}
     try:
         with httpx.Client(timeout=10, follow_redirects=False, headers={"User-Agent": USER_AGENT}) as c:
             for _ in range(5):
+                if _linkedin_host(url):
+                    # A website that sends visitors on to LinkedIn: kept, not followed.
+                    return {"ok": False, "error": "its website sends visitors to LinkedIn", "linkedin": _linkedin(url)}
                 if not _public_host(url):
                     return {"ok": False, "error": "not a public website"}
                 with c.stream("GET", url) as r:
@@ -1271,7 +1420,8 @@ def read_site(url: str) -> dict:
     if SPAM.search(page.title + " " + text[:3000]):
         return {"ok": False, "hijacked": True,
                 "error": "the website shows gambling or spam, so it may be hijacked or abandoned"}
-    return {"ok": True, "title": _text(page.title, 200), "text": text[:5000], "emails": emails[:5], "phones": phones[:5]}
+    return {"ok": True, "title": _text(page.title, 200), "text": text[:5000], "emails": emails[:5], "phones": phones[:5],
+            "linkedin": _site_linkedin(html)}
 
 
 _MX: dict = {}
@@ -1361,6 +1511,9 @@ def rules_fit(p: dict, site: dict, campaign: dict | None) -> dict:
     if p.get("phone") or site.get("phones"):
         score += 5
         reasons.append("has a phone number")
+    if p.get("linkedin") or site.get("linkedin"):
+        score += 4
+        reasons.append("is on LinkedIn")
     role = p.get("contact_role") or ""
     if p.get("contact_name"):
         if JUNIOR.search(role):
@@ -1372,7 +1525,8 @@ def rules_fit(p: dict, site: dict, campaign: dict | None) -> dict:
         else:
             score += 4
             reasons.append(f"you know who to write to: {p['contact_name']}")
-    if not (p.get("email") or p.get("phone") or site.get("emails") or site.get("phones")):
+    if not (p.get("email") or p.get("phone") or site.get("emails") or site.get("phones")
+            or p.get("linkedin") or site.get("linkedin")):
         score -= 30
         reasons.append("no way to reach them yet")
     return {"fit": max(0, min(100, score)), "reasons": reasons[:4],
@@ -1389,6 +1543,7 @@ def research_one(p: dict, campaign: dict | None, business: dict) -> dict:
         "contact": p.get("contact_name"), "contact_role": p.get("contact_role"), "notes": p.get("notes"),
         "has_email": bool(p.get("email") or site.get("emails")),
         "has_phone": bool(p.get("phone") or site.get("phones")),
+        "has_linkedin": bool(p.get("linkedin") or site.get("linkedin")),
         "website_title": site.get("title"), "website_text": (site.get("text") or "")[:3500],
     }
     got = ask_json(
@@ -1422,6 +1577,8 @@ def research_one(p: dict, campaign: dict | None, business: dict) -> dict:
         found["email"] = site["emails"][0]
     if not p.get("phone") and site.get("phones"):
         found["phone"] = site["phones"][0]
+    if not p.get("linkedin") and site.get("linkedin"):
+        found["linkedin"] = site["linkedin"]
     email = found.get("email") or p.get("email")
     if email and mail_domain_ok(email) is False:
         out["fit"] = max(0, out["fit"] - 30)
@@ -1477,6 +1634,22 @@ def _offer_sentence(campaign: dict | None) -> str:
     return f"{o[0].upper()}{o[1:]}."
 
 
+def linkedin_note(p: dict, campaign: dict | None, settings: dict, business: dict) -> str:
+    """The note sent with a LinkedIn invitation: who the owner is and what
+    they offer, inside LINKEDIN_NOTE_MAX. The offer and where they were seen
+    go in only while there is room; the greeting, the name and the ask always
+    do."""
+    who = first_name(p)
+    name, firm = _sender(settings, business)
+    me = f"I'm {name} from {firm}." if firm and firm != name else (f"I'm {name}." if name else "")
+    ask = "I would be glad to connect."
+    text = " ".join(x for x in (f"Hello {who}," if who else "Hello,", me) if x)
+    for extra in (_offer_sentence(campaign), f"I came across {_text(p.get('name'), 80)}."):
+        if extra and len(text) + len(extra) + len(ask) + 2 <= LINKEDIN_NOTE_MAX:
+            text = f"{text} {extra}"
+    return f"{text} {ask}"[:LINKEDIN_NOTE_MAX]
+
+
 def _template_first(p: dict, campaign: dict | None, settings: dict, business: dict) -> dict:
     who = first_name(p)
     name, firm = _sender(settings, business)
@@ -1502,13 +1675,15 @@ def _template_first(p: dict, campaign: dict | None, settings: dict, business: di
         STOP_WA,
     ) if x)
     subject = _text(p["name"], 60)
-    return {"subject": subject, "body": body, "whatsapp": wa, "by": "template"}
+    return {"subject": subject, "body": body, "whatsapp": wa,
+            "linkedin": linkedin_note(p, campaign, settings, business), "by": "template"}
 
 
 def write_first(p: dict, campaign: dict | None, settings: dict, business: dict) -> dict:
-    """The first message, by email and by WhatsApp. The shape that worked on
-    the owner's own campaigns: one true detail about them, who we are and what
-    that means for them, then ask for a reply, not a meeting."""
+    """The first message, by email, by WhatsApp and as a LinkedIn note. The
+    shape that worked on the owner's own campaigns: one true detail about
+    them, who we are and what that means for them, then ask for a reply, not
+    a meeting."""
     base = _template_first(p, campaign, settings, business)
     c = campaign or {}
     name, firm = _sender(settings, business)
@@ -1519,7 +1694,9 @@ def write_first(p: dict, campaign: dict | None, settings: dict, business: dict) 
         "example 'Could I send you a few short ideas?'); never invent facts, numbers, clients or awards; no "
         "em dashes; British spelling. Do not write a signature or an opt-out line: they are added after. "
         "Reply with JSON only: {\"subject\": \"one to three words\", \"body\": \"the email, starting with the "
-        "greeting\", \"whatsapp\": \"the same message for WhatsApp, under 60 words, starting with the greeting\"}",
+        "greeting\", \"whatsapp\": \"the same message for WhatsApp, under 60 words, starting with the greeting\", "
+        f"\"linkedin\": \"a note to send with a LinkedIn invitation, under {LINKEDIN_NOTE_MAX - 20} characters, "
+        "starting with the greeting, saying who the sender is and why they would like to connect\"}",
         json.dumps({"to": {"business": p.get("name"), "contact": p.get("contact_name"),
                            "role": p.get("contact_role"), "town": p.get("town"), "summary": p.get("summary"),
                            "hook": p.get("hook")},
@@ -1530,9 +1707,14 @@ def write_first(p: dict, campaign: dict | None, settings: dict, business: dict) 
         wa = _text(got.get("whatsapp"), 600) or base["whatsapp"]
         if STOP_WA not in wa:
             wa = f"{wa} {STOP_WA}"
+        # A note LinkedIn would refuse as too long is not cut mid-sentence: the
+        # rules write one that fits.
+        note = _text(got.get("linkedin"), 1000)
+        if not note or len(note) > LINKEDIN_NOTE_MAX:
+            note = base["linkedin"]
         return {"subject": _text(got.get("subject"), 60) or base["subject"],
                 "body": f"{body}\n\n{_signature(settings, business)}\n\n{STOP_LINE}",
-                "whatsapp": wa, "by": "ai"}
+                "whatsapp": wa, "linkedin": note, "by": "ai"}
     return base
 
 
@@ -1696,14 +1878,27 @@ def _discard_drafts(db, uid: str, pid: str) -> None:
         .eq("prospect_id", pid).eq("status", "draft").execute()
 
 
+def _channel(p: dict) -> str:
+    """The way a message to them goes when the owner does not say: email,
+    else WhatsApp, else LinkedIn."""
+    if _email(p.get("email")):
+        return "email"
+    if whatsapp_number(p.get("phone")) or not _linkedin(p.get("linkedin")):
+        return "whatsapp"
+    return "linkedin"
+
+
 def add_draft(db, uid: str, bid: str, p: dict, kind: str, msg: dict) -> dict:
-    """One waiting draft per business at a time: a new one replaces the old."""
+    """One waiting draft per business at a time: a new one replaces the old.
+    A first message carries its LinkedIn note too."""
     _discard_drafts(db, uid, p["id"])
     row = {"user_id": uid, "business_id": bid, "prospect_id": p["id"], "direction": "out", "kind": kind,
-           "channel": "email" if p.get("email") else "whatsapp", "subject": msg.get("subject"),
+           "channel": _channel(p), "subject": msg.get("subject"),
            "body": msg.get("body") or "", "whatsapp": msg.get("whatsapp"), "status": "draft",
            "written_by": msg.get("by")}
-    made = db.table("client_messages").insert(row).execute().data or []
+    if msg.get("linkedin"):
+        row["linkedin"] = msg["linkedin"]
+    made, _ = _li_write(lambda r: db.table("client_messages").insert(r).execute().data or [], row)
     return made[0] if made else row
 
 
@@ -1725,8 +1920,11 @@ def edit_message(db, uid: str, mid: str, patch: dict) -> dict:
             raise ValueError("The message is empty.")
     if "whatsapp" in patch:
         row["whatsapp"] = _para(patch["whatsapp"], 1500)
+    if "linkedin" in patch:
+        # Premium allows 300 characters; the page says when it is past 200.
+        row["linkedin"] = _text(patch["linkedin"], 300) or None
     if row:
-        db.table("client_messages").update(row).eq("user_id", uid).eq("id", mid).execute()
+        _li_write(lambda r: db.table("client_messages").update(r).eq("user_id", uid).eq("id", mid).execute(), row)
     return get_message(db, uid, mid) or m
 
 
@@ -1741,8 +1939,11 @@ def discard_message(db, uid: str, mid: str) -> None:
             .eq("user_id", uid).eq("id", p["id"]).execute()
 
 
+CHANNELS = ("email", "whatsapp", "linkedin")
+
+
 def mark_sent(db, uid: str, mid: str, channel: str, settings: dict, now: datetime | None = None) -> dict:
-    """The owner pressed send in their own email or WhatsApp."""
+    """The owner pressed send in their own email, WhatsApp or LinkedIn."""
     now = now or _now()
     m = get_message(db, uid, mid)
     if not m or m.get("status") != "draft":
@@ -1752,9 +1953,12 @@ def mark_sent(db, uid: str, mid: str, channel: str, settings: dict, now: datetim
         raise NotHere("That business is not here.")
     if blocked(p, settings.get("do_not_contact") or []):
         raise Refused(f"{p['name']} is on your do not contact list.")
-    channel = channel if channel in ("email", "whatsapp") else (m.get("channel") or "email")
-    db.table("client_messages").update({"status": "sent", "sent_at": _iso(now), "channel": channel}) \
-        .eq("user_id", uid).eq("id", mid).execute()
+    channel = channel if channel in CHANNELS else (m.get("channel") or "email")
+    # Before migration 0046 a message sent on LinkedIn is still counted as
+    # sent (so follow-ups come), under the way it was drafted for.
+    _li_write(lambda r: db.table("client_messages").update(r).eq("user_id", uid).eq("id", mid).execute(),
+              {"status": "sent", "sent_at": _iso(now), "channel": channel},
+              m.get("channel") if m.get("channel") in ("email", "whatsapp") else "email")
     row: dict = {"last_contacted_at": _iso(now), "updated_at": _iso(now)}
     sent = int(p.get("followups_sent") or 0) + (1 if m.get("kind") == "followup" else 0)
     row["followups_sent"] = sent
@@ -1786,7 +1990,7 @@ def record_reply(db, uid: str, bid: str, pid: str, text: str, campaign: dict | N
     row: dict = {"updated_at": _iso(now)}
     if label == "unsubscribe":
         row.update({"stage": "lost", "next_followup_at": None, "hot": False})
-        add_to_dnc(db, uid, bid, *(x for x in (p.get("email"), p.get("phone")) if x))
+        add_to_dnc(db, uid, bid, *(x for x in (p.get("email"), p.get("phone"), _linkedin(p.get("linkedin"))) if x))
     elif label == "not_interested":
         row.update({"stage": "lost", "next_followup_at": None, "hot": False})
     elif label == "out_of_office":
@@ -1813,8 +2017,9 @@ def record_reply(db, uid: str, bid: str, pid: str, text: str, campaign: dict | N
 
 def write_first_for(db, uid: str, bid: str, p: dict, campaign: dict | None, settings: dict,
                     business: dict) -> dict:
-    if not (p.get("email") or whatsapp_number(p.get("phone"))):
-        raise ValueError(f"There is no email or WhatsApp number for {p['name']} yet.")
+    if not (p.get("email") or whatsapp_number(p.get("phone")) or _linkedin(p.get("linkedin"))):
+        raise ValueError(f"There is no email, WhatsApp number or LinkedIn for {p['name']} yet. "
+                         "Find them on LinkedIn and paste their address in Edit details.")
     if blocked(p, settings.get("do_not_contact") or []):
         raise Refused(f"{p['name']} is on your do not contact list.")
     kind = "followup" if p.get("stage") == "contacted" and p.get("last_contacted_at") else "first"
@@ -2061,13 +2266,23 @@ def research_and_write(db, uid: str, bid: str, p: dict, campaign: dict | None, s
         row["email"] = found["email"]
     if found.get("phone") and not p.get("phone"):
         row["phone"] = found["phone"]
+    if found.get("linkedin"):
+        row["linkedin"] = found["linkedin"]
+
+    def save(r):
+        r = dict(r)
+        merged = {**p, **r}
+        reachable = bool(_email(merged.get("email")) and not found.get("email_dead")) or bool(
+            whatsapp_number(merged.get("phone"))) or bool(_linkedin(merged.get("linkedin")))
+        r["stage"] = "researched" if reachable else "skipped"
+        if blocked(merged, settings.get("do_not_contact") or []):
+            r["stage"] = "skipped"
+        db.table("client_prospects").update(r).eq("user_id", uid).eq("id", p["id"]).execute()
+        return r
+
+    # Reachable on LinkedIn only counts once the address is kept (migration 0046).
+    row, _ = _li_write(save, row)
     merged = {**p, **row}
-    reachable = bool(_email(merged.get("email")) and not found.get("email_dead")) or bool(
-        whatsapp_number(merged.get("phone")))
-    row["stage"] = "researched" if reachable else "skipped"
-    if blocked(merged, settings.get("do_not_contact") or []):
-        row["stage"] = "skipped"
-    db.table("client_prospects").update(row).eq("user_id", uid).eq("id", p["id"]).execute()
     _count_one(db, uid, p["id"], pool)
     if row["stage"] == "researched" and got["fit"] >= WRITE_FROM:
         p2 = get_prospect(db, uid, p["id"]) or merged
@@ -2145,7 +2360,7 @@ def _demo_pick(prospects: list, n: int) -> list:
     with a website first (their fit can be read), then the ones that can be
     reached at all, newest first within each."""
     def rank(p):
-        return (0 if p.get("website") else 1, 0 if (p.get("email") or p.get("phone")) else 1)
+        return (0 if p.get("website") else 1, 0 if (p.get("email") or p.get("phone") or p.get("linkedin")) else 1)
     return sorted(prospects, key=rank)[:max(0, n)]
 
 
@@ -2229,6 +2444,8 @@ def _brief(p: dict) -> dict:
             "followups_sent", "notes", "source", "address", "researched_at", "research_note", "created_at")
     out = {k: p.get(k) for k in keep}
     out["whatsapp"] = whatsapp_number(p.get("phone"))
+    out["linkedin"] = _linkedin(p.get("linkedin"))
+    out["linkedin_search"] = linkedin_search(p)
     return out
 
 
