@@ -4190,6 +4190,26 @@ def notify_test_whatsapp(ctx: membership.Context = Depends(membership.require_co
     return {"ok": True, "to": number[-3:]}
 
 
+@app.get("/brief/spoken")
+def brief_spoken(ctx: membership.Context = Depends(membership.require_context)):
+    """The brief AIBOS reads aloud when the owner presses Talk (spoken_brief.py).
+
+    The emailed Morning Brief's own lines and plan rules, the next two days of
+    the schedule, and "What would you like me to handle first?". Staff hear
+    the schedule only. No model call, so it costs nothing and never invents a
+    number; `speech` is the same text in words a voice reads properly."""
+    import spoken_brief
+    db = _require_db()
+    name = None
+    try:
+        rows = getattr(db.table("profiles").select("business_name")
+                       .eq("id", ctx.tenant).limit(1).execute(), "data", None) or []
+        name = (rows[0].get("business_name") if rows else None) or None
+    except Exception as e:  # noqa: BLE001: the brief goes on without the name
+        logger.info("spoken brief: no business name for %s: %s", ctx.tenant, e)
+    return spoken_brief.compose(db, ctx.tenant, ctx.role, ctx.business_id, name)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EVOLUTION SPINE — Business Events + Digital Twin
 # (Directive Initiatives 5, 11, 12 · ADR-001 · RFC-001)
