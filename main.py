@@ -8460,6 +8460,9 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a month, from 07:00 on the 1st: what AIBOS did for each
             # owner in the month just gone, every line from their records.
             ("month_note", lambda: __import__("month_note").deliver(db)),
+            # Once a week, from 07:00 on Monday, every plan: last week's money
+            # in and out and one thing to do this week (weekly_note.py).
+            ("weekly_note", lambda: __import__("weekly_note").deliver(db)),
             # Find clients' own directory of places, filled and renewed a
             # few towns at a time on a thread of its own, so a search reads
             # it instead of waiting on a busy public map server.

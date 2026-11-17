@@ -959,9 +959,17 @@ def decide(db, tenant: str, actor: str, action_id: str, yes: bool) -> dict:
     out = _run(db, tenant, biz, actor, row, "asked")
     kind = row["kind"]
     if KINDS[kind]["earnable"]:
-        offer = _offer(_recent(db, tenant, biz), kind, autopilot_on(db, tenant, biz, kind))
+        rows = _recent(db, tenant, biz)
+        switched_on = autopilot_on(db, tenant, biz, kind)
+        offer = _offer(rows, kind, switched_on)
         if offer:
             out["offer_autopilot"] = offer
+        elif not switched_on:
+            # How close this kind is to running by itself (the UX audit,
+            # 17 Nov 2026): every yes visibly builds toward something.
+            s = streak(rows, kind)
+            if 0 < s["count"] < EARN_AFTER:
+                out["earning"] = {"approved_in_a_row": s["count"], "needs": EARN_AFTER}
     return out
 
 

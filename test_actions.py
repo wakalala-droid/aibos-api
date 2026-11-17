@@ -160,9 +160,12 @@ def test_automatic_is_offered_on_the_fifth_yes_and_only_switched_on_once_earned(
         out = _approve(db, amount)
         if n < actions.EARN_AFTER:
             assert "offer_autopilot" not in out
+            # Each yes says how close it is.
+            assert out["earning"] == {"approved_in_a_row": n, "needs": actions.EARN_AFTER}
             with pytest.raises(actions.ActionError, match="more of these first"):
                 actions.set_autopilot(db, OWNER, None, "record_entry", True)
     offer = out["offer_autopilot"]
+    assert "earning" not in out
     assert offer["approved_in_a_row"] == 5 and offer["largest"] == 400
     assert "up to K400.00 each" in offer["said"]
 
