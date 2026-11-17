@@ -246,11 +246,28 @@ def test_a_worker_question_waits_a_week(db):
 def test_the_roster_counts_what_each_worker_has_waiting(db):
     _seed(db)
     workers.run_business(db, OWNER, None, whole_owner=False, now=NOW)
-    r = {w["id"]: w for w in workers.roster(db, OWNER, None, now=NOW)["workers"]}
-    assert [w["name"] for w in workers.roster(db, OWNER, None, now=NOW)["workers"]] == \
-        ["Bookkeeper", "Collector", "Tax clerk", "Payroll clerk", "Sales scout", "Guest desk"]
+    team = workers.roster(db, OWNER, None, now=NOW)
+    r = {w["id"]: w for w in team["workers"]}
+    assert [w["name"] for w in team["workers"]] == \
+        ["Assistant", "Bookkeeper", "Collector", "Tax clerk", "Payroll clerk", "Sales scout", "Guest desk"]
     assert r["bookkeeper"]["waiting"] == 1 and r["collector"]["waiting"] == 1
     assert r["guest_desk"]["waiting"] == 0 and r["guest_desk"]["last"] is None
+    # On Pro+ the Guest desk is not on the plan; payroll is.
+    assert r["guest_desk"]["on"] is False and r["guest_desk"]["off_reason"] == "Comes with Growth"
+    assert r["payroll"]["on"] is True
+    assert team["looked_at"] == NOW.isoformat()
+
+
+def test_the_assistant_counts_what_the_owner_asked_for_and_its_earned_switch(db):
+    for i in range(2):
+        job = actions.propose(db, OWNER, OWNER, None, "record_entry",
+                              {"event_type": "Sale", "amount": 100 + i, "customer": "Banda"}, now=NOW)
+        actions.decide(db, OWNER, OWNER, job["id"], True)
+    a = workers.roster(db, OWNER, None, now=NOW)["workers"][0]
+    assert a["id"] == "assistant" and a["done_this_week"] == 2 and a["waiting"] == 0
+    (entries,) = a["autopilot"]
+    assert entries["kind"] == "record_entry" and entries["approved_in_a_row"] == 2
+    assert entries["earned"] is False and entries["on"] is False
 
 
 def test_the_hourly_pass_runs_in_the_day_every_few_hours_and_tells_the_owner(db, monkeypatch):

@@ -338,6 +338,7 @@ def run_business(db, tenant: str, business_id: str | None, whole_owner: bool = T
                     and r.get("ref") not in fresh):
                 actions._update(db, tenant, r["id"], {"status": "expired", "decided_at": actions._now_iso()})
                 closed += 1
+    _LOOKED[(tenant, str(actions.twin._books_for(db, tenant, business_id)))] = now.isoformat()
     return {"new": new, "closed": closed}
 
 
@@ -354,23 +355,46 @@ def run_now(db, tenant: str, business_id: str | None) -> dict:
     return {"new": len(out["new"]), "closed": out["closed"]}
 
 
+# What each worker needs on the owner's plan, beyond jobs themselves.
+NEEDS = {"payroll": ("payroll", "Pro+"), "guest_desk": ("hospitality", "Growth")}
+
+# When the workers last looked through each business's books, in this run of
+# the API (the mission-control screen says it; a restart forgets it).
+_LOOKED: dict = {}
+
+
 def roster(db, tenant: str, business_id: str | None, now: datetime | None = None) -> dict:
-    """Each worker with what it has waiting and what the owner said yes to in
-    the last 7 days. Raises actions.NotReady before migration 0047."""
+    """The team for the mission-control screen: the Assistant (the jobs the
+    owner asks for in the chat, with the earned "do these yourself" switch)
+    and each worker, with whether the plan includes it, what it has waiting,
+    what was done in the last 7 days and its last job. Raises
+    actions.NotReady before migration 0047."""
+    import entitlements
     now = now or datetime.now(timezone.utc)
     biz = actions.twin._books_for(db, tenant, business_id)
     rows = actions._recent(db, tenant, biz, limit=300)
-    out = []
-    for w, name, does in WORKERS:
-        mine = [r for r in rows if actions.worker_of(r) == w]
+    tier = entitlements.tier_detail(tenant)["tier"]
+
+    def counts(mine: list) -> dict:
         waiting = [r for r in mine if r.get("status") == "waiting" and not actions._expired(r, now)]
         done = [r for r in mine if r.get("status") == "done"
                 and not actions._older_than({"created_at": r.get("decided_at") or r.get("created_at")},
                                             7 * 86400, now, unreadable=True)]
-        out.append({"id": w, "name": name, "does": does, "waiting": len(waiting),
-                    "done_this_week": len(done),
-                    "last": actions.public(mine[0]) if mine else None})
-    return {"workers": out}
+        return {"waiting": len(waiting), "done_this_week": len(done),
+                "last": actions.public(mine[0]) if mine else None}
+
+    asked = [r for r in rows if r.get("source") in ("chat", "talk")]
+    out = [{"id": "assistant", "name": "Assistant", "does": "Does the jobs you ask for, typed or spoken",
+            "on": True, "off_reason": None, **counts(asked),
+            "autopilot": actions.autopilot_state(db, tenant, biz)["kinds"]}]
+    for w, name, does in WORKERS:
+        need = NEEDS.get(w)
+        on = not need or entitlements.can_access(tier, need[0])
+        out.append({"id": w, "name": name, "does": does, "on": on,
+                    "off_reason": None if on else f"Comes with {need[1]}",
+                    **counts([r for r in rows if actions.worker_of(r) == w])})
+    return {"workers": out, "looked_at": _LOOKED.get((tenant, str(biz))),
+            "every_hours": EVERY_HOURS, "day_from": DAY_FROM, "day_to": DAY_TO}
 
 
 _LAST = {"at": None}
