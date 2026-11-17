@@ -8861,6 +8861,39 @@ def admin_card_reminder(req: CardReminder, user_id: str = Depends(require_user))
                                                  card_environment=paddle.environment())}
 
 
+class PlanGift(BaseModel):
+    target_user_id: str
+    plan: str = "growth"
+    months: int = 1
+    # Who the welcome screen greets, as the owner would say it ("Mr Ryan Banda").
+    name: str
+    business: str = ""
+
+
+@app.post("/admin/gift-plan")
+def admin_gift_plan(req: PlanGift, user_id: str = Depends(require_user)):
+    """Give an account a paid plan free for a few months (gifts.py): it ends on
+    its own, nobody is asked to pay for it, and the owner is welcomed by name.
+
+    Only an AI-BOS administrator (membership.is_admin)."""
+    db = _require_db()
+    if not membership.is_admin(db, user_id):
+        raise HTTPException(status_code=403, detail="Only an AI-BOS administrator can give a plan.")
+    import gifts
+    try:
+        out = gifts.grant(db, req.target_user_id, req.plan, req.months, req.name, req.business,
+                          granted_by=f"admin:{user_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        import webpush
+        webpush.send_to_user(db, req.target_user_id, out["title"], out["body"], "/dashboard",
+                             extra={"tag": "plan-gift"})
+    except Exception as e:  # noqa: BLE001 — the bell and the welcome screen still have it
+        log.info("[gifts] push skipped: %s", e)
+    return out
+
+
 @app.get("/notifications")
 def list_notifications(unread_only: bool = Query(False), limit: int = Query(50),
                              ctx: membership.Context = Depends(membership.require_context)):

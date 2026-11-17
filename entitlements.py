@@ -205,16 +205,25 @@ def tier_detail(user_id: str) -> dict:
     if value and value not in _VALID_TIERS:
         log.warning("[entitlements] profiles.tier for %s is %r, which is not a plan "
                     "this build knows about — treating as free", user_id, value)
-    until = _parse_ts(rows[0].get("paid_until")) if rows[0].get("tier_source") == "payment" else None
+    source = rows[0].get("tier_source")
+    until = _parse_ts(rows[0].get("paid_until")) if source in ("payment", "gift") else None
+    # A plan given free (gifts.py) ends on its day: the week of grace is for a
+    # payment running late, and a gift has nothing to be late with.
+    grace = timedelta(days=0 if source == "gift" else GRACE_DAYS)
     if tier != "free" and until is not None:
-        if datetime.now(timezone.utc) > until + timedelta(days=GRACE_DAYS):
+        if datetime.now(timezone.utc) > until + grace:
             # Cached like any answer: a renewal calls invalidate().
             lapsed = {"reason": "expired", "paid_tier": tier, "paid_until": until.isoformat(),
                       "note": f"The {_TIER_LABEL.get(tier, tier)} plan ran until "
                               f"{until.strftime('%d %B %Y')}. Renew it to switch everything back on."}
             _cache_put(user_id, "free", lapsed)
             return {"tier": "free", "row": True, **lapsed}
-    extra = {"paid_until": until.isoformat()} if until is not None else {}
+    # A running gift is not "paid up to": the app's renewal strip reads
+    # paid_until, so a gift's end goes out under its own name.
+    if until is not None and source == "gift":
+        extra = {"gift_until": until.isoformat()}
+    else:
+        extra = {"paid_until": until.isoformat()} if until is not None else {}
     _cache_put(user_id, tier, extra)
     return {"tier": tier, "reason": "ok", "row": True, **extra}
 

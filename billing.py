@@ -566,6 +566,20 @@ def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None 
     by_card = card_status(card, plan, until, now)
     if by_card:
         return {**out, **by_card}
+    gift_until = _parse(profile.get("paid_until")) if profile.get("tier_source") == "gift" else None
+    if gift_until is not None and now <= gift_until:
+        # Given free by AIBOS (gifts.py): it ends on its day, with no grace.
+        days = (gift_until.astimezone(LUSAKA).date() - now.astimezone(LUSAKA).date()).days
+        return {**out, "state": "active", "days_left": days, "switches_off_on": gift_until.isoformat(),
+                "sentence": f"Your {name} plan is a gift from AIBOS, free until {_long_day(gift_until)}. "
+                            f"To keep it on after that, set up card payment on or before that day: "
+                            f"it then renews automatically for {money(price)} each {period} until you cancel."}
+    if gift_until is not None:
+        return {**out, "state": "expired", "switches_off_on": gift_until.isoformat(),
+                "sentence": f"Your free {name} plan from AIBOS ended on {_day(gift_until)}, so the account "
+                            f"is on Free for now. Your records are all there. Set up card payment to switch "
+                            f"{name} back on: it then renews automatically for {money(price)} each {period} "
+                            f"until you cancel."}
     if until is None:
         return {**out, "state": "included",
                 "sentence": f"Your {name} plan was set up for you by AIBOS and has no end date."}
