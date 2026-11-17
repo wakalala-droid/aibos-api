@@ -67,15 +67,26 @@ KINDS: dict[str, dict] = {
     "mark_invoice_paid": {"level": ASK, "earnable": False, "undo": False},
     # Phase 3: jobs only the workers (workers.py) put forward. Each waits for
     # the owner's yes; none sends anything or moves money.
-    # Not undone from here: taking back a confirmed entry is removing it, and
-    # that stays on the Activity page where the owner sees the whole entry.
-    "confirm_entry":     {"level": ASK, "earnable": False, "undo": False},
+    # Undo puts the entry back to waiting (auto mode confirms these by itself,
+    # 17 Nov 2026); removing it stays on the Activity page.
+    "confirm_entry":     {"level": ASK, "earnable": False, "undo": True},
     "chase_payment":     {"level": ASK, "earnable": False, "undo": False},
     "settle_tax":        {"level": ASK, "earnable": False, "undo": False},
     "note":              {"level": ASK, "earnable": False, "undo": False},
 }
 WORKER_KINDS = frozenset({"confirm_entry", "chase_payment", "settle_tax", "note"})
 WORKER_WAIT_DAYS = 7    # a worker's question waits longer than a chat one
+
+# AIBOS auto (17 Nov 2026): one switch at the top of every page. While it is
+# on, the team looks every hour and the safe jobs do themselves, each with an
+# Undo: entries the owner asks for and entries staff recorded are recorded and
+# confirmed, up to AUTO_LIMIT or the largest entry the owner approved by hand,
+# whichever is more. Still asked, always: anything that goes out to another
+# person, marking money paid, settling tax, a refund, and anything bigger.
+# Kept as one more row in ai_autopilot (kind AUTO_KIND), so no new migration.
+AUTO_KIND = "auto_mode"
+AUTO_LIMIT = 1000.0
+AUTO_TYPES = ("Sale", "Expense", "Purchase", "CustomerPayment", "SupplierPayment")
 
 # The answer buttons, where "Yes, do it" would not fit the question.
 _ANSWERS = {
@@ -360,7 +371,10 @@ def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
         if et == "SupplierPayment" and not payload.get("supplier"):
             raise ActionError("Which supplier did you pay?")
         if et == "Refund":
-            payload["direction"] = args.get("direction") if args.get("direction") in ("in", "out") else "out"
+            # The model says in/out; the books say who the money went to or came from.
+            # (Written "in"/"out" straight through, every chat refund was refused.)
+            raw = str(args.get("direction") or "").lower()
+            payload["direction"] = "from_supplier" if raw in ("in", "from_supplier") else "to_customer"
         on = _parse_day(args.get("on"))
         if on and on > (now or datetime.now(timezone.utc)).astimezone(LUSAKA).date():
             raise ActionError("That date is still to come. Put it in the diary instead?")
@@ -377,7 +391,8 @@ def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
         ev = _pending_entry(db, tenant, args.get("event_id"))
         p = ev.get("payload") or {}
         on = _parse_day(str(ev.get("occurred_at") or "")[:10])
-        return {"args": {"event_id": ev["id"]},
+        return {"args": {"event_id": ev["id"], "event_type": ev.get("event_type"),
+                         "amount": _num(p.get("amount")) or 0.0},
                 "said": "Confirm " + _entry_words(ev.get("event_type"), p, on)}
 
     if kind == "chase_payment":
@@ -563,6 +578,12 @@ def _take_back(db, tenant: str, actor: str, kind: str, result: dict) -> None:
     if kind == "record_entry" and result.get("event_id"):
         nervous.void(db, tenant, result["event_id"], reason="undone in the chat",
                      actor_role="owner", actor_id=actor)
+        return
+    if kind == "confirm_entry" and result.get("event_id"):
+        try:
+            nervous.unconfirm(db, tenant, result["event_id"], note="undone: back to wait for the owner")
+        except nervous.PipelineError as e:
+            raise ActionError(str(e))
         return
     raise ActionError("That one can't be undone from the chat.")
 
@@ -758,6 +779,59 @@ def set_autopilot(db, tenant: str, business_id: str | None, kind: str, on: bool)
     return autopilot_state(db, tenant, biz)
 
 
+def auto_on(db, tenant: str, biz: str | None) -> bool:
+    """Is AIBOS auto on for these books? Raises NotReady before 0047."""
+    return autopilot_on(db, tenant, biz, AUTO_KIND)
+
+
+def auto_limit(rows: list) -> float:
+    """The largest entry auto may record or confirm by itself. Pure."""
+    return max(AUTO_LIMIT, streak(rows, "record_entry")["largest"])
+
+
+def _auto_fits(event_type, amount, limit: float) -> bool:
+    amount = _num(amount) or 0.0
+    return event_type in AUTO_TYPES and 0 < amount <= limit
+
+
+def auto_state(db, tenant: str, business_id: str | None) -> dict:
+    biz = twin._books_for(db, tenant, business_id)
+    rows = _recent(db, tenant, biz)
+    return {"on": auto_on(db, tenant, biz), "limit": auto_limit(rows),
+            "does": ["Records and confirms entries up to the limit",
+                     "Sets reminders and drafts invoices",
+                     "Looks through your books every hour"],
+            "asks": ["Anything that goes to a customer or supplier",
+                     "Marking money paid or settling tax",
+                     "Refunds and anything over the limit"]}
+
+
+def set_auto(db, tenant: str, business_id: str | None, on: bool) -> dict:
+    """The AIBOS auto switch. Unlike a single kind it needs nothing earned:
+    what it does by itself is small, inside the limit, and has an Undo."""
+    biz = twin._books_for(db, tenant, business_id)
+    existing = [r for r in _autopilot_rows(db, tenant, biz) if r.get("kind") == AUTO_KIND]
+    patch = {"is_on": bool(on), "updated_at": _now_iso()}
+    if existing:
+        db.table(AUTOPILOT).update(patch).eq("id", existing[0]["id"]).eq("user_id", tenant).execute()
+    else:
+        db.table(AUTOPILOT).insert({"user_id": tenant, "business_id": biz, "kind": AUTO_KIND, **patch}).execute()
+    if on:
+        # What was already waiting and auto would have done itself is done now:
+        # the owner switched it on so they would not have to answer these.
+        rows = _recent(db, tenant, biz, limit=200)
+        limit = auto_limit(rows)
+        for r in rows:
+            a = r.get("args") or {}
+            if (r.get("status") == "waiting" and r.get("kind") == "confirm_entry" and r.get("source") == "worker"
+                    and not _expired(r) and _auto_fits(a.get("event_type"), a.get("amount"), limit)):
+                try:
+                    _run(db, tenant, biz, tenant, r, "automatic")
+                except ActionError as e:
+                    log.info("[auto] left %s waiting: %s", r.get("id"), e)
+    return auto_state(db, tenant, biz)
+
+
 def _fits_what_was_approved(plan: dict, s: dict) -> bool:
     """An automatic entry must look like the ones the owner approved by hand:
     a type they approved, no bigger than the largest."""
@@ -804,11 +878,21 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
 
     how = None
     if source == "worker":
-        pass
+        # Auto confirms what staff recorded, inside the limit. Every other
+        # worker question still waits: it goes out to someone, or it is tax.
+        if kind == "confirm_entry" and auto_on(db, tenant, biz):
+            a = plan["args"]
+            if _auto_fits(a.get("event_type"), a.get("amount"), auto_limit(_recent(db, tenant, biz))):
+                how = "automatic"
     elif spec["level"] == DO:
         how = "did"
     elif spec["earnable"] and autopilot_on(db, tenant, biz, kind):
         if _fits_what_was_approved(plan, streak(_recent(db, tenant, biz), kind)):
+            how = "automatic"
+    if how is None and kind == "record_entry" and source != "worker" and auto_on(db, tenant, biz):
+        a = plan["args"]
+        if _auto_fits(a.get("event_type"), (a.get("payload") or {}).get("amount"),
+                      auto_limit(_recent(db, tenant, biz))):
             how = "automatic"
 
     row = _insert(db, {

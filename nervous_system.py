@@ -493,6 +493,22 @@ def confirm(db, user_id: str, event_id: str) -> dict:
     return (getattr(res, "data", None) or [ev])[0]
 
 
+def unconfirm(db, user_id: str, event_id: str, note: str = "put back to wait for the owner") -> dict:
+    """Put a confirmed entry back to waiting (AIBOS auto confirmed it and the
+    owner tapped Undo). Nothing is removed: it waits on Activity as it did."""
+    ev = _get_event(db, user_id, event_id)
+    if ev["status"] != "confirmed":
+        raise PipelineError("That entry is not confirmed, so there is nothing to put back.")
+    audit = (ev.get("audit") or []) + [_audit_entry(user_id, "unconfirmed", note)]
+    res = (
+        db.table("business_events")
+        .update({"status": "pending", "audit": audit})
+        .eq("id", event_id).eq("user_id", user_id).execute()
+    )
+    twin.rebuild(db, user_id, ev.get("business_id"))
+    return (getattr(res, "data", None) or [ev])[0]
+
+
 def correct(db, user_id: str, event_id: str, patch: dict,
             actor_role: str = "owner", actor_id: str | None = None) -> dict:
     """

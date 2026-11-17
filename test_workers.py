@@ -186,7 +186,7 @@ def test_yes_confirms_the_entry(db):
     entry = next(j for j in out["new"] if j["kind"] == "confirm_entry")
     done = actions.decide(db, OWNER, OWNER, entry["id"], True)
     assert done["status"] == "done" and done["did"].startswith("Confirmed a sale of K360.00")
-    assert done["can_undo"] is False and done["why"]
+    assert done["can_undo"] is True and done["why"]       # Undo puts it back to waiting
     assert db.rows["business_events"][0]["status"] == "confirmed"
 
 
@@ -276,6 +276,7 @@ def test_the_hourly_pass_runs_in_the_day_every_few_hours_and_tells_the_owner(db,
     db.rows["profiles"] = [{"id": OWNER, "tier": "proplus"}]
     monkeypatch.setattr(businesses, "list_businesses", lambda db, uid: [{"id": "biz-1", "name": "Shop"}])
     monkeypatch.setattr(workers, "_LAST", {"at": None})
+    monkeypatch.setattr(workers, "_PASSED", {})
     told = []
     night = datetime(2026, 11, 17, 21, 0, tzinfo=timezone.utc)          # 23:00 in Lusaka
     assert workers.run_all(db, lambda *a: told.append(a), now=night) == {"skipped": "night"}
@@ -283,8 +284,11 @@ def test_the_hourly_pass_runs_in_the_day_every_few_hours_and_tells_the_owner(db,
     assert out == {"owners": 1, "new": 3, "closed": 0}
     (note,) = told
     assert note[2] == "needs_you" and note[3] == "3 things need you" and note[5] == "/dashboard#needs-you"
-    assert workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(hours=1)) == \
+    assert workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(minutes=30)) == \
         {"skipped": "ran lately"}
+    # An hour on, the job runs, but books not on AIBOS auto wait their three hours.
+    assert workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(hours=1)) == \
+        {"owners": 1, "new": 0, "closed": 0}
 
 
 def test_before_the_migration_the_pass_does_nothing(db, monkeypatch):
@@ -293,6 +297,7 @@ def test_before_the_migration_the_pass_does_nothing(db, monkeypatch):
     db.rows["profiles"] = [{"id": OWNER, "tier": "proplus"}]
     monkeypatch.setattr(businesses, "list_businesses", lambda db, uid: [])
     monkeypatch.setattr(workers, "_LAST", {"at": None})
+    monkeypatch.setattr(workers, "_PASSED", {})
     assert workers.run_all(db, lambda *a: None, now=NOW) == {"skipped": "migration 0047 not run"}
 
 

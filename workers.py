@@ -59,6 +59,8 @@ QUIET_VISITS = 3            # a regular has bought on at least this many days
 QUIET_MIN_DAYS = 14
 QUIET_MAX_DAYS = 120        # quiet longer than this is gone, not quiet
 EVERY_HOURS = 3             # how often a pass runs
+AUTO_EVERY_HOURS = 1        # how often it runs while AIBOS auto is on
+EVENING_HOUR = 18           # from here, auto's "what AIBOS did today" goes out
 DAY_FROM, DAY_TO = 7, 21    # Lusaka hours a pass may run in
 
 
@@ -393,23 +395,65 @@ def roster(db, tenant: str, business_id: str | None, now: datetime | None = None
         out.append({"id": w, "name": name, "does": does, "on": on,
                     "off_reason": None if on else f"Comes with {need[1]}",
                     **counts([r for r in rows if actions.worker_of(r) == w])})
-    return {"workers": out, "looked_at": _LOOKED.get((tenant, str(biz))),
-            "every_hours": EVERY_HOURS, "day_from": DAY_FROM, "day_to": DAY_TO}
+    auto = actions.auto_on(db, tenant, biz)
+    return {"workers": out, "looked_at": _LOOKED.get((tenant, str(biz))), "auto": auto,
+            "every_hours": AUTO_EVERY_HOURS if auto else EVERY_HOURS, "day_from": DAY_FROM, "day_to": DAY_TO}
+
+
+def preview(db, tenant: str, business_id: str | None, now: datetime | None = None) -> dict:
+    """What the team would find in these books right now, writing nothing.
+    For an owner whose plan does not have the team yet: the switch shows
+    their own numbers ("3 entries to confirm, 1 customer to chase") rather
+    than a locked card. Counts only; no names leave the books."""
+    now = now or datetime.now(timezone.utc)
+    biz = actions.twin._books_for(db, tenant, business_id)
+    found = _findings(db, tenant, biz, True, now, set())
+    counts = {w: len(items) for w, items in found.items() if items}
+    return {"found": counts, "total": sum(counts.values()),
+            "names": {w: NAMES.get(w, w) for w in counts}}
 
 
 _LAST = {"at": None}
+# When each business last had a pass in this run of the API, for the owners
+# who are not on auto (they are looked at every EVERY_HOURS, not every hour).
+_PASSED: dict = {}
+
+
+def _due(uid, biz_id, auto: bool, now: datetime) -> bool:
+    last = _PASSED.get((uid, str(biz_id)))
+    every = AUTO_EVERY_HOURS if auto else EVERY_HOURS
+    # A few minutes' slack: the hourly job does not land on the minute.
+    return last is None or now - last >= timedelta(hours=every) - timedelta(minutes=10)
+
+
+def did_today(db, tenant: str, biz, now: datetime) -> int:
+    """Jobs AIBOS did by itself today (Lusaka), for auto's evening note."""
+    today = now.astimezone(LUSAKA).date().isoformat()
+    n = 0
+    for r in actions._recent(db, tenant, biz, limit=200):
+        at = str(r.get("decided_at") or "")
+        if r.get("status") == "done" and r.get("how") in ("automatic", "did") and at:
+            try:
+                local = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(LUSAKA).date()
+            except ValueError:
+                continue
+            if local.isoformat() == today:
+                n += 1
+    return n
 
 
 def run_all(db, record_notification, now: datetime | None = None) -> dict:
-    """The hourly job: every owner whose plan lets AIBOS do jobs, every few
-    hours, in the day. Tells the owner once a day when something new needs them."""
+    """The hourly job: every owner whose plan lets AIBOS do jobs, in the day:
+    every hour for books with AIBOS auto on, every few hours for the rest.
+    Tells the owner once a day when something new needs them, and on auto,
+    once in the evening what AIBOS did by itself."""
     import businesses
     import entitlements
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(LUSAKA)
     if not (DAY_FROM <= local.hour < DAY_TO):
         return {"skipped": "night"}
-    if _LAST["at"] and now - _LAST["at"] < timedelta(hours=EVERY_HOURS):
+    if _LAST["at"] and now - _LAST["at"] < timedelta(hours=AUTO_EVERY_HOURS) - timedelta(minutes=10):
         return {"skipped": "ran lately"}
     _LAST["at"] = now
     if db is None:
@@ -427,6 +471,10 @@ def run_all(db, record_notification, now: datetime | None = None) -> dict:
             owned = businesses.list_businesses(db, uid) or [{"id": None}]
             owners += 1
             for i, biz in enumerate(owned):
+                auto = actions.auto_on(db, uid, actions.twin._books_for(db, uid, biz.get("id")))
+                if not _due(uid, biz.get("id"), auto, now):
+                    continue
+                _PASSED[(uid, str(biz.get("id")))] = now
                 out = run_business(db, uid, biz.get("id"), whole_owner=(i == 0), now=now)
                 added += len(out["new"])
                 closed += out["closed"]
@@ -439,6 +487,16 @@ def run_all(db, record_notification, now: datetime | None = None) -> dict:
                         out["new"][0].get("said") or "", "/dashboard#needs-you",
                         {"booking_id": f"needsyou-{biz.get('id')}-{local.date().isoformat()}",
                          "business_id": biz.get("id")})
+                if auto and local.hour >= EVENING_HOUR:
+                    done = did_today(db, uid, actions.twin._books_for(db, uid, biz.get("id")), now)
+                    if done:
+                        suffix = f": {biz.get('name')}" if biz.get("name") and len(owned) > 1 else ""
+                        record_notification(
+                            db, uid, "auto_day",
+                            f"AIBOS did {done} {'thing' if done == 1 else 'things'} for you today{suffix}",
+                            "Each one has an Undo on the AIBOS team page.", "/dashboard/team",
+                            {"booking_id": f"autoday-{biz.get('id')}-{local.date().isoformat()}",
+                             "business_id": biz.get("id")})
         except actions.NotReady:
             return {"skipped": "migration 0047 not run"}
         except Exception as e:  # noqa: BLE001 - one owner's books must not stop the rest

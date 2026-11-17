@@ -4333,6 +4333,50 @@ def run_workers_now(ctx: membership.Context = Depends(membership.require_owner))
     return {"ok": True, **_action_call(workers_api.run_now, db, ctx.tenant, ctx.business_id)}
 
 
+# ── AIBOS auto (17 Nov 2026): the switch at the top of every page ─────────────
+# On: the team looks every hour and the safe jobs do themselves, each with an
+# Undo (actions.AUTO_*). Anything that goes to another person, marks money
+# paid, settles tax, refunds or is over the limit still waits for a yes.
+
+class AutoRequest(BaseModel):
+    on: bool
+
+
+@app.get("/auto")
+def get_auto(ctx: membership.Context = Depends(membership.require_owner)):
+    """Whether AIBOS auto is on, its limit, what it does and what it still asks.
+    available is False on a plan without the team; ready is False before 0047."""
+    if not entitlements.can_access(entitlements.tier_detail(ctx.tenant)["tier"], "chat_actions"):
+        return {"ok": True, "available": False, "ready": True, "on": False}
+    db = _require_db()
+    try:
+        return {"ok": True, "available": True, "ready": True,
+                **actions_api.auto_state(db, ctx.tenant, ctx.business_id)}
+    except actions_api.NotReady:
+        return {"ok": True, "available": True, "ready": False, "on": False}
+
+
+@app.post("/auto")
+def set_auto(req: AutoRequest, ctx: membership.Context = Depends(membership.require_owner)):
+    entitlements.require_feature(ctx.tenant, "chat_actions")
+    db = _require_db()
+    state = _action_call(actions_api.set_auto, db, ctx.tenant, ctx.business_id, req.on)
+    if req.on:
+        # Look straight away: the owner switched it on to see it work.
+        try:
+            workers_api.run_now(db, ctx.tenant, ctx.business_id)
+        except Exception as e:  # noqa: BLE001 - the switch is on either way
+            log.warning("[auto] first pass for %s: %s", ctx.tenant, e)
+    return {"ok": True, "available": True, "ready": True, **state}
+
+
+@app.get("/auto/preview")
+def preview_auto(ctx: membership.Context = Depends(membership.require_owner)):
+    """What the team would find in these books now, as counts. Writes nothing."""
+    db = _require_db()
+    return {"ok": True, **workers_api.preview(db, ctx.tenant, ctx.business_id)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EVOLUTION SPINE — Business Events + Digital Twin
 # (Directive Initiatives 5, 11, 12 · ADR-001 · RFC-001)
