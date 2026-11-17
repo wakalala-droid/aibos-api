@@ -124,7 +124,7 @@ def test_auto_books_are_looked_at_every_hour_and_told_in_the_evening(db, monkeyp
     evening = datetime(2026, 11, 17, 16, 30, tzinfo=timezone.utc)      # 18:30 in Lusaka
     workers.run_all(db, lambda *a: told.append(a), now=evening)
     (note,) = [t for t in told if t[2] == "auto_day"]
-    assert note[3] == "AIBOS did 2 things for you today" and note[5] == "/dashboard/team"
+    assert note[3] == "AIBOS did 2 things for you today" and note[5] == "/dashboard#team"
 
 
 def test_the_preview_counts_what_the_team_would_find_and_writes_nothing(db):

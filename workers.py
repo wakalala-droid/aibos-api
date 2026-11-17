@@ -494,7 +494,7 @@ def run_all(db, record_notification, now: datetime | None = None) -> dict:
                         record_notification(
                             db, uid, "auto_day",
                             f"AIBOS did {done} {'thing' if done == 1 else 'things'} for you today{suffix}",
-                            "Each one has an Undo on the AIBOS team page.", "/dashboard/team",
+                            "Each one has an Undo with your AIBOS team on Home.", "/dashboard#team",
                             {"booking_id": f"autoday-{biz.get('id')}-{local.date().isoformat()}",
                              "business_id": biz.get("id")})
         except actions.NotReady:
