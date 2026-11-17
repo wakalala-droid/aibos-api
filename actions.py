@@ -26,6 +26,11 @@ that fails half way is on record, Undo knows what to take back, the earned
 count comes from the record rather than from memory, and phase 3's "Needs you"
 list is the jobs still waiting.
 
+Phase 3 (workers.py) adds the jobs only AIBOS's workers put forward
+(WORKER_KINDS): confirm an entry, write a reminder to a customer, record a tax
+payment, or a note pointing at a page. A worker's job always waits for a yes,
+and waits a week rather than a day.
+
 Only the owner can ask for jobs in phase 2 (the chat gives staff and the
 accountant no action tools). Every function takes the tenant and business
 resolved from the verified login; the model chooses the job and its details,
@@ -60,6 +65,23 @@ KINDS: dict[str, dict] = {
     "record_entry":      {"level": ASK, "earnable": True,  "undo": True},
     "send_invoice":      {"level": ASK, "earnable": False, "undo": False},
     "mark_invoice_paid": {"level": ASK, "earnable": False, "undo": False},
+    # Phase 3: jobs only the workers (workers.py) put forward. Each waits for
+    # the owner's yes; none sends anything or moves money.
+    # Not undone from here: taking back a confirmed entry is removing it, and
+    # that stays on the Activity page where the owner sees the whole entry.
+    "confirm_entry":     {"level": ASK, "earnable": False, "undo": False},
+    "chase_payment":     {"level": ASK, "earnable": False, "undo": False},
+    "settle_tax":        {"level": ASK, "earnable": False, "undo": False},
+    "note":              {"level": ASK, "earnable": False, "undo": False},
+}
+WORKER_KINDS = frozenset({"confirm_entry", "chase_payment", "settle_tax", "note"})
+WORKER_WAIT_DAYS = 7    # a worker's question waits longer than a chat one
+
+# The answer buttons, where "Yes, do it" would not fit the question.
+_ANSWERS = {
+    "confirm_entry": ("Yes, confirm it", "Not now"),
+    "chase_payment": ("Yes, write it", "Not now"),
+    "settle_tax":    ("Yes, I paid it", "Not yet"),
 }
 
 # Entry types the chat may record. Payroll, loans, transfers and tax payments
@@ -157,7 +179,7 @@ ACTION_TOOLS = [
     }},
 ]
 
-ACTION_NAMES = frozenset(KINDS)
+ACTION_NAMES = frozenset(t["function"]["name"] for t in ACTION_TOOLS)
 
 
 def action_prompt(now: datetime | None = None) -> str:
@@ -251,6 +273,47 @@ def _find_invoice(db, tenant: str, biz: str | None, number) -> dict:
     raise ActionError(f"I can't find invoice {_text(number, 40)}.")
 
 
+def _entry_words(et: str, payload: dict, on: date | None = None) -> str:
+    """'a sale of K360.00 to Banda (3 crates), paid by cash'. Pure."""
+    amount = _num(payload.get("amount")) or 0.0
+    who = payload.get("customer") or payload.get("supplier")
+    what = f" ({_num(payload['quantity']):g} {payload['item']})" if payload.get("quantity") and payload.get("item") \
+        else (f" ({payload['item']})" if payload.get("item") else "")
+    words = f"{_ENTRY_WORDS.get(et, 'an entry')} of {_money(amount)}"
+    if et == "Expense":
+        words += f" for {payload.get('category') or 'General'}"
+    if who:
+        words += (" to " if et in ("Sale", "SupplierPayment") else " from ") + str(who)
+    words += what
+    method = payload.get("payment_method")
+    if method in _METHOD_WORDS:
+        words += f", {_METHOD_WORDS[method]}" if method == "credit" else f", paid by {_METHOD_WORDS[method]}"
+    if on:
+        words += f", on {_date_words(on)}"
+    return words
+
+
+def _pending_entry(db, tenant: str, event_id) -> dict:
+    """An entry still waiting to be confirmed, of a kind the chat may record."""
+    res = (db.table("business_events").select("*").eq("id", str(event_id or ""))
+           .eq("user_id", tenant).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows or rows[0].get("status") != "pending":
+        raise ActionError("That entry is not waiting any more.")
+    if rows[0].get("event_type") not in ENTRY_TYPES:
+        raise ActionError("That entry has its own page to be confirmed on.")
+    return rows[0]
+
+
+def _schedule_item(db, tenant: str, item_id) -> dict:
+    res = (db.table("schedule_items").select("*").eq("id", str(item_id or ""))
+           .eq("user_id", tenant).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    if not rows or rows[0].get("status") != "scheduled":
+        raise ActionError("That reminder has been dealt with already.")
+    return rows[0]
+
+
 def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
             now: datetime | None = None) -> dict:
     """The job checked and put in words: {"args": clean, "said": "..."}.
@@ -308,21 +371,58 @@ def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
         clean = {"event_type": et, "payload": payload}
         if on:
             clean["occurred_at"] = f"{on.isoformat()}T12:00:00+02:00"
-        who = payload.get("customer") or payload.get("supplier")
-        what = f" ({payload['quantity']:g} {payload['item']})" if payload.get("quantity") and payload.get("item") \
-            else (f" ({payload['item']})" if payload.get("item") else "")
-        said = f"Record {_ENTRY_WORDS[et]} of {_money(amount)}"
-        if et == "Expense":
-            said += f" for {payload['category']}"
-        if who:
-            said += (" to " if et in ("Sale", "SupplierPayment") else " from ") + who
-        said += what
-        if payload.get("payment_method"):
-            said += f", {_METHOD_WORDS[payload['payment_method']]}" if payload["payment_method"] == "credit" \
-                else f", paid by {_METHOD_WORDS[payload['payment_method']]}"
-        if on:
-            said += f", on {_date_words(on)}"
+        return {"args": clean, "said": "Record " + _entry_words(et, payload, on)}
+
+    if kind == "confirm_entry":
+        ev = _pending_entry(db, tenant, args.get("event_id"))
+        p = ev.get("payload") or {}
+        on = _parse_day(str(ev.get("occurred_at") or "")[:10])
+        return {"args": {"event_id": ev["id"]},
+                "said": "Confirm " + _entry_words(ev.get("event_type"), p, on)}
+
+    if kind == "chase_payment":
+        customer = _text(args.get("customer"), 80)
+        total = _num(args.get("total"))
+        if not customer or not total or total <= 0:
+            raise ActionError("Nobody owes money there now.")
+        refs = [_text(r, 20) for r in (args.get("refs") or []) if _text(r, 20)][:3]
+        days = int(_num(args.get("oldest_days")) or 0)
+        clean = {"customer": customer, "total": round(total, 2), "oldest_days": days, "refs": refs}
+        said = f"Get a reminder ready for {customer}, who owes {_money(total)}"
+        if refs:
+            said += f" ({', '.join(refs)})"
+        if days > 0:
+            said += f", {days} days late"
         return {"args": clean, "said": said}
+
+    if kind == "settle_tax":
+        import compliance
+        item = _schedule_item(db, tenant, args.get("item_id"))
+        tax = compliance.tax_of_title(item.get("title"))
+        period = compliance.period_paid_by(item.get("starts_at"))
+        if not tax or not period:
+            raise ActionError("That reminder is not a PAYE, NAPSA, NHIMA or levy payment.")
+        y, m = (int(x) for x in period.split("-"))
+        due = _parse_day(str(item.get("starts_at") or "")[:10])
+        said = (f"Record that you paid {compliance.TAX_NAMES[tax]} to {compliance.TAX_AUTHORITY[tax]} "
+                f"for {_MONTHS[m - 1]} {y}")
+        bits = []
+        amount = _num(item.get("amount"))
+        if amount and amount > 0:
+            bits.append(_money(amount))
+        if due:
+            bits.append(f"due {_date_words(due)}")
+        if bits:
+            said += f" ({', '.join(bits)})"
+        return {"args": {"item_id": item["id"], "due": str(item.get("starts_at") or "")[:10]}, "said": said}
+
+    if kind == "note":
+        text = _text(args.get("text"), 240)
+        href = str(args.get("href") or "")
+        if not text or not href.startswith("/dashboard"):
+            raise ActionError("A note needs words and a page of AIBOS to open.")
+        return {"args": {"text": text, "href": href[:120], "label": _text(args.get("label"), 30) or "Open"},
+                "said": text}
 
     if kind == "draft_invoice":
         import invoices as invoices_api
@@ -377,8 +477,49 @@ def _execute(db, tenant: str, biz: str | None, actor: str, kind: str, args: dict
     result = dict(result or {})
     if kind == "add_reminder":
         import schedule_items as schedule_api
+        args = dict(args)
+        # Said yes to after its time had gone (a worker's question can wait a
+        # few days): the reminder goes on tomorrow morning instead.
+        when = schedule_api.parse_ts(args.get("starts_at"))
+        now = datetime.now(timezone.utc)
+        if when is not None and when < now - timedelta(hours=1):
+            tomorrow = now.astimezone(LUSAKA).date() + timedelta(days=1)
+            args["starts_at"] = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0,
+                                         tzinfo=LUSAKA).isoformat()
         item = schedule_api.create_item(db, tenant, args, business_id=biz)
         return {"schedule_item_id": item.get("id")}
+    if kind == "confirm_entry":
+        _pending_entry(db, tenant, args.get("event_id"))      # still waiting?
+        ev = nervous.confirm(db, tenant, args["event_id"])
+        return {"event_id": ev.get("id") or args["event_id"]}
+    if kind == "chase_payment":
+        import debtors
+        name = None
+        if biz:
+            try:
+                res = db.table("businesses").select("name").eq("id", biz).limit(1).execute()
+                name = ((getattr(res, "data", None) or [{}])[0] or {}).get("name")
+            except Exception:  # noqa: BLE001 - the message reads fine without it
+                name = None
+        items = [{"kind": "invoice", "ref": r} for r in args.get("refs") or []]
+        text = debtors.nudge_text({"name": args["customer"], "total": args["total"],
+                                   "oldest_days": args.get("oldest_days"), "items": items},
+                                  business_name=name)
+        from urllib.parse import quote
+        # Nothing is sent: the owner opens WhatsApp, picks the customer and sends it.
+        return {"message": text, "whatsapp": "https://wa.me/?text=" + quote(text)}
+    if kind == "settle_tax":
+        import compliance
+        import schedule_items as schedule_api
+        item = _schedule_item(db, tenant, args.get("item_id"))
+        if str(item.get("starts_at") or "")[:10] != args.get("due"):
+            raise ActionError("That reminder has moved on since. Look at it on the Schedule.")
+        out = compliance.settle_reminder(db, tenant, item, actor_role="owner", actor_id=actor)
+        ev_id = (out.get("event") or {}).get("id")
+        schedule_api.set_status(db, tenant, item["id"], "done", ev_id)
+        return {"event_id": ev_id, "outcome": out.get("outcome"), "message": out.get("message")}
+    if kind == "note":
+        return {}
     if kind == "draft_invoice":
         import invoices as invoices_api
         inv = invoices_api.create_invoice(db, tenant, args, business_id=biz)
@@ -485,10 +626,20 @@ def _older_than(row: dict, seconds: float, now: datetime | None = None,
 
 
 def _expired(row: dict, now: datetime | None = None) -> bool:
-    return _older_than(row, WAIT_HOURS * 3600, now, unreadable=False)
+    hours = WORKER_WAIT_DAYS * 24 if row.get("source") == "worker" else WAIT_HOURS
+    return _older_than(row, hours * 3600, now, unreadable=False)
 
 
-_PAST = {"Add": "Added", "Record": "Recorded", "Draft": "Drafted", "Issue": "Issued", "Mark": "Marked"}
+_PAST = {"Add": "Added", "Record": "Recorded", "Draft": "Drafted", "Issue": "Issued", "Mark": "Marked",
+         "Confirm": "Confirmed", "Get": "Got"}
+
+
+def worker_of(row: dict) -> str | None:
+    """Which worker put a job forward: its ref is 'worker:<id>:<what>'."""
+    ref = str(row.get("ref") or "")
+    if row.get("source") != "worker" or not ref.startswith("worker:"):
+        return None
+    return ref.split(":", 2)[1] or None
 
 
 def past(said: str) -> str:
@@ -511,9 +662,27 @@ def public(row: dict) -> dict:
         "can_undo": bool(KINDS.get(kind, {}).get("undo")) and row.get("status") == "done",
         "at": row.get("decided_at") or row.get("created_at"),
     }
-    number = (row.get("result") or {}).get("number") or (row.get("args") or {}).get("number")
+    result, args = row.get("result") or {}, row.get("args") or {}
+    number = result.get("number") or args.get("number")
     if number:
         out["number"] = number
+    worker = worker_of(row)
+    if worker:
+        import workers
+        out["worker"] = {"id": worker, "name": workers.NAMES.get(worker, "AIBOS")}
+    if result.get("why"):
+        out["why"] = result["why"]
+    if kind in _ANSWERS:
+        out["yes"], out["no"] = _ANSWERS[kind]
+    elif worker and kind == "add_reminder":
+        out["yes"], out["no"] = "Yes, remind me", "Not now"
+    if kind == "note":
+        out["link"] = {"href": args.get("href"), "label": args.get("label") or "Open"}
+        out["yes"], out["no"] = out["link"]["label"], "Not now"
+    if row.get("status") == "done" and result.get("message"):
+        out["message"] = result["message"]
+    if row.get("status") == "done" and result.get("whatsapp"):
+        out["whatsapp"] = result["whatsapp"]
     return out
 
 
@@ -613,10 +782,12 @@ def _offer(rows: list, kind: str, switched_on: bool) -> dict | None:
 # ── The three moves: ask for a job, answer it, take it back ───────────────────
 
 def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, args: dict,
-            source: str = "chat", now: datetime | None = None, ref: str | None = None) -> dict:
+            source: str = "chat", now: datetime | None = None, ref: str | None = None,
+            why: str | None = None) -> dict:
     """Ask for a job. Small jobs and earned ones run now; the rest wait for a yes.
+    A worker's job always waits: the owner did not ask for it.
     Returns the job as the chat shows it. Raises ActionError or NotReady."""
-    if kind not in KINDS:
+    if kind not in KINDS or (kind in WORKER_KINDS and source != "worker"):
         raise ActionError("I can't do that job from the chat.")
     biz = twin._books_for(db, tenant, business_id)
     plan = prepare(db, tenant, biz, kind, args, now=now)
@@ -632,7 +803,9 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
                 return public(r)
 
     how = None
-    if spec["level"] == DO:
+    if source == "worker":
+        pass
+    elif spec["level"] == DO:
         how = "did"
     elif spec["earnable"] and autopilot_on(db, tenant, biz, kind):
         if _fits_what_was_approved(plan, streak(_recent(db, tenant, biz), kind)):
@@ -642,7 +815,8 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
         "user_id": tenant, "business_id": biz, "actor_id": actor, "kind": kind,
         "args": plan["args"], "said": plan["said"], "status": "waiting",
         "source": source if source in ("chat", "talk", "worker") else "chat",
-        **({"ref": str(ref)[:80]} if ref else {}),
+        **({"ref": str(ref)[:120]} if ref else {}),
+        **({"result": {"why": _text(why, 240)}} if why else {}),
     })
 
     if how is None:
@@ -654,7 +828,7 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
                     event_type=plan["args"]["event_type"], payload=dict(plan["args"]["payload"]),
                     source="voice", occurred_at=plan["args"].get("occurred_at"), status="pending",
                     note="drafted by AIBOS"), actor_role="owner", actor_id=actor, business_id=biz)
-                row["result"] = {"event_id": ev.get("id")}
+                row["result"] = {**(row.get("result") or {}), "event_id": ev.get("id")}
                 _update(db, tenant, row["id"], {"result": row["result"]})
             except Exception as e:  # noqa: BLE001 - the job still waits; the yes records it
                 log.warning("[actions] could not draft the pending entry: %s", e)
@@ -672,7 +846,8 @@ def _run(db, tenant: str, biz: str | None, actor: str, row: dict, how: str) -> d
                                          "result": {**(row.get("result") or {}), "error": reason[:300]}})
         log.warning("[actions] %s failed for %s: %s", row["kind"], tenant, e)
         raise ActionError(f"I couldn't do it: {reason}")
-    patch = {"status": "done", "how": how, "decided_at": _now_iso(), "result": made}
+    patch = {"status": "done", "how": how, "decided_at": _now_iso(),
+             "result": {**(row.get("result") or {}), **made}}
     _update(db, tenant, row["id"], patch)
     return public({**row, **patch})
 
@@ -722,9 +897,20 @@ def listing(db, tenant: str, business_id: str | None, status: str | None = None,
             limit: int = 30) -> dict:
     """Recent jobs, newest first; with status='waiting', what still needs the owner."""
     biz = twin._books_for(db, tenant, business_id)
-    rows = _recent(db, tenant, biz, limit=max(1, min(int(limit or 30), 100)))
+    limit = max(1, min(int(limit or 30), 100))
     if status:
-        rows = [r for r in rows if r.get("status") == status]
+        # Read by status, so a long history of done jobs never hides one waiting.
+        q = db.table(TABLE).select("*").eq("user_id", tenant).eq("status", status)
+        if biz is not None:
+            q = q.eq("business_id", biz)
+        try:
+            rows = getattr(q.order("created_at", desc=True).limit(limit).execute(), "data", None) or []
+        except Exception as e:  # noqa: BLE001
+            if missing_schema(e):
+                raise NotReady()
+            raise
+    else:
+        rows = _recent(db, tenant, biz, limit=limit)
     if status == "waiting":
         rows = [r for r in rows if not _expired(r)]
     return {"actions": [public(r) for r in rows]}

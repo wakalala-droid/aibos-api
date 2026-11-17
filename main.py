@@ -54,6 +54,7 @@ import customer_intel
 import invoices as invoices_api
 import cfo_tools
 import actions as actions_api
+import workers as workers_api
 import chat_history
 import apns
 import webpush
@@ -4311,6 +4312,27 @@ def undo_action(action_id: str, ctx: membership.Context = Depends(membership.req
     return {"ok": True, "action": _action_call(actions_api.undo, db, ctx.tenant, ctx.actor, action_id)}
 
 
+# ── The workers (workers.py): AIBOS as Jarvis, phase 3 ────────────────────────
+# Six workers look through the books every few hours (run_hourly_jobs) and put
+# what they find forward as jobs waiting for the owner's yes: the "Needs you"
+# list, which is GET /actions?status=waiting. These two routes are the roster
+# and the owner's "check now".
+
+@app.get("/workers")
+def get_workers(ctx: membership.Context = Depends(membership.require_owner)):
+    """Each worker, what it looks after, and what it has waiting for the owner."""
+    db = _require_db()
+    return {"ok": True, **_action_call(workers_api.roster, db, ctx.tenant, ctx.business_id)}
+
+
+@app.post("/workers/run")
+def run_workers_now(ctx: membership.Context = Depends(membership.require_owner)):
+    """Look through the books now instead of waiting for the next pass."""
+    entitlements.require_feature(ctx.tenant, "chat_actions")
+    db = _require_db()
+    return {"ok": True, **_action_call(workers_api.run_now, db, ctx.tenant, ctx.business_id)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EVOLUTION SPINE — Business Events + Digital Twin
 # (Directive Initiatives 5, 11, 12 · ADR-001 · RFC-001)
@@ -8398,6 +8420,10 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # few towns at a time on a thread of its own, so a search reads
             # it instead of waiting on a busy public map server.
             ("find_clients_map", lambda: find_clients.start_harvest(get_db)),
+            # Every few hours in the day: AIBOS's workers look through each
+            # Pro+ owner's books and put what they find on the "Needs you"
+            # list, each waiting for the owner's yes (workers.py).
+            ("workers", lambda: workers_api.run_all(db, notify.record_notification)),
         ):
             try:
                 out[name] = job()

@@ -153,7 +153,7 @@ def nudge_text(debtor: dict, sym: str = "K", business_name: str | None = None) -
     total = _num(debtor.get("total"))
     oldest = int(debtor.get("oldest_days") or 0)
     refs = [i.get("ref") for i in debtor.get("items") or [] if i.get("kind") == "invoice" and i.get("ref")]
-    who = f" — {business_name}" if business_name else ""
+    who = f" This is {business_name}." if business_name else ""
     lines = [
         f"Hi {debtor.get('name')}, hope business is going well!{who}",
         "",
@@ -161,6 +161,6 @@ def nudge_text(debtor: dict, sym: str = "K", business_name: str | None = None) -
         + (f" ({', '.join(refs[:3])})" if refs else "")
         + (f", the oldest from {oldest} days back" if oldest > 30 else "") + ".",
         "",
-        "Mobile money works fine — just reply if anything needs sorting out. 🙏",
+        "Mobile money works fine. Just reply if anything needs sorting out. 🙏",
     ]
     return "\n".join(lines)

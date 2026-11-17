@@ -167,6 +167,19 @@ def compose(db, tenant: str, role: str, business_id: str | None = None,
     if with_money and not recorded:
         lines = [EMPTY_LINE]
 
+    # What AIBOS's workers found and left waiting for the owner's yes (phase 3).
+    if role == "owner":
+        try:
+            import actions
+            waiting = actions.listing(db, tenant, business_id, status="waiting", limit=50)["actions"]
+            if waiting:
+                first = str(waiting[-1].get("said") or "").rstrip(".")
+                n = len(waiting)
+                lines = lines + [f"One thing needs your yes: {first}." if n == 1 else
+                                 f"{n} things need your yes on the home page, the first: {first}."]
+        except Exception as e:  # noqa: BLE001: before migration 0047, or the table unreadable
+            log.info("[spoken_brief] needs-you skipped for %s: %s", tenant, e)
+
     hello = greeting(now)
     if business_name:
         hello = f"{hello} Here is {business_name}."
