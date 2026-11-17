@@ -53,6 +53,7 @@ import parties as parties_api
 import customer_intel
 import invoices as invoices_api
 import cfo_tools
+import actions as actions_api
 import chat_history
 import apns
 import webpush
@@ -1908,6 +1909,8 @@ class ChatRequest(BaseModel):
     # single question reaches this server twice — without this the free taster
     # was charged both times and 3 questions/day became 1 or 2 (audit #24).
     qid: Optional[str] = None
+    # True when the owner is talking (Talk mode), so a job is logged as spoken.
+    talk: Optional[bool] = None
     # Legacy shape
     messages: Optional[List[Dict[str, str]]] = None
     cabinet_id: Optional[str] = None
@@ -2284,6 +2287,18 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
     if told:
         system_parts.append("\n" + told)
 
+    # Jobs (actions.py): the owner alone, on a plan with recording from the
+    # chat. Everyone else keeps the lookups only.
+    act = None
+    if ctx.role == "owner":
+        try:
+            if entitlements.can_access(entitlements.tier_detail(ctx.tenant)["tier"], "chat_actions"):
+                # ref: the question's own id, so the stream and its buffered
+                # retry asking for the same job make one job, not two.
+                act = {"actor": ctx.actor, "source": "talk" if req.talk else "chat", "ref": req.qid}
+        except Exception as e:  # noqa: BLE001 - no plan read: lookups only, as before
+            logger.info("chat: no jobs this time, the plan could not be read: %s", e)
+
     tool_system = "\n\n".join(system_parts + [
         "You have TOOLS over this business's real recorded data — the source of "
         "record. ALWAYS look figures up with a tool before stating them, and "
@@ -2293,8 +2308,10 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
         "their dates and amounts — e.g. 'K1,860 across 3 fuel expenses (5 Jun "
         "K620, 15 Jun K620, 25 Jun K620)'. Never give a number without the "
         "records that back it. If the recorded data doesn't cover the question, "
-        "say so plainly — never invent numbers. Tools are read-only: to record "
-        "something, point the owner at the Record page (or chat recording on Pro+).",
+        "say so plainly — never invent numbers.",
+        actions_api.action_prompt() if act else
+        "Your tools are read-only: to record something, point the owner at the "
+        "Record page (or chat recording on Pro+).",
     ])
 
     return {
@@ -2308,6 +2325,7 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
         "tenant": ctx.tenant,
         "business_id": business_id,
         "allowed_tools": cfo_tools.tools_for_role(ctx.role),
+        "act": act,
     }
 
 
@@ -2417,7 +2435,7 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                     [{"role": "system", "content": prep["tool_system"]}, *prep["chat_messages"]],
                     db, prep["tenant"],
                     business_id=prep["business_id"], allowed=prep["allowed_tools"],
-                    deadline=deadline,
+                    deadline=deadline, act=prep.get("act"),
                 ):
                     if kind == "token":
                         timing.setdefault("first_word", time.monotonic())
@@ -2426,6 +2444,8 @@ def chat_stream(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("cha
                         yield f"data: {json.dumps({'tool': data})}\n\n"
                     elif kind == "read":
                         yield f"data: {json.dumps({'read': data}, default=str)}\n\n"
+                    elif kind == "action":
+                        yield f"data: {json.dumps({'action': data}, default=str)}\n\n"
                     elif kind == "done":
                         if taster_note:
                             yield f"data: {json.dumps({'t': taster_note})}\n\n"
@@ -2507,16 +2527,17 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
                     [{"role": "system", "content": prep["tool_system"]}, *chat_messages],
                     db, prep["tenant"],
                     business_id=prep["business_id"], allowed=prep["allowed_tools"],
-                    deadline=time.monotonic() + _CHAT_BUDGET_SECONDS,
+                    deadline=time.monotonic() + _CHAT_BUDGET_SECONDS, act=prep.get("act"),
                 )
-                if (out.get("reply") or "").strip():
-                    reply = out["reply"] + (taster_note or "")
+                if (out.get("reply") or "").strip() or out.get("actions"):
+                    reply = (out.get("reply") or "") + (taster_note or "")
                     return {
                         "reply": reply,
                         "response": reply,
                         "model": "AIBOS Intelligence",
                         "context_injected": injected,
                         "tools_used": out["tools_used"],
+                        "actions": out.get("actions") or [],
                     }
                 logger.warning("chat tool-loop returned empty reply — using single-shot fallback")
             except Exception as exc:  # noqa: BLE001
@@ -2581,7 +2602,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 46
+EXPECTS_MIGRATION = 47
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -4208,6 +4229,86 @@ def brief_spoken(ctx: membership.Context = Depends(membership.require_context)):
     except Exception as e:  # noqa: BLE001: the brief goes on without the name
         logger.info("spoken brief: no business name for %s: %s", ctx.tenant, e)
     return spoken_brief.compose(db, ctx.tenant, ctx.role, ctx.business_id, name)
+
+
+# ── Jobs AIBOS does (actions.py, migration 0047): AIBOS as Jarvis, phase 2 ────
+# The chat asks for jobs through its tools; these routes are the owner's
+# answers (yes, no, undo), the record of what AIBOS did, and the earned
+# "do these yourself" switch. Owner only: staff and the accountant ask for
+# nothing in phase 2.
+
+class ActionRequest(BaseModel):
+    kind: str
+    args: Dict[str, Any] = {}
+    talk: Optional[bool] = None
+
+
+class AutopilotRequest(BaseModel):
+    kind: str
+    on: bool
+
+
+def _action_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except actions_api.NotReady:
+        raise HTTPException(status_code=503, detail=actions_api.NOT_READY)
+    except actions_api.ActionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/actions")
+def propose_action(req: ActionRequest, ctx: membership.Context = Depends(membership.require_owner)):
+    """Ask for a job without the model: the chat's own "sold 3 crates for K360"
+    goes through here, so its yeses count towards automatic like any other."""
+    entitlements.require_feature(ctx.tenant, "chat_actions")
+    db = _require_db()
+    return {"ok": True, "action": _action_call(
+        actions_api.propose, db, ctx.tenant, ctx.actor, ctx.business_id, req.kind, req.args,
+        source="talk" if req.talk else "chat")}
+
+
+@app.get("/actions")
+def list_actions(status: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100),
+                 ctx: membership.Context = Depends(membership.require_owner)):
+    """What AIBOS did lately, newest first; status=waiting is what needs the owner."""
+    db = _require_db()
+    return {"ok": True, **_action_call(actions_api.listing, db, ctx.tenant, ctx.business_id,
+                                       status=status, limit=limit)}
+
+
+@app.get("/actions/autopilot")
+def get_autopilot(ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    return {"ok": True, **_action_call(actions_api.autopilot_state, db, ctx.tenant, ctx.business_id)}
+
+
+@app.post("/actions/autopilot")
+def set_autopilot(req: AutopilotRequest, ctx: membership.Context = Depends(membership.require_owner)):
+    """Switch a kind of job to automatic (only once earned) or back to asking."""
+    db = _require_db()
+    return {"ok": True, **_action_call(actions_api.set_autopilot, db, ctx.tenant, ctx.business_id,
+                                       req.kind, req.on)}
+
+
+@app.post("/actions/{action_id}/approve")
+def approve_action(action_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    return {"ok": True, "action": _action_call(actions_api.decide, db, ctx.tenant, ctx.actor,
+                                               action_id, True)}
+
+
+@app.post("/actions/{action_id}/decline")
+def decline_action(action_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    return {"ok": True, "action": _action_call(actions_api.decide, db, ctx.tenant, ctx.actor,
+                                               action_id, False)}
+
+
+@app.post("/actions/{action_id}/undo")
+def undo_action(action_id: str, ctx: membership.Context = Depends(membership.require_owner)):
+    db = _require_db()
+    return {"ok": True, "action": _action_call(actions_api.undo, db, ctx.tenant, ctx.actor, action_id)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -10,8 +10,10 @@ the events behind them.
 Discipline:
   • Every executor takes (db, user_id) resolved SERVER-SIDE from the verified
     JWT — the model chooses tools and arguments, never the tenant.
-  • Read-only by construction: no executor writes. Recording stays with the
-    propose→confirm surfaces (SAFEGUARD §0.4).
+  • Read-only by construction: no executor here writes. Jobs (a reminder, an
+    entry, an invoice) are actions.py's, offered to the owner alone and gated
+    by the trust each kind has earned: done at once, asked first, or automatic
+    once earned (SAFEGUARD §0.4, the 10th Law).
   • Results are deliberately compact (caps everywhere) — tool output is token
     budget, and an owner's question rarely needs more than the top slice.
   • run_agent_loop() is dependency-injected (any client with the OpenAI
@@ -34,6 +36,11 @@ import llm
 log = logging.getLogger("aibos.cfo_tools")
 
 MAX_TOOL_ROUNDS = 4
+
+# The job tools (actions.py). Kept by name here so a lookup summary is never
+# written for a job, even one refused before it became a job.
+ACTION_TOOL_NAMES = frozenset({"add_reminder", "record_entry", "draft_invoice",
+                               "send_invoice", "mark_invoice_paid"})
 # Every confirmed entry, not the newest 2,000: a total over a year, what a
 # customer owes or a month's drivers worked out from a slice disagreed with
 # the money figure on screen for any business busier than that.
@@ -536,7 +543,22 @@ def describe_read(name: str, args: dict, result: dict) -> dict:
 # ── Agent loop (client-injected → offline-testable) ───────────────────────────
 
 
-def tool_schemas(allowed: frozenset | None = None) -> list:
+def _call_tool(db, user_id: str, name: str, args: dict, business_id, allowed, act):
+    """One tool call: (result for the model, job for the chat or None).
+
+    A job tool (actions.py) runs only when `act` says this person may ask for
+    jobs; otherwise it is as unknown as any other name the model makes up."""
+    import actions
+    if name in actions.ACTION_NAMES:
+        if not act:
+            return {"error": f"Unknown tool: {name}"}, None
+        return actions.run_for_model(db, user_id, act.get("actor") or user_id, business_id,
+                                     name, args, source=act.get("source") or "chat",
+                                     ref=act.get("ref"))
+    return run_tool(db, user_id, name, args, business_id, allowed), None
+
+
+def tool_schemas(allowed: frozenset | None = None, act: dict | None = None) -> list:
     """TOOLS in the shape the provider is actually sent.
 
     A tool that takes no arguments was declared as
@@ -550,10 +572,15 @@ def tool_schemas(allowed: frozenset | None = None) -> list:
     `parameters` is optional in the OpenAI schema, so omitting it for a tool
     with no arguments is valid everywhere rather than a special case for one
     provider. Guarded by test_cfo_tools.
+
+    The job tools (actions.ACTION_TOOLS) are added only with `act`: the owner
+    on a plan with chat_actions.
     """
+    import actions
     out = []
-    for t in TOOLS:
-        if allowed is not None and t["function"]["name"] not in allowed:
+    for t in TOOLS + (actions.ACTION_TOOLS if act else []):
+        if allowed is not None and t["function"]["name"] not in allowed \
+                and t["function"]["name"] not in actions.ACTION_NAMES:
             continue
         fn = dict(t["function"])
         params = fn.get("parameters") or {}
@@ -764,12 +791,13 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
                           max_rounds: int = MAX_TOOL_ROUNDS,
                           temperature: float = 0.4, max_tokens: int = 1024,
                           business_id: str | None = None, allowed: frozenset | None = None,
-                          deadline: float | None = None):
+                          deadline: float | None = None, act: dict | None = None):
     """
     Streaming twin of run_agent_loop (audit #21). Yields (kind, data) tuples:
 
         ("tool",  name)   — a lookup started (the UI can show "checking …")
         ("read",  {...})  — what that lookup read, in words, with entry ids (C8)
+        ("action", {...}) — a job AIBOS did or is waiting to do (actions.public)
         ("token", text)   — a piece of the answer, as the model writes it
         ("done",  {...})  — finished; carries tools_used
 
@@ -798,7 +826,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
         kwargs = dict(model=model, messages=convo, temperature=temperature,
                       max_tokens=max_tokens, stream=True,
                       **(llm.reasoning_kwargs() if thinking else {}))
-        schemas = tool_schemas(allowed)
+        schemas = tool_schemas(allowed, act)
         if not force_prose and schemas:
             kwargs.update(tools=schemas, tool_choice="auto")
 
@@ -876,11 +904,14 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
             args = _parse_args(c["arguments"])
             tools_used.append(name)
             yield ("tool", name)
-            result = run_tool(db, user_id, name, args, business_id, allowed)
-            try:
-                yield ("read", describe_read(name, args, result))
-            except Exception as exc:  # noqa: BLE001 — a summary must never stop the answer
-                log.warning("[cfo_tools] could not describe %s: %s", name, exc)
+            result, job = _call_tool(db, user_id, name, args, business_id, allowed, act)
+            if job is not None:
+                yield ("action", job)
+            elif name not in ACTION_TOOL_NAMES:
+                try:
+                    yield ("read", describe_read(name, args, result))
+                except Exception as exc:  # noqa: BLE001 — a summary must never stop the answer
+                    log.warning("[cfo_tools] could not describe %s: %s", name, exc)
             convo.append({
                 "role": "tool",
                 "tool_call_id": c["id"] or f"call_{i}",
@@ -894,18 +925,20 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
                    max_rounds: int = MAX_TOOL_ROUNDS,
                    temperature: float = 0.4, max_tokens: int = 1024,
                    business_id: str | None = None, allowed: frozenset | None = None,
-                   deadline: float | None = None) -> dict:
+                   deadline: float | None = None, act: dict | None = None) -> dict:
     """
     Tool loop: call the model, execute any tool calls, feed results back,
     repeat until it answers in prose (or the round budget runs out — then one
-    final forced-prose call). Returns {"reply", "tools_used", "rounds"}.
+    final forced-prose call). Returns {"reply", "tools_used", "rounds",
+    "actions"}: the jobs done or waiting, for the chat to show.
     """
     convo = list(messages)
     tools_used: list[str] = []
+    jobs: list[dict] = []
 
     for round_no in range(max_rounds + 1):
         force_prose = round_no == max_rounds or (round_no > 0 and _out_of_time(deadline))
-        schemas = tool_schemas(allowed)
+        schemas = tool_schemas(allowed, act)
         tool_kwargs = {} if (force_prose or not schemas) else {"tools": schemas, "tool_choice": "auto"}
         thinking = llm.reasoning_kwargs()
         try:
@@ -928,7 +961,8 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
         tool_calls = getattr(msg, "tool_calls", None) or []
 
         if not tool_calls or force_prose:
-            return {"reply": msg.content or "", "tools_used": tools_used, "rounds": round_no}
+            return {"reply": msg.content or "", "tools_used": tools_used, "rounds": round_no,
+                    "actions": jobs}
 
         # Echo the assistant turn (with its tool calls), then answer each call.
         convo.append({
@@ -941,11 +975,13 @@ def run_agent_loop(client, model: str, messages: list, db, user_id: str,
         for tc in tool_calls:
             args = _parse_args(tc.function.arguments)
             tools_used.append(tc.function.name)
-            result = run_tool(db, user_id, tc.function.name, args, business_id, allowed)
+            result, job = _call_tool(db, user_id, tc.function.name, args, business_id, allowed, act)
+            if job is not None:
+                jobs.append(job)
             convo.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": json.dumps(result, default=str)[:6000],
             })
 
-    return {"reply": "", "tools_used": tools_used, "rounds": max_rounds}  # unreachable
+    return {"reply": "", "tools_used": tools_used, "rounds": max_rounds, "actions": jobs}  # unreachable
