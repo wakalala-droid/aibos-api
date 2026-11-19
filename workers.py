@@ -327,7 +327,7 @@ def run_business(db, tenant: str, business_id: str | None, whole_owner: bool = T
                 continue
             try:
                 job = actions.propose(db, tenant, tenant, business_id, f["kind"], f["args"],
-                                      source="worker", ref=ref, why=f.get("why"))
+                                      source="worker", now=now, ref=ref, why=f.get("why"))
             except actions.ActionError as e:
                 log.info("[workers] %s skipped %s: %s", worker, f["key"], e)
                 continue

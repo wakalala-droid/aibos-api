@@ -918,19 +918,23 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
                 log.warning("[actions] could not draft the pending entry: %s", e)
         return public(row)
 
-    return _run(db, tenant, biz, actor, row, how)
+    return _run(db, tenant, biz, actor, row, how, now=now)
 
 
-def _run(db, tenant: str, biz: str | None, actor: str, row: dict, how: str) -> dict:
+def _run(db, tenant: str, biz: str | None, actor: str, row: dict, how: str,
+         now: datetime | None = None) -> dict:
+    # The job is stamped with the pass's own clock, so the evening count of what
+    # AIBOS did "today" (workers.did_today) reads the same day the pass ran on.
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
     try:
         made = _execute(db, tenant, biz, actor, row["kind"], row.get("args") or {}, row.get("result"))
     except Exception as e:  # noqa: BLE001
         reason = str(e) if isinstance(e, (ActionError, ValueError)) else "something went wrong on our side"
-        _update(db, tenant, row["id"], {"status": "failed", "decided_at": _now_iso(),
+        _update(db, tenant, row["id"], {"status": "failed", "decided_at": stamp,
                                          "result": {**(row.get("result") or {}), "error": reason[:300]}})
         log.warning("[actions] %s failed for %s: %s", row["kind"], tenant, e)
         raise ActionError(f"I couldn't do it: {reason}")
-    patch = {"status": "done", "how": how, "decided_at": _now_iso(),
+    patch = {"status": "done", "how": how, "decided_at": stamp,
              "result": {**(row.get("result") or {}), **made}}
     _update(db, tenant, row["id"], patch)
     return public({**row, **patch})
