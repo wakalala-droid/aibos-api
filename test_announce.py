@@ -91,9 +91,18 @@ def test_a_different_message_reaches_them_again(pushes):
 
 def test_a_dry_run_only_counts(pushes):
     out = notify.broadcast(_db(), "Anything", dry_run=True)
-    assert out == {"key": "anything", "people": 3, "with_devices": 2, "told": 0,
+    assert out == {"key": "anything", "people": 3, "with_devices": 2, "left_out": 0, "told": 0,
                    "already": 0, "pushed": 0, "not_pushed": 0, "errors": 0, "dry_run": True}
     assert pushes == []
+
+
+def test_it_can_leave_people_out(pushes):
+    # The ask to review leaves out whoever has reviewed (reviews.ask).
+    db = _db()
+    people = [r["id"] for r in db.rows["profiles"]]
+    out = notify.broadcast(db, "Review AIBOS", skip={people[0]})
+    assert out["people"] == 2 and out["left_out"] == 1 and out["told"] == 2
+    assert {n["user_id"] for n in db.rows["notifications"]} == set(people[1:])
 
 
 def test_out_of_time_still_leaves_it_in_the_bell(pushes):

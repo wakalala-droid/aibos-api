@@ -173,9 +173,8 @@ def payroll_clerk(employees: list, runs: list, to_fix: int, today: date) -> list
     return out
 
 
-def sales_scout(sales: list, today: date) -> list:
-    """Customers who bought on QUIET_VISITS days or more and have not come back
-    in twice their usual gap (at least QUIET_MIN_DAYS). The biggest buyers first."""
+def _buyers(sales: list) -> dict:
+    """Named customers' confirmed sales: {key: {name, days, spent}}. Pure."""
     per: dict = {}
     for ev in sales:
         if ev.get("status") != "confirmed" or ev.get("event_type") != "Sale":
@@ -188,6 +187,14 @@ def sales_scout(sales: list, today: date) -> list:
         c = per.setdefault(normalize_key(name), {"name": name, "days": set(), "spent": 0.0})
         c["days"].add(d)
         c["spent"] += _num(p.get("amount"))
+    return per
+
+
+def sales_scout(sales: list, today: date, per: dict | None = None) -> list:
+    """Customers who bought on QUIET_VISITS days or more and have not come back
+    in twice their usual gap (at least QUIET_MIN_DAYS). The biggest buyers first.
+    `per` is `_buyers(sales)` when the caller has it already."""
+    per = _buyers(sales) if per is None else per
     found = []
     for key, c in per.items():
         days = sorted(c["days"])
@@ -238,6 +245,76 @@ def guest_desk(bookings: list, today: date, sym: str = "K") -> list:
     return out
 
 
+# ── What each worker went through, in a few words (20 Nov 2026) ──────────────
+# On a quiet day the team scene said "Watching" six times over, the same on
+# every visit. Each worker now says what it went through on its last pass
+# today ("6 regulars", "PAYE due tomorrow"), and the mark in the middle says
+# when ("Checked your books at 10:42"). From the records that pass read
+# anyway: nothing extra is read and nothing is guessed. A worker that could
+# not read its records says nothing. Pure, and at most 18 characters each:
+# they sit on a card 146px wide.
+
+def _many(n: int, one: str, more: str) -> str:
+    return f"{n} {one if n == 1 else more}"
+
+
+def _say_short(d: date, today: date) -> str:
+    if d == today:
+        return "today"
+    if d == today + timedelta(days=1):
+        return "tomorrow"
+    return f"{d.day} {actions._MONTHS[d.month - 1][:3]}"
+
+
+def looked_entries(pending: list) -> str:
+    n = sum(1 for ev in pending
+            if ev.get("status") == "pending" and ev.get("event_type") in actions.ENTRY_TYPES
+            and _num((ev.get("payload") or {}).get("amount")) > 0)
+    return "All confirmed" if n == 0 else f"{n} not confirmed"
+
+
+def looked_owed(report: dict) -> str:
+    n = sum(1 for c in report.get("customers") or [] if _num(c.get("total")) >= 1)
+    return "Nobody owes you" if n == 0 else f"{n} {'owes' if n == 1 else 'owe'} you"
+
+
+def looked_regulars(per: dict) -> str:
+    n = sum(1 for c in per.values() if len(c["days"]) >= QUIET_VISITS)
+    return "No regulars yet" if n == 0 else _many(n, "regular", "regulars")
+
+
+def looked_tax(items: list, today: date) -> str:
+    """A late one first (as far back as the Tax clerk asks), then the next one."""
+    import compliance
+    late, ahead = [], []
+    for it in items:
+        name = compliance.tax_of_title(it.get("title"))
+        due = _day(it.get("starts_at"))
+        if it.get("status") != "scheduled" or not name or due is None:
+            continue
+        if due >= today:
+            ahead.append((due, name))
+        elif due >= today - timedelta(days=45):
+            late.append((due, name))
+    if late:
+        due, name = min(late)
+        return f"Late: {name} {_say_short(due, today)}"
+    if ahead:
+        due, name = min(ahead)
+        return f"{name} due {_say_short(due, today)}"
+    return "No tax dates ahead"
+
+
+def looked_pay(employees: list) -> str:
+    n = sum(1 for e in employees if e.get("status", "active") == "active")
+    return "No staff yet" if n == 0 else f"{n} on the payroll"
+
+
+def looked_stays(bookings: list) -> str:
+    n = len(bookings)
+    return "No stays ahead" if n == 0 else f"{_many(n, 'stay', 'stays')} ahead"
+
+
 # ── One business: read, find, put forward ─────────────────────────────────────
 
 def _sym(db, tenant: str, biz: str | None) -> str:
@@ -250,24 +327,32 @@ def _sym(db, tenant: str, biz: str | None) -> str:
 
 
 def _findings(db, tenant: str, biz: str | None, whole_owner: bool, now: datetime,
-              taken: set) -> dict:
+              taken: set, looked: dict | None = None) -> dict:
     """{worker: [findings]} for the workers that could read their records.
-    A worker that could not read is left out, so its questions are kept."""
+    A worker that could not read is left out, so its questions are kept.
+    `looked`, when given, gets each worker's few words on what it went
+    through (see looked_entries and the rest above)."""
     import entitlements
     import nervous_system as nervous
     today = now.astimezone(LUSAKA).date()
     tier = entitlements.tier_detail(tenant)["tier"]
     sym = _sym(db, tenant, biz)
     out: dict = {}
+    said: dict = {} if looked is None else looked
 
     def attempt(worker, fn):
         try:
             out[worker] = fn()
         except Exception as e:  # noqa: BLE001 - one worker must not stop the rest
+            said.pop(worker, None)
             log.warning("[workers] %s for %s: %s", worker, tenant, e)
 
-    attempt("bookkeeper", lambda: bookkeeper(
-        nervous.list_events(db, tenant, status="pending", limit=300, business_id=biz), taken, now))
+    def books():
+        pending = nervous.list_events(db, tenant, status="pending", limit=300, business_id=biz)
+        said["bookkeeper"] = looked_entries(pending)
+        return bookkeeper(pending, taken, now)
+
+    attempt("bookkeeper", books)
 
     confirmed: list = []
 
@@ -276,15 +361,24 @@ def _findings(db, tenant: str, biz: str | None, whole_owner: bool, now: datetime
         import invoices as invoices_api
         confirmed.extend(nervous.list_events(db, tenant, status="confirmed", limit=200000, business_id=biz))
         invoices = invoices_api.list_invoices(db, tenant, business_id=biz)
-        return collector(debtors.aging_report(invoices, confirmed, today=today.isoformat()), today)
+        report = debtors.aging_report(invoices, confirmed, today=today.isoformat())
+        said["collector"] = looked_owed(report)
+        return collector(report, today)
+
+    def scout():
+        per = _buyers(confirmed)
+        said["scout"] = looked_regulars(per)
+        return sales_scout(confirmed, today, per)
 
     attempt("collector", owed)
     if "collector" in out:          # the scout reads the same entries
-        attempt("scout", lambda: sales_scout(confirmed, today))
+        attempt("scout", scout)
 
     def taxes():
         import schedule_items as schedule_api
-        return tax_clerk(schedule_api.list_items(db, tenant, business_id=biz), today)
+        items = schedule_api.list_items(db, tenant, business_id=biz)
+        said["tax"] = looked_tax(items, today)
+        return tax_clerk(items, today)
 
     attempt("tax", taxes)
 
@@ -292,16 +386,19 @@ def _findings(db, tenant: str, biz: str | None, whole_owner: bool, now: datetime
     if whole_owner and entitlements.can_access(tier, "payroll"):
         def pay():
             import payroll
-            return payroll_clerk(payroll.list_employees(db, tenant, include_left=False),
-                                 payroll.list_runs(db, tenant, limit=3),
+            staff = payroll.list_employees(db, tenant, include_left=False)
+            said["payroll"] = looked_pay(staff)
+            return payroll_clerk(staff, payroll.list_runs(db, tenant, limit=3),
                                  int(payroll.checks(db, tenant, today).get("act") or 0), today)
         attempt("payroll", pay)
     if whole_owner and entitlements.can_access(tier, "hospitality"):
         def stays():
             import hospitality
-            return guest_desk(hospitality.list_bookings(
+            bookings = hospitality.list_bookings(
                 db, tenant, statuses=["confirmed", "pending"], frm=today.isoformat(),
-                to=(today + timedelta(days=120)).isoformat()), today, sym)
+                to=(today + timedelta(days=120)).isoformat())
+            said["guest_desk"] = looked_stays(bookings)
+            return guest_desk(bookings, today, sym)
         attempt("guest_desk", stays)
     return out
 
@@ -314,7 +411,8 @@ def run_business(db, tenant: str, business_id: str | None, whole_owner: bool = T
     rows = actions._recent(db, tenant, business_id, limit=500)
     seen = {r.get("ref") for r in rows if r.get("source") == "worker"}
     taken = {str((r.get("result") or {}).get("event_id")) for r in rows if (r.get("result") or {}).get("event_id")}
-    found = _findings(db, tenant, business_id, whole_owner, now, taken)
+    looked: dict = {}
+    found = _findings(db, tenant, business_id, whole_owner, now, taken, looked)
 
     new, closed = [], 0
     for worker, items in found.items():
@@ -340,7 +438,9 @@ def run_business(db, tenant: str, business_id: str | None, whole_owner: bool = T
                     and r.get("ref") not in fresh):
                 actions._update(db, tenant, r["id"], {"status": "expired", "decided_at": actions._now_iso()})
                 closed += 1
-    _LOOKED[(tenant, str(actions.twin._books_for(db, tenant, business_id)))] = now.isoformat()
+    key = (tenant, str(actions.twin._books_for(db, tenant, business_id)))
+    _LOOKED[key] = now.isoformat()
+    _WENT_THROUGH[key] = looked
     return {"new": new, "closed": closed}
 
 
@@ -361,8 +461,20 @@ def run_now(db, tenant: str, business_id: str | None) -> dict:
 NEEDS = {"payroll": ("payroll", "Pro+"), "guest_desk": ("hospitality", "Growth")}
 
 # When the workers last looked through each business's books, in this run of
-# the API (the mission-control screen says it; a restart forgets it).
+# the API (the mission-control screen says it; a restart forgets it), and
+# each worker's few words on what it went through then.
 _LOOKED: dict = {}
+_WENT_THROUGH: dict = {}
+
+
+def _today_in_lusaka(at: str | None, now: datetime) -> bool:
+    try:
+        d = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(LUSAKA).date() == now.astimezone(LUSAKA).date()
 
 
 def roster(db, tenant: str, business_id: str | None, now: datetime | None = None) -> dict:
@@ -389,14 +501,19 @@ def roster(db, tenant: str, business_id: str | None, now: datetime | None = None
     out = [{"id": "assistant", "name": "Assistant", "does": "Does the jobs you ask for, typed or spoken",
             "on": True, "off_reason": None, **counts(asked),
             "autopilot": actions.autopilot_state(db, tenant, biz)["kinds"]}]
+    looked_at = _LOOKED.get((tenant, str(biz)))
+    # What each worker went through, only from a pass today (a morning
+    # before the first pass says nothing rather than yesterday's words).
+    went = _WENT_THROUGH.get((tenant, str(biz)), {}) if _today_in_lusaka(looked_at, now) else {}
     for w, name, does in WORKERS:
         need = NEEDS.get(w)
         on = not need or entitlements.can_access(tier, need[0])
         out.append({"id": w, "name": name, "does": does, "on": on,
                     "off_reason": None if on else f"Comes with {need[1]}",
+                    "looked": went.get(w) if on else None,
                     **counts([r for r in rows if actions.worker_of(r) == w])})
     auto = actions.auto_on(db, tenant, biz)
-    return {"workers": out, "looked_at": _LOOKED.get((tenant, str(biz))), "auto": auto,
+    return {"workers": out, "looked_at": looked_at, "auto": auto,
             "every_hours": AUTO_EVERY_HOURS if auto else EVERY_HOURS, "day_from": DAY_FROM, "day_to": DAY_TO}
 
 

@@ -675,9 +675,10 @@ def _slug(text: str, fallback: str = "announcement") -> str:
 
 
 def broadcast(db, title: str, body: str = "", link: str = "/dashboard", key: str = "",
-              dry_run: bool = False, budget_seconds: float = 25.0) -> dict:
+              dry_run: bool = False, budget_seconds: float = 25.0, skip: set | None = None) -> dict:
     """One message to everyone: a row in every account's bell and a
-    notification on every device that has them on.
+    notification on every device that has them on. `skip` leaves accounts
+    out (the ask to review leaves out whoever has reviewed, reviews.ask).
 
     ONCE, WHATEVER HAPPENS. `key` (or the title) stamps each row, and migration
     0030's unique index refuses a second copy, so a retry after a timeout tells
@@ -697,8 +698,10 @@ def broadcast(db, title: str, body: str = "", link: str = "/dashboard", key: str
     key = _slug(key or title)
     stamp = f"announce:{key}"
 
-    people = [r["id"] for r in (getattr(db.table("profiles").select("id").limit(5000).execute(),
-                                        "data", None) or []) if r.get("id")]
+    everyone = [r["id"] for r in (getattr(db.table("profiles").select("id").limit(5000).execute(),
+                                          "data", None) or []) if r.get("id")]
+    left_out = {str(u) for u in (skip or ())}
+    people = [uid for uid in everyone if str(uid) not in left_out]
     try:
         devices = {r["user_id"] for r in
                    (getattr(db.table("push_subscriptions").select("user_id").limit(5000).execute(),
@@ -708,6 +711,7 @@ def broadcast(db, title: str, body: str = "", link: str = "/dashboard", key: str
         devices = set()
 
     out = {"key": key, "people": len(people), "with_devices": len(devices & set(people)),
+           "left_out": len(everyone) - len(people),
            "told": 0, "already": 0, "pushed": 0, "not_pushed": 0, "errors": 0}
     if dry_run:
         return {**out, "dry_run": True}

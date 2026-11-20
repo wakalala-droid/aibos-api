@@ -258,6 +258,76 @@ def test_the_roster_counts_what_each_worker_has_waiting(db):
     assert team["looked_at"] == NOW.isoformat()
 
 
+def test_each_worker_says_what_it_went_through_in_a_few_words():
+    # The team scene's cards on a quiet day, in place of "Watching" six times.
+    assert workers.looked_entries([]) == "All confirmed"
+    evs = [{"status": "pending", "event_type": "Sale", "payload": {"amount": 50}},
+           {"status": "pending", "event_type": "Expense", "payload": {"amount": 20}},
+           {"status": "pending", "event_type": "Salary", "payload": {"amount": 50}},     # payroll's own
+           {"status": "pending", "event_type": "Sale", "payload": {"amount": 0}}]
+    assert workers.looked_entries(evs) == "2 not confirmed"
+    assert workers.looked_owed({"customers": []}) == "Nobody owes you"
+    assert workers.looked_owed({"customers": [{"total": 1200}, {"total": 0.4}]}) == "1 owes you"
+    assert workers.looked_owed({"customers": [{"total": 1200}, {"total": 80}]}) == "2 owe you"
+    per = workers._buyers([_sale("2026-11-01", who="Banda"), _sale("2026-11-05", who="Banda"),
+                           _sale("2026-11-09", who="Banda"), _sale("2026-11-09", who="Phiri"),
+                           _sale("2026-11-10", who="Walk-in")])
+    assert workers.looked_regulars(per) == "1 regular"
+    assert workers.looked_regulars({}) == "No regulars yet"
+    items = [{"status": "scheduled", "title": "NAPSA to NAPSA", "starts_at": "2026-11-20T08:00:00+00:00"},
+             {"status": "scheduled", "title": "PAYE to ZRA", "starts_at": "2026-11-18T08:00:00+00:00"},
+             {"status": "done", "title": "PAYE to ZRA", "starts_at": "2026-11-17T08:00:00+00:00"},
+             {"status": "scheduled", "title": "Pay the rent", "starts_at": "2026-11-17T08:00:00+00:00"}]
+    assert workers.looked_tax(items, TODAY) == "PAYE due tomorrow"
+    late = items + [{"status": "scheduled", "title": "NHIMA", "starts_at": "2026-11-10T08:00:00+00:00"}]
+    assert workers.looked_tax(late, TODAY) == "Late: NHIMA 10 Nov"
+    gone = items + [{"status": "scheduled", "title": "NHIMA", "starts_at": "2026-08-10T08:00:00+00:00"}]
+    assert workers.looked_tax(gone, TODAY) == "PAYE due tomorrow"            # past what the clerk asks
+    assert workers.looked_tax([], TODAY) == "No tax dates ahead"
+    assert workers.looked_pay([{"status": "active"}, {}, {"status": "left"}]) == "2 on the payroll"
+    assert workers.looked_pay([{}]) == "1 on the payroll"
+    assert workers.looked_pay([]) == "No staff yet"
+    assert workers.looked_stays([{}, {}]) == "2 stays ahead"
+    assert workers.looked_stays([]) == "No stays ahead"
+    napsa = [{"status": "scheduled", "title": "NAPSA", "starts_at": "2026-11-30"}]
+    assert workers.looked_tax(napsa, TODAY) == "NAPSA due 30 Nov"
+    # Each fits its card (146px of text, about 18 characters).
+    longest = ["12 not confirmed", "Nobody owes you", "No regulars yet", "No tax dates ahead",
+               workers.looked_tax([{"status": "scheduled", "title": "NAPSA", "starts_at": "2026-11-18"}], TODAY),
+               workers.looked_tax([{"status": "scheduled", "title": "NHIMA", "starts_at": "2026-11-12"}], TODAY),
+               "12 on the payroll", "12 stays ahead"]
+    assert all(len(w) <= 18 for w in longest), longest
+
+
+def test_after_a_pass_each_worker_says_what_it_went_through_that_day_only(db):
+    _seed(db)
+    workers.run_business(db, OWNER, None, whole_owner=False, now=NOW)
+    r = {w["id"]: w for w in workers.roster(db, OWNER, None, now=NOW)["workers"]}
+    assert r["bookkeeper"]["looked"] == "1 not confirmed"
+    assert r["collector"]["looked"] == "1 owes you"
+    assert r["scout"]["looked"] == "No regulars yet"
+    assert r["tax"]["looked"] == "PAYE due tomorrow"
+    # Staff and stays are looked at once, for the whole owner, not in this pass.
+    assert r["payroll"]["looked"] is None and r["guest_desk"]["looked"] is None
+    assert "looked" not in r["assistant"]
+    # The next morning, before a pass, nobody repeats yesterday's words.
+    later = workers.roster(db, OWNER, None, now=NOW + timedelta(days=1))
+    assert all(w.get("looked") is None for w in later["workers"])
+
+
+def test_a_worker_that_could_not_read_says_nothing(db, monkeypatch):
+    import schedule_items
+    _seed(db)
+
+    def broken(*a, **k):
+        raise RuntimeError("schedule unreadable")
+
+    monkeypatch.setattr(schedule_items, "list_items", broken)
+    workers.run_business(db, OWNER, None, whole_owner=False, now=NOW)
+    r = {w["id"]: w for w in workers.roster(db, OWNER, None, now=NOW)["workers"]}
+    assert r["tax"]["looked"] is None and r["bookkeeper"]["looked"] == "1 not confirmed"
+
+
 def test_the_assistant_counts_what_the_owner_asked_for_and_its_earned_switch(db):
     for i in range(2):
         job = actions.propose(db, OWNER, OWNER, None, "record_entry",

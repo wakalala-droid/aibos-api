@@ -2603,7 +2603,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 47
+EXPECTS_MIGRATION = 48
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -9270,3 +9270,9 @@ def twin_financials(ctx: membership.Context = Depends(membership.require_context
 # ── Find clients (Growth, 5 Nov 2026; migration 0045) ─────────────────────────
 # The routes live in find_clients_routes.py, the work in find_clients.py.
 app.include_router(find_clients_routes.router)
+
+# ── Owners review AIBOS (20 Nov 2026; migration 0048) ─────────────────────────
+# The review centre, the website's reviews and the ask: all in reviews.py.
+import reviews as reviews_api  # noqa: E402
+
+app.include_router(reviews_api.router)
