@@ -14,7 +14,9 @@ connects in Business profile (payment_accounts.py, migration 0038). Using the
 platform keys for these would pay every customer's invoices into one account,
 so these two functions take the business's Account and have no fallback to the
 environment. Today the provider is Lenco (Bank of Zambia licensed), which asks
-the payer's phone on MTN, Airtel or Zamtel.
+the payer's phone on MTN, Airtel or Zamtel, or takes a bank card (Visa or
+Mastercard, from any bank) in its own secure card window. The card window needs
+the business's Lenco PUBLIC key as well (card_options).
 
 With no keys at all the module can run in SIMULATION mode for development (a
 request resolves to 'successful' a few seconds after it is initiated). It must
@@ -267,11 +269,16 @@ def status(network: str, reference: str, created_at: float = None) -> str:
 class Account:
     """One business's own collection account. `secret` is the provider's API
     key, opened for this request only. It is left out of repr so it cannot
-    reach a log line by accident."""
+    reach a log line by accident.
+
+    `public_key` is Lenco's PUBLIC key, the one its card window opens with
+    (migration 0049). It is safe in a browser and is what switches card
+    payments on. None means mobile money only."""
     provider: str                          # "lenco"
     secret: str = field(repr=False)
     environment: str = "live"              # "live" | "sandbox"
     owner: str = ""                        # the business's user id, for logs
+    public_key: Optional[str] = None
 
 
 class CollectRefused(Exception):
@@ -285,7 +292,42 @@ LENCO_BASE = {
     "live": "https://api.lenco.co/access/v2",
     "sandbox": "https://sandbox.lenco.co/access/v2",
 }
+# Lenco's card window (its "popup widget"). Cards are typed into Lenco's own
+# frame, never into a page of ours: taking card numbers directly needs PCI DSS.
+# The window takes cards from any bank and mobile money as well.
+LENCO_WIDGET = {
+    "live": "https://pay.lenco.co/js/v1/inline.js",
+    "sandbox": "https://pay.sandbox.lenco.co/js/v1/inline.js",
+}
 _NETWORK_NAMES = {"mtn": "MTN", "airtel": "Airtel", "zamtel": "Zamtel"}
+
+# A card payment is kept in the same table as a mobile money one, under this
+# "network", so the status checks, the sweep and Lenco's webhook settle both.
+CARD = "card"
+
+
+def card_options(account: Optional[Account], currency: str = "ZMW") -> Optional[dict]:
+    """What a payment page needs to open Lenco's card window for this business,
+    or None when cards are not switched on for it. Nothing secret: the public
+    key is made to be read by a browser."""
+    if account is None or account.provider != "lenco" or not account.public_key:
+        return None
+    if (currency or "ZMW").strip().upper() not in ("ZMW", "USD"):
+        return None
+    environment = account.environment if account.environment in LENCO_WIDGET else "live"
+    return {
+        "public_key": account.public_key,
+        "script": LENCO_WIDGET[environment],
+        "test_mode": environment == "sandbox",
+    }
+
+
+def paid_by(network: Optional[str]) -> str:
+    """How a collection was paid, in the words an owner reads in the bell."""
+    if network == CARD:
+        return "card"
+    name = _NETWORK_NAMES.get(str(network or "").lower())
+    return f"{name} mobile money" if name else "mobile money"
 
 
 def networks_for(account: Optional[Account], currency: str = "ZMW") -> dict:
@@ -334,15 +376,30 @@ def collection_status(account: Optional[Account], network: str, reference: str,
                       created_at: Optional[float] = None) -> str:
     """Ask the business's own provider how a collection went.
     Returns 'pending' | 'successful' | 'failed'."""
+    return collection_detail(account, network, reference, created_at)["status"]
+
+
+def collection_detail(account: Optional[Account], network: str, reference: str,
+                      created_at: Optional[float] = None) -> dict:
+    """How a collection went, with what the provider says was actually paid.
+
+    {"status", "amount", "currency", "type", "found"}. `amount` and `currency`
+    are the provider's own figures, None when it did not give them. They matter
+    for a card payment: the card window is opened by the payer's browser, so its
+    amount is a number the payer could have changed, and only Lenco's answer
+    says what really arrived. `found` is True when Lenco knows the reference,
+    False when Lenco said it has never seen it (a card window closed before
+    paying) and None when nobody could ask. Never raises."""
+    empty = {"status": "pending", "amount": None, "currency": None, "type": None, "found": None}
     if account is None:
         if SIMULATION_ENABLED and created_at and (time.time() - created_at) >= SIMULATION_DELAY:
-            return "successful"
-        return "pending"
+            return {**empty, "status": "successful"}
+        return empty
     try:
-        return _lenco_status(account, reference)
+        return _lenco_status_detail(account, reference)
     except Exception as e:  # noqa: BLE001
         log.error("[payments] lenco status failed for %s (%s): %s", account.owner, reference, e)
-        return "pending"
+        return empty
 
 
 # ── Lenco ─────────────────────────────────────────────────────────────────────
@@ -409,12 +466,33 @@ def _lenco_collect(account: Account, network: str, reference: str, amount: float
 
 
 def _lenco_status(account: Account, reference: str) -> str:
+    return _lenco_status_detail(account, reference)["status"]
+
+
+def _money_or_none(value) -> Optional[float]:
+    """Lenco sends amounts as strings ("10.00")."""
+    try:
+        return round(float(value), 2) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _lenco_status_detail(account: Account, reference: str) -> dict:
     r = _lenco_request(account, "GET", f"/collections/status/{reference}")
     if r.status_code == 404:
-        return "pending"          # not recorded at Lenco yet; the next check asks again
+        # Not recorded at Lenco yet (or a card window that was closed before
+        # paying); the next check asks again.
+        return {"status": "pending", "amount": None, "currency": None, "type": None, "found": False}
     if r.status_code != 200:
         raise RuntimeError(f"Lenco status {r.status_code}: {str(_json(r).get('message'))[:160]}")
-    return _lenco_state((_json(r).get("data") or {}).get("status"))
+    data = _json(r).get("data") or {}
+    return {
+        "status": _lenco_state(data.get("status")),
+        "amount": _money_or_none(data.get("amount")),
+        "currency": (str(data.get("currency")).strip().upper() or None) if data.get("currency") else None,
+        "type": data.get("type") or None,
+        "found": True,
+    }
 
 
 def verify_lenco_key(secret: str) -> dict:

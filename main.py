@@ -170,9 +170,16 @@ app.add_middleware(
 # perfect, and every date check silently fails in the browser with a CORS error
 # the owner will never see. That is the same shape of failure as the wrong
 # Supabase key: a configuration step nobody knows they missed.
+#
+# /pay/stay/* joins it for the same reason: the website's checkout takes the
+# payment itself (mobile money prompt or Lenco's card window) with the pay token
+# the booking request handed back. Token-scoped, no credentials, throttled.
+_PUBLIC_PREFIXES = ("/public/", "/pay/stay/")
+
+
 @app.middleware("http")
 async def _public_cors(request: Request, call_next):
-    is_public = request.url.path.startswith("/public/")
+    is_public = request.url.path.startswith(_PUBLIC_PREFIXES)
     if is_public and request.method == "OPTIONS":
         response = Response(status_code=204)
     else:
@@ -2603,7 +2610,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 48
+EXPECTS_MIGRATION = 49
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -6812,11 +6819,35 @@ def public_stay(token: str, request: Request):
     except Exception:  # noqa: BLE001
         pass
     name, logo = _business_brand_for(db, booking["user_id"])
+    account = payment_accounts.for_owner(db, booking["user_id"])
+    currency = booking.get("currency") or "ZMW"
     return {"ok": True,
             "stay": hospitality_api.public_stay_view(
                 booking, _unit_name(db, booking["user_id"], booking.get("unit_id")), name, logo),
-            "networks": payments.networks_for(payment_accounts.for_owner(db, booking["user_id"]),
-                                              booking.get("currency") or "ZMW")}
+            "networks": payments.networks_for(account, currency),
+            # Lenco's card window: any bank's Visa or Mastercard.
+            "card": payments.card_options(account, currency) is not None,
+            # A Lenco test key: nothing real moves, and the page says so.
+            "test_mode": bool(account is not None and account.environment == "sandbox")}
+
+
+def _stay_due_or_409(db, booking: Dict[str, Any]) -> float:
+    """What the stay's link asks for now, checked the way every payment route
+    must check it: something is due and, for a website request that paying
+    confirms, its nights are still free. The amount is the booking's, read
+    here. Nothing the guest sends sets it."""
+    amount = hospitality_api.amount_due(booking)
+    if amount <= 0.005:
+        if booking.get("status") in ("declined", "cancelled", "no_show"):
+            raise HTTPException(status_code=409, detail="This booking is closed, so it cannot be "
+                                                        "paid. Please contact the property.")
+        raise HTTPException(status_code=409, detail="Nothing is owed on this stay. Thank you!")
+    try:
+        hospitality_api.check_bookable(db, booking)
+    except hospitality_api.DatesUnavailable as e:
+        # The public message: the full one names another guest's dates.
+        raise HTTPException(status_code=409, detail=e.public_message)
+    return amount
 
 
 @app.post("/pay/stay/{token}/initiate")
@@ -6825,10 +6856,7 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
     _throttle_public(request, "pay_initiate", 60, 60, token=token, token_limit=5)
     db = _require_db()
     booking = _stay_or_404(db, token)
-    # The amount is the booking's, read here. Nothing the guest sends sets it.
-    amount = hospitality_api.amount_due(booking)
-    if amount <= 0.005:
-        raise HTTPException(status_code=409, detail="Nothing is owed on this stay. Thank you!")
+    amount = _stay_due_or_409(db, booking)
     currency = booking.get("currency") or "ZMW"
     reference = str(uuid.uuid4())
     network = (body.network or "").lower()
@@ -6838,7 +6866,7 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
     row = {
         "booking_id": booking["id"], "user_id": booking["user_id"], "reference": reference,
         "network": network, "payer_phone": body.payer_phone.strip(),
-        "amount": amount, "currency": currency, "status": state,
+        "amount": amount, "currency": currency, "status": state, "settled": False,
     }
     if account is not None:
         row["provider"] = account.provider         # migration 0038
@@ -6846,19 +6874,41 @@ def public_stay_initiate(token: str, body: PublicPayRequest, request: Request):
     return {"ok": True, "reference": reference, "status": state, "amount": amount, "currency": currency}
 
 
-def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
+def _settle_booking_payment(db, row: Dict[str, Any], new_status: str,
+                            detail: Optional[Dict[str, Any]] = None) -> str:
     """Apply a resolved status once; on success the booking records the money.
     `settled` is claimed with a conditional write first, so a status check and
     the provider's confirmation cannot both record it. As with invoices, a row
     already 'successful' but not settled is settled now, and a failure to post
-    gives the claim back for the sweep."""
+    gives the claim back for the sweep.
+
+    `detail` is Lenco's own account of the collection (payments.collection_detail).
+    What Lenco says arrived is what is recorded: Lenco's card window is opened
+    by the payer's browser with an amount the browser hands it, so the row's
+    amount is only what was expected. A website request paid in full confirms
+    itself (hospitality.record_link_payment); one paid short, or whose nights
+    were taken while the guest paid, is left for the owner, who is told."""
     if new_status not in ("successful", "failed"):
         return row.get("status", "pending")
     if new_status == row.get("status") and (new_status == "failed" or row.get("settled")):
         return new_status
+    is_card = row.get("network") == payments.CARD
+    expected_currency = str(row.get("currency") or "ZMW").upper()
+    unchecked = wrong_currency = False
     if new_status != row.get("status"):
-        db.table("booking_payments").update({"status": new_status}).eq("id", row["id"]).execute()
-        row["status"] = new_status
+        patch: Dict[str, Any] = {"status": new_status}
+        if new_status == "successful":
+            got = (detail or {}).get("amount")
+            got_currency = (detail or {}).get("currency")
+            if got is not None and abs(float(got) - float(row.get("amount") or 0)) > 0.005:
+                patch["amount"] = round(float(got), 2)
+            if got_currency and got_currency != expected_currency:
+                patch["currency"] = got_currency
+                wrong_currency = True
+            # A card amount only Lenco can vouch for, and Lenco said nothing.
+            unchecked = is_card and got is None
+        db.table("booking_payments").update(patch).eq("id", row["id"]).execute()
+        row.update(patch)
     if new_status != "successful" or row.get("settled"):
         return new_status
     claimed = (db.table("booking_payments").update({"settled": True})
@@ -6866,29 +6916,61 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
     if not (getattr(claimed, "data", None) or []):
         return new_status
     row["settled"] = True
-    # A stay is paid by mobile money, in Kwacha (plans are the ones in dollars).
     currency = row.get("currency") or "ZMW"
-    money = billing_api.money(float(row.get("amount") or 0), currency)
+    amount = float(row.get("amount") or 0)
+    money = billing_api.money(amount, currency)
+    how = payments.paid_by(row.get("network"))
+    ref = row["reference"]
     link = f"/dashboard/hospitality?booking={row['booking_id']}"
+
+    def tell(kind: str, title: str, body: str, key: str) -> None:
+        try:
+            notify.record_notification(db, row["user_id"], kind, title, body,
+                                       link=link, meta={"booking_id": key})
+        except Exception as e:  # noqa: BLE001 (telling the owner must never fail the payer)
+            log.warning("[pay] could not tell the owner about stay payment %s: %s", ref, e)
+
+    if wrong_currency or unchecked:
+        tell("booking_payment_unmatched",
+             f"A guest paid {money} by {how} that AIBOS could not check",
+             f"Reference {ref}. "
+             + ("It came in a different currency from the stay"
+                if wrong_currency else "Lenco did not say how much was paid")
+             + ", so the booking was not confirmed and the money is not in your books. "
+               "Check the payment in Lenco, then confirm the booking and record it, or refund it.",
+             f"pay-{ref}")
+        return new_status
     try:
-        out = hospitality_api.record_link_payment(db, row["user_id"], row["booking_id"],
-                                                  float(row.get("amount") or 0),
-                                                  reference=row["reference"])
+        out = hospitality_api.record_link_payment(
+            db, row["user_id"], row["booking_id"], amount, reference=ref,
+            method="card" if is_card else "mobile_money")
+    except hospitality_api.PaidShort as e:
+        # The card window was told a smaller amount. Not confirmed, not booked:
+        # the owner decides whether to take it as a deposit or refund it.
+        tell("booking_payment_unmatched",
+             f"A guest paid {money} towards a booking of {billing_api.money(e.due, currency)}",
+             f"By {how}, reference {ref}. That is less than the full price, so the booking was "
+             "not confirmed and the money is not in your books yet. Confirm the booking and "
+             "record the payment, or refund it.",
+             f"pay-{ref}")
+        return new_status
+    except hospitality_api.DatesUnavailable:
+        tell("booking_payment_unmatched",
+             f"A guest paid {money} but their dates are no longer free",
+             f"By {how}, reference {ref}. Another booking took those nights while they were "
+             "paying, so the booking was not confirmed and the money is not in your books. "
+             "Offer them other dates or another apartment, or refund them.",
+             f"pay-{ref}")
+        return new_status
     except ValueError as e:
         # Cancelled while the guest was approving. Their money arrived anyway,
         # so the owner must hear about it: it is owed back or to be recorded.
-        log.warning("[pay] stay payment %s arrived but booking %s: %s",
-                    row["reference"], row["booking_id"], e)
-        try:
-            notify.record_notification(
-                db, row["user_id"], "booking_payment_unmatched",
-                f"A guest paid {money} for a stay that is no longer booked",
-                f"{row['network'].upper()} mobile money reference {row['reference']}. The stay "
-                f"changed ({e}) while they were paying, so this money is not in your books. "
-                "Record it or refund it.",
-                link=link, meta={"booking_id": f"pay-{row['reference']}"})
-        except Exception:  # noqa: BLE001 — telling the owner must never fail the payer
-            pass
+        log.warning("[pay] stay payment %s arrived but booking %s: %s", ref, row["booking_id"], e)
+        tell("booking_payment_unmatched",
+             f"A guest paid {money} for a stay that is no longer booked",
+             f"By {how}, reference {ref}. The stay changed ({e}) while they were paying, so "
+             "this money is not in your books. Record it or refund it.",
+             f"pay-{ref}")
         return new_status
     except Exception:
         # The books could not take it. Only this releases the claim: a failure
@@ -6897,32 +6979,88 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str) -> str:
         raise
 
     saved = out["booking"]
-    try:
-        if out["applied"] > 0.005:
-            notify.record_notification(
-                db, row["user_id"], "booking_paid_by_link",
-                f"A guest paid {billing_api.money(out['applied'], currency)} for their stay",
-                f"{str(saved.get('check_in'))[:10]} to {str(saved.get('check_out'))[:10]}: "
-                f"{'paid in full' if saved.get('payment_status') == 'paid' else 'deposit received'} "
-                f"by {row['network'].upper()} mobile money, reference {row['reference']}. "
-                "It is in your books.",
-                link=link, meta={"booking_id": f"pay-{row['reference']}"})
-        if out["excess"] > 0.005:
-            # Paid twice (two prompts approved), or paid after the owner had
-            # recorded the stay as paid. The money arrived and the stay did not
-            # owe it, so it is owed back. Never absorbed in silence.
-            extra = billing_api.money(out["excess"], currency)
-            notify.record_notification(
-                db, row["user_id"], "booking_payment_unmatched",
-                f"A guest paid {extra} more than their stay owed",
-                f"{row['network'].upper()} mobile money reference {row['reference']} brought {money}"
-                + (f", of which {billing_api.money(out['applied'], currency)} went to the stay"
-                   if out["applied"] > 0.005 else ", and the stay was already paid in full")
-                + f". The other {extra} is not in your books. Check and refund it if they paid twice.",
-                link=link, meta={"booking_id": f"over-{row['reference']}"})
-    except Exception as e:  # noqa: BLE001 — the money is recorded; the bell is best-effort
-        log.warning("[pay] could not tell the owner about stay payment %s: %s", row["reference"], e)
+    dates = f"{str(saved.get('check_in'))[:10]} to {str(saved.get('check_out'))[:10]}"
+    if out.get("confirmed"):
+        # The guest paid for a request and it is theirs now: they hear it from
+        # the property, as they would when the owner presses Confirm.
+        try:
+            guest_mail.deliver(db, row["user_id"], saved, "confirmed")
+        except Exception as e:  # noqa: BLE001 (deliver never raises; belt and braces)
+            log.warning("[pay] confirmed email for %s failed: %s", ref, e)
+    if out["applied"] > 0.005:
+        applied = billing_api.money(out["applied"], currency)
+        if out.get("confirmed"):
+            tell("booking_paid_by_link",
+                 f"New booking paid and confirmed: {applied}",
+                 f"{dates}: the guest paid in full by {how}, reference {ref}. AIBOS confirmed "
+                 "the booking because it was paid, and it is in your books.",
+                 f"pay-{ref}")
+        else:
+            tell("booking_paid_by_link",
+                 f"A guest paid {applied} for their stay",
+                 f"{dates}: "
+                 f"{'paid in full' if saved.get('payment_status') == 'paid' else 'deposit received'} "
+                 f"by {how}, reference {ref}. It is in your books.",
+                 f"pay-{ref}")
+    if out["excess"] > 0.005:
+        # Paid twice (two prompts approved), or paid after the owner had
+        # recorded the stay as paid. The money arrived and the stay did not
+        # owe it, so it is owed back. Never absorbed in silence.
+        extra = billing_api.money(out["excess"], currency)
+        tell("booking_payment_unmatched",
+             f"A guest paid {extra} more than their stay owed",
+             f"Paid by {how}, reference {ref}, it brought {money}"
+             + (f", of which {billing_api.money(out['applied'], currency)} went to the stay"
+                if out["applied"] > 0.005 else ", and the stay was already paid in full")
+             + f". The other {extra} is not in your books. Check and refund it if they paid twice.",
+             f"over-{ref}")
     return new_status
+
+
+def _collection_detail_for(account: Optional[payments.Account], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Lenco's account of one payment-link collection. A collection that went
+    into a business's own account (it has a provider) is only ever answered by
+    that account. Disconnected since, the answer is "still pending": never the
+    developer-only simulation, which would confirm a booking nobody paid for."""
+    if account is None and row.get("provider"):
+        return {"status": "pending", "amount": None, "currency": None, "type": None, "found": None}
+    created = entitlements._parse_ts(row.get("created_at"))
+    return payments.collection_detail(account, row["network"], row["reference"],
+                                      created.timestamp() if created else None)
+
+
+@app.post("/pay/stay/{token}/card")
+def public_stay_card(token: str, request: Request):
+    """Start a card payment for what the stay is due.
+
+    AIBOS keeps the reference and the amount and the page opens Lenco's own
+    card window with them, so card details go to Lenco and never touch AIBOS.
+    Any bank's Visa or Mastercard. Whatever the window is told, the booking
+    records what Lenco says arrived (_settle_booking_payment). The guest's
+    email, which Lenco's window asks for, is typed on the page: it is not
+    handed out here to whoever holds the link."""
+    _throttle_public(request, "pay_card", 60, 60, token=token, token_limit=5)
+    db = _require_db()
+    booking = _stay_or_404(db, token)
+    amount = _stay_due_or_409(db, booking)
+    currency = booking.get("currency") or "ZMW"
+    account = payment_accounts.for_owner(db, booking["user_id"])
+    card = payments.card_options(account, currency)
+    if card is None or account is None:
+        raise HTTPException(status_code=503, detail="Paying by card isn’t switched on for this "
+                                                    "business yet. Please pay by mobile money.")
+    reference = str(uuid.uuid4())
+    db.table("booking_payments").insert({
+        "booking_id": booking["id"], "user_id": booking["user_id"], "reference": reference,
+        "network": payments.CARD, "payer_phone": None, "amount": amount, "currency": currency,
+        "status": "pending", "settled": False, "provider": account.provider,
+    }).execute()
+    name, _logo = _business_brand_for(db, booking["user_id"])
+    unit = _unit_name(db, booking["user_id"], booking.get("unit_id"))
+    stay = f"{str(booking.get('check_in'))[:10]} to {str(booking.get('check_out'))[:10]}"
+    label = ": ".join(p for p in (name, ", ".join(q for q in (unit, stay) if q)) if p)
+    return {"ok": True, "reference": reference, "amount": amount, "currency": currency,
+            "label": label[:100], **card}
 
 
 @app.get("/pay/stay/{token}/status/{reference}")
@@ -6939,11 +7077,20 @@ def public_stay_status(token: str, reference: str, request: Request):
     row = rows[0]
     status = row["status"]
     if status == "pending":
-        created = entitlements._parse_ts(row.get("created_at"))
-        status = _settle_booking_payment(
-            db, row, payments.collection_status(payment_accounts.for_owner(db, row["user_id"]), row["network"],
-                                                reference, created.timestamp() if created else None))
-    return {"ok": True, "reference": reference, "status": status}
+        detail = _collection_detail_for(payment_accounts.for_owner(db, row["user_id"]), row)
+        status = _settle_booking_payment(db, row, detail["status"], detail)
+    out = {"ok": True, "reference": reference, "status": status}
+    if status == "successful":
+        # Paying a website request confirms it. The page says which happened:
+        # confirmed, or received and left for the owner (paid short, or the
+        # nights went while the guest was paying).
+        try:
+            now = hospitality_api.get_booking(db, booking["user_id"], booking["id"])
+        except ValueError:
+            now = booking
+        out["booking_status"] = now.get("status")
+        out["confirmed"] = now.get("status") in hospitality_api.STAY_STATUSES
+    return out
 
 
 # ── Each business's own payment account (migration 0038) ──────────────────────
@@ -6996,6 +7143,37 @@ def payment_account_connect(body: PaymentAccountIn, request: Request,
     return _payment_account_view(db, ctx.tenant)
 
 
+class PaymentPublicKeyIn(BaseModel):
+    public_key: str
+
+
+@app.put("/payments/account/public-key")
+def payment_account_public_key(body: PaymentPublicKeyIn, request: Request,
+                               ctx: membership.Context = Depends(membership.require_owner)):
+    """Switch card payments on: the Lenco PUBLIC key opens Lenco's card window
+    on the payment page. The secret key is refused here."""
+    _throttle_public(request, "pay_account", 20, 600, token=ctx.tenant, token_limit=8)
+    db = _require_db()
+    try:
+        payment_accounts.set_public_key(db, ctx.tenant, body.public_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except payment_accounts.NotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return _payment_account_view(db, ctx.tenant)
+
+
+@app.delete("/payments/account/public-key")
+def payment_account_public_key_clear(ctx: membership.Context = Depends(membership.require_owner)):
+    """Switch card payments off. Mobile money carries on."""
+    db = _require_db()
+    try:
+        payment_accounts.clear_public_key(db, ctx.tenant)
+    except payment_accounts.NotSetUp as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return _payment_account_view(db, ctx.tenant)
+
+
 @app.delete("/payments/account")
 def payment_account_disconnect(ctx: membership.Context = Depends(membership.require_owner)):
     """Stop taking mobile money on this business's links and forget the key."""
@@ -7043,6 +7221,10 @@ async def lenco_webhook(request: Request):
                 raise HTTPException(status_code=403, detail="Invalid signature")
             if row.get("status") != "pending":
                 return {"ok": True, "status": row.get("status")}
+            if table == "booking_payments":
+                # With what Lenco says arrived: a card amount is the payer's to set.
+                detail = payments.collection_detail(account, row["network"], reference)
+                return {"ok": True, "status": _settle_booking_payment(db, row, detail["status"], detail)}
             state = payments.collection_status(account, row["network"], reference)
             return {"ok": True, "status": settle_row(db, row, state)}
         # Not one of ours. 200, so Lenco does not retry it for a day.
@@ -8291,6 +8473,9 @@ def hospitality_ical_public_feed(token: str):
 
 PAYMENTS_SWEEP_SECONDS = int(os.environ.get("PAYMENTS_SWEEP_SECONDS", "300"))
 PAYMENTS_SWEEP_HOURS = 48
+# A card payment Lenco has never heard of this long after its window opened
+# was never made: the guest closed the window, or opened a new one.
+CARD_WINDOW_SECONDS = 2 * 3600
 
 
 def sweep_pending_payments(db) -> dict:
@@ -8307,13 +8492,14 @@ def sweep_pending_payments(db) -> dict:
     platform_live = any(payments.configured_networks().values()) or payments.SIMULATION_ENABLED
     accounts: Dict[str, Optional[payments.Account]] = {}
 
-    def business_status(row) -> str:
+    def business_detail(row) -> dict:
         owner = row.get("user_id")
         if owner not in accounts:
             accounts[owner] = payment_accounts.for_owner(db, owner)
-        created = entitlements._parse_ts(row.get("created_at"))
-        return payments.collection_status(accounts[owner], row["network"], row["reference"],
-                                          created.timestamp() if created else None)
+        return _collection_detail_for(accounts[owner], row)
+
+    def business_status(row) -> str:
+        return business_detail(row)["status"]
 
     try:
         subs = (db.table("subscription_payments").select("*").eq("status", "pending")
@@ -8380,7 +8566,17 @@ def sweep_pending_payments(db) -> dict:
                  .gte("created_at", since).limit(200).execute())
         for row in getattr(stays, "data", None) or []:
             try:
-                if _settle_booking_payment(db, row, business_status(row)) != "pending":
+                detail = business_detail(row)
+                state = detail["status"]
+                if (row.get("network") == payments.CARD and state == "pending"
+                        and detail.get("found") is False):
+                    # A card window closed without paying: Lenco has never heard
+                    # of the reference. Let it go after a while, so abandoned
+                    # windows are not asked about for two days.
+                    created = entitlements._parse_ts(row.get("created_at"))
+                    if created and (datetime.now(timezone.utc) - created).total_seconds() > CARD_WINDOW_SECONDS:
+                        state = "failed"
+                if _settle_booking_payment(db, row, state, detail) != "pending":
                     out["stays"] += 1
             except Exception as e:  # noqa: BLE001
                 out["errors"] += 1
@@ -8632,6 +8828,27 @@ def public_stay_availability(site_token: str,
         raise HTTPException(status_code=code, detail=str(e))
 
 
+@app.get("/public/stay/{site_token}/payments")
+def public_stay_payments(site_token: str):
+    """How a guest can pay online on this property's website, asked before
+    they send the booking form, so the form only offers what is really there:
+    which mobile money networks, and whether bank cards (Lenco's card window)
+    are on. Says nothing about the account itself. All false means the site
+    shows its own way to pay (account numbers to send money to)."""
+    db = _require_db()
+    try:
+        prop = hospitality_api._site_for_token(db, site_token)
+    except hospitality_api.SetupRequired as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    account = payment_accounts.for_owner(db, prop["user_id"])
+    return {"ok": True,
+            "networks": payments.networks_for(account, "ZMW"),
+            "card": payments.card_options(account, "ZMW") is not None,
+            "test_mode": bool(account is not None and account.environment == "sandbox")}
+
+
 @app.post("/public/stay/{site_token}/booking-request")
 def public_stay_booking_request(site_token: str, request: Request,
                                       body: Dict[str, Any] = Body(...)):
@@ -8697,7 +8914,20 @@ def public_stay_booking_request(site_token: str, request: Request,
 
     # And tell the guest, in the property's name. deliver() never raises, and
     # only a yes/no goes back to the website: the note can name the owner's setup.
-    guest = guest_mail.deliver(db, result.get("owner_id"), result.get("booking") or {}, "received")
+    # When the business takes payments online, the email carries the same pay
+    # link the website shows, so a guest who closed the page can still pay.
+    booking_row = result.get("booking") or {}
+    try:
+        account = (payment_accounts.for_owner(db, result.get("owner_id"))
+                   if result.get("pay_token") else None)
+        if account is not None:
+            currency = booking_row.get("currency") or "ZMW"
+            if any(payments.networks_for(account, currency).values()):
+                booking_row["_pay_url"] = f"{PUBLIC_APP_URL.rstrip('/')}/pay/stay/{result['pay_token']}"
+                booking_row["_pay_card"] = payments.card_options(account, currency) is not None
+    except Exception as e:  # noqa: BLE001 (the email goes either way)
+        log.warning("[hospitality] pay link for the request email failed: %s", e)
+    guest = guest_mail.deliver(db, result.get("owner_id"), booking_row, "received")
 
     # owner_id and the full booking row are ours, not the internet's.
     public = {k: v for k, v in result.items() if k not in ("owner_id", "booking")}

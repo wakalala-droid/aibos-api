@@ -109,7 +109,7 @@ def test_a_payment_reported_twice_is_recorded_once(monkeypatch):
     import main
     recorded = []
     monkeypatch.setattr(main.hospitality_api, "record_link_payment",
-                        lambda db, uid, bid, amount, reference=None: recorded.append(amount) or
+                        lambda db, uid, bid, amount, reference=None, **_: recorded.append(amount) or
                         {"booking": _stay(payment_status="paid"), "applied": amount, "excess": 0.0})
     monkeypatch.setattr(main.notify, "record_notification", lambda *a, **k: True)
 

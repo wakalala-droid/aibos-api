@@ -196,7 +196,7 @@ def test_the_sweep_asks_each_payment_with_its_own_businesss_key(monkeypatch):
                                     "status": "pending", "provider": "lenco", "created_at": now}]
     settled = []
     monkeypatch.setattr(main, "_settle_invoice_payment", lambda db_, row, s: settled.append((row["reference"], s)) or s)
-    monkeypatch.setattr(main, "_settle_booking_payment", lambda db_, row, s: settled.append((row["reference"], s)) or s)
+    monkeypatch.setattr(main, "_settle_booking_payment", lambda db_, row, s, detail=None: settled.append((row["reference"], s)) or s)
     # The platform's keys are off: business payments are still checked.
     monkeypatch.setattr(payments, "configured_networks", lambda: {"mtn": False, "airtel": False})
 

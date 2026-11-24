@@ -2465,6 +2465,19 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         "source_notes": "Booking request from the property website."
                         + (f" {price_note}" if price_note else ""),
     })
+    # The link the guest pays on, made with the request. Paying the full price
+    # through it confirms the booking (record_link_payment), so a guest who
+    # pays is not left waiting on a person to say yes. Pre-0035 there is
+    # nowhere to keep it and the request goes on exactly as before.
+    pay_token = secrets.token_urlsafe(32)
+    try:
+        (db.table("bookings").update({"pay_token": pay_token})
+         .eq("id", booking.get("id")).eq("user_id", owner).execute())
+        booking["pay_token"] = pay_token
+    except Exception as e:  # noqa: BLE001 (a request is worth more than its pay link)
+        if not _no_stay_link_schema(e):
+            log.warning("[hospitality] public request: pay link not made: %s", e)
+        pay_token = None
     return {
         # Stripped off by the route before it answers the website: the owner's
         # id and the full row are ours, not the internet's. They are here so the
@@ -2477,6 +2490,8 @@ def public_booking_request(db, token: str, data: dict) -> dict:
         "unit": unit.get("unit_name"),
         "check_in": check_in.isoformat(),
         "check_out": check_out.isoformat(),
+        # The website shows "Pay now" with it. It addresses this booking only.
+        "pay_token": pay_token,
     }
 
 
@@ -2500,6 +2515,34 @@ _SETUP_NOTE = ("Payment links for stays need migration 0035. Run "
                "supabase/migrations/0035_booking_payment_links.sql in the Supabase SQL editor.")
 
 
+class PaidShort(ValueError):
+    """A guest paid less than the full price of a booking request, so it was
+    not confirmed. The caller tells the owner; nothing is in the books."""
+
+    def __init__(self, due: float, paid: float):
+        super().__init__(f"paid {paid:,.2f} of {due:,.2f}")
+        self.due = due
+        self.paid = paid
+
+
+def awaiting_payment(booking: dict) -> bool:
+    """A website request the guest can pay for now. Paying its full price
+    confirms it. Not yet income: owed_on stays 0 until it is confirmed."""
+    return (booking.get("status") == "pending" and booking.get("source") == "website"
+            and _num(booking.get("total_amount"), 0.0) > 0)
+
+
+def check_bookable(db, booking: dict) -> None:
+    """Before a guest pays for a request: are its nights still free? A hold
+    can lapse, and an OTA import can take nights a request was holding.
+    Raises DatesUnavailable (its public_message is what the guest may read)."""
+    if not awaiting_payment(booking):
+        return
+    _assert_free(db, booking["user_id"], booking["unit_id"],
+                 str(booking.get("check_in"))[:10], str(booking.get("check_out"))[:10],
+                 exclude_booking_id=booking.get("id"))
+
+
 def owed_on(booking: dict) -> float:
     """What the guest still owes on a stay that counts as income."""
     if not _counts_as_income(booking):
@@ -2508,7 +2551,10 @@ def owed_on(booking: dict) -> float:
 
 
 def amount_due(booking: dict) -> float:
-    """What the link asks for now: its requested amount, never more than is owed."""
+    """What the link asks for now: its requested amount, never more than is
+    owed. A website request waiting to be paid for asks for its full price."""
+    if awaiting_payment(booking):
+        return round(_num(booking.get("total_amount"), 0.0), 2)
     owed = owed_on(booking)
     asked = _num(booking.get("pay_request"), 0.0)
     return round(min(asked, owed), 2) if asked > 0 else owed
@@ -2562,7 +2608,9 @@ def public_stay_view(booking: dict, unit_name: str | None, business: str | None,
                   - date.fromisoformat(str(booking.get("check_in"))[:10])).days
     except ValueError:
         nights = None
-    owed = owed_on(booking)
+    awaiting = awaiting_payment(booking)
+    owed = round(_num(booking.get("total_amount"), 0.0), 2) if awaiting else owed_on(booking)
+    due = amount_due(booking)
     return {
         "business_name": business,
         "business_logo_url": logo,
@@ -2576,19 +2624,29 @@ def public_stay_view(booking: dict, unit_name: str | None, business: str | None,
         "total": round(_num(booking.get("total_amount"), 0.0), 2),
         "paid": round(_paid_target(booking), 2),
         "owed": owed,
-        "amount_due": amount_due(booking),
-        "is_deposit": 0 < amount_due(booking) < owed - 0.005,
+        "amount_due": due,
+        "is_deposit": 0 < due < owed - 0.005,
         "payable": owed > 0.005,
         "paid_in_full": _counts_as_income(booking) and owed <= 0.005,
+        # A request not confirmed yet: paying it confirms it.
+        "awaiting_confirmation": awaiting,
+        "status": booking.get("status"),
     }
 
 
 def record_link_payment(db, user_id: str, booking_id: str, amount: float,
-                        reference: str | None = None) -> dict:
-    """A guest's link payment arrived: it goes into the books as a mobile money
-    CustomerPayment carrying the provider's reference, and the booking follows.
+                        reference: str | None = None, method: str = "mobile_money") -> dict:
+    """A guest's link payment arrived: it goes into the books as a
+    CustomerPayment (mobile money or card) carrying the provider's reference,
+    and the booking follows.
 
-    Returns {"booking", "applied", "excess"}. Only what the stay still owes is
+    A website request that is still waiting is CONFIRMED first when the guest
+    paid its full price: the dates are checked again, the Sale is posted, and
+    then the payment goes against it. A request paid short raises PaidShort and
+    one whose nights were taken meanwhile raises DatesUnavailable; neither
+    touches the books, and the caller tells the owner.
+
+    Returns {"booking", "applied", "excess", "confirmed"}. Only what the stay still owes is
     applied. The rest (`excess`) is money the guest paid twice, or paid after
     the owner had already recorded the stay as paid: the caller must tell the
     owner, because it is owed back. Before, it was absorbed in silence, and a
@@ -2600,9 +2658,17 @@ def record_link_payment(db, user_id: str, booking_id: str, amount: float,
     take the payment, so the caller can try again later. Safe to call again
     for the same reference: a payment already in the books is not posted twice."""
     booking = get_booking(db, user_id, booking_id)
+    value = round(_num(amount, 0.0), 2)
+    method = method if method in PAYMENT_METHODS else "mobile_money"
+    confirmed = False
+    if awaiting_payment(booking):
+        due = amount_due(booking)
+        if value < due - 0.005:
+            raise PaidShort(due, value)
+        booking = confirm_booking(db, user_id, booking_id)
+        confirmed = booking.get("status") in STAY_STATUSES
     if not _counts_as_income(booking):
         raise ValueError(f"the stay is {booking.get('status')}")
-    value = round(_num(amount, 0.0), 2)
 
     total = _num(booking.get("total_amount"), 0.0)
     existing = _booking_payments(db, user_id, booking_id) if reference else []
@@ -2621,7 +2687,7 @@ def record_link_payment(db, user_id: str, booking_id: str, amount: float,
     else:
         applied = round(min(value, owed_on(booking)), 2)
         if applied > 0.005:
-            if not _post_stay_payment(db, user_id, booking, applied, None, "mobile_money", reference):
+            if not _post_stay_payment(db, user_id, booking, applied, None, method, reference):
                 raise RuntimeError("the payment could not be saved to the books")
             saved = update_booking(db, user_id, booking_id,
                                    _paid_patch(total, _paid_target(booking) + applied))
@@ -2632,7 +2698,7 @@ def record_link_payment(db, user_id: str, booking_id: str, amount: float,
          .eq("id", booking_id).eq("user_id", user_id).execute())
     except Exception:  # noqa: BLE001
         pass
-    return {"booking": saved, "applied": applied, "excess": excess}
+    return {"booking": saved, "applied": applied, "excess": excess, "confirmed": confirmed}
 
 
 # ── Instalments: each payment on a stay with its own date and method ─────────

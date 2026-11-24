@@ -56,6 +56,23 @@ def _rows(db, user_id: str, columns: str) -> list:
     return getattr(res, "data", None) or []
 
 
+# Migration 0049 adds public_key. Code deploys the moment it is pushed and a
+# migration waits for a person, so in between, asking for the column must not
+# cost every business its mobile money: the read is tried again without it.
+CARDS_NOT_SET_UP = ("Card payments are being switched on. Please check back soon.")
+
+
+def _rows_with_card(db, user_id: str, columns: str) -> tuple[list, bool]:
+    """(rows, has_card_column). Asks for public_key too, and copes without it."""
+    from db import missing_schema
+    try:
+        return _rows(db, user_id, columns + ",public_key"), True
+    except Exception as e:  # noqa: BLE001
+        if not missing_schema(e, "public_key"):
+            raise
+    return _rows(db, user_id, columns), False
+
+
 def for_owner(db, user_id: Optional[str]) -> Optional[payments.Account]:
     """The account this owner's payment links collect into, or None.
 
@@ -67,7 +84,7 @@ def for_owner(db, user_id: Optional[str]) -> Optional[payments.Account]:
     if hit and time.time() < hit[1]:
         return hit[0]
     try:
-        rows = _rows(db, user_id, "provider,environment,secret_enc")
+        rows, _ = _rows_with_card(db, user_id, "provider,environment,secret_enc")
     except Exception as e:  # noqa: BLE001 (pre-0038: nobody has an account yet)
         log.info("[pay-accounts] no account table (%s)", type(e).__name__)
         return None
@@ -83,7 +100,8 @@ def for_owner(db, user_id: Optional[str]) -> Optional[payments.Account]:
         if secret:
             account = payments.Account(provider=row["provider"], secret=secret,
                                        environment=row.get("environment") or "live",
-                                       owner=user_id)
+                                       owner=user_id,
+                                       public_key=(row.get("public_key") or "").strip() or None)
     _CACHE[user_id] = (account, time.time() + _TTL)
     return account
 
@@ -91,14 +109,18 @@ def for_owner(db, user_id: Optional[str]) -> Optional[payments.Account]:
 def status(db, user_id: str) -> dict:
     """What the owner may see about their connection. Never the key."""
     try:
-        rows = _rows(db, user_id, "provider,environment,account_name,account_ref,key_hint,connected_at")
+        rows, has_card = _rows_with_card(
+            db, user_id, "provider,environment,account_name,account_ref,key_hint,connected_at")
     except Exception as e:  # noqa: BLE001
         raise NotSetUp(NOT_SET_UP) from e
     if not rows:
         return {"connected": False, "provider": None, "environment": None,
                 "account_name": None, "account_ref": None, "key_hint": None,
-                "connected_at": None, "usable": False}
+                "connected_at": None, "usable": False,
+                "cards": False, "public_key_hint": None, "cards_available": has_card}
     row = rows[0]
+    public_key = (row.get("public_key") or "").strip()
+    usable = for_owner(db, user_id) is not None
     return {
         "connected": True,
         "provider": row.get("provider"),
@@ -109,7 +131,12 @@ def status(db, user_id: str) -> dict:
         "connected_at": row.get("connected_at"),
         # False when the key is saved but cannot be opened any more (the
         # server's encryption key changed). The owner is asked to paste it again.
-        "usable": for_owner(db, user_id) is not None,
+        "usable": usable,
+        # Card payments: Lenco's card window opens with the PUBLIC key.
+        "cards": bool(public_key) and usable,
+        "public_key_hint": public_key[-4:] if public_key else None,
+        # False until migration 0049 is run: there is nowhere to keep the key yet.
+        "cards_available": has_card,
     }
 
 
@@ -145,12 +172,78 @@ def connect(db, user_id: str, actor: str, provider: str, api_key: str) -> dict:
         "connected_at": now,
         "updated_at": now,
     }
+    # A public key belongs to one Lenco account in one mode (test or live).
+    # Kept when the same account is connected again (a key pasted afresh after
+    # the server's encryption key changed), dropped when it is a different
+    # account or mode: its card window would pay into the old account while the
+    # payments were checked with the new key.
+    try:
+        before, has_card = _rows_with_card(db, user_id, "account_ref,environment")
+    except Exception:  # noqa: BLE001 (the upsert below says what is wrong)
+        before, has_card = [], False
+    if has_card and before:
+        old = before[0]
+        same_account = (str(old.get("account_ref") or "") == str(found.get("account_ref") or "")
+                        and (old.get("environment") or "live") == found["environment"])
+        if not same_account:
+            row["public_key"] = None
     try:
         db.table(TABLE).upsert(row, on_conflict="user_id").execute()
     except Exception as e:  # noqa: BLE001
         raise NotSetUp(NOT_SET_UP) from e
     _CACHE.pop(user_id, None)
     log.info("[pay-accounts] %s connected %s (%s)", user_id, provider, found["environment"])
+    return status(db, user_id)
+
+
+def set_public_key(db, user_id: str, public_key: str) -> dict:
+    """Switch card payments on: keep the business's Lenco PUBLIC key.
+
+    It is public by design (Lenco's card window opens with it in the payer's
+    browser), so it is stored as it is. What must never happen is the SECRET
+    key being pasted here by mistake and then handed to every payer's browser,
+    so a key that is the account's own secret key is refused.
+
+    Raises ValueError, NotSetUp."""
+    key = (public_key or "").strip()
+    if len(key) < 10 or len(key) > 200 or any(ch.isspace() for ch in key):
+        raise ValueError("That does not look like a Lenco public key. Copy the whole public key "
+                         "from Lenco and paste it again.")
+    account = for_owner(db, user_id)
+    if account is None:
+        raise ValueError("Connect your Lenco API key first, then add the public key.")
+    if key == account.secret:
+        raise ValueError("That is your SECRET API key, not the public key. It was not saved, "
+                         "because the public key is shown to everyone who pays. Paste the "
+                         "public key instead.")
+    try:
+        _, has_card = _rows_with_card(db, user_id, "user_id")
+    except Exception as e:  # noqa: BLE001
+        raise NotSetUp(NOT_SET_UP) from e
+    if not has_card:
+        raise NotSetUp(CARDS_NOT_SET_UP)
+    try:
+        (db.table(TABLE).update({"public_key": key,
+                                 "updated_at": datetime.now(timezone.utc).isoformat()})
+         .eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        from db import missing_schema
+        raise NotSetUp(CARDS_NOT_SET_UP if missing_schema(e, "public_key") else NOT_SET_UP) from e
+    _CACHE.pop(user_id, None)
+    log.info("[pay-accounts] %s switched card payments on", user_id)
+    return status(db, user_id)
+
+
+def clear_public_key(db, user_id: str) -> dict:
+    """Switch card payments off. Mobile money carries on."""
+    try:
+        if _rows_with_card(db, user_id, "user_id")[1]:
+            (db.table(TABLE).update({"public_key": None,
+                                     "updated_at": datetime.now(timezone.utc).isoformat()})
+             .eq("user_id", user_id).execute())
+    except Exception as e:  # noqa: BLE001
+        raise NotSetUp(NOT_SET_UP) from e
+    _CACHE.pop(user_id, None)
     return status(db, user_id)
 
 

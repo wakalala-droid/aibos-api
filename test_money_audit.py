@@ -237,7 +237,7 @@ def test_the_owner_is_told_when_a_guest_pays_more_than_the_stay_owes(monkeypatch
     db = _fresh()
     row = _stay_payment_row(db)
     monkeypatch.setattr(main.hospitality_api, "record_link_payment",
-                        lambda db_, uid, bid, amount, reference=None:
+                        lambda db_, uid, bid, amount, reference=None, **_:
                         {"booking": _stay(payment_status="paid"), "applied": 0.0, "excess": 2000.0})
     told = []
     monkeypatch.setattr(main.notify, "record_notification", lambda *a, **k: told.append(a) or True)
@@ -265,7 +265,7 @@ def test_a_failed_bell_does_not_record_a_stay_payment_twice(monkeypatch):
     row = _stay_payment_row(db)
     recorded = []
     monkeypatch.setattr(main.hospitality_api, "record_link_payment",
-                        lambda db_, uid, bid, amount, reference=None: recorded.append(amount) or
+                        lambda db_, uid, bid, amount, reference=None, **_: recorded.append(amount) or
                         {"booking": _stay(payment_status="paid"), "applied": 2000.0, "excess": 0.0})
 
     def bell_down(*a, **k):

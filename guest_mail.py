@@ -272,10 +272,18 @@ def compose(kind: str, prop: dict, unit: dict, b: dict) -> tuple[str, str, str]:
         paragraphs = [
             f"Thank you for choosing {name}. We have your request and we are checking it now.",
         ]
-        # The website already offers paying straight away, so the email does too,
-        # in the same optional terms. Without instructions it simply says wait.
-        block = (("If you would like to pay now", s["payment_instructions"])
-                 if s["payment_instructions"] else None)
+        url = b.get("_pay_url")
+        if url:
+            # The business takes payments online: paying through the link
+            # confirms the booking straight away (hospitality.record_link_payment).
+            how = "mobile money or bank card" if b.get("_pay_card") else "Airtel, MTN or Zamtel mobile money"
+            block = ("Pay now to confirm your booking",
+                     f"Pay by {how} here and your booking is confirmed the moment the payment arrives:\n{url}")
+        else:
+            # The website already offers paying straight away, so the email does
+            # too, in the same optional terms. Without instructions it says wait.
+            block = (("If you would like to pay now", s["payment_instructions"])
+                     if s["payment_instructions"] else None)
         after = [
             f"Your dates are held for {held} while we confirm. We usually reply within a few hours.",
             ("You are also welcome to wait until we confirm before paying."
@@ -288,17 +296,24 @@ def compose(kind: str, prop: dict, unit: dict, b: dict) -> tuple[str, str, str]:
 
     if kind == "confirmed":
         subject = f"Confirmed: your stay at {name}{ref_part}"
-        paragraphs = ["Good news. Your stay is confirmed and the dates are yours."]
-        if s["payment_instructions"]:
+        paid = str(b.get("payment_status") or "") == "paid"
+        if paid:
+            # Paid online (the booking confirmed itself) or paid before the
+            # owner said yes: there is nothing to pay, so no "How to pay".
+            paragraphs = ["Good news. Your payment has arrived, your stay is confirmed and the "
+                          "dates are yours."]
+        else:
+            paragraphs = ["Good news. Your stay is confirmed and the dates are yours."]
+        if s["payment_instructions"] and not paid:
             block = ("How to pay", s["payment_instructions"])
         else:
             block = None
         after = []
-        if not block:
+        if not block and not paid:
             after.append("To arrange payment, reply to this email"
                          + (f" or call us on {s['phone']}." if s["phone"] else "."))
         after += ["We look forward to welcoming you.",
-                  _contact_line(s) if block else ""]
+                  _contact_line(s) if block or paid else ""]
         after = [p for p in after if p]
         text, page = _render(s, greeting, paragraphs, _details(prop, unit, b, "total_amount"),
                              after, block)
