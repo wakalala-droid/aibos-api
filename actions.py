@@ -487,22 +487,25 @@ def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
 # ── Doing it, and taking it back ──────────────────────────────────────────────
 
 def _execute(db, tenant: str, biz: str | None, actor: str, kind: str, args: dict,
-             result: dict | None = None) -> dict:
+             result: dict | None = None, now: datetime | None = None) -> dict:
     """Run a prepared job. Returns what it made, for Undo."""
     result = dict(result or {})
     if kind == "add_reminder":
         import schedule_items as schedule_api
         args = dict(args)
         # Said yes to after its time had gone (a worker's question can wait a
-        # few days): the reminder goes on tomorrow morning instead.
+        # few days): the reminder goes on tomorrow morning instead, and the job
+        # says so. The pass's own clock decides "gone", the same clock that
+        # checked the time when the job was asked for.
         when = schedule_api.parse_ts(args.get("starts_at"))
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        moved = None
         if when is not None and when < now - timedelta(hours=1):
             tomorrow = now.astimezone(LUSAKA).date() + timedelta(days=1)
-            args["starts_at"] = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0,
-                                         tzinfo=LUSAKA).isoformat()
+            moved = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0, tzinfo=LUSAKA).isoformat()
+            args["starts_at"] = moved
         item = schedule_api.create_item(db, tenant, args, business_id=biz)
-        return {"schedule_item_id": item.get("id")}
+        return {"schedule_item_id": item.get("id"), **({"moved_to": moved} if moved else {})}
     if kind == "confirm_entry":
         _pending_entry(db, tenant, args.get("event_id"))      # still waiting?
         ev = nervous.confirm(db, tenant, args["event_id"])
@@ -684,6 +687,14 @@ def public(row: dict) -> dict:
         "at": row.get("decided_at") or row.get("created_at"),
     }
     result, args = row.get("result") or {}, row.get("args") or {}
+    if kind == "add_reminder" and row.get("status") == "done" and result.get("moved_to"):
+        # Its time had gone by the yes: say the day it really went on, not the one asked.
+        try:
+            moved = datetime.fromisoformat(str(result["moved_to"]))
+            out["did"] = (f"Added a reminder: {args.get('title') or 'Reminder'}, {_when_words(moved)}, "
+                          "as the time asked for had passed")
+        except ValueError:
+            pass
     number = result.get("number") or args.get("number")
     if number:
         out["number"] = number
@@ -927,7 +938,8 @@ def _run(db, tenant: str, biz: str | None, actor: str, row: dict, how: str,
     # AIBOS did "today" (workers.did_today) reads the same day the pass ran on.
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     try:
-        made = _execute(db, tenant, biz, actor, row["kind"], row.get("args") or {}, row.get("result"))
+        made = _execute(db, tenant, biz, actor, row["kind"], row.get("args") or {}, row.get("result"),
+                        now=now)
     except Exception as e:  # noqa: BLE001
         reason = str(e) if isinstance(e, (ActionError, ValueError)) else "something went wrong on our side"
         _update(db, tenant, row["id"], {"status": "failed", "decided_at": stamp,

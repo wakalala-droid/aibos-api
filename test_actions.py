@@ -56,6 +56,22 @@ def test_a_reminder_is_done_at_once_and_undo_takes_it_back(db):
     assert db.rows["schedule_items"] == []
 
 
+def test_a_reminder_said_yes_to_after_its_time_goes_on_tomorrow_and_says_so(db):
+    # A worker asked on the 17th about the 18th; the owner says yes on the 20th.
+    job = actions.propose(db, OWNER, OWNER, None, "add_reminder",
+                          {"title": "Call NAPSA", "when": "2026-11-18T09:00"},
+                          source="worker", ref="worker:clerk:napsa", now=NOW)
+    assert job["status"] == "waiting"
+    row = db.rows[actions.TABLE][0]
+    later = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)        # 14:00 in Lusaka, Friday
+    done = actions._run(db, OWNER, row.get("business_id"), OWNER, row, "asked", now=later)
+    item = db.rows["schedule_items"][0]
+    assert item["starts_at"] == "2026-11-21T09:00:00+02:00"           # Saturday, 09:00 Lusaka
+    assert done["did"] == ("Added a reminder: Call NAPSA, Saturday 21 November at 09:00, "
+                           "as the time asked for had passed")
+    assert done["said"] == "Add a reminder: Call NAPSA, Wednesday 18 November at 09:00"
+
+
 def test_a_date_alone_is_nine_in_the_morning_and_the_past_is_refused(db):
     job = actions.propose(db, OWNER, OWNER, None, "add_reminder",
                           {"title": "Call NAPSA", "when": "2026-11-18"}, now=NOW)

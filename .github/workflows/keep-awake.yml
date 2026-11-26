@@ -23,14 +23,23 @@
 # 05:05). A run that pinged twice and stopped left the API asleep for hours at
 # a time, and whoever opened AIBOS first waited a minute or more; a chat
 # question asked then ran into the website's 60 second limit. So each run now
-# pings every 4 minutes for up to 5 hours 50 minutes. The next scheduled run
-# queues behind it (the concurrency group below) and takes over when it ends,
-# so even at GitHub's slowest the pings never stop. Public repositories do not
-# pay for Actions minutes.
+# pings every 4 minutes for about 5 hours 40 minutes. The next run was meant
+# to queue behind it (the concurrency group below) and take over when it
+# ends. Public repositories do not pay for Actions minutes.
+#
+# WHY EACH RUN STARTS THE NEXT ONE. The queue above never formed: GitHub did
+# not fire the schedule at all while a run was going, only a few times a day,
+# so the API slept between runs. On 24 Nov 2026 nothing pinged from 10:40 to
+# 15:21 UTC (12:40 to 17:21 in Lusaka) and on 26 Nov from 07:51 to past 09:36,
+# with reminders and the hourly jobs waiting. So a run that ends well starts
+# the next itself (workflow_dispatch, the one event a run's own token may
+# start), and the schedule stays as the way back in after a run that failed.
+# To stop the pings, disable this workflow on the Actions tab.
 #
 # A dedicated pinger is still more dependable than this. A free cron-job.org
 # or UptimeRobot check on https://aibos-api-37v9.onrender.com/health every 5
-# minutes does the same job without depending on GitHub's timing.
+# minutes does the same job without depending on GitHub's timing, and Render's
+# Starter plan never sleeps at all.
 #
 # ONE THING TO KNOW. GitHub switches off scheduled workflows in a repository
 # that has had no commits for 60 days. It emails first. If the API starts
@@ -47,6 +56,10 @@ on:
 concurrency:
   group: keep-awake
   cancel-in-progress: false
+
+# Only what the hand-over needs: starting the next run of this workflow.
+permissions:
+  actions: write
 
 jobs:
   ping:
@@ -78,7 +91,9 @@ jobs:
             curl -s -o /dev/null -w "$(date -u '+%H:%M:%S') hourly jobs -> %{http_code}\n" --max-time 120 \
               -X POST -H "X-Cron-Secret: $CRON_SECRET" "$API_URL/cron/hourly" || true
           }
-          end=$(( $(date +%s) + 350 * 60 ))
+          # 340 minutes, so the last ping, a slow cold start and the sleep all
+          # finish well inside the 355 minute limit and the hand-over runs.
+          end=$(( $(date +%s) + 340 * 60 ))
           fails=0
           last_hourly=0
           while [ "$(date +%s)" -lt "$end" ]; do
@@ -90,3 +105,23 @@ jobs:
             fi
             sleep 240
           done
+
+      - name: Start the next run
+        # It waits in the concurrency group until this run has finished, then
+        # takes over within a minute. Skipped when the pings failed: then the
+        # schedule brings it back, and a down API is not knocked on in a loop.
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          code=$(curl -s -o /tmp/next.json -w '%{http_code}' --max-time 30 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/keep-awake.yml/dispatches" \
+            -d "{\"ref\":\"$REF\"}" || echo 000)
+          echo "next run -> $code"
+          if [ "$code" != "204" ]; then
+            cat /tmp/next.json 2>/dev/null | head -c 400; echo
+            echo "::warning::Could not start the next run ($code). The schedule will bring one back later."
+          fi
