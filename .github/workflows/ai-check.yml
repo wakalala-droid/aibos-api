@@ -1,0 +1,54 @@
+# The AI check: is the AI answering, and if not, why.
+#
+# /health/ai answers that, but only for an owner who is signed in. This runs
+# the same kind of probes from here with the cron secret (POST /cron/ai-check,
+# ai_check.py) whenever someone presses Run workflow on the Actions tab.
+#
+# THE LOG IS PUBLIC, like this repository. So the API answers in categories
+# only ("allowance spent for today", "model not found", "not answering") and
+# never passes on a provider's own message, a key or a project number.
+#
+# "Models to try" asks other model ids on the same key, one request each. Each
+# Gemini model has its own free allowance, so a run spends almost nothing of
+# the chat model's. The answer also lists the models the key can use.
+
+name: AI check
+
+on:
+  workflow_dispatch:
+    inputs:
+      try:
+        description: "Other model ids to try, comma separated (optional)"
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ask the API which AI calls work
+        env:
+          API_URL: ${{ vars.API_URL || 'https://aibos-api-37v9.onrender.com' }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          TRY: ${{ inputs.try }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::The CRON_SECRET repository secret is not set."
+            exit 1
+          fi
+          case "$TRY" in
+            *[!A-Za-z0-9._/:,-]*) echo "::error::Model ids are letters, digits and . _ / : - only."; exit 1 ;;
+          esac
+          url="$API_URL/cron/ai-check"
+          [ -n "$TRY" ] && url="$url?try=$TRY"
+          # --max-time 300: a cold start, then up to a minute per silent provider.
+          code=$(curl -s -o /tmp/ai.json -w '%{http_code}' --max-time 300 -X POST \
+            -H "X-Cron-Secret: $CRON_SECRET" "$url" || echo 000)
+          echo "AI check -> $code"
+          python3 -m json.tool /tmp/ai.json 2>/dev/null || head -c 2000 /tmp/ai.json
+          echo
+          [ "$code" = "200" ] || { echo "::error::The API did not answer the AI check ($code)."; exit 1; }
+          python3 -c 'import json; print("::notice::" + json.load(open("/tmp/ai.json")).get("verdict", ""))'

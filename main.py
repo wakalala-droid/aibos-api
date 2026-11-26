@@ -8696,6 +8696,19 @@ def payments_sweep(x_cron_secret: Optional[str] = Header(default=None)):
     return sweep_pending_payments(get_db())
 
 
+@app.post("/cron/ai-check")
+def cron_ai_check(x_cron_secret: Optional[str] = Header(default=None),
+                  try_models: Optional[str] = Query(default=None, alias="try", max_length=400,
+                                                    pattern=r"^[A-Za-z0-9._/:,-]*$")):
+    """Which AI calls work, for the "AI check" workflow (ai_check.py). Cron-only,
+    and in categories only, because that workflow's log is public. ?try=a,b
+    probes other model ids on the same key."""
+    if not _secret_ok(os.environ.get("CRON_SECRET"), x_cron_secret):
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    import ai_check
+    return ai_check.run([m for m in (try_models or "").split(",") if m][:8])
+
+
 @app.on_event("startup")
 def _start_paddle_setup() -> None:
     """Make sure Paddle has the plans, the webhook and the checkout token before
