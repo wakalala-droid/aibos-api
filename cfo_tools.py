@@ -729,11 +729,15 @@ def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
 
     This used to fall through after the smaller model answered and send the
     question a third time with its lookups stripped, so the answer that came
-    back had been written blind."""
+    back had been written blind.
+
+    A spent PAID budget (llm.is_budget_error: credit at $0, or the monthly
+    spend cap) refuses every model on the key alike, so it goes straight to
+    the second provider."""
     if not llm.is_quota_error(exc):
         if llm.secondary_configured():
             llm.note_primary_unavailable(exc)
-    else:
+    elif not llm.is_budget_error(exc):
         for fb in llm.fallbacks_after(model):
             log.warning("[cfo] %s quota spent, streaming on %s", model, fb)
             kwargs["model"] = fb
@@ -744,6 +748,8 @@ def _first_round_elsewhere(client, model: str, kwargs: dict, exc: Exception):
                     break               # a silent model would keep the owner waiting again
                 if llm.is_quota_error(e2):
                     exc = e2            # the refusal the owner is told about
+                    if llm.is_budget_error(e2):
+                        break           # the budget ran out mid-chain: no model will answer
                 else:                   # retired, or refused this request: the next one
                     log.warning("[cfo] %s cannot answer (%s); trying the next model",
                                 fb, llm.failure_kind(e2))

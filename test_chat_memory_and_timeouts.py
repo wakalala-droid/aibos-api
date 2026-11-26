@@ -648,3 +648,60 @@ def test_a_long_wait_is_not_waited():
     assert llm.retry_after_seconds(_Quota("429 Please try again in 8.8s.")) == 8.8
     assert llm.retry_after_seconds(Exception("400 try again in 2s")) is None
     assert 72.5 > llm.SECOND_WAIT_MAX
+
+
+# ── A spent paid budget (26 Nov 2026) ────────────────────────────────────────
+# Prepaid Gemini credit at $0 refuses every model on the key alike with a 402,
+# and so does a monthly spend cap once it is reached.
+
+class _Budget(Exception):
+    status_code = 402
+
+
+def _broke(calls):
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        raise _Budget("Error code: 402 - Payment Required")
+    return NS(chat=NS(completions=NS(create=create)))
+
+
+def test_a_spent_paid_budget_goes_straight_to_the_second_provider(monkeypatch, rested):
+    monkeypatch.setattr(llm, "fallback_models", lambda: ["f1", "f2"])
+    seen, calls = [], []
+    _second(monkeypatch, seen)
+    out = list(cfo_tools.run_agent_loop_stream(_broke(calls), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "Answered by the backup."
+    assert calls == ["m"] and seen[0]["model"] == "backup-model"
+
+
+def test_a_spent_paid_budget_without_a_backup_is_told_as_paused(monkeypatch, rested):
+    monkeypatch.setattr(llm, "fallback_models", lambda: ["f1", "f2"])
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    monkeypatch.setattr(llm, "_LAST", {})
+    calls = []
+    with pytest.raises(_Budget) as raised:
+        list(cfo_tools.run_agent_loop_stream(_broke(calls), "m",
+                                             [{"role": "user", "content": "hi"}], None, "u1"))
+    assert calls == ["m"]
+    assert llm.last_outcome()["failure"] == "paid budget spent"
+    assert llm.quota_message(raised.value) == llm.BUDGET_MESSAGE
+
+
+def test_the_chat_says_paused_when_the_paid_budget_is_spent(monkeypatch, rested):
+    """The frame the browser reads: the paused message, and no retry (the
+    buffered retry would only meet the same 402)."""
+    import json
+    import auth
+    import main
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(auth, "verify_token", lambda token: "u1")
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    monkeypatch.setattr(main, "_prepare_chat", lambda *a, **k: {
+        "db": None, "taster_note": None, "system_prompt": "s", "tool_system": "s",
+        "chat_messages": [{"role": "user", "content": "hi"}], "client": _broke([]),
+        "tenant": "u1", "business_id": None, "allowed_tools": None, "act": None})
+    res = TestClient(main.app).post("/chat/stream", json={"message": "hi"},
+                                    headers={"Authorization": "Bearer t"})
+    frames = [f for f in res.text.split("\n\n") if f.startswith("data:")]
+    assert json.loads(frames[-1][len("data:"):]) == {"error": llm.BUDGET_MESSAGE, "retry": False}

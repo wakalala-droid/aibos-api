@@ -95,6 +95,17 @@ def test_a_spent_allowance_is_named_and_nothing_of_the_provider_leaks(monkeypatc
     assert "123456789" not in text and "quotaId" not in text and "test-key" not in text
 
 
+def test_a_spent_paid_budget_says_where_to_top_up(monkeypatch):
+    """Prepaid credit at $0 (26 Nov 2026): a 402 on every model on the key."""
+    broke = _Err("Error code: 402 - Payment Required for projects/123456789", 402)
+    client = _Client(fail={m: broke for m in [llm._DEFAULTS["gemini"]["chat"], *llm._GEMINI_FALLBACKS]})
+    _setup(monkeypatch, client)
+    out = ai_check.run()
+    assert ai_check.kind(broke) == "paid budget spent"
+    assert out["chat_model"]["plain"] == "paid budget spent"
+    assert "Spend page" in out["verdict"] and "123456789" not in repr(out)
+
+
 def test_a_silent_provider_is_asked_once_not_three_times(monkeypatch):
     model = llm._DEFAULTS["gemini"]["chat"]
     client = _Client(fail={model: _Err("Request timed out.")})

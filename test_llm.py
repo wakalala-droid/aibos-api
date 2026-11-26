@@ -367,3 +367,73 @@ def test_a_model_the_provider_no_longer_knows_is_told_apart():
     assert llm.is_model_gone(E("Error code: 404 - model not found"))
     assert not llm.is_model_gone(E("429 RESOURCE_EXHAUSTED", 429))
     assert not llm.is_model_gone(E("Invalid JSON payload", 400))
+
+
+# ── a spent paid budget (26 Nov 2026) ────────────────────────────────────────
+# Prepaid Gemini credit at $0 stops every key on the billing account with a
+# 402, and a monthly spend cap stops the project until the month turns. No
+# other model on the key can answer then.
+
+class _Budget(Exception):
+    status_code = 402
+
+
+def test_a_spent_paid_budget_is_told_apart_from_a_spent_free_allowance():
+    assert llm.is_budget_error(_Budget("Error code: 402 - Payment Required"))
+    assert llm.is_budget_error(Exception("Error code: 402 - prepayment credits are depleted"))
+    assert llm.is_budget_error(Exception("429 RESOURCE_EXHAUSTED: the project reached its monthly spend cap"))
+    assert llm.is_budget_error(Exception("Your credit balance is insufficient"))
+    # Google's ordinary quota refusal mentions billing: that is not a spent budget.
+    plain = _Quota("429 You exceeded your current quota, please check your plan and billing details.")
+    assert llm.is_quota_error(plain) and not llm.is_budget_error(plain)
+    assert not llm.is_budget_error(Exception("thinking budget is not supported for this model (400)"))
+    # A spent budget is a quota error, so every caller stops instead of retrying.
+    assert llm.is_quota_error(_Budget("Payment Required"))
+    assert not llm.is_unavailable_error(_Budget("Payment Required"))
+
+
+def test_a_spent_paid_budget_says_paused_not_free_or_tomorrow():
+    with env(GEMINI_API_KEY="k"):
+        msg = llm.quota_message(_Budget("Error code: 402 - Payment Required"))
+        assert msg == llm.BUDGET_MESSAGE
+        assert "free" not in msg and "tomorrow" not in msg and "Lusaka" not in msg
+        assert "—" not in msg and ", and" not in msg      # the house style
+        assert llm.failure_kind(_Budget("Error code: 402")) == "paid budget spent"
+        assert llm.failure_kind(Exception("monthly spend cap reached (429)")) == "paid budget spent"
+        # A free allowance still says when it is back.
+        assert llm.quota_message(_Quota("429 GenerateRequestsPerDayPerProjectPerModel")) != msg
+
+
+def test_a_spent_paid_budget_skips_the_fallback_models():
+    """Every model on the key is refused alike, so stepping down the chain would
+    only make the owner wait for the same 402 five times."""
+    with env(GEMINI_API_KEY="k"):
+        c = _Client(fail_times=99, error=_Budget("Error code: 402 - model gemini-x: Payment Required"))
+        try:
+            llm.chat_create(c, messages=[])
+            assert False
+        except _Budget:
+            pass
+        assert c.models == [llm.chat_model()]
+
+
+def test_a_spent_paid_budget_hands_the_question_to_the_second_provider(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, "secondary", lambda: (
+        NS(chat=NS(completions=NS(create=lambda **k: seen.append(k) or "from the backup"))), "backup"))
+    with env(GEMINI_API_KEY="k"):
+        c = _Client(fail_times=99, error=_Budget("Error code: 402 - Payment Required"))
+        assert llm.chat_create(c, messages=[]) == "from the backup"
+        assert c.models == [llm.chat_model()] and seen[0]["model"] == "backup"
+
+
+def test_a_budget_that_runs_out_mid_chain_stops_the_chain():
+    with env(GEMINI_API_KEY="k"):
+        c = _scripted(_Client(), _Quota("429 RESOURCE_EXHAUSTED"),
+                      _Budget("Error code: 402 - Payment Required"))
+        try:
+            llm.chat_create(c, messages=[])
+            assert False
+        except _Budget:
+            pass
+        assert len(c.models) == 2

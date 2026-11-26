@@ -197,6 +197,8 @@ def failure_kind(exc: Exception | None) -> str:
     import re
     low = str(exc).lower()
     if is_quota_error(exc):
+        if is_budget_error(exc):
+            return "paid budget spent"
         # "limit: 0" is Google saying the model has no free allowance at all on
         # this key. Waiting for the daily reset cannot fix that one.
         if re.search(r"limit:\s*0\b", low):
@@ -501,6 +503,13 @@ QUOTA_MESSAGE = ("The AI assistant has reached its usage limit for now, so it ca
                  "this minute. Your records are all still there, and every other page works. "
                  "Please try again a little later.")
 
+# The paid budget is spent (is_budget_error). The owner of the business asking
+# cannot do anything about it, and the AI comes back when AIBOS tops up the
+# credit or the month turns, so the message says neither "tomorrow" nor "free".
+BUDGET_MESSAGE = ("The AI assistant is paused on our side for now, so it cannot answer. Your "
+                  "records are all still there and every other page works, including Record "
+                  "and the reports. Please try again later.")
+
 
 def _daily_reset_lusaka(now=None) -> str:
     """When a spent daily allowance comes back, as a Lusaka clock time.
@@ -529,6 +538,8 @@ def quota_message(exc: Exception | None = None) -> str:
     A per-minute limit clears within a minute; a daily one not until the
     provider's reset. Saying which is the difference between "wait a moment"
     and "come back tomorrow"."""
+    if exc is not None and is_budget_error(exc):
+        return BUDGET_MESSAGE
     text = str(exc or "")
     if "PerMinute" in text or "per minute" in text.lower():
         return ("The AI assistant is answering a lot of questions right now. Please ask "
@@ -540,14 +551,41 @@ def quota_message(exc: Exception | None = None) -> str:
     return QUOTA_MESSAGE
 
 
+# ── A paid budget that is spent ──────────────────────────────────────────────
+# With prepaid Gemini credit (26 Nov 2026), a balance at $0 stops EVERY key on
+# the billing account at once with HTTP 402 Payment Required, and a monthly
+# spend cap set in AI Studio stops the project until the month turns. No other
+# model on the same key can answer then, so the fallback chain is skipped: the
+# second provider answers when one is set, and otherwise the owner is told the
+# AI is paused instead of being shown "Error code: 402". Google does not
+# publish the cap's wording, hence the words below. "billing" is not one of
+# them: Google's ordinary 429 says "check your plan and billing details".
+_BUDGET_WORDS = ("payment required", "spend cap", "spending cap", "spend limit",
+                 "spending limit", "monthly spend")
+_CREDIT_WORDS = ("depleted", "insufficient", "balance", "ran out", "run out", "exhausted")
+
+
+def is_budget_error(exc: Exception) -> bool:
+    """The paid budget is spent: prepaid credit at $0 (HTTP 402) or the
+    monthly spend cap reached."""
+    if getattr(exc, "status_code", None) == 402:
+        return True
+    low = str(exc).lower()
+    if "error code: 402" in low or any(w in low for w in _BUDGET_WORDS):
+        return True
+    return "credit" in low and any(w in low for w in _CREDIT_WORDS)
+
+
 def is_quota_error(exc: Exception) -> bool:
-    """The provider refused because the account's quota is spent (HTTP 429).
+    """The provider refused because the account's quota is spent (HTTP 429),
+    or its paid budget is (is_budget_error).
 
     Retrying cannot help, and every retry spends one more request against the
     same exhausted limit, so callers stop and say so instead."""
     text = str(exc)
     return (getattr(exc, "status_code", None) == 429 or "429" in text
-            or "RESOURCE_EXHAUSTED" in text or "exceeded your current quota" in text)
+            or "RESOURCE_EXHAUSTED" in text or "exceeded your current quota" in text
+            or is_budget_error(exc))
 
 
 def chat_create(client, **kwargs):
@@ -587,10 +625,11 @@ def _chat_create(client, **kwargs):
             return _on_second_provider(kwargs, exc)
         # A spent allowance or a model-shaped refusal steps down through the
         # fallback models, each with an allowance of its own (fallback_models).
+        # A spent paid budget refuses every model on the key alike, so not that.
         last = exc
         spent = exc if is_quota_error(exc) else None
         for fb in fallbacks_after(kwargs.get("model")):
-            if not _model_shaped_error(last):
+            if is_budget_error(last) or not _model_shaped_error(last):
                 break
             log.warning("[llm] %s failed on %s (%s) — retrying on %s",
                         "chat", kwargs.get("model"), last, fb)

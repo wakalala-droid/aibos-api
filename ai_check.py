@@ -71,6 +71,9 @@ def verdict(out: dict) -> str:
     parts = [f"The chat model ({out['model']}): {first}."]
     if first == "allowance spent for today":
         parts.append(f"It comes back {llm._daily_reset_lusaka()}.")
+    elif first == "paid budget spent":
+        parts.append("The prepaid credit is used up or the monthly spend cap is reached: "
+                     "top up, or raise the cap, on AI Studio's Spend page.")
     second = out.get("second_provider")
     if second and second.get("streaming_with_tools") == "ok":
         parts.append(f"The backup ({second['model']}) is answering, so the chat still works.")
