@@ -13,15 +13,14 @@ reported as "ok" or a category such as "allowance spent for today" or "model
 not found". Model ids are public names and are shown.
 
 WHAT A RUN COSTS. The chat model is asked three times (a plain reply, a reply
-with the chat's tools declared, and the streamed call the chat makes), the
-fallback model once and each model in ?try= once. Each Gemini model has its
+with the chat's tools declared, and the streamed call the chat makes), each
+fallback model once (llm.fallback_models) and each model in ?try= once, both
+with the tools declared. Each Gemini model has its
 own free allowance, so trying another model spends none of the chat model's.
 Listing the models the key can use spends nothing.
 """
 
 from __future__ import annotations
-
-import re
 
 import cfo_tools
 import llm
@@ -35,37 +34,7 @@ _NOT_CHAT = ("embedding", "imagen", "veo", "aqa", "tts", "image", "learnlm", "ly
 
 def kind(exc: Exception | None) -> str:
     """A provider failure as a category, with none of the provider's words."""
-    if exc is None:
-        return "ok"
-    low = str(exc).lower()
-    if llm.is_quota_error(exc):
-        # "limit: 0" is Google saying the model has no free allowance at all on
-        # this key. Waiting for the daily reset cannot fix that one.
-        if re.search(r"limit:\s*0\b", low):
-            return "no free allowance on this model"
-        if "perday" in low or "per day" in low:
-            return "allowance spent for today"
-        if "perminute" in low or "per minute" in low:
-            return "allowance spent for this minute"
-        return "allowance spent"
-    if llm.is_unavailable_error(exc):
-        return "not answering"
-    status = getattr(exc, "status_code", None)
-    if not isinstance(status, int):
-        m = re.search(r"error code:\s*(\d{3})", low)
-        status = int(m.group(1)) if m else None
-    if status == 404 or "not found" in low or "not_found" in low:
-        return "model not found"
-    if (status in (401, 403) or "api key" in low or "permission" in low
-            or "unauthenticated" in low):
-        return "key refused"
-    if llm.is_reasoning_rejection(exc):
-        return "thinking setting refused"
-    if status == 400:
-        return "request refused (400)"
-    if status:
-        return f"failed ({status})"
-    return f"failed ({type(exc).__name__})"
+    return llm.failure_kind(exc)
 
 
 def _try(fn) -> str:
@@ -136,10 +105,12 @@ def run(try_models=()) -> dict:
             client, model=model, messages=_MSGS, max_tokens=5, tools=tools, tool_choice="auto"))
 
     others = {}
-    for m in dict.fromkeys([llm.fallback_model(), *try_models]):
+    for m in dict.fromkeys([*llm.fallback_models(), *try_models]):
         if m and m != model:
+            # With the chat's tools declared: a model the chat steps down to
+            # has to take them, or it cannot look anything up.
             others[m] = _try(lambda m=m: client.chat.completions.create(
-                model=m, messages=_MSGS, max_tokens=5))
+                model=m, messages=_MSGS, max_tokens=5, tools=tools, tool_choice="auto"))
 
     out = {
         "provider": llm.provider(),

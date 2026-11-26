@@ -75,7 +75,9 @@ def test_a_working_ai_says_so(monkeypatch):
     _setup(monkeypatch, client)
     out = ai_check.run()
     assert out["chat_model"] == {"plain": "ok", "with_tools": "ok", "streaming_with_tools": "ok"}
-    assert out["other_models"] == {llm.fallback_model(): "ok"}
+    assert out["other_models"] == {m: "ok" for m in llm.fallback_models()}
+    assert len(out["other_models"]) == len(llm._GEMINI_FALLBACKS)
+    assert all("tools" in c for c in client.calls if c["model"] in out["other_models"])
     assert out["models_on_key"] == ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
     assert out["verdict"] == "The AI is answering."
 
@@ -86,7 +88,7 @@ def test_a_spent_allowance_is_named_and_nothing_of_the_provider_leaks(monkeypatc
     _setup(monkeypatch, client)
     out = ai_check.run(["gemini-9-flash"])
     assert out["chat_model"]["plain"] == "allowance spent for today"
-    assert out["other_models"] == {llm.fallback_model(): "ok", "gemini-9-flash": "ok"}
+    assert out["other_models"] == {**{m: "ok" for m in llm.fallback_models()}, "gemini-9-flash": "ok"}
     assert "No backup AI is set" in out["verdict"]
     assert "gemini-9-flash" in out["verdict"]
     text = repr(out)
@@ -119,6 +121,19 @@ def test_tools_refused_is_told_apart_from_a_dead_model(monkeypatch):
     out = ai_check.run()
     assert out["chat_model"] == {"plain": "ok", "with_tools": "request refused (400)",
                                  "streaming_with_tools": "request refused (400)"}
+
+
+def test_the_health_page_says_when_the_ai_last_answered_and_failed(monkeypatch):
+    """Readable by anyone, so categories and model ids only."""
+    import main
+    monkeypatch.setattr(llm, "_LAST", {})
+    assert main.health()["ai_last"] == {}
+    llm.note_answered("gemini-3.1-flash-lite")
+    llm.note_failed(DAY)
+    last = main.health()["ai_last"]
+    assert last["answered_by"] == "gemini-3.1-flash-lite"
+    assert last["failure"] == "allowance spent for today"
+    assert "123456789" not in repr(last)
 
 
 def test_the_address_needs_the_cron_secret(monkeypatch):

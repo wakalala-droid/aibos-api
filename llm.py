@@ -44,7 +44,8 @@ https://ai.google.dev/gemini-api/docs/models) and set LLM_MODEL rather than
 editing this file.
 
     LLM_MODEL            primary chat/classify model
-    LLM_FALLBACK_MODEL   smaller emergency model
+    LLM_FALLBACK_MODEL   models to step down to first once the chat model's
+                         allowance is spent, comma separated, in order
     LLM_VISION_MODEL     receipt OCR
     LLM_TRANSCRIBE_MODEL voice notes
 
@@ -131,8 +132,124 @@ def chat_model() -> str:
     return _model("chat")
 
 
+# Gemini's free allowance is counted per model: each model has its own
+# requests a day. With one fallback, two models' allowances were all the AI
+# had, a chat question spends two to four requests, and on 26 Nov 2026 the
+# owner found the AI not answering. So a spent allowance now steps down through
+# these before the chat rests. Each was a current model on Google's models page
+# that day. One that is retired or refuses the request is passed over at once;
+# one that does not answer at all stops the chain, so the preview model, the
+# least proven, goes last. The AI check (ai_check.py) shows which of them
+# answer on our key. Models named in LLM_FALLBACK_MODEL are tried first, then
+# these: an old one-model setting left in a dashboard cannot switch them off.
+_GEMINI_FALLBACKS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+                     "gemini-3-flash-preview")
+
+
+def fallback_models() -> list:
+    """Every model to step down to, in order, once the chat model's allowance
+    is spent: those named in LLM_FALLBACK_MODEL (or GROQ_FALLBACK_MODEL, comma
+    separated) first, then on Gemini the free models above. Never the chat
+    model itself, never one twice."""
+    named = ""
+    for name in _ENV_NAMES["fallback"]:
+        named = os.environ.get(name) or ""
+        if named:
+            break
+    chain = [m.strip() for m in named.split(",") if m.strip()]
+    if provider() == "gemini":
+        chain += list(_GEMINI_FALLBACKS)
+    elif not chain:
+        chain = [_model("fallback")]
+    chat = chat_model()
+    return [m for m in dict.fromkeys(chain) if m != chat]
+
+
 def fallback_model() -> str:
-    return _model("fallback")
+    """The first model stepped down to (see fallback_models)."""
+    chain = fallback_models()
+    return chain[0] if chain else _model("fallback").split(",")[0].strip()
+
+
+def fallbacks_after(model: str) -> list:
+    """The fallback models still to try once `model` has failed: the whole list
+    after the chat model, the rest of it after one of its own models."""
+    chain = fallback_models()
+    if model in chain:
+        return chain[chain.index(model) + 1:]
+    return chain
+
+
+def is_model_gone(exc: Exception) -> bool:
+    """The provider does not know the model (retired or never there): skip it."""
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    return status == 404 or "error code: 404" in text or (
+        "model" in text and ("not found" in text or "not_found" in text))
+
+
+def failure_kind(exc: Exception | None) -> str:
+    """A provider failure as a category, with none of the provider's words, for
+    places anyone may read: the public /health page and the AI check's log. A
+    provider's own message can carry a project number or part of the request."""
+    if exc is None:
+        return "ok"
+    import re
+    low = str(exc).lower()
+    if is_quota_error(exc):
+        # "limit: 0" is Google saying the model has no free allowance at all on
+        # this key. Waiting for the daily reset cannot fix that one.
+        if re.search(r"limit:\s*0\b", low):
+            return "no free allowance on this model"
+        if "perday" in low or "per day" in low:
+            return "allowance spent for today"
+        if "perminute" in low or "per minute" in low:
+            return "allowance spent for this minute"
+        return "allowance spent"
+    if is_unavailable_error(exc):
+        return "not answering"
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        m = re.search(r"error code:\s*(\d{3})", low)
+        status = int(m.group(1)) if m else None
+    if status == 404 or "not found" in low or "not_found" in low:
+        return "model not found"
+    if (status in (401, 403) or "api key" in low or "permission" in low
+            or "unauthenticated" in low):
+        return "key refused"
+    if is_reasoning_rejection(exc):
+        return "thinking setting refused"
+    if status == 400:
+        return "request refused (400)"
+    if status:
+        return f"failed ({status})"
+    return f"failed ({type(exc).__name__})"
+
+
+# ── What the AI last did, for /health ────────────────────────────────────────
+# On 26 Nov 2026 the owner wrote "The ai isnt working" and the cause could not
+# be read: /health/ai needs a sign-in, and the AI check needs a secret GitHub
+# did not have. So every answer and every final failure is noted here, and
+# /health shows when the AI last answered (and on which model) and when it last
+# failed, in categories only. In memory, so a restart starts it empty.
+_LAST: dict = {}
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def note_answered(model: str) -> None:
+    _LAST.update(answered_at=_now_iso(), answered_by=model)
+
+
+def note_failed(exc: Exception) -> None:
+    _LAST.update(failed_at=_now_iso(), failure=failure_kind(exc))
+
+
+def last_outcome() -> dict:
+    return dict(_LAST)
 
 
 def vision_model() -> str:
@@ -434,8 +551,23 @@ def is_quota_error(exc: Exception) -> bool:
 
 
 def chat_create(client, **kwargs):
-    """client.chat.completions.create with a one-shot model fallback.
-    `model` defaults to chat_model(); everything else passes through."""
+    """client.chat.completions.create, stepping down the fallback models and
+    then to the second provider (_chat_create). `model` defaults to
+    chat_model(); everything else passes through. What happened is noted for
+    /health (note_answered, note_failed)."""
+    try:
+        return _chat_create(client, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — noted, then raised as it was
+        note_failed(exc)
+        raise
+
+
+def _answered(response, model: str):
+    note_answered(model)
+    return response
+
+
+def _chat_create(client, **kwargs):
     kwargs.setdefault("model", chat_model())
     if primary_resting():
         try:
@@ -444,29 +576,38 @@ def chat_create(client, **kwargs):
             log.warning("[llm] the second provider failed while the first rests (%s); "
                         "trying the first", exc)
     try:
-        return client.chat.completions.create(**kwargs)
+        return _answered(client.chat.completions.create(**kwargs), kwargs["model"])
     except Exception as exc:  # noqa: BLE001
         if "reasoning_effort" in kwargs and is_reasoning_rejection(exc):
             note_reasoning_rejected()
             kwargs.pop("reasoning_effort", None)
-            return chat_create(client, **kwargs)
+            return _chat_create(client, **kwargs)
         if is_unavailable_error(exc) and secondary_configured():
             note_primary_unavailable(exc)
             return _on_second_provider(kwargs, exc)
-        fb = fallback_model()
-        if kwargs.get("model") == fb or not _model_shaped_error(exc):
-            if is_quota_error(exc):
-                return _on_second_provider(kwargs, exc)
+        # A spent allowance or a model-shaped refusal steps down through the
+        # fallback models, each with an allowance of its own (fallback_models).
+        last = exc
+        spent = exc if is_quota_error(exc) else None
+        for fb in fallbacks_after(kwargs.get("model")):
+            if not _model_shaped_error(last):
+                break
+            log.warning("[llm] %s failed on %s (%s) — retrying on %s",
+                        "chat", kwargs.get("model"), last, fb)
+            kwargs["model"] = fb
+            try:
+                return _answered(client.chat.completions.create(**kwargs), fb)
+            except Exception as exc2:  # noqa: BLE001
+                last = exc2
+                if is_quota_error(exc2):
+                    spent = exc2
+        # A spent allowance is what the owner is told about, even when a
+        # fallback model failed some other way after it.
+        if spent is not None:
+            return _on_second_provider(kwargs, spent)
+        if last is exc:
             raise
-        log.warning("[llm] %s failed on %s (%s) — retrying on %s",
-                    "chat", kwargs.get("model"), exc, fb)
-        kwargs["model"] = fb
-        try:
-            return client.chat.completions.create(**kwargs)
-        except Exception as exc2:  # noqa: BLE001
-            if is_quota_error(exc2):
-                return _on_second_provider(kwargs, exc2)
-            raise
+        raise last
 
 
 def _second_create(kwargs: dict):
@@ -481,7 +622,7 @@ def _second_create(kwargs: dict):
     waited = False
     while True:
         try:
-            return client2.chat.completions.create(**retry)
+            return _answered(client2.chat.completions.create(**retry), retry["model"])
         except Exception as exc:  # noqa: BLE001
             nxt = next_second_model(retry["model"], exc)
             if nxt is None:

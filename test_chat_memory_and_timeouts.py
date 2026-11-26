@@ -372,6 +372,63 @@ def test_when_the_smaller_model_answers_the_question_is_not_sent_again(monkeypat
     assert len(calls) == 2 and "tools" in calls[1]
 
 
+def test_a_spent_allowance_steps_down_the_whole_chain_skipping_a_retired_model(monkeypatch):
+    """Gemini's free allowance is per model (26 Nov 2026): each fallback model
+    gets its go in turn, and one the provider no longer knows is passed over."""
+    monkeypatch.setattr(llm, "fallback_models", lambda: ["f1", "f2", "f3"])
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    calls = []
+
+    class _Gone(Exception):
+        status_code = 404
+
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] in ("m", "f1"):
+            raise _Quota("429 RESOURCE_EXHAUSTED")
+        if kwargs["model"] == "f2":
+            raise _Gone("Error code: 404 - models/f2 is not found")
+        return iter([_chunk("From f3.")])
+
+    monkeypatch.setattr(llm, "_LAST", {})
+    out = list(cfo_tools.run_agent_loop_stream(NS(chat=NS(completions=NS(create=create))), "m",
+                                               [{"role": "user", "content": "hi"}], None, "u1"))
+    assert "".join(d for k, d in out if k == "token") == "From f3."
+    assert calls == ["m", "f1", "f2", "f3"]
+    assert llm.last_outcome()["answered_by"] == "f3"
+
+
+def test_when_the_whole_chain_is_spent_the_allowance_message_is_what_is_raised(monkeypatch):
+    monkeypatch.setattr(llm, "fallback_models", lambda: ["f1", "f2"])
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    monkeypatch.setattr(llm, "_LAST", {})
+    calls = []
+    with pytest.raises(_Quota):
+        list(cfo_tools.run_agent_loop_stream(_refusing(calls), "m",
+                                             [{"role": "user", "content": "hi"}], None, "u1"))
+    assert [c["model"] for c in calls] == ["m", "f1", "f2"]
+    assert llm.last_outcome()["failure"] == "allowance spent"
+
+
+def test_a_silent_fallback_model_stops_the_chain(monkeypatch, rested):
+    """A fallback that does not answer would keep the owner waiting once per
+    model: the chain stops there and the spent allowance is what is told."""
+    monkeypatch.setattr(llm, "fallback_models", lambda: ["f1", "f2"])
+    monkeypatch.setattr(llm, "secondary", lambda: None)
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "m":
+            raise _Quota("429 RESOURCE_EXHAUSTED")
+        raise APITimeoutError("Request timed out.")
+
+    with pytest.raises(_Quota):
+        list(cfo_tools.run_agent_loop_stream(NS(chat=NS(completions=NS(create=create))), "m",
+                                             [{"role": "user", "content": "hi"}], None, "u1"))
+    assert calls == ["m", "f1"]
+
+
 def test_other_ai_features_also_use_the_second_provider(monkeypatch):
     seen = []
     monkeypatch.setattr(llm, "secondary", lambda: (

@@ -241,3 +241,129 @@ def test_gemini_default_is_not_the_model_that_hangs():
         for got in (llm.chat_model(), llm.fallback_model(), llm.vision_model()):
             assert "3.8-flash" not in got, got
         assert llm.fallback_model() != llm.chat_model()
+
+
+# ── the fallback chain (26 Nov 2026) ─────────────────────────────────────────
+# Gemini's free allowance is per model. One fallback meant two models' worth of
+# questions a day, and then the AI stopped.
+
+class _Quota(Exception):
+    status_code = 429
+
+
+def test_a_spent_allowance_steps_down_through_every_gemini_fallback():
+    with env(GEMINI_API_KEY="k"):
+        chain = llm.fallback_models()
+        assert chain == list(llm._GEMINI_FALLBACKS) and llm.chat_model() not in chain
+        c = _Client(fail_times=len(chain), error=_Quota("429 RESOURCE_EXHAUSTED"))
+        out = llm.chat_create(c, messages=[])
+        assert out.choices[0].message.content == "ok"
+        assert c.models == [llm.chat_model(), *chain]
+
+
+def test_when_every_gemini_model_is_spent_the_quota_error_comes_back():
+    with env(GEMINI_API_KEY="k"):
+        c = _Client(fail_times=99, error=_Quota("429 RESOURCE_EXHAUSTED"))
+        try:
+            llm.chat_create(c, messages=[])
+            assert False
+        except _Quota:
+            pass
+        assert c.models == [llm.chat_model(), *llm.fallback_models()]   # each once, no loop
+
+
+def _scripted(c, *errors):
+    """Make client `c` raise these errors in turn, recording the models asked."""
+    it = iter(errors)
+
+    def create(**kwargs):
+        c.models.append(kwargs.get("model"))
+        raise next(it)
+    c.chat.completions.create = create
+    return c
+
+
+def test_a_refusal_that_is_not_model_shaped_stops_the_chain():
+    with env(GEMINI_API_KEY="k"):
+        c = _scripted(_Client(), Exception("The model `x` has been decommissioned"),
+                      Exception("invalid api key"))
+        try:
+            llm.chat_create(c, messages=[])
+            assert False
+        except Exception as e:
+            assert "invalid api key" in str(e)
+        assert len(c.models) == 2
+
+
+def test_a_spent_allowance_is_what_is_told_even_if_a_fallback_then_fails_otherwise():
+    """The owner is told the AI is resting until the reset, which is true, not
+    about whatever odd refusal the last fallback model gave."""
+    with env(GEMINI_API_KEY="k"):
+        c = _scripted(_Client(), _Quota("429 RESOURCE_EXHAUSTED"), Exception("invalid api key"))
+        try:
+            llm.chat_create(c, messages=[])
+            assert False
+        except _Quota:
+            pass
+        assert len(c.models) == 2
+
+
+def test_what_happened_is_noted_for_the_health_page(monkeypatch):
+    monkeypatch.setattr(llm, "_LAST", {})
+    with env(GEMINI_API_KEY="k"):
+        c = _Client(fail_times=1, error=_Quota("429 quotaId: GenerateRequestsPerDayPerProjectPerModel"))
+        llm.chat_create(c, messages=[])
+        last = llm.last_outcome()
+        assert last["answered_by"] == llm.fallback_models()[0] and last["answered_at"]
+        assert "failure" not in last
+
+        c = _Client(fail_times=99, error=_Quota("429 quotaId: GenerateRequestsPerDayPerProjectPerModel"))
+        try:
+            llm.chat_create(c, messages=[])
+        except _Quota:
+            pass
+        last = llm.last_outcome()
+        assert last["failure"] == "allowance spent for today" and last["failed_at"]
+        assert "quotaId" not in repr(last)
+
+
+def test_named_models_go_first_and_nothing_repeats_or_is_the_chat_model():
+    with env(GEMINI_API_KEY="k", LLM_MODEL="main", LLM_FALLBACK_MODEL=" a, b ,a,main"):
+        defaults = list(llm._GEMINI_FALLBACKS)
+        assert llm.fallback_models() == ["a", "b", *defaults]
+        assert llm.fallback_model() == "a"
+        assert llm.fallbacks_after("main") == ["a", "b", *defaults]
+        assert llm.fallbacks_after("b") == defaults
+        assert llm.fallbacks_after(defaults[-1]) == []
+
+
+def test_an_old_one_model_setting_cannot_switch_the_chain_off():
+    """In October the fix was one fallback. Had that been typed into the
+    dashboard as LLM_FALLBACK_MODEL, it must not cut the chain back to one."""
+    with env(GEMINI_API_KEY="k", LLM_FALLBACK_MODEL="gemini-3.5-flash-lite"):
+        assert llm.fallback_models() == list(llm._GEMINI_FALLBACKS)
+
+
+def test_no_shut_down_or_hanging_model_is_in_the_chain():
+    with env(GEMINI_API_KEY="k"):
+        for m in llm.fallback_models():
+            assert "2.0-flash" not in m and "3.8-flash" not in m, m
+        # The least proven model goes last: a silent one stops the chain.
+        assert "preview" not in "".join(llm.fallback_models()[:-1])
+
+
+def test_groq_keeps_its_one_fallback():
+    with env(GROQ_API_KEY="g"):
+        assert llm.fallback_models() == ["openai/gpt-oss-20b"]
+
+
+def test_a_model_the_provider_no_longer_knows_is_told_apart():
+    class E(Exception):
+        def __init__(self, msg, status=None):
+            super().__init__(msg)
+            if status is not None:
+                self.status_code = status
+    assert llm.is_model_gone(E("models/gemini-x is not found for API version v1beta", 404))
+    assert llm.is_model_gone(E("Error code: 404 - model not found"))
+    assert not llm.is_model_gone(E("429 RESOURCE_EXHAUSTED", 429))
+    assert not llm.is_model_gone(E("Invalid JSON payload", 400))

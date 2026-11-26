@@ -2661,6 +2661,11 @@ def health():
         "ai_configured": ai_ready,
         "ai_provider": llm.provider() or "none",
         "ai_model": llm.chat_model() if ai_ready else None,
+        # When the AI last answered (and on which model) and last failed, in
+        # categories only, so "the AI is not working" can be read here without
+        # a sign-in (llm.last_outcome). Empty until the first question after a
+        # restart.
+        "ai_last": llm.last_outcome(),
         "cabinet_size": len(CABINET),
         "supabase_configured": supabase_enabled(),   # Evolution spine persistence
         # Whether the key in SUPABASE_SERVICE_KEY can actually SEE the database.
