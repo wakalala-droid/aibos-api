@@ -9158,12 +9158,17 @@ class PlanGift(BaseModel):
     # Who the welcome screen greets, as the owner would say it ("Mr Ryan Banda").
     name: str
     business: str = ""
+    # Why it was given ("Referral: brought Cookies & Coffee"). The admin
+    # history keeps it; the owner never sees it.
+    note: str = ""
 
 
 @app.post("/admin/gift-plan")
 def admin_gift_plan(req: PlanGift, user_id: str = Depends(require_user)):
     """Give an account a paid plan free for a few months (gifts.py): it ends on
     its own, nobody is asked to pay for it, and the owner is welcomed by name.
+    A gift still running gets the months on its end. The admin page's Gift a
+    plan card calls this, once more for the owner who referred the account.
 
     Only an AI-BOS administrator (membership.is_admin)."""
     db = _require_db()
@@ -9172,7 +9177,7 @@ def admin_gift_plan(req: PlanGift, user_id: str = Depends(require_user)):
     import gifts
     try:
         out = gifts.grant(db, req.target_user_id, req.plan, req.months, req.name, req.business,
-                          granted_by=f"admin:{user_id}")
+                          granted_by=f"admin:{user_id}", note=req.note)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:

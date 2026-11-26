@@ -107,6 +107,83 @@ def test_a_month_from_the_31st_ends_on_the_last_day():
     assert gifts.gift_end(datetime(2027, 1, 31, tzinfo=timezone.utc), 1).day == 28
 
 
+# ── Referrals (26 Nov 2026): a note for the history, and months that add up ──
+
+def test_the_note_stays_in_the_admin_history():
+    db = _db()
+    gifts.grant(db, "u1", "growth", 1, "Mr A", "A Shop", now=NOW, note="  Referral:  brought  B Shop ")
+    assert db.tables["admin_audit"][0]["detail"]["note"] == "Referral: brought B Shop"
+    # The owner never sees why: not in the bell, not in what the app reads.
+    note = db.tables["notifications"][0]
+    assert "Referral" not in note["title"] + note["body"] + str(note["meta"])
+
+
+def test_a_gift_without_a_note_writes_none():
+    db = _db()
+    out = gifts.grant(db, "u1", "growth", 1, "Mr A", now=NOW)
+    assert "note" not in db.tables["admin_audit"][0]["detail"] and out["note"] == ""
+
+
+def test_a_gift_while_one_runs_goes_on_its_end():
+    first_end = datetime(2026, 12, 17, 10, 0, tzinfo=timezone.utc)
+    db = _db(tier="growth", tier_source="gift", paid_until=first_end.isoformat())
+    out = gifts.grant(db, "u1", "growth", 1, "Mr A", "A Shop", now=NOW + timedelta(days=9))
+    p = db.tables["profiles"][0]
+    assert p["paid_until"] == datetime(2027, 1, 17, 10, 0, tzinfo=timezone.utc).isoformat()
+    assert p["tier_source"] == "gift" and out["extended_from"] == first_end.isoformat()
+    note = db.tables["notifications"][0]
+    assert note["title"] == "One more month of Growth, free"
+    assert "17 January 2027" in note["body"] and "—" not in note["title"] + note["body"]
+    assert note["meta"]["extended_from"] == first_end.isoformat()
+    assert db.tables["admin_audit"][0]["detail"]["extended_from"] == first_end.isoformat()
+
+
+def test_a_gift_after_one_ended_starts_today():
+    db = _db(tier="growth", tier_source="gift", paid_until=(NOW - timedelta(days=1)).isoformat())
+    out = gifts.grant(db, "u1", "pro", 2, "Mr A", now=NOW)
+    assert out["extended_from"] is None
+    assert out["until"] == datetime(2027, 1, 17, 10, 0, tzinfo=timezone.utc).isoformat()
+    assert db.tables["notifications"][0]["title"] == "Pro is yours, free for 2 months"
+    assert "extended_from" not in db.tables["notifications"][0]["meta"]
+
+
+def test_more_months_read_as_more():
+    title, body = gifts.message("proplus", 2, NOW, "Mr A", "", more=True)
+    assert title == "2 more months of Pro+, free"
+    assert body.startswith("Mr A, your business stays on AIBOS Pro+ free until 17 November 2026.")
+
+
+def test_the_route_is_for_an_admin_and_keeps_the_note(monkeypatch):
+    import main
+    import webpush
+    from fastapi.testclient import TestClient
+
+    # Patched where the route reads them: another test swaps the membership
+    # module in sys.modules, so a fresh import here can be a different object.
+    db = _db()
+    allowed = {"admin": False}
+    monkeypatch.setattr(main, "get_db", lambda: db)
+    monkeypatch.setattr(main.membership, "is_admin", lambda _db, uid: allowed["admin"] and uid == "admin-1")
+    monkeypatch.setattr(webpush, "send_to_user", lambda *a, **k: {"sent": 0})
+    main.app.dependency_overrides[main.require_user] = lambda: "admin-1"
+    try:
+        client = TestClient(main.app)
+        gift = {"target_user_id": "u1", "plan": "growth", "months": 1, "name": "Mr A",
+                "business": "A Shop", "note": "Referral: brought B Shop"}
+        assert client.post("/admin/gift-plan", json=gift).status_code == 403
+        assert "notifications" not in db.tables and db.tables["profiles"][0]["tier"] == "free"
+
+        allowed["admin"] = True
+        res = client.post("/admin/gift-plan", json=gift)
+        assert res.status_code == 200 and res.json()["extended_from"] is None
+        audit = db.tables["admin_audit"][0]
+        assert audit["admin_email"] == "admin:admin-1"
+        assert audit["detail"]["note"] == "Referral: brought B Shop"
+        assert client.post("/admin/gift-plan", json={**gift, "months": 0}).status_code == 400
+    finally:
+        main.app.dependency_overrides.pop(main.require_user, None)
+
+
 def _tier(monkeypatch, row, now):
     db = FakeDB([{"id": "u1", **row}])
     monkeypatch.setattr(entitlements, "get_db", lambda: db)

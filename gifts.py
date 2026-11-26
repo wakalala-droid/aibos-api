@@ -18,6 +18,15 @@ A gift is not a payment and not a demo:
 
 An account that already pays for a plan is refused: a gift written over it
 would drop the period the card is billing.
+
+A gift given while another is still running adds its months on the end of
+that one, as paying again before a period ends does (26 Nov 2026). Gifts are
+how referrals are thanked, a month for each business an owner brings, so an
+owner who brings a second one while the first month runs gets two months,
+not one cut short. The bell and the welcome then say "one more month".
+
+A note says why the gift was given ("Referral: brought Cookies & Coffee"). It
+goes in the admin history only: the owner never sees it.
 """
 
 from __future__ import annotations
@@ -34,13 +43,14 @@ KIND = "plan_gift"
 SOURCE = "gift"
 PLANS = {"pro": "Pro", "proplus": "Pro+", "growth": "Growth"}
 MAX_MONTHS = 12
+NOTE_MAX = 200
 
 
-def gift_end(now: datetime, months: int) -> datetime:
-    """`months` calendar months on from `now`, on the same day of the month."""
-    end = now
+def gift_end(start: datetime, months: int) -> datetime:
+    """`months` calendar months on from `start`, on the same day of the month."""
+    end = start
     for _ in range(months):
-        end = billing_api.add_period(end, "monthly", now.day)
+        end = billing_api.add_period(end, "monthly", start.day)
     return end
 
 
@@ -49,11 +59,19 @@ def _long_day(dt: datetime) -> str:
     return f"{local.day} {local.strftime('%B %Y')}"
 
 
-def message(plan: str, months: int, until: datetime, name: str, business: str) -> tuple[str, str]:
-    """The bell row's title and body. Pure."""
+def message(plan: str, months: int, until: datetime, name: str, business: str,
+            more: bool = False) -> tuple[str, str]:
+    """The bell row's title and body. `more`: added on the end of a gift that
+    was still running. Pure."""
     plan_name = PLANS[plan]
-    span = "one month" if months == 1 else f"{months} months"
     who = business or "your business"
+    if more:
+        span = "One more month" if months == 1 else f"{months} more months"
+        title = f"{span} of {plan_name}, free"
+        body = (f"{name}, {who} stays on AIBOS {plan_name} free until {_long_day(until)}. "
+                f"Nothing to pay and no card needed.")
+        return title, body
+    span = "one month" if months == 1 else f"{months} months"
     title = f"{plan_name} is yours, free for {span}"
     body = (f"Welcome, {name}. {who} is on AIBOS {plan_name} free until {_long_day(until)}. "
             f"Everything in {plan_name} is switched on now. Nothing to pay and no card needed.")
@@ -61,14 +79,18 @@ def message(plan: str, months: int, until: datetime, name: str, business: str) -
 
 
 def grant(db, user_id: str, plan: str, months: int, name: str, business: str = "",
-          granted_by: str = "AIBOS", now: datetime | None = None) -> dict:
+          granted_by: str = "AIBOS", now: datetime | None = None, note: str = "") -> dict:
     """Give `user_id` `plan` free for `months` and leave the welcome in their bell.
 
+    A gift that is still running is not cut short: the months go on its end.
+    `note` says why, for the admin history only.
+
     Raises ValueError for anything that should not be granted. Returns what was
-    written: the plan, the end date and the notification id."""
+    written: the plan, the end date, where it ran on from and the notification id."""
     plan = (plan or "").strip().lower()
     name = " ".join((name or "").split())
     business = " ".join((business or "").split())
+    note = " ".join((note or "").split())[:NOTE_MAX]
     if plan not in PLANS:
         raise ValueError("A gift is one of the paid plans: pro, proplus or growth.")
     if not isinstance(months, int) or not 1 <= months <= MAX_MONTHS:
@@ -89,7 +111,11 @@ def grant(db, user_id: str, plan: str, months: int, name: str, business: str = "
         if until is None or now < until:
             raise ValueError("This account pays for its plan. A gift would replace what it paid for.")
 
-    until = gift_end(now, months)
+    # A gift still running: the new months go on its end, so a second
+    # referral is a second month and never shortens the first.
+    running = entitlements._parse_ts(row.get("paid_until")) if row.get("tier_source") == SOURCE else None
+    extended_from = running if running is not None and running > now else None
+    until = gift_end(extended_from or now, months)
     (db.table("profiles").update({
         "tier": plan,
         "subscription_tier": plan,
@@ -100,24 +126,32 @@ def grant(db, user_id: str, plan: str, months: int, name: str, business: str = "
     }).eq("id", user_id).execute())
     entitlements.invalidate(user_id)
 
-    title, body = message(plan, months, until, name, business)
+    title, body = message(plan, months, until, name, business, more=extended_from is not None)
     meta = {"plan": plan, "months": months, "until": until.isoformat(),
             "name": name, "business": business}
+    if extended_from is not None:
+        meta["extended_from"] = extended_from.isoformat()
     res = db.table("notifications").insert({
         "user_id": user_id, "kind": KIND, "title": title, "body": body,
         "link": "/dashboard", "meta": meta,
     }).execute()
     note_id = ((getattr(res, "data", None) or [{}])[0]).get("id")
 
+    detail = {"tier": plan, "source": SOURCE, "months": months,
+              "paid_until": until.isoformat(), "for": name, "business": business}
+    if extended_from is not None:
+        detail["extended_from"] = extended_from.isoformat()
+    if note:
+        detail["note"] = note
     try:
         db.table("admin_audit").insert({
             "admin_email": granted_by, "target_user_id": user_id, "action": "set_tier",
-            "detail": {"tier": plan, "source": SOURCE, "months": months,
-                       "paid_until": until.isoformat(), "for": name, "business": business},
+            "detail": detail,
         }).execute()
     except Exception as e:  # noqa: BLE001 — the gift stands without its audit line
         log.warning("[gifts] audit row not written for %s: %s", user_id, e)
 
     log.info("[gifts] %s free for %s month(s) to %s until %s", plan, months, user_id, until.isoformat())
     return {"ok": True, "plan": plan, "months": months, "until": until.isoformat(),
-            "notification_id": note_id, "title": title, "body": body}
+            "extended_from": extended_from.isoformat() if extended_from is not None else None,
+            "note": note, "notification_id": note_id, "title": title, "body": body}
