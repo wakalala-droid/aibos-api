@@ -9524,6 +9524,12 @@ def twin_financials(ctx: membership.Context = Depends(membership.require_context
 # The routes live in find_clients_routes.py, the work in find_clients.py.
 app.include_router(find_clients_routes.router)
 
+# ── The live guide (27 Nov 2026) ──────────────────────────────────────────────
+# Talk out loud with AIBOS while it reads the screen and points: the routes in
+# live_guide_routes.py, the token, limits and costs in live_guide.py.
+import live_guide_routes  # noqa: E402
+app.include_router(live_guide_routes.router)
+
 # ── Owners review AIBOS (20 Nov 2026; migration 0048) ─────────────────────────
 # The review centre, the website's reviews and the ask: all in reviews.py.
 import reviews as reviews_api  # noqa: E402
