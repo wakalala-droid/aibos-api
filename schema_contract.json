@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "AUTHORITATIVE database-schema contract between the two AIBOS repos.",
+    "AUTHORITATIVE database-schema contract between the two AI-BOS repos.",
     "",
     "The migration FILES live in the frontend repo (aibos/supabase/migrations/).",
     "The BACKEND is what breaks when one has not been run. So the backend has to",
@@ -25,5 +25,5 @@
     "in main.py, push aibos-api FIRST. The owner runs migrations by hand, so a",
     "green /health after a deploy is how they know the new image is really live."
   ],
-  "expects_migration": 49
+  "expects_migration": 50
 }

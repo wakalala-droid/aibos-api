@@ -1,5 +1,5 @@
 """
-AIBOS — Morning Brief delivery (email + WhatsApp).
+AI-BOS — Morning Brief delivery (email + WhatsApp).
 
 Ready-for-keys, exactly like payments.py: fully implemented, dormant until the
 env keys exist, never fakes a send. The brief itself is composed server-side
@@ -67,7 +67,7 @@ def email_art_url() -> str:
 
 def aibos_email_html(body: str, button: tuple[str, str] | None = None,
                      title: str | None = None) -> str:
-    """A plain-text email body, in the AIBOS x Mercury look.
+    """A plain-text email body, in the AI-BOS x Mercury look.
 
     The owner, 5 Oct 2026: every notice, payment reminders and scheduled
     meetings included, is built from the What's new screen's pieces. In an
@@ -118,7 +118,7 @@ def aibos_email_html(body: str, button: tuple[str, str] | None = None,
         '<img src="' + e(grey_mark, quote=True) + '" alt="" width="18" height="19" '
         'style="display:inline-block;vertical-align:middle;width:18px;height:auto;border:0;">'
         '<span style="vertical-align:middle;margin-left:8px;font-size:18px;color:#78716c;' + font + '">'
-        'Sent by AIBOS</span>'
+        'Sent by AI-BOS</span>'
         '</td></tr></table></div>'
     )
 
@@ -204,7 +204,7 @@ def money_line(state: dict, sym: str = "K") -> str:
 # ── The one-line brief (Free and Pro, 28 October 2026) ────────────────────────
 # The full brief is Pro+ (the plan ladder of 22 October). Below it an owner who
 # switched the brief on used to get nothing at all, so the plans that most
-# needed a reason to open AIBOS each morning had none. They now get the brief's
+# needed a reason to open AI-BOS each morning had none. They now get the brief's
 # first line, their cash and who owes whom, from the same books and the same
 # arithmetic. The email says once what the full brief adds; the phone
 # notification never sells (the iPhone app sells nothing, and neither does a

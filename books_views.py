@@ -1,5 +1,5 @@
 """
-AIBOS — the money views: every figure about money, from one place.
+AI-BOS — the money views: every figure about money, from one place.
 
 Home and the Money page show the money right now, where it sits (the drawer,
 the mobile money wallet, the bank), the line under it, what came in and went

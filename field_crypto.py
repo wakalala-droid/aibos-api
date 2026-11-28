@@ -1,5 +1,5 @@
 """
-AIBOS — application-level field encryption.
+AI-BOS — application-level field encryption.
 
 One narrow job: seal a single sensitive string (today: guests.id_document_number,
 migration 0015) with Fernet BEFORE it ever reaches Supabase, and open it again only

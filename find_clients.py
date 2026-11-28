@@ -1,12 +1,12 @@
 """
-AIBOS: Find clients (Growth from 5 November 2026, every plan from 7 November,
+AI-BOS: Find clients (Growth from 5 November 2026, every plan from 7 November,
 priced the way Explee prices it from 9 November).
 
 An agent that finds businesses that could buy from the owner, reads their
 websites, says how well each one fits and why, and writes the first message,
 the follow-ups and the answer to a reply. It is the owner's own outreach tool
 (aibos-prospect, built that day from how Explee works), made into a part of
-AIBOS that every business can use for its own sales.
+AI-BOS that every business can use for its own sales.
 
 HOW IT IS PAID FOR (owner's decision, 9 Nov 2026, after Explee: search its
 directory free, pay for the work, top up when you run out, try it free for a
@@ -21,7 +21,7 @@ soonest goes first), each spend recorded in usage_events with its pool.
 IT NEVER SENDS ANYTHING ITSELF. Every message is a draft until the owner
 presses Send by email, on WhatsApp or on LinkedIn, which opens their own
 email, WhatsApp or LinkedIn with the message ready. So each message goes out
-in the owner's own name, from their own address, and AIBOS's mail domain (the
+in the owner's own name, from their own address, and AI-BOS's mail domain (the
 one that carries payslips, briefs and receipts) never carries anyone's first
 message to a stranger. Every first message ends with a way to say no, and a
 "stop" puts the address on the do not contact list for good.
@@ -29,7 +29,7 @@ message to a stranger. Every first message ends with a way to say no, and a
 LINKEDIN, THE SAFE WAY (owner's decision, 10 Nov 2026). Explee sends from a
 LinkedIn account connected to it. LinkedIn's User Agreement (section 8.2)
 bars bots that add contacts or send messages, and its open API gives apps no
-search and no messaging, so AIBOS never opens LinkedIn itself, not even one
+search and no messaging, so AI-BOS never opens LinkedIn itself, not even one
 page. It keeps the LinkedIn address a business links to from its own website
 (or one the owner pastes or imports), gives a LinkedIn search that opens in
 the owner's own LinkedIn, and writes a connection note short enough for a
@@ -42,7 +42,7 @@ on the Flash model, about 1.5 US cents. Finding costs nothing, and follow-ups
 and answers are written from the owner's own words, so neither counts. Without
 an AI key everything still works on rules and templates.
 
-Finding: AIBOS's own directory of named places, by kind and town, taken from
+Finding: AI-BOS's own directory of named places, by kind and town, taken from
 OpenStreetMap (free, no key) and kept in Supabase Storage, so a search answers
 from what is held, like Explee's own database, instead of waiting on a public
 map server. On 9 Nov 2026 every public Overpass server but one was down or
@@ -168,9 +168,9 @@ MAP_FIRST = 2         # servers asked at once
 MAP_HEDGE = 8.0       # seconds before the rest are asked too
 MAP_DEADLINE = 60.0   # seconds a search may take in all (it runs on after the answer)
 MAP_CACHE_MAX = 60     # pairs held in memory (Lusaka's shops are about 700 places)
-USER_AGENT = "AIBOS Find clients (+https://ai-bos.website)"
+USER_AGENT = "AI-BOS Find clients (+https://ai-bos.website)"
 
-# AIBOS's own directory: every named place of one kind within DIR_RADIUS_KM of
+# AI-BOS's own directory: every named place of one kind within DIR_RADIUS_KM of
 # a town, kept in Storage. A search reads it and takes the nearest places the
 # owner does not have yet, so it answers at once and each press brings new ones.
 DIR_BUCKET = "map-directory"
@@ -198,7 +198,7 @@ class Refused(Exception):
 
 
 class Busy(RuntimeError):
-    """A public service AIBOS leans on is busy; try again shortly (503)."""
+    """A public service AI-BOS leans on is busy; try again shortly (503)."""
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
@@ -345,7 +345,7 @@ def _linkedin(v) -> str | None:
 
 
 def _linkedin_host(url) -> bool:
-    """A LinkedIn address of any kind, which AIBOS never opens itself."""
+    """A LinkedIn address of any kind, which AI-BOS never opens itself."""
     h = _host(url)
     return h in ("linkedin.com", "lnkd.in") or h.endswith(".linkedin.com")
 
@@ -997,9 +997,9 @@ def nearest(rows: list, town: str, radius_km: float | None = None) -> list:
 
 
 MAP_BUSY = "The map is busy just now. Try again in a minute."
-MAP_WAITING = ("Every public map server is busy just now. AIBOS keeps asking every 30 seconds for up to "
+MAP_WAITING = ("Every public map server is busy just now. AI-BOS keeps asking every 30 seconds for up to "
                "ten minutes. You can leave this page; it carries on.")
-MAP_GAVE_UP = ("The public map servers were busy for ten minutes. AIBOS will fetch these places in the "
+MAP_GAVE_UP = ("The public map servers were busy for ten minutes. AI-BOS will fetch these places in the "
                "background within the hour, so try again then, or paste a list of businesses.")
 
 
@@ -1069,7 +1069,7 @@ def _race(q: str, first: int | None = None, deadline_s: float | None = None) -> 
     raise Busy(MAP_BUSY)
 
 
-# ── AIBOS's own directory ─────────────────────────────────────────────────────
+# ── AI-BOS's own directory ─────────────────────────────────────────────────────
 # One snapshot per kind and town, {"kind", "town", "radius_km", "fetched_at",
 # "rows"}, in a private Storage bucket made on first use, plus index.json
 # saying when each was fetched (for the harvest). It holds only what
@@ -1206,7 +1206,7 @@ def fetch_pair(db, kind: str, town: str, first: int | None = None, server_timeou
 
 
 def search_map(kind: str, town: str, radius_km: float | None = None, db=None) -> list:
-    """Named places of one kind around a town, nearest first, from AIBOS's
+    """Named places of one kind around a town, nearest first, from AI-BOS's
     directory. The map is asked only for a pair not held, or held too long;
     when it is busy then, what is held is used. Raises Busy when the map is
     busy and nothing is held."""
@@ -1648,8 +1648,8 @@ STOP_WA = "(Reply STOP and I will not message again.)"
 
 
 # An offer the owner wrote as a deed ("Deliver cement within a day") reads
-# after "We"; one written as a sentence of its own ("AIBOS keeps your books")
-# is used as it stands. Splicing the second after "We" read "We AIBOS keeps".
+# after "We"; one written as a sentence of its own ("AI-BOS keeps your books")
+# is used as it stands. Splicing the second after "We" read "We AI-BOS keeps".
 _DEED = re.compile(
     r"^(deliver|help|supply|sell|provide|make|build|fix|keep|offer|install|train|clean|design|print|repair|run|"
     r"manage|do|give|bring|set|turn|handle|grow|save|cut|track|teach|host|cater|transport|move|ship|source|"
@@ -2007,7 +2007,7 @@ def mark_sent(db, uid: str, mid: str, channel: str, settings: dict, now: datetim
 
 def record_reply(db, uid: str, bid: str, pid: str, text: str, campaign: dict | None, settings: dict,
                  business: dict, now: datetime | None = None) -> dict:
-    """The owner pasted what a business wrote back. AIBOS reads it, moves the
+    """The owner pasted what a business wrote back. AI-BOS reads it, moves the
     business on and drafts the answer."""
     now = now or _now()
     p = get_prospect(db, uid, pid)

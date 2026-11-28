@@ -51,13 +51,13 @@ def _clock(dt):
 def test_it_leads_with_cash_then_sales_then_the_schedule(brief):
     later = NOW + timedelta(hours=26)
     db = _db(_item("Supplier meeting", later, kind="meeting"),
-             _item("Propose AIBOS to Izeni", NOW - timedelta(hours=30)))
+             _item("Propose AI-BOS to Izeni", NOW - timedelta(hours=30)))
     title, body = notify.snapshot(db, "owner", None, now=NOW)
     assert title == "Cash: K11,630.50"
     lines = body.split("\n")
     assert lines[0] == "Customers owe you K2,000."
     assert lines[1] == "No sales recorded yesterday or today yet."
-    assert lines[2].startswith("Overdue: Propose AIBOS to Izeni (")
+    assert lines[2].startswith("Overdue: Propose AI-BOS to Izeni (")
     assert lines[3].endswith(f"{_clock(later)}: Supplier meeting")
     assert lines[-1].startswith("One thing today")
     assert "Any questions" not in body

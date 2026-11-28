@@ -1,5 +1,5 @@
 """
-AIBOS — Debtors ledger + AR aging (audit 2026-07 item #15).
+AI-BOS — Debtors ledger + AR aging (audit 2026-07 item #15).
 
 "Who owes me, how much, and for how long?" — answered per customer with
 aging buckets, from two honest sources:
@@ -12,7 +12,7 @@ aging buckets, from two honest sources:
     a customer's loose balance never goes below zero — an overpayment is a
     credit note conversation, not a negative debt.
 
-Nudge drafts follow the house pattern: AIBOS writes the WhatsApp message,
+Nudge drafts follow the house pattern: AI-BOS writes the WhatsApp message,
 the OWNER sends it from their own phone. Nothing is auto-sent.
 
 Pure functions, offline-tested in test_debtors.py. Free tier — collecting

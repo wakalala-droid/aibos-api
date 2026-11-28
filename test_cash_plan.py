@@ -336,7 +336,7 @@ def test_two_debts_from_one_customer_are_one_reminder():
     assert "https://x/pay/a" in msg and "https://x/pay/b" in msg
 
 
-# ── What the owner told AIBOS (interview.py, 28 Oct 2026) ────────────────────
+# ── What the owner told AI-BOS (interview.py, 28 Oct 2026) ────────────────────
 
 def test_the_cushion_is_named_as_the_owners_own_line():
     events, pending, invoices, schedule = shop()
@@ -347,7 +347,7 @@ def test_the_cushion_is_named_as_the_owners_own_line():
     assert told["safe_to_spend"] == plain["safe_to_spend"] and told["chance_short_pct"] == plain["chance_short_pct"]
     assert plain["floor_from"] is None and told["floor_from"] == "cushion"
     assert "your K20,000 cushion" in told["headline"] and "cushion" not in plain["headline"]
-    assert any("K20,000 cushion" in a and "answers to AIBOS" in a for a in told["assumptions"])
+    assert any("K20,000 cushion" in a and "answers to AI-BOS" in a for a in told["assumptions"])
     assert cp.floor_words(0, "K", "cushion") == "zero"            # no floor is never a cushion
     # Almost sure to go below it still reads as a person says it.
     assert cp.chance_sentence(1.0, "your money goes below your K20,000 cushion") == \
@@ -367,7 +367,7 @@ def test_a_loan_the_books_do_not_show_is_counted_from_the_owners_word():
     assert told["close"]["p50"] == round(without["close"]["p50"] - 12000.0, 2)
     assert told["safe_to_spend"] < without["safe_to_spend"]
     assert any("K4,000 a month" in a and "1st of each month" in a for a in told["assumptions"])
-    # Its day is AIBOS's guess, so moving it is never suggested.
+    # Its day is AI-BOS's guess, so moving it is never suggested.
     burn = cp.build(*shop(burn=True), 6000.0, loan_monthly=4000.0, **kw)
     assert not any("Loan repayment" in lv["title"] for lv in burn["levers"])
 

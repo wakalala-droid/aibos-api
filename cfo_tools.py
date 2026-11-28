@@ -1,9 +1,9 @@
 """
-AIBOS — CFO chat tools + agent loop (audit 2026-07 items #8/#21).
+AI-BOS — CFO chat tools + agent loop (audit 2026-07 items #8/#21).
 
 Until now the AI CFO knew only what the browser tab sent it — a chat skin.
 This module gives the model tenant-scoped, READ-ONLY tools over the data
-AIBOS actually holds (twin, events, products, schedule, invoices, simulation,
+AI-BOS actually holds (twin, events, products, schedule, invoices, simulation,
 customer intelligence), so answers come from recorded reality and can cite
 the events behind them.
 
@@ -118,7 +118,7 @@ TOOLS = [
                        "'when will I run short'. Growth plan; on other plans it says so.",
         "parameters": {"type": "object", "properties": {
             "floor": {"type": "number", "description": "the least the owner wants to keep; leave it out to use "
-                                                       "the cash cushion they told AIBOS (zero without one)"},
+                                                       "the cash cushion they told AI-BOS (zero without one)"},
         }},
     }},
     {"type": "function", "function": {
@@ -357,7 +357,7 @@ def _investigate(db, user_id, args, business_id=None):
     biz = _books(db, user_id, business_id)
     events = nervous.list_events(db, user_id, status="confirmed", limit=_EVENT_SCAN_CAP, business_id=biz)
     month = args.get("month")
-    # The worst month AIBOS picks by itself skips one the owner said runs busy or quiet.
+    # The worst month AI-BOS picks by itself skips one the owner said runs busy or quiet.
     return (investigate.investigate_month(events, month)
             if month else investigate.auto_investigation(events, interview.seasons(
                 interview.answers_for(db, user_id, biz))))
@@ -810,7 +810,7 @@ def run_agent_loop_stream(client, model: str, messages: list, db, user_id: str,
 
         ("tool",  name)   — a lookup started (the UI can show "checking …")
         ("read",  {...})  — what that lookup read, in words, with entry ids (C8)
-        ("action", {...}) — a job AIBOS did or is waiting to do (actions.public)
+        ("action", {...}) — a job AI-BOS did or is waiting to do (actions.public)
         ("token", text)   — a piece of the answer, as the model writes it
         ("done",  {...})  — finished; carries tools_used
 

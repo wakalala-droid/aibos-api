@@ -1,5 +1,5 @@
 """
-Owners review AIBOS (reviews.py, migration 0048).
+Owners review AI-BOS (reviews.py, migration 0048).
 
 Pins the promises: one review per account, which its writer can change or
 take back; nothing reaches the website without the writer's yes, and the
@@ -38,7 +38,7 @@ def db():
 
 
 def _review(**k):
-    base = {"rating": 5, "body": "AIBOS keeps my books every day without me thinking about it.",
+    base = {"rating": 5, "body": "AI-BOS keeps my books every day without me thinking about it.",
             "name": "Mwila", "business": "Mwila General Store", "town": "Lusaka", "show_on_site": True}
     return {**base, **k}
 
@@ -67,7 +67,7 @@ def test_what_a_review_must_have(db):
                       ({"name": "", "business": ""}, "who said it")]:
         with pytest.raises(reviews.ReviewError, match=says):
             reviews.save(db, "u1", _review(**bad), now=NOW)
-    # Kept to the AIBOS team, it needs no name.
+    # Kept to the AI-BOS team, it needs no name.
     kept = reviews.save(db, "u1", _review(name="", business="", show_on_site=False, show_logo=True), now=NOW)
     assert kept["show_on_site"] is False and kept["show_logo"] is False
     # Spaces are tidied, names kept short.
@@ -77,11 +77,11 @@ def test_what_a_review_must_have(db):
 
 def test_a_shared_review_carries_no_link_email_or_phone(db):
     for body in ["Great app, see www.mwilastore.com for my shop.", "Call me on 0973 759 352 about it.",
-                 "Write to mwila@example.com about AIBOS.", "Visit https://mwila.zm today for more.",
+                 "Write to mwila@example.com about AI-BOS.", "Visit https://mwila.zm today for more.",
                  "Ring +260 97 375 9352 for my prices."]:
         with pytest.raises(reviews.ReviewError, match="web addresses"):
             reviews.save(db, "u1", _review(body=body), now=NOW)
-        # Sent to AIBOS only, it is the owner's own business.
+        # Sent to AI-BOS only, it is the owner's own business.
         assert reviews.save(db, "u1", _review(body=body, show_on_site=False), now=NOW)
     with pytest.raises(reviews.ReviewError, match="web addresses"):
         reviews.save(db, "u1", _review(business="mwilastore.com"), now=NOW)
@@ -105,7 +105,7 @@ def test_the_website_shows_what_owners_shared_low_stars_too_newest_first(db):
     assert page["logos"] == [{"name": "Mwila General Store", "logo": LOGO.format("u1")}]
     assert page["count"] == 2 and page["average"] is None
     assert all("user_id" not in r for r in page["reviews"])
-    # Chanda kept it to the AIBOS team: nothing of theirs is on the website, logo or words.
+    # Chanda kept it to the AI-BOS team: nothing of theirs is on the website, logo or words.
     assert all(r["name"] != "Chanda" for r in page["reviews"])
 
 
@@ -152,7 +152,7 @@ def test_the_ask_goes_to_everyone_who_has_not_reviewed(db, monkeypatch):
     monkeypatch.setattr(webpush, "send_to_user", lambda *a, **k: {"sent": 1})
     db.rows["notifications"] = []
     db.rows["push_subscriptions"] = [{"user_id": "u2"}, {"user_id": "u1"}]
-    # u1 and u2 are using AIBOS now; u1 has reviewed, so only u2 counts as "now".
+    # u1 and u2 are using AI-BOS now; u1 has reviewed, so only u2 counts as "now".
     for p in db.rows["profiles"][:2]:
         p["last_active_at"] = NOW.isoformat()
     reviews.save(db, "u1", _review(), now=NOW)

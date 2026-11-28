@@ -1,5 +1,5 @@
 """
-AIBOS — the cash watch (Growth, 16 October 2026).
+AI-BOS — the cash watch (Growth, 16 October 2026).
 
 Reads one business's books for the 13-week cash plan (cash_plan.py is pure;
 this is where the reading happens), and once a day looks at every Growth
@@ -37,7 +37,7 @@ WATCH_PATHS = 500
 # Not before 07:00 in Lusaka (05:00 UTC): a warning is a phone notification,
 # and nobody should be woken at three in the morning to be told about November.
 WATCH_FROM_UTC_HOUR = 5
-# AIBOS's home clock for the daily jobs (Lusaka, no daylight saving).
+# AI-BOS's home clock for the daily jobs (Lusaka, no daylight saving).
 HOME_TZ_MINUTES = 120
 _CHECKED = {"day": None}
 SUMMARY_SECONDS = 300
@@ -79,7 +79,7 @@ def inputs(db, owner_id: str, business_id: str | None) -> dict:
 
 
 def told(db, owner_id: str, business_id: str | None) -> dict:
-    """What the owner told AIBOS that the plan uses: {cushion, loan_monthly},
+    """What the owner told AI-BOS that the plan uses: {cushion, loan_monthly},
     each None when they did not say. Never raises."""
     import interview
     answers = interview.answers_for(db, owner_id, business_id)
@@ -93,9 +93,9 @@ def build(db, owner_id: str, business_id: str | None, tz: int = 0, floor: float 
     now, the plan and the 12 months).
 
     `floor` None means the owner has not typed one: the cash cushion they gave
-    AIBOS in the interview is the floor then (zero without one), so what is
+    AI-BOS in the interview is the floor then (zero without one), so what is
     safe to spend and the low-cash warning keep their cushion. A loan
-    repayment they told AIBOS about counts while the books show none."""
+    repayment they told AI-BOS about counts while the books show none."""
     books = books or inputs(db, owner_id, business_id)
     said = told(db, owner_id, books["business_id"])
     if floor is None:
@@ -140,7 +140,7 @@ def _business_name(db, owner_id: str, business_id: str | None) -> str | None:
 
 def chase_message(row: dict, business: str | None, sym: str = "K", pay_url: str | None = None) -> str:
     """The reminder the owner sends from their own phone. Warm, short, exact,
-    with the payment link when there is one. AIBOS never sends it itself."""
+    with the payment link when there is one. AI-BOS never sends it itself."""
     # The whole name: "Hi Lusaka" for Lusaka Lodge reads wrong, and a person's
     # full name never does.
     first = str(row.get("customer") or "").strip() or "there"
@@ -301,7 +301,7 @@ def preview(plan: dict) -> dict:
     return {"ok": True, "preview": True, "chance_short_pct": plan["chance_short_pct"],
             "chance_words": plan["chance_words"], "first_risk_date": plan.get("first_risk_date"),
             "at_risk": plan["chance_short_pct"] >= 5,
-            # The line the chance is about: their cushion, when they gave AIBOS one.
+            # The line the chance is about: their cushion, when they gave AI-BOS one.
             "floor": plan.get("floor"), "floor_from": plan.get("floor_from")}
 
 
@@ -322,7 +322,7 @@ def warning(plan: dict, sym: str = "K") -> dict | None:
     if plan.get("floor_from") == "cushion" and float(plan.get("cash_now") or 0.0) < floor:
         # Already under the cushion: say so, not that it may happen.
         title = f"Your cash is below your {money(floor)} cushion"
-        body = f"{money(plan['cash_now'])} now, against the {money(floor)} you told AIBOS to keep at all times."
+        body = f"{money(plan['cash_now'])} now, against the {money(floor)} you told AI-BOS to keep at all times."
     else:
         title = (f"Cash may run short in the week of {when}" if floor <= 0
                  else f"Cash may go below {line} in the week of {when}")

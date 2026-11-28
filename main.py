@@ -1,5 +1,5 @@
 """
-AIBOS Backend — FastAPI
+AI-BOS Backend — FastAPI
 Fixes: column detection, multi-sheet Excel, AI chat, cabinet, data studio
 """
 
@@ -134,7 +134,7 @@ class SafeJSONResponse(JSONResponse):
             return super().render(_finite_only(content))
 
 
-app = FastAPI(title="AIBOS API", version="3.0.0", default_response_class=SafeJSONResponse)
+app = FastAPI(title="AI-BOS API", version="3.0.0", default_response_class=SafeJSONResponse)
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 # Browsers never call this API directly — the Next.js app talks to it
@@ -1214,7 +1214,7 @@ def upload_file(
 
         if rev_col is None or cost_col is None:
             raise ValueError(
-                "This file does not hold a monthly summary, and AIBOS could not find "
+                "This file does not hold a monthly summary, and AI-BOS could not find "
                 "dated payments in it to add up either. It needs either month, revenue "
                 "and cost columns, or a list of transactions with a date and an amount. "
                 f"Columns found: {list(df.columns)}"
@@ -1259,7 +1259,7 @@ def upload_file(
         return {
             "success": True,
             "engine": engine_type,
-            # True when AIBOS added a ledger up into months rather than reading a
+            # True when AI-BOS added a ledger up into months rather than reading a
             # summary, so the screen can say where the figures came from.
             "rolled_up_from_transactions": rolled_up,
             "odd_dates": _far_off_months([str(r.get("month")) for r in monthly_rows
@@ -1334,7 +1334,7 @@ def switch_sheet(cabinet_id: str = Query(...), sheet_name: str = Query(...),
     if rev_col is None or cost_col is None:
         raise HTTPException(
             status_code=400,
-            detail=(f"There are no figures AIBOS can add up on sheet '{sheet_name}'. "
+            detail=(f"There are no figures AI-BOS can add up on sheet '{sheet_name}'. "
                     "It needs either revenue and cost columns, or dated payments with "
                     f"an amount. Columns on this sheet: {list(df.columns)}"),
         )
@@ -2221,12 +2221,12 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
              "exactly as given. NEVER substitute $, K or any other symbol."
     )
     system_parts = [
-        "You are the AI CFO (Chief Financial Officer) for AIBOS, "
+        "You are the AI CFO (Chief Financial Officer) for AI-BOS, "
         "a financial intelligence platform serving Zambian SMEs.",
         currency_line,
         "You are expert in Zambian business, economics, and SME finance.",
         "Be direct, insightful, and action-oriented. No fluff.",
-        # The house style every AIBOS screen follows, so the AI's own words
+        # The house style every AI-BOS screen follows, so the AI's own words
         # read like the rest of the product: plain words for an owner, not an
         # accountant, and two punctuation rules the owner holds absolutely.
         "Write in plain, simple words a busy shop owner reads at a glance. Say "
@@ -2288,7 +2288,7 @@ def _prepare_chat(req: "ChatRequest", user_id: str, x_business_id: Optional[str]
     business_id = businesses_api.resolve_business_id(get_db(), ctx.tenant, x_business_id,
                                                      create=True)
 
-    # What the owner told AIBOS in the setup interview (interview.py), so the
+    # What the owner told AI-BOS in the setup interview (interview.py), so the
     # answer is about THIS business: its normal month, its goals, its seasons.
     # Best-effort: '' when there is none or the table is not there yet.
     told = interview_api.briefing(get_db(), ctx.tenant, business_id)
@@ -2542,7 +2542,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
                     return {
                         "reply": reply,
                         "response": reply,
-                        "model": "AIBOS Intelligence",
+                        "model": "AI-BOS Intelligence",
                         "context_injected": injected,
                         "tools_used": out["tools_used"],
                         "actions": out.get("actions") or [],
@@ -2572,7 +2572,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
         return {
             "reply": response_text,
             "response": response_text,
-            "model": "AIBOS Intelligence",
+            "model": "AI-BOS Intelligence",
             "context_injected": injected,
         }
 
@@ -2610,7 +2610,7 @@ def chat(req: ChatRequest, user_id: str = Depends(rate_limit.limiter("chat", 30,
 #
 # Adding a migration = add the .sql in aibos, bump this AND
 # schema_contract.json, push aibos-api first.
-EXPECTS_MIGRATION = 49
+EXPECTS_MIGRATION = 50
 
 
 # The commit each host injects, in the order we are likely to be on them.
@@ -3087,7 +3087,7 @@ def my_receipt(payment_id: str, user_id: str = Depends(require_user)):
                                     prof.get("contact_email") or prof.get("email"))
     name = billing_api.receipt_number(pay)
     if pdfdoc.available():
-        return Response(content=pdfdoc.render("AIBOS receipt", text), media_type="application/pdf",
+        return Response(content=pdfdoc.render("AI-BOS receipt", text), media_type="application/pdf",
                         headers={"Content-Disposition": f"attachment; filename={name}.pdf"})
     return Response(content=text, media_type="text/plain",
                     headers={"Content-Disposition": f"attachment; filename={name}.txt"})
@@ -3213,7 +3213,7 @@ CALLBACK_SECRET = os.environ.get("PAYMENTS_CALLBACK_SECRET")
 
 # Where the customer-facing app lives — used to build invoice payment links.
 # Set this on Railway if the frontend ever moves off the Vercel domain, or every
-# link AIBOS hands a paying customer points at the wrong host.
+# link AI-BOS hands a paying customer points at the wrong host.
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://ai-bos.website")
 
 
@@ -3404,7 +3404,7 @@ def payments_initiate():
     Kept as an address so an old page left open gets a plain answer, not a 404.
     Mobile money still collects invoice and booking payment links; those have
     their own addresses."""
-    raise HTTPException(status_code=410, detail="AIBOS plans are paid by card now and renew "
+    raise HTTPException(status_code=410, detail="AI-BOS plans are paid by card now and renew "
                                                 "automatically. Choose your plan again on the "
                                                 "pricing page to pay by card.")
 
@@ -3995,7 +3995,7 @@ def paddle_checkout(body: CardPlanRequest, user_id: str = Depends(require_user))
                                                     "not open yet. Please pay with mobile money.")
     card = _live_card_plan(db, user_id)
     if card:
-        raise HTTPException(status_code=409, detail="You already pay for AIBOS by card. Change your "
+        raise HTTPException(status_code=409, detail="You already pay for AI-BOS by card. Change your "
                                                     "plan from Plan & billing instead.")
     prof = (db.table("profiles").select("email,contact_email").eq("id", user_id)
             .limit(1).execute())
@@ -4226,7 +4226,7 @@ def notify_test_whatsapp(ctx: membership.Context = Depends(membership.require_co
 
 @app.get("/brief/spoken")
 def brief_spoken(ctx: membership.Context = Depends(membership.require_context)):
-    """The brief AIBOS reads aloud when the owner presses Talk (spoken_brief.py).
+    """The brief AI-BOS reads aloud when the owner presses Talk (spoken_brief.py).
 
     The emailed Morning Brief's own lines and plan rules, the next two days of
     the schedule, and "What would you like me to handle first?". Staff hear
@@ -4244,9 +4244,9 @@ def brief_spoken(ctx: membership.Context = Depends(membership.require_context)):
     return spoken_brief.compose(db, ctx.tenant, ctx.role, ctx.business_id, name)
 
 
-# ── Jobs AIBOS does (actions.py, migration 0047): AIBOS as Jarvis, phase 2 ────
+# ── Jobs AI-BOS does (actions.py, migration 0047): AI-BOS as Jarvis, phase 2 ────
 # The chat asks for jobs through its tools; these routes are the owner's
-# answers (yes, no, undo), the record of what AIBOS did, and the earned
+# answers (yes, no, undo), the record of what AI-BOS did, and the earned
 # "do these yourself" switch. Owner only: staff and the accountant ask for
 # nothing in phase 2.
 
@@ -4284,7 +4284,7 @@ def propose_action(req: ActionRequest, ctx: membership.Context = Depends(members
 @app.get("/actions")
 def list_actions(status: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100),
                  ctx: membership.Context = Depends(membership.require_owner)):
-    """What AIBOS did lately, newest first; status=waiting is what needs the owner."""
+    """What AI-BOS did lately, newest first; status=waiting is what needs the owner."""
     db = _require_db()
     return {"ok": True, **_action_call(actions_api.listing, db, ctx.tenant, ctx.business_id,
                                        status=status, limit=limit)}
@@ -4324,7 +4324,7 @@ def undo_action(action_id: str, ctx: membership.Context = Depends(membership.req
     return {"ok": True, "action": _action_call(actions_api.undo, db, ctx.tenant, ctx.actor, action_id)}
 
 
-# ── The workers (workers.py): AIBOS as Jarvis, phase 3 ────────────────────────
+# ── The workers (workers.py): AI-BOS as Jarvis, phase 3 ────────────────────────
 # Six workers look through the books every few hours (run_hourly_jobs) and put
 # what they find forward as jobs waiting for the owner's yes: the "Needs you"
 # list, which is GET /actions?status=waiting. These two routes are the roster
@@ -4345,7 +4345,7 @@ def run_workers_now(ctx: membership.Context = Depends(membership.require_owner))
     return {"ok": True, **_action_call(workers_api.run_now, db, ctx.tenant, ctx.business_id)}
 
 
-# ── AIBOS auto (17 Nov 2026): the switch at the top of every page ─────────────
+# ── AI-BOS auto (17 Nov 2026): the switch at the top of every page ─────────────
 # On: the team looks every hour and the safe jobs do themselves, each with an
 # Undo (actions.AUTO_*). Anything that goes to another person, marks money
 # paid, settles tax, refunds or is over the limit still waits for a yes.
@@ -4356,7 +4356,7 @@ class AutoRequest(BaseModel):
 
 @app.get("/auto")
 def get_auto(ctx: membership.Context = Depends(membership.require_owner)):
-    """Whether AIBOS auto is on, its limit, what it does and what it still asks.
+    """Whether AI-BOS auto is on, its limit, what it does and what it still asks.
     available is False on a plan without the team; ready is False before 0047."""
     if not entitlements.can_access(entitlements.tier_detail(ctx.tenant)["tier"], "chat_actions"):
         return {"ok": True, "available": False, "ready": True, "on": False}
@@ -4901,7 +4901,7 @@ def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
         raise HTTPException(status_code=400, detail=(
             "AI-BOS opened the file but found no table of figures in it. "
             "Check the sheet has column headings and rows underneath them."))
-    # The AIBOS workbook's own sheets are known by their headings and filed
+    # The AI-BOS workbook's own sheets are known by their headings and filed
     # exactly. When every table is one of them, no AI is asked at all.
     known = starter_book.plan_tables(scanned)
     if known and len(known) == len(scanned["tables"]):
@@ -4914,7 +4914,7 @@ def _scan_and_plan(content: bytes, filename: str, use_ai: bool) -> tuple:
     return scanned, plan
 
 
-# Lines of the AIBOS workbook already in the books, per business, so the same
+# Lines of the AI-BOS workbook already in the books, per business, so the same
 # workbook can be added to and uploaded again without a line going in twice.
 _WORKBOOK_KEYS_MAX = 40000
 
@@ -5027,7 +5027,7 @@ def _heading(table: dict, mapping: dict) -> str:
 
     A table with a quantity AND a unit price is an itemised purchase list, whatever
     its title says — that is what those two columns together mean. Without this,
-    "boom cream 750ml" and "vatra 330ml" were things AIBOS could not place,
+    "boom cream 750ml" and "vatra 330ml" were things AI-BOS could not place,
     rather than obviously stock that was bought."""
     parts = [str(table.get("title") or ""), str(table.get("sheet") or "")]
     cols = " ".join(_norm_col(c) for c in table.get("columns", []))
@@ -5171,7 +5171,7 @@ def documents_scan(
         "questions": questions,
         "ai": plan.get("ai", False),
         "ai_note": plan.get("reason", ""),
-        # The file is (or holds sheets from) the AIBOS workbook.
+        # The file is (or holds sheets from) the AI-BOS workbook.
         "workbook": workbook,
         "known": {"employees": len(base_context["employees"]),
                   "products": len(context["products"]),
@@ -5227,7 +5227,7 @@ def documents_import(
         raise HTTPException(status_code=400, detail=(
             "There was nothing to import: every table in this file is either empty "
             "or holds totals worked out from another table."))
-    # The AIBOS workbook's Products and Workers sheets go on file before any
+    # The AI-BOS workbook's Products and Workers sheets go on file before any
     # sale, purchase or wage that names them is matched.
     workbook = bool(plan.get("workbook"))
     wb_made = _add_workbook_records(db, ctx, scanned, planned, picked) if workbook else None
@@ -5406,7 +5406,7 @@ def _row_to_event(row: dict, mapping: dict, verdict: dict, currency: str, table:
         occurred_at=occurred,
         # What AI-BOS worked out, not what a person confirmed: below the
         # auto-confirm line these stay pending until the owner looks at them.
-        # A line of the AIBOS workbook that nothing had to be worked out for
+        # A line of the AI-BOS workbook that nothing had to be worked out for
         # (the owner chose the sheet, the date, the amount and the category)
         # is the owner's own entry, booked like one typed on the Record page.
         confidence=min(float(verdict.get("confidence") or 0.5), 0.99 if verdict.get("sure") else 0.98),
@@ -5527,7 +5527,7 @@ def recommendation_feedback(rec_id: str, body: Dict[str, Any] = Body(...),
 
 @app.get("/recommendations/track-record")
 def recommendations_track_record(ctx: membership.Context = Depends(membership.require_context)):
-    """AIBOS's own advice scoreboard — self-auditing intelligence."""
+    """AI-BOS's own advice scoreboard — self-auditing intelligence."""
     db = _require_db()
     return {"ok": True, **rec_store.track_record(db, ctx.tenant)}
 
@@ -5557,7 +5557,7 @@ def create_product(body: Dict[str, Any] = Body(...), ctx: membership.Context = D
 @app.post("/products/stock-take")
 def stock_take(body: Dict[str, Any] = Body(...), ctx: membership.Context = Depends(membership.require_write)):
     """Guided stock count (audit #49): the owner enters the ACTUAL on-hand for
-    each product; AIBOS posts one InventoryAdjustment per discrepancy (delta =
+    each product; AI-BOS posts one InventoryAdjustment per discrepancy (delta =
     counted − current), through the spine like every other event. Nothing is
     adjusted where the count matches."""
     db = _require_db()
@@ -5685,7 +5685,7 @@ def _reminders_with_first_run(db, ctx: membership.Context) -> list:
 
 
 # ── Parties: customers & suppliers (audit #6) ─────────────────────────────────
-# CRUD is free, like recording — parties are how AIBOS learns who the business
+# CRUD is free, like recording — parties are how AI-BOS learns who the business
 # deals with. The paid layer is the intelligence computed OVER them (engine2).
 
 @app.get("/members/me")
@@ -5747,12 +5747,12 @@ def revoke_member(member_row_id: str,
     return {"ok": True}
 
 
-# ── What AIBOS has learned (audit #57) ────────────────────────────────────────
+# ── What AI-BOS has learned (audit #57) ────────────────────────────────────────
 
 @app.get("/memory/summary")
 def memory_summary(ctx: membership.Context = Depends(membership.require_context)):
     """The corrections-learning loop, made visible: how many supplier/customer
-    aliases and category rules AIBOS has picked up (Bible 8th Law: nothing
+    aliases and category rules AI-BOS has picked up (Bible 8th Law: nothing
     entered twice)."""
     db = _require_db()
     return {"ok": True, **memory.summary(db, ctx.tenant)}
@@ -5767,7 +5767,7 @@ def memory_mappings(ctx: membership.Context = Depends(membership.require_context
 
 @app.delete("/memory/mappings/{mapping_id}")
 def forget_mapping(mapping_id: str, ctx: membership.Context = Depends(membership.require_write)):
-    """Owner corrects AIBOS by deleting a wrong mapping (audit #57)."""
+    """Owner corrects AI-BOS by deleting a wrong mapping (audit #57)."""
     db = _require_db()
     memory.forget(db, ctx.tenant, mapping_id)
     return {"ok": True}
@@ -5853,9 +5853,9 @@ def remove_budget(budget_id: str, ctx: membership.Context = Depends(membership.r
     return {"ok": True}
 
 
-# ── Teach AIBOS your business: the owner interview (migration 0041) ───────────
+# ── Teach AI-BOS your business: the owner interview (migration 0041) ───────────
 # One question at a time. The AI chat reads the answers on every question, the
-# money goals become monthly targets when the owner says so, and the AIBOS
+# money goals become monthly targets when the owner says so, and the AI-BOS
 # workbook is made from them (interview.py, starter_book.py).
 
 _INTERVIEW_SETUP = ("The interview is not set up on this database yet. "
@@ -5888,7 +5888,7 @@ def _interview_state(row: dict, facts: dict, said: Optional[str] = None) -> dict
         "finished_at": (row or {}).get("finished_at"),
         "plan_applied_at": (row or {}).get("plan_applied_at"),
         # One line back about the answer just given, so the owner sees what
-        # AIBOS took from it.
+        # AI-BOS took from it.
         "said": said,
     }
 
@@ -6010,7 +6010,7 @@ def apply_interview_plan(ctx: membership.Context = Depends(membership.require_ow
 
 @app.get("/templates/workbook.xlsx")
 def download_workbook(ctx: membership.Context = Depends(membership.require_write)):
-    """The AIBOS workbook, made for this business: its products and workers in
+    """The AI-BOS workbook, made for this business: its products and workers in
     the dropdowns, its own ways of being paid and biggest costs first."""
     db = _require_db()
     facts = interview_api.business_facts(db, ctx.tenant, ctx.business_id)
@@ -6030,7 +6030,7 @@ def download_workbook(ctx: membership.Context = Depends(membership.require_write
                if (e.get("status") or "active") == "active"]
     content = starter_book.build(facts["name"], facts["industry"], answers, products, workers)
     stem = re.sub(r"[^A-Za-z0-9 \-]+", "", facts["name"] or "").strip()[:60]
-    filename = f"{stem} AIBOS workbook.xlsx" if stem else starter_book.FILENAME
+    filename = f"{stem} AI-BOS workbook.xlsx" if stem else starter_book.FILENAME
     return Response(content=content,
                     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
@@ -6360,7 +6360,7 @@ def invoice_share_text(invoice_id: str, business_name: Optional[str] = Query(Non
                              pay_note: Optional[str] = Query(None),
                              ctx: membership.Context = Depends(membership.require_context)):
     """WhatsApp-ready message for the OWNER to send from their own phone —
-    AIBOS never messages a customer itself (automation.ts precedent).
+    AI-BOS never messages a customer itself (automation.ts precedent).
 
     A sent invoice carries its tap-to-pay link in the message. The token is
     minted lazily here too, so invoices issued before migration 0025 get one the
@@ -6937,7 +6937,7 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str,
 
     if wrong_currency or unchecked:
         tell("booking_payment_unmatched",
-             f"A guest paid {money} by {how} that AIBOS could not check",
+             f"A guest paid {money} by {how} that AI-BOS could not check",
              f"Reference {ref}. "
              + ("It came in a different currency from the stay"
                 if wrong_currency else "Lenco did not say how much was paid")
@@ -6997,7 +6997,7 @@ def _settle_booking_payment(db, row: Dict[str, Any], new_status: str,
         if out.get("confirmed"):
             tell("booking_paid_by_link",
                  f"New booking paid and confirmed: {applied}",
-                 f"{dates}: the guest paid in full by {how}, reference {ref}. AIBOS confirmed "
+                 f"{dates}: the guest paid in full by {how}, reference {ref}. AI-BOS confirmed "
                  "the booking because it was paid, and it is in your books.",
                  f"pay-{ref}")
         else:
@@ -7038,8 +7038,8 @@ def _collection_detail_for(account: Optional[payments.Account], row: Dict[str, A
 def public_stay_card(token: str, request: Request):
     """Start a card payment for what the stay is due.
 
-    AIBOS keeps the reference and the amount and the page opens Lenco's own
-    card window with them, so card details go to Lenco and never touch AIBOS.
+    AI-BOS keeps the reference and the amount and the page opens Lenco's own
+    card window with them, so card details go to Lenco and never touch AI-BOS.
     Any bank's Visa or Mastercard. Whatever the window is told, the booking
     records what Lenco says arrived (_settle_booking_payment). The guest's
     email, which Lenco's window asks for, is typed on the page: it is not
@@ -7140,7 +7140,7 @@ def payment_account_connect(body: PaymentAccountIn, request: Request,
         raise HTTPException(status_code=400, detail=str(e))
     except field_crypto.FieldCryptoUnavailable:
         raise HTTPException(status_code=503, detail="The server cannot lock payment keys away yet, "
-                                                    "so nothing was saved. The AIBOS team has to switch this on.")
+                                                    "so nothing was saved. The AI-BOS team has to switch this on.")
     except payment_accounts.NotSetUp as e:
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
@@ -7276,7 +7276,7 @@ def forecast_outlook(tz: int = Query(0, ge=-840, le=840),
     evs = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=biz,
                               event_types=("Sale",) + outlook_api.COST_TYPES)
     now = _dt.now(_tz.utc) + _td(minutes=tz)
-    # The busy and quiet months the owner told AIBOS, so the page says where
+    # The busy and quiet months the owner told AI-BOS, so the page says where
     # they change the reading (seasons.forecast_notes).
     told = interview_api.seasons(interview_api.answers_for(db, ctx.tenant, biz))
     return {"ok": True, "outlook": outlook_api.outlook(state.get("monthly") or [], today=now.isoformat(),
@@ -7292,7 +7292,7 @@ class MonthsRequest(BaseModel):
 @app.post("/reports/months")
 def read_months(body: MonthsRequest, ctx: membership.Context = Depends(membership.require_context)):
     """Unusual spending and Month by month, read with the busy and quiet
-    months the owner told AIBOS (seasons.py): the months a page shows, as
+    months the owner told AI-BOS (seasons.py): the months a page shows, as
     {month, revenue, costs} in order. Pure arithmetic on what is sent."""
     if len(body.rows) > 240:
         raise HTTPException(status_code=400, detail="At most 240 months.")
@@ -7303,7 +7303,7 @@ def read_months(body: MonthsRequest, ctx: membership.Context = Depends(membershi
 
 @app.get("/forecast/track-record")
 def forecast_track_record(ctx: membership.Context = Depends(membership.require_context)):
-    """What AIBOS forecast before each month happened (kept once a month by
+    """What AI-BOS forecast before each month happened (kept once a month by
     the hourly jobs, never rewritten), held against the confirmed books: each
     month's range, the actual, whether it fell inside, and how often it has.
     Next month's sales for everyone who sees the Forecast page; the cash
@@ -7330,7 +7330,7 @@ def forecast_series(body: SeriesRequest, ctx: membership.Context = Depends(membe
 
 
 class CashPlanRequest(BaseModel):
-    # Left out: the cash cushion the owner gave AIBOS in the interview, else zero.
+    # Left out: the cash cushion the owner gave AI-BOS in the interview, else zero.
     floor: Optional[float] = None
     tz: int = 0
     scenarios: List[Dict[str, Any]] = []
@@ -7346,7 +7346,7 @@ def cash_plan_route(floor: Optional[float] = Query(None, ge=0, le=1e12), tz: int
     """The 13-week cash plan for the business being looked at. Growth sees all
     of it; any other plan sees its own headline risk, so the upgrade is argued
     with the owner's real numbers (FeatureGate's locked-but-visible). With no
-    floor, the floor is the cash cushion the owner gave AIBOS (zero without)."""
+    floor, the floor is the cash cushion the owner gave AI-BOS (zero without)."""
     _sees_money(ctx)
     db = _require_db()
     if not _plan_tier_ok(ctx):
@@ -7462,7 +7462,7 @@ def investigate_anomaly(month: Optional[str] = Query(None),
                               ctx: membership.Context = Depends(membership.require_context)):
     db = _require_db()
     events = nervous.list_events(db, ctx.tenant, status="confirmed", limit=200000, business_id=ctx.business_id)
-    # A month the owner told AIBOS runs busy or quiet is not the anomaly explained
+    # A month the owner told AI-BOS runs busy or quiet is not the anomaly explained
     # for being what they said it is.
     told = interview_api.seasons(interview_api.answers_for(db, ctx.tenant, ctx.business_id))
     result = (investigate_api.investigate_month(events, month)
@@ -7489,7 +7489,7 @@ def customers_intelligence(ctx: membership.Context = Depends(membership.require_
 
 
 # ── Scheduler (meetings, pick-ups, deadlines) ─────────────────────────────────
-# Core CRUD is free (like recording — commitments are how AIBOS learns the
+# Core CRUD is free (like recording — commitments are how AI-BOS learns the
 # owner's week). The paid layer is recurrence + reminders, enforced here via
 # entitlements so a Free caller can't obtain it by hitting the API directly.
 
@@ -7607,7 +7607,7 @@ def remove_employee(employee_id: str, ctx: membership.Context = Depends(membersh
 
 @app.get("/payroll/rates")
 def get_payroll_rates(ctx: membership.Context = Depends(membership.require_owner)):
-    """The statutory rates AIBOS applies (transparency — the owner reads, never edits)."""
+    """The statutory rates AI-BOS applies (transparency — the owner reads, never edits)."""
     return {"ok": True, "rates": payroll_api.public_rates(payroll_api.current_rates(None, "ZMW"))}
 
 
@@ -7822,7 +7822,7 @@ def payslip_share_text(run_id: str, employee_id: str = Query(...),
 
 
 # ── Payslips to the staff themselves (payslip_delivery.py, migration 0042) ────
-# Each person's payslip by email from AIBOS (PDF attached, replies to the
+# Each person's payslip by email from AI-BOS (PDF attached, replies to the
 # owner) or on WhatsApp from the owner's own phone, and a record of who has
 # theirs. Owner only and the payroll plan, like the payslip PDF itself.
 
@@ -7874,7 +7874,7 @@ class PayslipSharedRequest(BaseModel):
 @app.post("/payroll/runs/{run_id}/payslips/{employee_id}/shared")
 def payslip_shared(run_id: str, employee_id: str, body: PayslipSharedRequest = Body(default=None),
                    ctx: membership.Context = Depends(membership.require_owner)):
-    """The owner opened this person's payslip in WhatsApp from AIBOS."""
+    """The owner opened this person's payslip in WhatsApp from AI-BOS."""
     import payslip_delivery
     db, _run, _employees, _contacts = _payslip_run(ctx, run_id)
     try:
@@ -8592,7 +8592,7 @@ def sweep_pending_payments(db) -> dict:
 
 
 def _plan_email(to, subject, body, button):
-    """A plan email in AIBOS's own name, its button opening the app."""
+    """A plan email in AI-BOS's own name, its button opening the app."""
     label, link = button
     url = f"{PUBLIC_APP_URL.rstrip('/')}{link}"
     return notify.send_email(to, subject, body, notify.aibos_email_html(body, (label, url), title="Your plan"))
@@ -8621,7 +8621,7 @@ def payments_renewals(x_cron_secret: Optional[str] = Header(default=None)):
 # ── The hourly jobs, in one place (upgrade 15) ────────────────────────────────
 # Plan renewals, wages on payday, payment reminders to guests. They ran only
 # inside the API's own background loop, so on Render's free plan, which puts
-# the API to sleep, they ran only while someone happened to be using AIBOS.
+# the API to sleep, they ran only while someone happened to be using AI-BOS.
 # Now the same work is one function the loop calls hourly AND an address an
 # outside timer can call (the daily Vercel cron, the keep-awake job with the
 # CRON_SECRET, or any free cron service). Each job is safe to run again: a
@@ -8658,7 +8658,7 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # Once a month: what each business's forecast says before the month
             # happens, kept so the Forecast page's track record is earned.
             ("track_record", lambda: track_record.keep(db)),
-            # Once a month, from 07:00 on the 1st: what AIBOS did for each
+            # Once a month, from 07:00 on the 1st: what AI-BOS did for each
             # owner in the month just gone, every line from their records.
             ("month_note", lambda: __import__("month_note").deliver(db)),
             # Once a week, from 07:00 on Monday, every plan: last week's money
@@ -8668,7 +8668,7 @@ def run_hourly_jobs() -> Dict[str, Any]:
             # few towns at a time on a thread of its own, so a search reads
             # it instead of waiting on a busy public map server.
             ("find_clients_map", lambda: find_clients.start_harvest(get_db)),
-            # Every few hours in the day: AIBOS's workers look through each
+            # Every few hours in the day: AI-BOS's workers look through each
             # Pro+ owner's books and put what they find on the "Needs you"
             # list, each waiting for the owner's yes (workers.py).
             ("workers", lambda: workers_api.run_all(db, notify.record_notification)),
@@ -9036,7 +9036,7 @@ class ApnsToken(BaseModel):
 @app.post("/push/apns")
 def push_apns_subscribe(body: ApnsToken, request: Request,
                         ctx: membership.Context = Depends(membership.require_context)):
-    """Remember this iPhone (the AIBOS app hands over its Apple push token) so
+    """Remember this iPhone (the AI-BOS app hands over its Apple push token) so
     alerts reach its lock screen. The app's web view has no web push."""
     try:
         return apns.subscribe(_require_db(), ctx.actor, body.token,
@@ -9525,12 +9525,12 @@ def twin_financials(ctx: membership.Context = Depends(membership.require_context
 app.include_router(find_clients_routes.router)
 
 # ── The live guide (27 Nov 2026) ──────────────────────────────────────────────
-# Talk out loud with AIBOS while it reads the screen and points: the routes in
+# Talk out loud with AI-BOS while it reads the screen and points: the routes in
 # live_guide_routes.py, the token, limits and costs in live_guide.py.
 import live_guide_routes  # noqa: E402
 app.include_router(live_guide_routes.router)
 
-# ── Owners review AIBOS (20 Nov 2026; migration 0048) ─────────────────────────
+# ── Owners review AI-BOS (20 Nov 2026; migration 0048) ─────────────────────────
 # The review centre, the website's reviews and the ask: all in reviews.py.
 import reviews as reviews_api  # noqa: E402
 

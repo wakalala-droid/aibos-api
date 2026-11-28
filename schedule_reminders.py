@@ -1,5 +1,5 @@
 """
-AIBOS: schedule reminders that actually arrive.
+AI-BOS: schedule reminders that actually arrive.
 
 The Scheduler has stored `remind_minutes_before` since it shipped (July 2026)
 and Pro has sold "reminders" ever since, but nothing ever read the column. An

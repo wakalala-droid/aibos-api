@@ -1,8 +1,8 @@
 """
-AIBOS — WhatsApp recording bot (audit 2026-07 item #11).
+AI-BOS — WhatsApp recording bot (audit 2026-07 item #11).
 
 The data-collection unlock for this market: the owner texts their business
-("sold 3 bags of mealie meal 450") to the AIBOS WhatsApp number and it becomes
+("sold 3 bags of mealie meal 450") to the AI-BOS WhatsApp number and it becomes
 a PROPOSED business event — the same classify → propose → confirm path the
 Record page uses, so the trust gate (SAFEGUARD §0.4) is preserved: nothing an
 extraction produced is auto-confirmed.
@@ -105,7 +105,7 @@ def find_user_by_phone(db, sender: str):
 _HELP = ("I couldn't work out what to record from that. Try something like:\n"
          "\"sold 3 bags of mealie meal 450\" or \"paid K200 for fuel\".")
 
-_UNKNOWN = ("This number isn't linked to an AIBOS account yet. In the app: "
+_UNKNOWN = ("This number isn't linked to an AI-BOS account yet. In the app: "
             "Profile → WhatsApp number, save this number, then text me again.")
 
 
@@ -157,7 +157,7 @@ def handle_text(db, user_id: str, text: str, client, currency: str = "ZMW",
     # The figure as recorded, ngwee and all: K1,234.50 used to come back as K1,234.
     amount_txt = (f" {sym}{float(amt):,.0f}" if float(amt) == int(float(amt))
                   else f" {sym}{float(amt):,.2f}") if amt else ""
-    status_txt = "saved" if ev.get("status") == "confirmed" else "saved as pending — confirm it in AIBOS"
+    status_txt = "saved" if ev.get("status") == "confirmed" else "saved as pending — confirm it in AI-BOS"
     return f"Got it: {ev.get('event_type')}{amount_txt}, {status_txt}. ✅"
 
 

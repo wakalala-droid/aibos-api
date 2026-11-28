@@ -1,7 +1,7 @@
 """
-AIBOS — what AIBOS did for you this month (28 October 2026).
+AI-BOS — what AI-BOS did for you this month (28 October 2026).
 
-Most of what AIBOS does happens where the owner never sees it: the cash watch
+Most of what AI-BOS does happens where the owner never sees it: the cash watch
 warns before a shortfall, payroll works out PAYE to the ngwee, a guest's
 booking request reaches them in a minute, the books check reads every entry.
 Each of those is a moment, and moments are forgotten. An owner asked to renew
@@ -9,7 +9,7 @@ remembers what they paid, not what was done for them.
 
 So on the 1st of each month every owner with books gets one note in the bell
 (and on their phone, and by email on a paid plan) that adds up the month just
-gone, from records AIBOS already keeps, every line a fact:
+gone, from records AI-BOS already keeps, every line a fact:
 
   * the cash watch's warnings (notifications, kind cash_watch);
   * payroll for the month: who was paid, the take-home, the taxes worked out;
@@ -173,12 +173,12 @@ def compose(f: dict, sym: str = "K") -> tuple[str, str] | None:
         did.append(f"{_n(f['payslips_sent'], 'payslip')} reached your staff.")
     inv = f.get("invoices_paid")
     if inv and inv.get("count"):
-        did.append(f"Customers paid {_n(inv['count'], 'invoice')} you sent from AIBOS: {m(inv['total'])}.")
+        did.append(f"Customers paid {_n(inv['count'], 'invoice')} you sent from AI-BOS: {m(inv['total'])}.")
     if f.get("booking_requests"):
         did.append(f"{_n(f['booking_requests'], 'booking request')} reached you the moment "
                    f"{'it' if f['booking_requests'] == 1 else 'they'} came in.")
     if f.get("reminders"):
-        did.append(f"AIBOS reminded you of {_n(f['reminders'], 'thing')} on your schedule.")
+        did.append(f"AI-BOS reminded you of {_n(f['reminders'], 'thing')} on your schedule.")
     if f.get("books_check_days"):
         did.append(f"The daily books check found something to look at on {_n(f['books_check_days'], 'day')} "
                    "and told you the same day.")
@@ -198,8 +198,8 @@ def compose(f: dict, sym: str = "K") -> tuple[str, str] | None:
 
     if not did:
         return None
-    lines = did + ([tax_line] if tax_line else []) + [f"AIBOS keeps watching in {month_words(shift(month, 1))}."]
-    return f"What AIBOS did for you in {month_words(month)}", "\n\n".join(lines)
+    lines = did + ([tax_line] if tax_line else []) + [f"AI-BOS keeps watching in {month_words(shift(month, 1))}."]
+    return f"What AI-BOS did for you in {month_words(month)}", "\n\n".join(lines)
 
 
 def _sym(db, user_id: str) -> str:

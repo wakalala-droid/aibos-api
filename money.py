@@ -1,7 +1,7 @@
 """
-AIBOS — money to the ngwee.
+AI-BOS — money to the ngwee.
 
-Every amount AIBOS keeps is a whole number of ngwee (K1 = 100 ngwee). A float
+Every amount AI-BOS keeps is a whole number of ngwee (K1 = 100 ngwee). A float
 cannot hold most of those exactly (0.1 + 0.2 is 0.30000000000000004), and
 Python's round() rounds the float it is handed, not the decimal a person
 typed: round(2.675, 2) is 2.67, and 5% of K1,234.50 came out as K61.72 when

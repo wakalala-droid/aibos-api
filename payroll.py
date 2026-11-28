@@ -1,5 +1,5 @@
 """
-AIBOS — Payroll engine + employee register (Zambian statutory).
+AI-BOS — Payroll engine + employee register (Zambian statutory).
 
 Two halves, deliberately separated so the maths is trustable:
 
@@ -69,10 +69,10 @@ so past runs stay truthful after a rate change (a replayable history).
   taken, or refunded when it is less than nothing. The charge year and its
   month go by the day the pay is paid (8.2). Used when the whole year so far
   is on record: every month from January has a payslip worked out this way
-  (or the owner typed the figures from before AIBOS or from a previous
+  (or the owner typed the figures from before AI-BOS or from a previous
   employer's ITF/P13), and the person was employed from 1 January or brought
   that ITF/P13. Anyone else is on the "month 1 basis", each month on its own
-  (5.3), which is what AIBOS did for everyone until now: payslips made before
+  (5.3), which is what AI-BOS did for everyone until now: payslips made before
   this change are not counted as on record, so a shortfall from the old rules
   is never taken from anyone's later pay (see draft_corrections).
   A second job is taxed at the top rate on every kwacha, without the bands
@@ -87,7 +87,7 @@ so past runs stay truthful after a rate change (a replayable history).
   (s.73(2), s.53(6)); a fixed-duration contract's severance pay is the same
   gratuity (s.54(1)(b),(c)). SI 48 of 2020 lifts s.73 for expatriates,
   management with a written gratuity contract, and domestic and farm workers.
-  AIBOS sets it aside every month on the basic pay of that month and keeps
+  AI-BOS sets it aside every month on the basic pay of that month and keeps
   what each person is owed; it is paid with a payroll run (the final pay).
   It is a pension benefit and so free of tax (Constitution of Zambia, Art.
   188(2); ZRA Employer's Guide to PAYE, 7.2): no PAYE. NAPSA's earnings do not
@@ -113,11 +113,11 @@ so past runs stay truthful after a rate change (a replayable history).
   normal week is double; the hourly rate is the month's basic pay over 208
   hours (240 for a watchperson or guard) (s.75). Both are taxed like any pay.
   Annual leave is at least 2 days a month on full pay (s.36(1)); leave not
-  taken is paid when the contract ends (s.36(5)). AIBOS earns it each month
+  taken is paid when the contract ends (s.36(5)). AI-BOS earns it each month
   worked, takes off days taken and paid out, and keeps the balance.
   NAPSA stops at the pensionable age of 60, or 65 when the member chose it and
   the employer agreed (NPS Act 2026, s.2 and s.29(2)(b)); a member registers
-  from 16 (s.16(1)). With a date of birth AIBOS stops it by itself.
+  from 16 (s.16(1)). With a date of birth AI-BOS stops it by itself.
   Minimum wages: min_wage.py (the 2023 Orders, in force from 1 January 2024).
 
 ── Records ──────────────────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ EMP_0039_COLUMNS = ("allowances", "napsa_exempt")
 # Migration 0042: where each person's payslip goes (payslip_delivery.py).
 EMP_0042_COLUMNS = ("phone", "email")
 # Migration 0043: what the returns and leaving papers need, a second job, the
-# gratuity owed from before AIBOS and the pay and PAYE earlier in the year.
+# gratuity owed from before AI-BOS and the pay and PAYE earlier in the year.
 EMP_0043_COLUMNS = ("nrc", "nhima_number", "second_job", "gratuity_opening", "paye_prior")
 
 # The Employment Code Act's lowest gratuity: 25% of basic pay earned (s.73(1)).
@@ -414,7 +414,7 @@ def napsa_applies(emp: dict, pay_date=None, rates: dict | None = None) -> tuple[
 
 def _prior_for(emp: dict, year: int) -> dict | None:
     """The pay and PAYE the owner typed for earlier in `year` (from their
-    payroll before AIBOS, or a previous employer's ITF/P13), or None."""
+    payroll before AI-BOS, or a previous employer's ITF/P13), or None."""
     p = emp.get("paye_prior")
     if not isinstance(p, dict):
         return None
@@ -440,7 +440,7 @@ def year_to_date(emp: dict, earlier: list, period: str, pay_date=None) -> dict:
     after the figures typed for earlier in the year, has a payslip worked out
     on the tables, and the person was employed from 1 January or brought a
     previous employer's ITF/P13 (5.1 and 5.3). Otherwise: the month 1 basis.
-    A payslip made before AIBOS used the tables (no paye_basis in it) does not
+    A payslip made before AI-BOS used the tables (no paye_basis in it) does not
     count as on record, so an old shortfall is never taken from later pay."""
     period = valid_period(period)
     day = parse_date(pay_date) or parse_date(f"{period}-28")
@@ -467,7 +467,7 @@ def year_to_date(emp: dict, earlier: list, period: str, pay_date=None) -> dict:
                "previous employer")
     elif missing:
         why = (f"{len(missing)} earlier month{'s' if len(missing) != 1 else ''} of {year} "
-               f"{'are' if len(missing) != 1 else 'is'} not on record in AIBOS")
+               f"{'are' if len(missing) != 1 else 'is'} not on record in AI-BOS")
     return {"basis": "month 1" if why else "cumulative", "year": year, "month": month,
             "pay": pay, "paye": paye, "napsa": napsa, "first_pay": not (earlier or []),
             "prior": bool(prior), "why": why}
@@ -766,7 +766,7 @@ def hydrate_slip(row: dict) -> dict:
 
 
 def rules_for_ai(on_date=None) -> str:
-    """The payroll rules AIBOS applies, for the AI chat's instructions, built
+    """The payroll rules AI-BOS applies, for the AI chat's instructions, built
     from the same rate set the payroll uses so the two can never disagree.
     Without it the chat answered NAPSA and PAYE questions from whatever it
     had read, which includes the pre-2018 'NAPSA comes off before PAYE'."""
@@ -778,7 +778,7 @@ def rules_for_ai(on_date=None) -> str:
         lower = upper or lower
     ceiling = _num(r.get("napsa_ceiling"))
     return (
-        f"Zambian payroll rules AIBOS applies ({r.get('effective_from', '')[:4]} rates, checked against "
+        f"Zambian payroll rules AI-BOS applies ({r.get('effective_from', '')[:4]} rates, checked against "
         "ZRA, NAPSA and NHIMA). State exactly these when asked; never other rates. "
         f"PAYE is on gross pay, every cash allowance included, monthly: {', '.join(parts)}. "
         "NAPSA is NOT taken off before PAYE (ZRA stopped that on 1 January 2018). "
@@ -800,19 +800,19 @@ def rules_for_ai(on_date=None) -> str:
         "contract (Employment Code Act 2019, s.54 and s.73), paid when it ends or prorated if it ends early; "
         "SI 48 of 2020 exempts expatriates, management with a written gratuity contract, and domestic and farm "
         "workers. Gratuity is tax-free (a pension benefit, Constitution Art. 188(2); ZRA Employer's Guide 7.2), "
-        "has no NAPSA or NHIMA, but the Skills Development Levy is added on it. AIBOS sets it aside every month "
+        "has no NAPSA or NHIMA, but the Skills Development Levy is added on it. AI-BOS sets it aside every month "
         "and pays it with the final pay when the owner ticks it. "
         "Leave days paid out are full pay × days ÷ 26 (Employment Code Act, Fifth Schedule) and are taxed "
         "like pay. When someone leaves, the employer gives a certificate of service (s.59) and sends ITF/P13 "
-        "part 1 to ZRA within 5 days; AIBOS writes both under Leaving papers on the Staff page. "
-        "Annual leave is at least 2 days a month (s.36); AIBOS keeps each person's balance and leave not "
+        "part 1 to ZRA within 5 days; AI-BOS writes both under Leaving papers on the Staff page. "
+        "Annual leave is at least 2 days a month (s.36); AI-BOS keeps each person's balance and leave not "
         "taken is paid when they leave. Overtime past 48 hours a week is 1.5 times the hourly rate and a "
         "rest day or public holiday double it, the hourly rate being the month's basic pay over 208 hours "
         "(240 for a guard) (s.75). A casual worker is paid by the hour with a 25% casual loading (s.3), "
         "taxed on ZRA's daily tables (the year's bands over 365 days, never cumulative), pays NAPSA and "
         "NHIMA, and earns no gratuity or annual leave; keeping a casual worker on lasting work is "
         "casualisation, an offence (s.7). NAPSA stops at 60, or 65 when the member chose it and the "
-        "employer agreed, by itself once the date of birth is in AIBOS. Minimum wages: the General Order "
+        "employer agreed, by itself once the date of birth is in AI-BOS. Minimum wages: the General Order "
         "(SI 48 of 2023), the Shop Workers Order (SI 50 of 2023, K1,487 to K3,142.26 basic a month) and the "
         "Domestic Workers Order (SI 49 of 2023, K1,100 basic plus K200 transport), in force from 1 January "
         "2024; the General and Shop Workers Orders add housing at 30% of basic unless the worker is housed, "
@@ -825,7 +825,7 @@ def rates_note(on_date=None) -> str | None:
     d = parse_date(on_date) or date.today()
     if d.year <= RATES_VERIFIED_THROUGH:
         return None
-    return (f"AIBOS has not yet checked the {d.year} PAYE, NAPSA and NHIMA rates against ZRA, "
+    return (f"AI-BOS has not yet checked the {d.year} PAYE, NAPSA and NHIMA rates against ZRA, "
             f"NAPSA and NHIMA. These figures use the {RATES_VERIFIED_THROUGH} rates. Check the "
             f"{d.year} Budget and NAPSA's ceiling notice before paying.")
 
@@ -847,15 +847,15 @@ def sdl_status(setting: str | None, turnover_12m: float | None, rates: dict | No
     if not rate:
         return {**base, "due": False, "why": "No Skills Development Levy applies to this payroll."}
     if setting == "pays":
-        return {**base, "due": True, "why": "You told AIBOS your business pays the Skills Development Levy."}
+        return {**base, "due": True, "why": "You told AI-BOS your business pays the Skills Development Levy."}
     if setting == "exempt":
         return {**base, "due": False,
-                "why": "You told AIBOS your business does not pay the Skills Development Levy "
+                "why": "You told AI-BOS your business does not pay the Skills Development Levy "
                        "(turnover under K800,000 a year, the public service, a local authority or "
                        "an approved public benefit organisation)."}
     if turnover_12m is None:
         return {**base, "due": True,
-                "why": "AIBOS could not read your sales, so the levy is included to be safe. Turn it "
+                "why": "AI-BOS could not read your sales, so the levy is included to be safe. Turn it "
                        "off if your turnover is under K800,000 a year."}
     if _num(turnover_12m) >= threshold:
         return {**base, "due": True,
@@ -863,7 +863,7 @@ def sdl_status(setting: str | None, turnover_12m: float | None, rates: dict | No
                        f"K{threshold:,.0f}, so the levy is due."}
     return {**base, "due": False,
             "why": f"Your sales in the last 12 months come to K{_num(turnover_12m):,.2f}, under "
-                   f"K{threshold:,.0f}, so the levy is not due. If not every sale is in AIBOS and your "
+                   f"K{threshold:,.0f}, so the levy is not due. If not every sale is in AI-BOS and your "
                    f"real turnover is K{threshold:,.0f} or more, set it to 'We pay it'."}
 
 
@@ -997,7 +997,7 @@ def _clean_employee(data: dict, partial: bool = False) -> dict:
 
 def _clean_prior(value) -> dict | None:
     """The pay and PAYE of earlier in a year, typed by the owner: from their
-    payroll before AIBOS ('before_aibos') or a previous employer's ITF/P13
+    payroll before AI-BOS ('before_aibos') or a previous employer's ITF/P13
     part 2 ('p13'). With it, PAYE can use ZRA's cumulative tables from the
     month after `through`. Empty clears it."""
     if not value:
@@ -1127,7 +1127,7 @@ def payslip_text(slip: dict, business_name: str | None = None, sym: str = "K") -
         lines.append("_PAYE at the top rate: this is a second job._")
     elif basis == "daily tables":
         lines.append(f"_PAYE on ZRA's daily tables for casual work, {_num(s.get('days_worked')):g} days._")
-    lines.append("\nWorked out by AIBOS at the Zambian rates in force for this month.")
+    lines.append("\nWorked out by AI-BOS at the Zambian rates in force for this month.")
     return "\n".join(lines)
 
 
@@ -1170,7 +1170,7 @@ def compliance_text(run: dict, business_name: str | None = None, sym: str = "K")
     if _num(totals.get("gratuity_paid")) > 0:
         lines.append(f"Gratuity paid to staff with this run: {fmt(totals.get('gratuity_paid'))}, tax-free.")
     lines.append("Paid late: ZRA adds 5% of the PAYE a month plus interest; NAPSA adds 10% a month.")
-    lines.append("\nWorked out by AIBOS at the Zambian rates in force for this month.")
+    lines.append("\nWorked out by AI-BOS at the Zambian rates in force for this month.")
     return "\n".join(lines)
 
 
@@ -1178,7 +1178,7 @@ MIGRATION_0039_NOTE = ("Allowances and the NAPSA age setting need migration 0039
                        "supabase/migrations/0039_payroll_allowances_and_levy.sql in the Supabase SQL editor.")
 MIGRATION_0042_NOTE = ("A phone or email for each person needs migration 0042. Run "
                        "supabase/migrations/0042_payslips_to_staff.sql in the Supabase SQL editor.")
-MIGRATION_0043_NOTE = ("NRC and NHIMA numbers, a second job, gratuity owed from before AIBOS, pay earlier in "
+MIGRATION_0043_NOTE = ("NRC and NHIMA numbers, a second job, gratuity owed from before AI-BOS, pay earlier in "
                        "the year and your employer numbers need migration 0043. Run "
                        "supabase/migrations/0043_payroll_statutory.sql in the Supabase SQL editor.")
 MIGRATION_0044_NOTE = ("Casual workers, a date of birth, leave, the minimum wage Order and a guard need "
@@ -1299,7 +1299,7 @@ def payslip_history(db, user_id: str) -> dict:
 def gratuity_position(emp: dict, slips: list) -> dict:
     """Where one person's gratuity stands, from their payslips. Pure.
 
-    Owed = what was owed before AIBOS + every month's gratuity set aside −
+    Owed = what was owed before AI-BOS + every month's gratuity set aside −
     every gratuity paid. The basic pay earned since it was last paid is what
     the Employment Code Act counts it on (s.73: 25% of "basic pay earned
     during the contract period"), so it is shown beside it."""
@@ -1349,7 +1349,7 @@ def gratuity_book(db, user_id: str, today: date | None = None) -> dict:
 def leave_position(emp: dict, slips: list) -> dict:
     """Where one person's annual leave stands, from their payslips. Pure.
 
-    Owed = the days owed before AIBOS + the days earned each month worked
+    Owed = the days owed before AI-BOS + the days earned each month worked
     (at least 2 a month, Employment Code Act s.36(1)) − the days taken − the
     days paid out. Its value is what paying them out would cost: full pay ×
     days ÷ 26 (Fifth Schedule)."""
@@ -1735,7 +1735,7 @@ def set_employer(db, user_id: str, numbers: dict) -> dict:
 
 def turnover_12m(db, user_id: str, period: str) -> float | None:
     """Sales in the books over the 12 months ending with `period`, across every
-    business the owner keeps in AIBOS (one employer, one turnover). None when
+    business the owner keeps in AI-BOS (one employer, one turnover). None when
     the books cannot be read."""
     end = valid_period(period)
     y, m = int(end[:4]), int(end[5:7])
@@ -1902,7 +1902,7 @@ def _recheck_summary(d: dict, owed_to_staff: float, short: float) -> str:
 # the owner confirms it as paid), once per run and authority. What was paid
 # too much is said in words, never drafted: it is the authority's to give back
 # or set against a later month. Nothing is taken from anyone's future pay;
-# recovering tax from staff needs their agreement, which is not AIBOS's to give.
+# recovering tax from staff needs their agreement, which is not AI-BOS's to give.
 
 CORRECTION_AUTHORITY = {"PAYE": "ZRA", "SDL": "ZRA", "NAPSA": "NAPSA", "NHIMA": "NHIMA"}
 CORRECTION_NAME = {"PAYE": "PAYE", "SDL": "Skills Development Levy", "NAPSA": "NAPSA", "NHIMA": "NHIMA"}
@@ -2021,14 +2021,14 @@ def _corrections_summary(period: str, drafted: list, already: list, overpaid: li
     for r in overpaid:
         name = CORRECTION_NAME[r["tax_type"]]
         parts.append(f"{name} was {k(r['amount'])} too much. If the {name} payment for {period} is still "
-                     f"waiting for you in AIBOS, change it to {k(r['now'])} before you confirm it; if it is "
+                     f"waiting for you in AI-BOS, change it to {k(r['now'])} before you confirm it; if it is "
                      f"paid, ask {r['authority']} to set {k(r['amount'])} against a later month.")
     if any(r["tax_type"] == "PAYE" for r in drafted + already):
-        parts.append("ZRA may add a penalty and interest for PAYE paid late (5% a month). AIBOS does not "
+        parts.append("ZRA may add a penalty and interest for PAYE paid late (5% a month). AI-BOS does not "
                      "work those out: your accountant or ZRA will give the amount.")
     if check.get("under_deducted_from_staff", 0) >= 0.005:
         parts.append(f"Too little was taken from staff pay ({k(check['under_deducted_from_staff'])} in all). "
-                     "The business pays it now. Taking it back from staff needs their agreement, so AIBOS "
+                     "The business pays it now. Taking it back from staff needs their agreement, so AI-BOS "
                      "takes nothing from anyone's pay.")
     if check.get("owed_to_staff", 0) >= 0.005:
         parts.append(f"Too much was taken from staff pay ({k(check['owed_to_staff'])} in all): that is owed "

@@ -1,5 +1,5 @@
 """
-AIBOS — the owner's busy and quiet months in the reports (28 October 2026).
+AI-BOS — the owner's busy and quiet months in the reports (28 October 2026).
 
 The interview asks which months run busy and which run quiet (interview.py).
 Before this, Unusual spending flagged every December as unusual for being
@@ -8,10 +8,10 @@ owner had said both were always so. A month the owner named is judged on what
 they said of it:
 
   • high in a busy month, or low in a quiet one, is not unusual: it is held
-    back from the flags and the report says why ("You told AIBOS November
+    back from the flags and the report says why ("You told AI-BOS November
     runs busy");
   • the other way round (low sales in a busy month) is still flagged, and the
-    flag says what the owner told AIBOS, since it makes the month stand out more;
+    flag says what the owner told AI-BOS, since it makes the month stand out more;
   • on Month by month, a fall into a quiet month or out of a busy one, and a
     rise into a busy month or out of a quiet one, are not counted as going the
     wrong way, with the reason beside the month.
@@ -68,9 +68,9 @@ def name(month) -> str:
 
 
 def told(seasons: dict, month) -> str | None:
-    """'You told AIBOS November runs busy.' or None for a month not named."""
+    """'You told AI-BOS November runs busy.' or None for a month not named."""
     s = of(seasons, month)
-    return f"You told AIBOS {name(month)} runs {s}." if s else None
+    return f"You told AI-BOS {name(month)} runs {s}." if s else None
 
 
 def expected(season: str | None, direction: str) -> bool:
@@ -176,7 +176,7 @@ def changes(rows: list, seasons: dict | None = None) -> list:
             # Out of a season into an ordinary month (or the other season).
             if before and before != here and expected(before, "up" if direction == "down" else "down"):
                 return (f"{'Down' if direction == 'down' else 'Up'} from {name(prev.get('month'))}, "
-                        f"which you told AIBOS runs {before}.")
+                        f"which you told AI-BOS runs {before}.")
             return None
 
         if row["sales_pct"] < 0:
@@ -228,6 +228,6 @@ def forecast_notes(ahead_months: list, softened: list, seasonal: bool, seasons: 
                 continue
             names = join_words([name(m) for m in months])
             runs = "runs" if len(months) == 1 else "run"
-            notes.append(f"You told AIBOS {names} {runs} {season}. Until two full years are recorded the "
+            notes.append(f"You told AI-BOS {names} {runs} {season}. Until two full years are recorded the "
                          f"forecast assumes no seasons, so {names} may come in {side} the forecast.")
     return {"notes": notes, "named": named}

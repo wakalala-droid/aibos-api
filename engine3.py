@@ -1,5 +1,5 @@
 """
-AIBOS Engine 3 — POS & Operations Intelligence
+AI-BOS Engine 3 — POS & Operations Intelligence
 Functions: 8 + QSR benchmarks | Target: QSR / Retail / Hospitality businesses in Zambia
 Real-world tested against Debonairs East Park Aura POS export format.
 """

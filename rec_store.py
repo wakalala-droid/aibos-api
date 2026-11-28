@@ -1,7 +1,7 @@
 """
-AIBOS — Recommendations ledger (audit 2026-07 item #20).
+AI-BOS — Recommendations ledger (audit 2026-07 item #20).
 
-The Advisor's recommendations become rows (migration 0021) so AIBOS can audit
+The Advisor's recommendations become rows (migration 0021) so AI-BOS can audit
 ITSELF: what it advised, when, how often, and whether the owner acted.
 Self-auditing intelligence is the trust doctrine made visible — no competitor
 shows you their advice hit-rate.
@@ -99,7 +99,7 @@ def set_status(db, user_id: str, rec_id: str, status: str) -> dict:
 
 
 def track_record(db, user_id: str) -> dict:
-    """AIBOS's own advice scoreboard: per-engine shown/accepted/dismissed."""
+    """AI-BOS's own advice scoreboard: per-engine shown/accepted/dismissed."""
     try:
         res = (db.table("recommendations").select("source_engine,status")
                .eq("user_id", user_id).execute())

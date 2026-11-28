@@ -1,5 +1,5 @@
 """
-AIBOS — Server-side tier entitlements.
+AI-BOS — Server-side tier entitlements.
 
 The frontend gates features on `profiles.tier` (lib/tiers.ts `canAccess`), but a
 client gate is only UX — a determined caller can hit the API directly. This
@@ -255,7 +255,7 @@ def can_access(tier: str, feature: str) -> bool:
 
 # ── Kept from before the re-cut (28 October 2026) ─────────────────────────────
 # The ladder re-cut of 22 October moved payroll from Pro to Pro+. A Pro owner
-# who was already running payroll on AIBOS would have found it locked the next
+# who was already running payroll on AI-BOS would have found it locked the next
 # payday: the one thing their staff and ZRA depend on, taken away from a plan
 # they were still paying for. Taking away what someone already uses pushes them
 # out, not up. So a Pro account that ran payroll before the re-cut keeps it on

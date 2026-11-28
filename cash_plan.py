@@ -1,5 +1,5 @@
 """
-AIBOS — the 13-week cash plan (Growth, 16 October 2026).
+AI-BOS — the 13-week cash plan (Growth, 16 October 2026).
 
 Day by day for the next 91 days, a thousand simulated futures of the money,
 from one read of the books. The cash outlook on the Money page projects the
@@ -31,7 +31,7 @@ positions), so a busy week is busy on both sides. Entries already confirmed
 but dated ahead are in today's money figure (books_views.money_line), so they
 are not counted again here.
 
-What the owner told AIBOS (interview.py, 28 October 2026) counts too: the
+What the owner told AI-BOS (interview.py, 28 October 2026) counts too: the
 cash cushion they want kept is the floor unless they set another; a loan
 repayment they said they make is counted on the 1st of each month while the
 books show none (so it is never counted twice). Each is marked as theirs.
@@ -135,7 +135,7 @@ def _money(v: float, sym: str) -> str:
 
 def floor_words(floor: float, sym: str = "K", floor_from: str | None = None) -> str:
     """The line the plan keeps above, as a sentence says it: 'zero',
-    'K5,000', or 'your K20,000 cushion' when it is the one the owner gave AIBOS."""
+    'K5,000', or 'your K20,000 cushion' when it is the one the owner gave AI-BOS."""
     if not floor or floor <= 0:
         return "zero"
     if floor_from == "cushion":
@@ -594,7 +594,7 @@ def prepare(events: list, pending: list, invoices: list, schedule: list, cash_no
 
 
 def told_loan(ctx: dict, monthly: float | None) -> list:
-    """The loan repayment the owner told AIBOS they make, as payments known to
+    """The loan repayment the owner told AI-BOS they make, as payments known to
     be coming: on the 1st of each month in the plan (the day is not known, and
     early is the cautious side). Nothing when the books already show the loan
     being repaid: it is then in the plan from the books and never twice."""
@@ -918,7 +918,7 @@ def summarise(ctx: dict, sim: Sim, run: dict, floor: float = 0.0, sym: str = "K"
         "until": days[-1].isoformat(),
         "cash_now": round(sim.cash, 2),
         "floor": round(floor, 2),
-        # 'cushion' when the floor is the cash the owner told AIBOS to keep.
+        # 'cushion' when the floor is the cash the owner told AI-BOS to keep.
         "floor_from": floor_from if floor > 0 and floor_from else None,
         "chance_short_pct": round(100 * risk["short"], 1),
         "chance_words": chance_words(risk["short"]),
@@ -990,8 +990,8 @@ def levers(ctx: dict, sim: Sim, base: dict, floor: float, sym: str = "K") -> lis
                   "Ask for deposits, send payment links the day you invoice.", {"faster": 7}))
     risk_end = 7 * (base["first_risk_week"] or WEEKS)
     # Never wages or ZRA, NAPSA and NHIMA: paying those late costs penalties
-    # and people, so AIBOS does not suggest it. Nor a repayment the owner told
-    # AIBOS about: its day is AIBOS's guess, so "move it" would be advice about
+    # and people, so AI-BOS does not suggest it. Nor a repayment the owner told
+    # AI-BOS about: its day is AI-BOS's guess, so "move it" would be advice about
     # a date nobody set.
     candidates = [k for k in sim.known if k["dir"] == "out" and not k["key"].startswith(STRUCTURAL)
                   and k.get("source") != "told"
@@ -1152,8 +1152,8 @@ def build(events: list, pending: list, invoices: list, schedule: list, cash_now:
           today: date | None = None, tz: int = 0, floor: float = 0.0, scenarios: list | None = None,
           paths: int = PATHS, sym: str = "K", monthly_in: list | None = None,
           floor_from: str | None = None, loan_monthly: float | None = None) -> dict:
-    """`floor_from` 'cushion' says the floor is the cash the owner told AIBOS
-    to keep; `loan_monthly` is the repayment they told AIBOS they make
+    """`floor_from` 'cushion' says the floor is the cash the owner told AI-BOS
+    to keep; `loan_monthly` is the repayment they told AI-BOS they make
     (interview.py), counted only while the books show none."""
     today = today or (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
     ctx = prepare(events, pending, invoices, schedule, cash_now, today, tz, monthly_in)
@@ -1296,10 +1296,10 @@ def _assumptions(ctx: dict, sim: Sim, sym: str = "K", cushion: float | None = No
     # Said with "your" so the bank's copy reads "the business's" (bank_pack).
     if cushion:
         words.append(f"The line kept above is your {_money(cushion, sym)} cushion, from your answers to "
-                     "AIBOS: the cash to keep in the business at all times.")
+                     "AI-BOS: the cash to keep in the business at all times.")
     if ctx.get("told_loan"):
         words.append(f"A loan repayment of {_money(ctx['told_loan'], sym)} a month, from your answers to "
-                     "AIBOS: your books do not show it yet, so it is counted on the 1st of each month.")
+                     "AI-BOS: your books do not show it yet, so it is counted on the 1st of each month.")
     med = surv.median_days()
     if surv.observed >= PaySurvival.MIN_ITEMS:
         if med is not None:

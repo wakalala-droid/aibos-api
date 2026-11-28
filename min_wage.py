@@ -1,5 +1,5 @@
 """
-AIBOS — the minimum wages the law sets (3 November 2026).
+AI-BOS — the minimum wages the law sets (3 November 2026).
 
 The Employment Code Act 2019 (s.98-106) lets the Minister set minimum wages
 and conditions for groups of workers by statutory instrument. Three Orders
@@ -21,7 +21,7 @@ hours worked against 208 hours a month (SI 50 of 2023, Schedule 12(4)).
 The Orders do not cover management, unionised workers whose pay is
 collectively bargained, a sector with its own Order, or anyone whose pay is
 already better than the Order's gross (SI 50 of 2023, para. 2(2)). So the
-owner says which Order, if any, covers each person: AIBOS never guesses it.
+owner says which Order, if any, covers each person: AI-BOS never guesses it.
 
 Sources: SI 50 of 2023 from the Government Gazette (its hourly and monthly
 rates exactly); SI 48 and SI 49 of 2023 as Mulenga Mundashi Legal

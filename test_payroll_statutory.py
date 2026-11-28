@@ -1,7 +1,7 @@
 """
 The statutory rules as ZRA, NAPSA and NHIMA set them (13 October 2026).
 
-A client said AIBOS worked out only half the NAPSA. The payroll table showed
+A client said AI-BOS worked out only half the NAPSA. The payroll table showed
 the employee's 5% alone and NAPSA bills 10%; and checking every rule behind it
 found PAYE worked after taking NAPSA off (ZRA stopped that in 2018), NHIMA on
 gross instead of basic pay, no allowances, and no Skills Development Levy.

@@ -1,5 +1,5 @@
 """
-The spoken brief (Jarvis, phase 1): what AIBOS says when the owner presses Talk.
+The spoken brief (Jarvis, phase 1): what AI-BOS says when the owner presses Talk.
 
 Pins that it says the emailed brief's own numbers, in words a voice reads
 properly, follows the plan ladder and the roles, and always ends by asking

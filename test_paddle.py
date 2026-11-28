@@ -4,7 +4,7 @@ Card payments through Paddle (September 2026).
   • A payment is the only thing that grants or extends a plan, and only when
     Paddle signed it. Unsigned, anyone could post "paid" and take a plan.
   • A card plan runs to the end of the period Paddle billed for, and renews by
-    itself: AIBOS must not also tell that customer to pay.
+    itself: AI-BOS must not also tell that customer to pay.
   • The same payment delivered twice (Paddle retries) is granted once.
 """
 

@@ -1,5 +1,5 @@
 """
-AIBOS — the sales outlook: what the Forecast page shows (16 October 2026).
+AI-BOS — the sales outlook: what the Forecast page shows (16 October 2026).
 
 Sales, costs and profit for this month and the three after it, each with the
 cautious and hopeful ends of its range, from the forecast engine; this month
@@ -76,7 +76,7 @@ def outlook(monthly: list, today: str | None = None, daily: dict | None = None,
             complete: bool = False, daily_cost: dict | None = None, seasons: dict | None = None) -> dict:
     """`monthly` rows {month, revenue, costs}. With `complete` (an uploaded
     file) every row is a finished period and none is the month running now.
-    `seasons` are the busy and quiet months the owner told AIBOS
+    `seasons` are the busy and quiet months the owner told AI-BOS
     (interview.seasons): the outlook then says where they change its reading."""
     today = today or datetime.now(timezone.utc).isoformat()
     current = str(today)[:7]
@@ -203,7 +203,7 @@ def accuracy_words(acc: dict) -> str:
     naive = acc.get("naive_miss_pct")
     if miss is None:
         return f"Tested on your last {tested} months."
-    words = f"Tested on your last {tested} months, AIBOS missed by {miss:g}% on average"
+    words = f"Tested on your last {tested} months, AI-BOS missed by {miss:g}% on average"
     if naive is not None and naive > miss:
         words += f"; repeating the month before would have missed by {naive:g}%"
     return words + "."

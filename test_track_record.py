@@ -1,5 +1,5 @@
 """
-The forecast's track record: what AIBOS said before each month, kept once a
+The forecast's track record: what AI-BOS said before each month, kept once a
 month and never rewritten, held against the confirmed books once the month has
 closed. Kept from the same outlook and cash plan the owner sees; judged on the
 same months and the same money line; a migration not yet run changes nothing.

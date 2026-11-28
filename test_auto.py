@@ -1,11 +1,11 @@
 """
-AIBOS auto (17 Nov 2026): one switch, and the team runs the day by itself.
+AI-BOS auto (17 Nov 2026): one switch, and the team runs the day by itself.
 
 Pins the promises the owner was given when they turn it on: the safe jobs do
 themselves, each with an Undo (entries up to the limit, recorded by the chat
 or confirmed for staff); anything that goes to another person, settles tax,
 refunds or is over the limit still waits for a yes; the team looks every hour
-instead of every three; and in the evening the owner is told what AIBOS did.
+instead of every three; and in the evening the owner is told what AI-BOS did.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -120,11 +120,11 @@ def test_auto_books_are_looked_at_every_hour_and_told_in_the_evening(db, monkeyp
     _pending(db, "ev-2", amount=80, made="2026-11-17T04:30:00+00:00")
     again = workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(hours=1))
     assert again["new"] == 1
-    # The evening pass tells the owner what AIBOS did by itself today.
+    # The evening pass tells the owner what AI-BOS did by itself today.
     evening = datetime(2026, 11, 17, 16, 30, tzinfo=timezone.utc)      # 18:30 in Lusaka
     workers.run_all(db, lambda *a: told.append(a), now=evening)
     (note,) = [t for t in told if t[2] == "auto_day"]
-    assert note[3] == "AIBOS did 2 things for you today" and note[5] == "/dashboard#team"
+    assert note[3] == "AI-BOS did 2 things for you today" and note[5] == "/dashboard#team"
 
 
 def test_the_preview_counts_what_the_team_would_find_and_writes_nothing(db):

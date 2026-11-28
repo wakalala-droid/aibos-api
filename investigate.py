@@ -1,5 +1,5 @@
 """
-AIBOS — Anomaly auto-investigation (audit 2026-07 item #13).
+AI-BOS — Anomaly auto-investigation (audit 2026-07 item #13).
 
 The mission statement, literally: "What changed? Why?" answered BEFORE the
 owner asks. When a month's money moves abnormally, this module drills into
@@ -188,7 +188,7 @@ def auto_investigation(events: list, seasons: dict | None = None) -> dict:
     """Detect + drill in one call: the worst recent anomaly, explained. The
     homepage/anomaly page renders this without the owner asking anything.
 
-    `seasons` are the busy and quiet months the owner told AIBOS
+    `seasons` are the busy and quiet months the owner told AI-BOS
     (interview.seasons): money in or out high in a busy month, or low in a
     quiet one, is what they said it would be, so it is not the anomaly
     explained (seasons.py holds the same rule for the reports)."""
@@ -200,7 +200,7 @@ def auto_investigation(events: list, seasons: dict | None = None) -> dict:
         n = len(monthly_flows(events))
         if found:
             return {"ok": False,
-                    "reason": "The months that stand out are ones you told AIBOS run busy or quiet, "
+                    "reason": "The months that stand out are ones you told AI-BOS run busy or quiet, "
                               "so none is counted as unusual."}
         return {"ok": False,
                 "reason": (f"Only {n} month{'s' if n != 1 else ''} of recorded history — "

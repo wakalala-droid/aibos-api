@@ -1,8 +1,8 @@
 """
 Find clients (find_clients.py, find_clients_routes.py): priced the way Explee
 prices it (credits a month on Pro and up, top-ups on any plan, one free day on
-Free), nothing ever sent by AIBOS, a "stop" honoured for good, the credits
-kept, and searches answered from AIBOS's own directory so a busy public map
+Free), nothing ever sent by AI-BOS, a "stop" honoured for good, the credits
+kept, and searches answered from AI-BOS's own directory so a busy public map
 never times out the page. No network, no AI: the website reader, the map,
 Storage and the AI are stood in for.
 """
@@ -439,7 +439,7 @@ def test_when_no_server_answers_the_map_is_busy(monkeypatch):
     assert str(e.value) == fc.MAP_BUSY
 
 
-# ── AIBOS's own directory: a search answers from what is held ─────────────────
+# ── AI-BOS's own directory: a search answers from what is held ─────────────────
 
 class _Store:
     """Supabase Storage, in memory: one private bucket's files."""
@@ -666,7 +666,7 @@ def test_research_reads_the_site_judges_the_fit_and_writes_to_good_fits(api):
     assert body.startswith("Hello Mary,") and "cement" in body and fc.STOP_LINE in body
     assert draft["links"]["mailto"].startswith("mailto:sales@mwapehardware.co.zm?subject=")
     assert draft["links"]["whatsapp"].startswith("https://wa.me/260977123456?text=")
-    # Nothing has been sent: AIBOS never sends.
+    # Nothing has been sent: AI-BOS never sends.
     assert all(m["status"] in ("draft", "discarded") for m in db.rows["client_messages"])
 
 
@@ -856,7 +856,7 @@ def test_names_numbers_and_addresses():
     assert fc.blocked({"email": "a@b.com"}, ["@b.com"]) is True
 
 
-# ── The words AIBOS writes without the AI ─────────────────────────────────────
+# ── The words AI-BOS writes without the AI ─────────────────────────────────────
 
 SETTINGS = {**fc.DEFAULT_SETTINGS, "sender_name": "Mwape Banda", "sender_role": "Owner",
             "booking_link": "https://calendar.app.google/x"}
@@ -867,22 +867,22 @@ SHOP = {"id": "p1", "name": "Chanda Stores", "town": "Kitwe", "contact_name": "M
 
 def test_the_offer_reads_as_a_sentence_however_the_owner_wrote_it(monkeypatch):
     """5 Nov 2026: an offer written as its own sentence was spliced after
-    "We" and read "We AIBOS keeps your books"."""
+    "We" and read "We AI-BOS keeps your books"."""
     monkeypatch.setattr(fc, "ask_json", lambda *a, **k: None)
-    said = fc.write_first(SHOP, {"offer": "AIBOS keeps your books on your phone."}, SETTINGS, BUSINESS)
-    assert "Mwape Systems. AIBOS keeps your books on your phone." in said["body"]
-    assert "We AIBOS" not in said["body"] and "We AIBOS" not in said["whatsapp"]
+    said = fc.write_first(SHOP, {"offer": "AI-BOS keeps your books on your phone."}, SETTINGS, BUSINESS)
+    assert "Mwape Systems. AI-BOS keeps your books on your phone." in said["body"]
+    assert "We AI-BOS" not in said["body"] and "We AI-BOS" not in said["whatsapp"]
     said = fc.write_first(SHOP, {"offer": "Deliver cement within a day"}, SETTINGS, BUSINESS)
     assert "We deliver cement within a day." in said["body"]
     # "Door" is not "do": a whole word is needed before "We".
     assert fc._offer_sentence({"offer": "Door repairs in a day"}) == "Door repairs in a day."
-    later = fc.write_followup(SHOP, 1, {"offer": "AIBOS keeps your books"}, SETTINGS, BUSINESS)
-    assert "AIBOS keeps" not in later["body"] and "Chanda Stores?" in later["body"]
+    later = fc.write_followup(SHOP, 1, {"offer": "AI-BOS keeps your books"}, SETTINGS, BUSINESS)
+    assert "AI-BOS keeps" not in later["body"] and "Chanda Stores?" in later["body"]
 
 
 def test_no_answer_goes_out_with_words_left_to_fill_in_unless_only_the_owner_knows_them(monkeypatch):
     monkeypatch.setattr(fc, "ask_json", lambda *a, **k: None)
-    camp = {"offer": "AIBOS keeps your books on your phone"}
+    camp = {"offer": "AI-BOS keeps your books on your phone"}
     for label in ("hot_lead", "wants_call", "later"):
         answer = fc._template_answer(SHOP, label, SETTINGS, BUSINESS, camp)
         assert "[" not in answer["body"] and "[" not in answer["whatsapp"], label
@@ -905,7 +905,7 @@ def test_a_campaign_filled_without_the_ai_has_a_proper_name(monkeypatch):
 
 
 # ── LinkedIn, the safe way (10 Nov 2026) ──────────────────────────────────────
-# AIBOS never opens LinkedIn: it keeps the address, gives a search the owner
+# AI-BOS never opens LinkedIn: it keeps the address, gives a search the owner
 # opens, writes the note, and the owner pastes and sends it themselves.
 
 def test_linkedin_addresses_are_kept_one_way_and_compared_that_way():
@@ -929,7 +929,7 @@ def test_linkedin_addresses_are_kept_one_way_and_compared_that_way():
 
 def test_aibos_never_opens_linkedin_and_keeps_the_page_a_website_links_to(monkeypatch):
     def no_network(*a, **k):
-        raise AssertionError("AIBOS opened a web page")
+        raise AssertionError("AI-BOS opened a web page")
     monkeypatch.setattr(fc.httpx, "Client", no_network)
     got = fc.read_site("https://www.linkedin.com/company/mwape-hardware")
     assert got["ok"] is False and got["linkedin"] == "https://www.linkedin.com/company/mwape-hardware"
@@ -1004,7 +1004,7 @@ def test_a_business_on_linkedin_only_is_written_to_and_sent_from_the_owners_own_
     assert p["stage"] == "contacted" and p["next_followup_at"]
     sent = next(m for m in db.rows["client_messages"] if m["id"] == draft["id"])
     assert sent["status"] == "sent" and sent["channel"] == "linkedin"
-    # Nothing was sent by AIBOS, and LinkedIn was never opened: no client was made.
+    # Nothing was sent by AI-BOS, and LinkedIn was never opened: no client was made.
     assert all(m["status"] in ("draft", "sent", "discarded") for m in db.rows["client_messages"])
 
 

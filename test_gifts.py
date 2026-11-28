@@ -150,7 +150,7 @@ def test_a_gift_after_one_ended_starts_today():
 def test_more_months_read_as_more():
     title, body = gifts.message("proplus", 2, NOW, "Mr A", "", more=True)
     assert title == "2 more months of Pro+, free"
-    assert body.startswith("Mr A, your business stays on AIBOS Pro+ free until 17 November 2026.")
+    assert body.startswith("Mr A, your business stays on AI-BOS Pro+ free until 17 November 2026.")
 
 
 def test_the_route_is_for_an_admin_and_keeps_the_note(monkeypatch):
@@ -225,7 +225,7 @@ def test_billing_page_says_it_is_a_gift_and_when_it_ends():
     p = {"tier": "growth", "tier_source": "gift", "paid_until": (NOW + timedelta(days=30)).isoformat()}
     s = billing.plan_status(p, PRICES, "monthly", now=NOW)
     assert s["state"] == "active" and s["days_left"] == 30
-    assert "gift from AIBOS" in s["sentence"] and "no end date" not in s["sentence"]
+    assert "gift from AI-BOS" in s["sentence"] and "no end date" not in s["sentence"]
 
 
 def test_billing_page_after_the_gift():

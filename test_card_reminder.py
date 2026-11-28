@@ -32,7 +32,7 @@ def _db():
         # Already paying by card: Paddle renews it, so not asked.
         {"id": "card", "tier": "pro", "tier_source": "payment",
          "paid_until": "2026-11-01T10:00:00+00:00", "email": "card@example.com"},
-        # Free, a plan AIBOS set up, and one that switched off weeks ago: not asked.
+        # Free, a plan AI-BOS set up, and one that switched off weeks ago: not asked.
         {"id": "free", "tier": "free", "tier_source": "payment", "email": "free@example.com"},
         {"id": "demo", "tier": "growth", "tier_source": "admin_demo", "email": "demo@example.com"},
         {"id": "gone", "tier": "pro", "tier_source": "payment",
@@ -64,7 +64,7 @@ def test_it_says_card_only_and_how_to_keep_the_plan():
     _, emails, _ = _send(_db())
     by = {e[0]: e for e in emails}
     paid = by["owner@dunslim.example"]
-    assert paid[1] == "Update your payment details: AIBOS is card only now"
+    assert paid[1] == "Update your payment details: AI-BOS is card only now"
     assert "paid by card only" in paid[2] and "paid up to 7 December" in paid[2]
     assert "$79" in paid[2] and "renews automatically" in paid[2]
     assert paid[3] == ("Set up card payment", "/checkout?plan=growth&billing=monthly")

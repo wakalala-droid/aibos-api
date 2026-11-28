@@ -1,5 +1,5 @@
 """
-AIBOS — Ingestion (Evolution Initiative 7).
+AI-BOS — Ingestion (Evolution Initiative 7).
 
 A modular layer that turns non-conversational inputs (Excel rows, QR payloads, and
 later receipt images / PDFs) into proposed Business Events, all converging on the
@@ -469,7 +469,7 @@ def rows_to_events(rows: list[dict], mapping: dict, defaults: dict | None = None
                 source="excel",
                 occurred_at=occurred,
                 # Reviewed in the import preview, except a negative line turned
-                # into a refund here: that was AIBOS's reading, so it waits for
+                # into a refund here: that was AI-BOS's reading, so it waits for
                 # the owner to confirm it (SAFEGUARD 0.4).
                 confidence=0.7 if reversal else 1.0,
             )

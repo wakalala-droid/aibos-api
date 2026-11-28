@@ -139,7 +139,7 @@ def test_the_alert_says_what_the_bell_says(key, monkeypatch):
     assert head["apns-collapse-id"] == "booking-42"          # a newer one replaces it
     assert head["apns-expiration"] == str(1_800_000_000 + 86400)
     assert head["authorization"] == "bearer " + apns.provider_token(now=1_800_000_000)
-    assert apns.payload({"title": ""}) == {"aps": {"alert": {"title": "AIBOS"}, "sound": "default"},
+    assert apns.payload({"title": ""}) == {"aps": {"alert": {"title": "AI-BOS"}, "sound": "default"},
                                            "link": "/dashboard"}
     assert apns.host() == "https://api.push.apple.com"
     monkeypatch.setenv("APNS_SANDBOX", "1")
@@ -219,8 +219,8 @@ def test_the_iphone_is_named_in_plain_words():
               {"id": "p4", "user_id": "u1", "endpoint": apns.PREFIX + "d4" * 32,
                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)"}])
     assert [d["device"] for d in webpush.devices(db, "u1")] == [
-        "the AIBOS app on an iPhone", "the AIBOS app on an iPhone",
-        "the AIBOS app on an iPad", "the AIBOS app on an iPhone"]
+        "the AI-BOS app on an iPhone", "the AI-BOS app on an iPhone",
+        "the AI-BOS app on an iPad", "the AI-BOS app on an iPhone"]
 
 
 def test_an_iphone_still_hears_when_browsers_cannot(key, monkeypatch):

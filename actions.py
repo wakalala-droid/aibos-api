@@ -1,5 +1,5 @@
 """
-AIBOS as Jarvis, phase 2: the chat does jobs, at the trust each job has earned.
+AI-BOS as Jarvis, phase 2: the chat does jobs, at the trust each job has earned.
 
 Until now every chat tool only read. The owner could ask what they are owed,
 but "remind me to pay rent on Friday" or "I sold 3 crates to Banda for K360"
@@ -9,16 +9,16 @@ module decides how far it may go on its own:
   do it      Small jobs that are easy to take back: a reminder, a draft
              invoice. Done at once; the chat shows Undo.
   ask first  Anything that puts money in the books, sends an invoice or marks
-             one paid. AIBOS says what it will do and waits for one yes, typed
+             one paid. AI-BOS says what it will do and waits for one yes, typed
              or spoken (POST /actions/{id}/approve).
   earned     The Bible's 10th Law, "automation earned". A kind of job the
              owner has said yes to EARN_AFTER times in a row, without taking
              one back, may be switched to automatic, and only then. Even then
-             AIBOS does by itself only what looks like what the owner approved
+             AI-BOS does by itself only what looks like what the owner approved
              by hand: an entry type they approved, no bigger than the largest
              one. Anything else is asked, as before.
 
-What AIBOS never does, at any level: send a message to anyone, or move money.
+What AI-BOS never does, at any level: send a message to anyone, or move money.
 "Send invoice" issues it in the books; sharing it stays with the owner.
 
 Every job is written to `ai_actions` BEFORE it runs (migration 0047), so a job
@@ -26,7 +26,7 @@ that fails half way is on record, Undo knows what to take back, the earned
 count comes from the record rather than from memory, and phase 3's "Needs you"
 list is the jobs still waiting.
 
-Phase 3 (workers.py) adds the jobs only AIBOS's workers put forward
+Phase 3 (workers.py) adds the jobs only AI-BOS's workers put forward
 (WORKER_KINDS): confirm an entry, write a reminder to a customer, record a tax
 payment, or a note pointing at a page. A worker's job always waits for a yes,
 and waits a week rather than a day.
@@ -55,7 +55,7 @@ EARN_AFTER = 5          # yeses in a row before a kind may run by itself
 WAIT_HOURS = 24         # a job nobody answered stops waiting after this
 LUSAKA = timezone(timedelta(hours=2))
 
-NOT_READY = ("I can't do jobs from the chat yet: AIBOS needs one update on its side first. "
+NOT_READY = ("I can't do jobs from the chat yet: AI-BOS needs one update on its side first. "
              "Everything else works, and the Record page records it for now.")
 
 # What each job is, how far it may go alone, and whether it can be undone.
@@ -77,7 +77,7 @@ KINDS: dict[str, dict] = {
 WORKER_KINDS = frozenset({"confirm_entry", "chase_payment", "settle_tax", "note"})
 WORKER_WAIT_DAYS = 7    # a worker's question waits longer than a chat one
 
-# AIBOS auto (17 Nov 2026): one switch at the top of every page. While it is
+# AI-BOS auto (17 Nov 2026): one switch at the top of every page. While it is
 # on, the team looks every hour and the safe jobs do themselves, each with an
 # Undo: entries the owner asks for and entries staff recorded are recorded and
 # confirmed, up to AUTO_LIMIT or the largest entry the owner approved by hand,
@@ -141,7 +141,7 @@ ACTION_TOOLS = [
     {"type": "function", "function": {
         "name": "record_entry",
         "description": "Record something that happened in the books: a sale, an expense, a stock "
-                       "purchase, a payment received or paid, a refund. AIBOS asks the owner to say "
+                       "purchase, a payment received or paid, a refund. AI-BOS asks the owner to say "
                        "yes before it counts. Only use what the owner actually said; never invent "
                        "an amount.",
         "parameters": {"type": "object", "properties": {
@@ -174,7 +174,7 @@ ACTION_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "send_invoice",
-        "description": "Issue a draft invoice: it counts as money owed from then on. AIBOS asks the "
+        "description": "Issue a draft invoice: it counts as money owed from then on. AI-BOS asks the "
                        "owner first and never messages the customer itself; the owner shares it.",
         "parameters": {"type": "object", "properties": {
             "number": {"type": "string", "description": "the invoice number, e.g. INV-0004"},
@@ -182,7 +182,7 @@ ACTION_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "mark_invoice_paid",
-        "description": "Mark a sent invoice paid because the money arrived. AIBOS asks the owner first.",
+        "description": "Mark a sent invoice paid because the money arrived. AI-BOS asks the owner first.",
         "parameters": {"type": "object", "properties": {
             "number": {"type": "string", "description": "the invoice number, e.g. INV-0004"},
             "payment_method": {"type": "string", "enum": ["cash", "mobile_money", "bank", "card"]},
@@ -435,7 +435,7 @@ def prepare(db, tenant: str, biz: str | None, kind: str, args: dict,
         text = _text(args.get("text"), 240)
         href = str(args.get("href") or "")
         if not text or not href.startswith("/dashboard"):
-            raise ActionError("A note needs words and a page of AIBOS to open.")
+            raise ActionError("A note needs words and a page of AI-BOS to open.")
         return {"args": {"text": text, "href": href[:120], "label": _text(args.get("label"), 30) or "Open"},
                 "said": text}
 
@@ -549,7 +549,7 @@ def _execute(db, tenant: str, biz: str | None, actor: str, kind: str, args: dict
             ev = nervous.ingest(db, tenant, nervous.EventIn(
                 event_type=args["event_type"], payload=dict(args["payload"]), source="voice",
                 occurred_at=args.get("occurred_at"), status="confirmed", confidence=1.0,
-                note="recorded by AIBOS"), actor_role="owner", actor_id=actor, business_id=biz)
+                note="recorded by AI-BOS"), actor_role="owner", actor_id=actor, business_id=biz)
         return {"event_id": ev.get("id")}
     if kind == "send_invoice":
         import invoices as invoices_api
@@ -674,7 +674,7 @@ def past(said: str) -> str:
 
 
 def public(row: dict) -> dict:
-    """A job as the chat shows it: `said` is what AIBOS will do, `did` what it did."""
+    """A job as the chat shows it: `said` is what AI-BOS will do, `did` what it did."""
     kind = row.get("kind")
     out = {
         "id": row.get("id"),
@@ -701,7 +701,7 @@ def public(row: dict) -> dict:
     worker = worker_of(row)
     if worker:
         import workers
-        out["worker"] = {"id": worker, "name": workers.NAMES.get(worker, "AIBOS")}
+        out["worker"] = {"id": worker, "name": workers.NAMES.get(worker, "AI-BOS")}
     if result.get("why"):
         out["why"] = result["why"]
     if kind in _ANSWERS:
@@ -774,12 +774,12 @@ def autopilot_state(db, tenant: str, business_id: str | None) -> dict:
 def set_autopilot(db, tenant: str, business_id: str | None, kind: str, on: bool) -> dict:
     """Switch a kind to automatic, or back. On only once it is earned."""
     if kind not in KINDS or not KINDS[kind]["earnable"]:
-        raise ActionError("AIBOS always asks before that kind of job.")
+        raise ActionError("AI-BOS always asks before that kind of job.")
     biz = twin._books_for(db, tenant, business_id)
     if on:
         s = streak(_recent(db, tenant, biz), kind)
         if s["count"] < EARN_AFTER:
-            raise ActionError(f"Say yes to {EARN_AFTER - s['count']} more of these first, so AIBOS "
+            raise ActionError(f"Say yes to {EARN_AFTER - s['count']} more of these first, so AI-BOS "
                               "has learned what you approve.")
     existing = [r for r in _autopilot_rows(db, tenant, biz) if r.get("kind") == kind]
     patch = {"is_on": bool(on), "updated_at": _now_iso()}
@@ -791,7 +791,7 @@ def set_autopilot(db, tenant: str, business_id: str | None, kind: str, on: bool)
 
 
 def auto_on(db, tenant: str, biz: str | None) -> bool:
-    """Is AIBOS auto on for these books? Raises NotReady before 0047."""
+    """Is AI-BOS auto on for these books? Raises NotReady before 0047."""
     return autopilot_on(db, tenant, biz, AUTO_KIND)
 
 
@@ -818,7 +818,7 @@ def auto_state(db, tenant: str, business_id: str | None) -> dict:
 
 
 def set_auto(db, tenant: str, business_id: str | None, on: bool) -> dict:
-    """The AIBOS auto switch. Unlike a single kind it needs nothing earned:
+    """The AI-BOS auto switch. Unlike a single kind it needs nothing earned:
     what it does by itself is small, inside the limit, and has an Undo."""
     biz = twin._books_for(db, tenant, business_id)
     existing = [r for r in _autopilot_rows(db, tenant, biz) if r.get("kind") == AUTO_KIND]
@@ -922,7 +922,7 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
                 ev = nervous.ingest(db, tenant, nervous.EventIn(
                     event_type=plan["args"]["event_type"], payload=dict(plan["args"]["payload"]),
                     source="voice", occurred_at=plan["args"].get("occurred_at"), status="pending",
-                    note="drafted by AIBOS"), actor_role="owner", actor_id=actor, business_id=biz)
+                    note="drafted by AI-BOS"), actor_role="owner", actor_id=actor, business_id=biz)
                 row["result"] = {**(row.get("result") or {}), "event_id": ev.get("id")}
                 _update(db, tenant, row["id"], {"result": row["result"]})
             except Exception as e:  # noqa: BLE001 - the job still waits; the yes records it
@@ -935,7 +935,7 @@ def propose(db, tenant: str, actor: str, business_id: str | None, kind: str, arg
 def _run(db, tenant: str, biz: str | None, actor: str, row: dict, how: str,
          now: datetime | None = None) -> dict:
     # The job is stamped with the pass's own clock, so the evening count of what
-    # AIBOS did "today" (workers.did_today) reads the same day the pass ran on.
+    # AI-BOS did "today" (workers.did_today) reads the same day the pass ran on.
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     try:
         made = _execute(db, tenant, biz, actor, row["kind"], row.get("args") or {}, row.get("result"),

@@ -1,10 +1,10 @@
 """
-AIBOS — The AIBOS workbook: a spreadsheet laid out the way AIBOS reads.
+AI-BOS — The AI-BOS workbook: a spreadsheet laid out the way AI-BOS reads.
 
-Any spreadsheet can be uploaded, and AIBOS works hard to understand one it has
+Any spreadsheet can be uploaded, and AI-BOS works hard to understand one it has
 never seen (sheetscan.py, doc_ai.py, attach.py). But a new owner with no
 spreadsheet yet should not have to invent one, and a guess is still a guess.
-So AIBOS hands them its own: one sheet for each kind of money, headed the way
+So AI-BOS hands them its own: one sheet for each kind of money, headed the way
 the importer files it, with dropdowns for how it was paid and what it was for.
 
   • build()        the workbook, made for this business: their products and
@@ -18,7 +18,7 @@ the importer files it, with dropdowns for how it was paid and what it was for.
                    booked like an entry typed on the Record page. A wage to a
                    name not on the worker list still asks, as any import does.
   • row_key()      what makes one line that line, so the same workbook can be
-                   kept, added to and uploaded again: lines AIBOS already has
+                   kept, added to and uploaded again: lines AI-BOS already has
                    are left out, and only the new ones go in.
 
 Recognition is by headings, not by a hidden mark, so a sheet copied into
@@ -35,8 +35,8 @@ import sheetscan
 
 log = logging.getLogger("aibos.starter_book")
 
-TAG = "AIBOS workbook v1"
-FILENAME = "AIBOS workbook.xlsx"
+TAG = "AI-BOS workbook v1"
+FILENAME = "AI-BOS workbook.xlsx"
 
 # Lines a workbook keeps room for, styled and offered dropdowns.
 ROWS = 2000
@@ -44,7 +44,7 @@ ROWS = 2000
 # Columns: (heading, width, kind). Kinds style the column and pick a dropdown.
 SHEETS = (
     {"kind": "sales", "title": "Sales", "event_type": "Sale",
-     "what": "Your sales from the AIBOS workbook",
+     "what": "Your sales from the AI-BOS workbook",
      "columns": (("Date", 13, "date"), ("Customer", 24, "text"), ("What was sold", 30, "product"),
                  ("Quantity", 11, "qty"), ("Amount", 14, "money"), ("Paid by", 16, "paid_by"),
                  ("Notes", 32, "text")),
@@ -53,7 +53,7 @@ SHEETS = (
                  "description": "What was sold", "quantity": "Quantity"},
      "guide": "Sales: what you sold, to whom and for how much. A day's takings on one line is fine."},
     {"kind": "expenses", "title": "Expenses", "event_type": "Expense",
-     "what": "Your running costs from the AIBOS workbook",
+     "what": "Your running costs from the AI-BOS workbook",
      "columns": (("Date", 13, "date"), ("Paid to", 24, "text"), ("What it was for", 30, "text"),
                  ("Category", 22, "category"), ("Amount", 14, "money"), ("Paid by", 16, "paid_by"),
                  ("Notes", 32, "text")),
@@ -62,7 +62,7 @@ SHEETS = (
                  "description": "What it was for", "category": "Category"},
      "guide": "Expenses: rent, fuel, airtime, repairs and every other running cost."},
     {"kind": "stock", "title": "Stock bought", "event_type": "Purchase",
-     "what": "Stock you bought, from the AIBOS workbook",
+     "what": "Stock you bought, from the AI-BOS workbook",
      "columns": (("Date", 13, "date"), ("Supplier", 24, "text"), ("Item", 30, "product"),
                  ("Quantity", 11, "qty"), ("Amount", 14, "money"), ("Paid by", 16, "paid_by"),
                  ("Notes", 32, "text")),
@@ -71,7 +71,7 @@ SHEETS = (
                  "description": "Item", "quantity": "Quantity"},
      "guide": "Stock bought: goods you buy to sell, or to use in what you make. Amount is the total you paid."},
     {"kind": "wages", "title": "Wages", "event_type": "Salary",
-     "what": "Wages from the AIBOS workbook",
+     "what": "Wages from the AI-BOS workbook",
      "columns": (("Date", 13, "date"), ("Worker", 26, "worker"), ("Amount", 14, "money"),
                  ("Paid by", 16, "paid_by"), ("Notes", 32, "text")),
      "required": ("date", "worker", "amount"),
@@ -94,14 +94,14 @@ SHEETS = (
      "required": ("name", "job", "monthly pay"),
      "mapping": {"name": "Name", "position": "Job", "basic_pay": "Monthly pay",
                  "phone": "Phone", "start_date": "Started on"},
-     "guide": "Workers: the people you pay. AIBOS works out their PAYE and NAPSA from here."},
+     "guide": "Workers: the people you pay. AI-BOS works out their PAYE and NAPSA from here."},
 )
 BY_KIND = {s["kind"]: s for s in SHEETS}
 RECORD_KINDS = ("products", "workers")
 
 PAID_BY = ("Cash", "Mobile money", "Bank transfer", "Card", "Cheque", "On credit")
 
-# What the owner picks under Category → what AIBOS books. A category not here
+# What the owner picks under Category → what AI-BOS books. A category not here
 # is kept in the owner's own words.
 CATEGORIES = (
     ("Rent", "Expense", "rent"),
@@ -196,8 +196,8 @@ def build(business: str | None = None, industry: str | None = None, answers: dic
     name = (business or "").strip() or "Your business"
 
     wb = Workbook()
-    wb.properties.title = f"{name} AIBOS workbook"
-    wb.properties.creator = "AIBOS"
+    wb.properties.title = f"{name} AI-BOS workbook"
+    wb.properties.creator = "AI-BOS"
     wb.properties.keywords = TAG
 
     # ── Start here ──────────────────────────────────────────────────────────
@@ -206,8 +206,8 @@ def build(business: str | None = None, industry: str | None = None, answers: dic
     ws.column_dimensions["A"].width = 100
     ws.sheet_view.showGridLines = False
     lines = [
-        (f"{name}: AIBOS workbook", Font(bold=True, size=16, color=ink)),
-        ("Fill this in, then upload it on the Upload a file page. AIBOS files every "
+        (f"{name}: AI-BOS workbook", Font(bold=True, size=16, color=ink)),
+        ("Fill this in, then upload it on the Upload a file page. AI-BOS files every "
          "line in the right place, with no questions about columns.", Font(size=11, color="44403C")),
         ("", None),
         ("How to fill it in", Font(bold=True, size=12, color=ink)),
@@ -217,7 +217,7 @@ def build(business: str | None = None, industry: str | None = None, answers: dic
         ("4. Paid by and Category offer a list. Pick from it, or type your own.", None),
         ("5. Leave a sheet empty if it does not apply to you. Keep the sheet names and the "
          "column headings as they are.", None),
-        ("6. Keep adding to this same file and upload it again whenever you like: AIBOS "
+        ("6. Keep adding to this same file and upload it again whenever you like: AI-BOS "
          "records only the lines it does not have yet.", None),
         ("", None),
         ("The sheets", Font(bold=True, size=12, color=ink)),
@@ -331,7 +331,7 @@ def plan_for(table: dict, kind: str) -> dict:
     base = {"id": table.get("id"), "confidence": 0.99, "source": "workbook", "workbook": kind,
             "mapping": {}, "event_type": "Expense"}
     if kind == "guide":
-        return {**base, "what_it_is": "The instructions page of your AIBOS workbook",
+        return {**base, "what_it_is": "The instructions page of your AI-BOS workbook",
                 "import": False, "reason": "Nothing to import on this page."}
     if kind == "lists":
         return {**base, "what_it_is": "The lists behind the workbook's dropdowns",
@@ -412,7 +412,7 @@ def _exact(name: str, records: list) -> dict | None:
 def resolve(kind: str, table: dict, mapping: dict, context: dict, known_keys=None,
             heading: str = "") -> dict:
     """Every line of one recognised sheet, as attach.resolve_table returns them:
-    {rows, questions, counts}, plus how many lines AIBOS already had.
+    {rows, questions, counts}, plus how many lines AI-BOS already had.
 
     A line the owner said everything about is booked as they said it, at the
     confidence of an entry typed on the Record page. Anything that still needs

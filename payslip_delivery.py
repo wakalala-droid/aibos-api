@@ -1,21 +1,21 @@
 """
-AIBOS — payslips that reach the staff themselves (28 October 2026).
+AI-BOS — payslips that reach the staff themselves (28 October 2026).
 
 A payslip was a PDF the owner downloaded one person at a time and passed on by
-hand, so nobody on staff ever heard from AIBOS, and switching AIBOS off cost
+hand, so nobody on staff ever heard from AI-BOS, and switching AI-BOS off cost
 the owner nothing their staff would notice. Now each person can carry a phone
 and an email (employees.phone / employees.email, migration 0042) and every run
 can go out to everyone on it:
 
-  * by EMAIL, sent by AIBOS: the payslip in the email and as a PDF to keep,
-    with replies going to the owner (the employer), never to AIBOS;
+  * by EMAIL, sent by AI-BOS: the payslip in the email and as a PDF to keep,
+    with replies going to the owner (the employer), never to AI-BOS;
   * on WHATSAPP, from the OWNER's own phone: a wa.me link with the payslip
     already written, one tap per person. Business-initiated WhatsApp needs a
-    Meta template and Meta has AIBOS switched off, and a payslip from the boss's
+    Meta template and Meta has AI-BOS switched off, and a payslip from the boss's
     own number is the one staff already trust.
 
 payslips.sent_at / sent_via keep who has theirs. A WhatsApp send is recorded
-when the owner opens it from AIBOS: WhatsApp does not say whether they then
+when the owner opens it from AI-BOS: WhatsApp does not say whether they then
 pressed send, so the page says "opened in WhatsApp", not "delivered".
 
 people() is pure: the run and the register in, one row per payslip out.
@@ -96,7 +96,7 @@ def people(run: dict, employees: list[dict], business_name: str | None = None,
 
 
 def summary(rows: list[dict]) -> dict:
-    """How many have theirs, and how many AIBOS has nowhere to send."""
+    """How many have theirs, and how many AI-BOS has nowhere to send."""
     sent = sum(1 for r in rows if r.get("sent_at"))
     unreachable = sum(1 for r in rows if not r.get("email") and not r.get("whatsapp_url"))
     return {"total": len(rows), "sent": sent, "waiting": len(rows) - sent, "unreachable": unreachable}

@@ -69,7 +69,7 @@ def test_daily_sales_reads_confirmed_sales_only():
 def test_accuracy_words():
     assert outlook.accuracy_words({"tested": 0}) == ""
     words = outlook.accuracy_words({"tested": 8, "avg_miss_pct": 6.5, "naive_miss_pct": 14.0})
-    assert words == ("Tested on your last 8 months, AIBOS missed by 6.5% on average; "
+    assert words == ("Tested on your last 8 months, AI-BOS missed by 6.5% on average; "
                      "repeating the month before would have missed by 14%.")
 
 

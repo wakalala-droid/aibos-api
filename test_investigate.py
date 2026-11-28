@@ -115,11 +115,11 @@ def test_money_in_and_out_follow_the_cash_figure():
 
 
 def test_a_month_the_owner_said_runs_busy_is_not_the_one_explained():
-    """June's spending spike, in a June the owner told AIBOS runs busy: high
+    """June's spending spike, in a June the owner told AI-BOS runs busy: high
     spending is what they said, so the investigation does not lead with it."""
     events = _steady_history()
     out = investigate.auto_investigation(events, {"busy": [6], "quiet": []})
-    assert out["ok"] is False and "you told AIBOS run busy or quiet" in out["reason"]
+    assert out["ok"] is False and "you told AI-BOS run busy or quiet" in out["reason"]
     # A quiet June is not explained away: high spending is not what quiet means.
     assert investigate.auto_investigation(events, {"busy": [], "quiet": [6]})["anomaly"]["month"] == "2026-06"
     assert investigate.auto_investigation(events)["anomaly"]["month"] == "2026-06"

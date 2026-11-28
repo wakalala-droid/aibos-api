@@ -1,5 +1,5 @@
 """
-AIBOS — the books check: every kwacha accounted for, to the ngwee.
+AI-BOS — the books check: every kwacha accounted for, to the ngwee.
 
 Money reaches the books from many places: a sale typed on the phone, a
 spreadsheet, an invoice, a guest's payment link, a payroll run. Each of those

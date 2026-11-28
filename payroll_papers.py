@@ -1,5 +1,5 @@
 """
-AIBOS — the payroll's papers (3 November 2026).
+AI-BOS — the payroll's papers (3 November 2026).
 
 The payslip, the monthly tax pack and the leaving papers, laid out as
 documents with tables (pdfdoc.report), from what the payroll already saved.
@@ -341,7 +341,7 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
         ("kv", [("Name of the employer", _given(er.get("name")), False),
                 ("Name of the employee", name, False),
                 ("Date of engagement", day_words(start.isoformat()) if start else
-                 (f"not given (paid through AIBOS from {month_words(first)})" if first else "not given"), False),
+                 (f"not given (paid through AI-BOS from {month_words(first)})" if first else "not given"), False),
                 ("Date of discharge", day_words(end.isoformat()) if end else "not given", False),
                 ("Nature of employment", _kind_words(emp), False),
                 ("Employer's NAPSA account number", _given(er.get("napsa")), False),
@@ -360,10 +360,10 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
                             ("Total", 40, "r")],
                    "rows": [["NAPSA", k(napsa_r), k(napsa_e), k(money.total([napsa_r, napsa_e]))],
                             ["NHIMA", k(nhima_r), k(nhima_e), k(money.total([nhima_r, nhima_e]))]]}),
-        ("note", (f"From the {len(worked)} payslip{'s' if len(worked) != 1 else ''} AIBOS keeps for {name}, "
+        ("note", (f"From the {len(worked)} payslip{'s' if len(worked) != 1 else ''} AI-BOS keeps for {name}, "
                   f"{month_words(first)} to {month_words(worked[-1].get('period'))}; contributions paid before "
-                  "AIBOS are not included." if worked else
-                  "No payslips in AIBOS yet: no contributions to show.")),
+                  "AI-BOS are not included." if worked else
+                  "No payslips in AI-BOS yet: no contributions to show.")),
     ]
 
     year = end.year if end else (payroll._paid_on(slips[-1]).year if slips else today.year)
@@ -395,8 +395,8 @@ def leaving_papers_doc(emp: dict, slips: list, employer: dict | None = None, sym
         basic = money.total(s.get("basic") for s in slips if _num(s.get("gratuity_accrued")) > 0)
         rows = []
         if pos["opening"] > 0:
-            rows.append(("Owed from before AIBOS", k(pos["opening"]), False))
-        rows += [(f"Earned on AIBOS ({pos['rate'] * 100:g}% of {k(basic)} basic pay)", k(pos["accrued"]), False),
+            rows.append(("Owed from before AI-BOS", k(pos["opening"]), False))
+        rows += [(f"Earned on AI-BOS ({pos['rate'] * 100:g}% of {k(basic)} basic pay)", k(pos["accrued"]), False),
                  ("Paid" + (f", last on {day_words(pos['last_paid_on'])}" if pos["last_paid_on"] else ""),
                   k(pos["paid"]), False),
                  ("Still owed", k(pos["owed"]), True)]

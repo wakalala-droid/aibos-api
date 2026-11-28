@@ -1,7 +1,7 @@
 """
-AIBOS — the forecast engine (16 October 2026).
+AI-BOS — the forecast engine (16 October 2026).
 
-Every forecast AIBOS shows comes from here: sales and costs on the Forecast
+Every forecast AI-BOS shows comes from here: sales and costs on the Forecast
 page, the cash outlook on Money, the 13-week cash plan, the AI's answers.
 
 What it replaced. Sales were a straight line drawn in the browser, and its

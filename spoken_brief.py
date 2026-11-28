@@ -1,8 +1,8 @@
 """
-The spoken brief: AIBOS reads your business to you and asks what to do first.
+The spoken brief: AI-BOS reads your business to you and asks what to do first.
 
-Phase 1 of "AIBOS as Jarvis" (16 Nov 2026). The owner presses Talk (or holds
-the AIBOS button) and hears a short greeting, the same lines the Morning Brief
+Phase 1 of "AI-BOS as Jarvis" (16 Nov 2026). The owner presses Talk (or holds
+the AI-BOS button) and hears a short greeting, the same lines the Morning Brief
 email carries, what is coming up on the schedule, and then the question
 "What would you like me to handle first?". The answer goes to the ordinary
 chat, so everything the chat can do (answer, look things up, draft a sale for
@@ -167,7 +167,7 @@ def compose(db, tenant: str, role: str, business_id: str | None = None,
     if with_money and not recorded:
         lines = [EMPTY_LINE]
 
-    # What AIBOS's workers found and left waiting for the owner's yes (phase 3).
+    # What AI-BOS's workers found and left waiting for the owner's yes (phase 3).
     if role == "owner":
         try:
             import actions

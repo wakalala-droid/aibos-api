@@ -283,7 +283,7 @@ def test_the_plan_card_judges_this_month_on_pace(books):
     assert 0 <= line["chance_pct"] <= 100
 
 
-# ── What the owner told AIBOS (interview.py, 28 Oct 2026) ────────────────────
+# ── What the owner told AI-BOS (interview.py, 28 Oct 2026) ────────────────────
 
 def _told(db, plan_applied=False, **answers):
     """The owner's interview answers for the default business, as the
@@ -345,7 +345,7 @@ def test_the_low_cash_warning_rings_below_the_cushion(books):
     assert out["warned"] == 1
     kind, title, body = next(s for s in sent if s[0] == "cash_watch")
     assert title == "Your cash is below your K10,000,000 cushion"
-    assert "you told AIBOS to keep at all times" in body and "—" not in body
+    assert "you told AI-BOS to keep at all times" in body and "—" not in body
     cash_watch._CHECKED["day"] = None
 
 
@@ -373,7 +373,7 @@ def test_a_loan_the_owner_told_aibos_about_is_in_the_plan_and_the_bank_pack(book
     assert plan["close"]["p50"] <= before["close"]["p50"] - 2 * 3000
     monkeypatch.setattr(pdfdoc, "available", lambda: False)        # the text copy carries the same words
     text = api.get("/forecast/cash-plan/bank.pdf").text
-    assert "The owner's word" in text and "the business's answers to AIBOS" in text
+    assert "The owner's word" in text and "the business's answers to AI-BOS" in text
 
 
 def test_ask_aibos_reads_the_plan_against_the_cushion(books):

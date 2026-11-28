@@ -1,9 +1,9 @@
 """
-AIBOS — the cash flow projection for the bank (Growth, 16 October 2026).
+AI-BOS — the cash flow projection for the bank (Growth, 16 October 2026).
 
 What a Zambian bank asks for with a loan application: where the money stands
 today, a 12-month projection of money in, money out and closing cash, and the
-assumptions behind it. AIBOS already holds every piece, so the owner downloads
+assumptions behind it. AI-BOS already holds every piece, so the owner downloads
 it from the Cash plan page instead of paying someone to build a spreadsheet:
 
   * the money now: the Money page's figure (cash_watch.inputs, the same read
@@ -207,7 +207,7 @@ def document(name: str, books: dict, plan: dict, year: dict, floor: float = 0.0)
     pairs += [(label, money_exact(split[key], sym), False) for key, label in SOMETIMES
               if abs(float(split.get(key) or 0)) > 0.005]
     blocks.append(("kv", pairs))
-    blocks.append(("note", "The same figure as the Money page in AIBOS: the starting balance and every "
+    blocks.append(("note", "The same figure as the Money page in AI-BOS: the starting balance and every "
                            "confirmed entry since, added up."))
 
     # At a glance
@@ -331,7 +331,7 @@ def document(name: str, books: dict, plan: dict, year: dict, floor: float = 0.0)
                 out.append(line)
         return out
 
-    general = [f"Every figure comes from the confirmed entries in the books of {name} in AIBOS on "
+    general = [f"Every figure comes from the confirmed entries in the books of {name} in AI-BOS on "
                f"{day_words(today)}. Entries still waiting for the owner count only as bills already known.",
                "The 12 months follow the business's monthly trend. The 13 weeks also count the bills already "
                "known and money owed, so the two can differ over the first three months.",
@@ -375,6 +375,6 @@ def document(name: str, books: dict, plan: dict, year: dict, floor: float = 0.0)
     # band, the source as a note under it (pdfdoc.report). The text keeps sub.
     unit = "Zambian kwacha (K)" if sym.strip() == "K" else sym.strip()
     return {"title": TITLE, "filename": filename(name, today), "blocks": blocks,
-            "sub": [name, f"Prepared on {day_words(today)} from the business's own books in AIBOS", currency],
-            "facts": [("Prepared for", name), ("Date", day_words(today)), ("From", "AIBOS"), ("Amounts in", unit)],
-            "source": "Prepared from the business's own books in AIBOS."}
+            "sub": [name, f"Prepared on {day_words(today)} from the business's own books in AI-BOS", currency],
+            "facts": [("Prepared for", name), ("Date", day_words(today)), ("From", "AI-BOS"), ("Amounts in", unit)],
+            "source": "Prepared from the business's own books in AI-BOS."}

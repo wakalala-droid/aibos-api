@@ -1,8 +1,8 @@
 """
-AIBOS: your week, every Monday morning (UX audit step 8, 17 November 2026).
+AI-BOS: your week, every Monday morning (UX audit step 8, 17 November 2026).
 
 The morning brief is the habit, and it is Pro+. Below it an owner who stops
-opening AIBOS for a week heard nothing, so the books went quiet and so did the
+opening AI-BOS for a week heard nothing, so the books went quiet and so did the
 owner. Now every owner with books, on every plan, gets one note on Monday from
 07:00 in Lusaka, in the bell and on their phone:
 
@@ -122,11 +122,11 @@ def compose(f: dict, sym: str = "K") -> tuple[str, str] | None:
     elif owed > 0:
         thing = f"customers owe you {m(owed)}. Home shows who."
     elif quiet:
-        thing = "tell AIBOS each sale and expense as it happens, so next Monday adds up."
+        thing = "tell AI-BOS each sale and expense as it happens, so next Monday adds up."
     elif spent > got:
         thing = f"{m(spent - got)} more went out than came in. Money shows where it went."
     else:
-        thing = "keep recording as you go. AIBOS is watching the cash for you."
+        thing = "keep recording as you go. AI-BOS is watching the cash for you."
 
     if quiet:
         title = "Your week in the books"

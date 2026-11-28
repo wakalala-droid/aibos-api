@@ -1,5 +1,5 @@
 """
-AIBOS Engine 2 — Customer & Market Intelligence
+AI-BOS Engine 2 — Customer & Market Intelligence
 Functions: 12 | Target: SME businesses in Zambia
 """
 

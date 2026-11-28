@@ -1,5 +1,5 @@
 """
-AIBOS's workers (Jarvis, phase 3): they find, the owner decides.
+AI-BOS's workers (Jarvis, phase 3): they find, the owner decides.
 
 Pins the promises: a worker never does anything on its own, every finding
 waits on the "Needs you" list for a yes; the same thing is never asked twice;
@@ -356,7 +356,7 @@ def test_the_hourly_pass_runs_in_the_day_every_few_hours_and_tells_the_owner(db,
     assert note[2] == "needs_you" and note[3] == "3 things need you" and note[5] == "/dashboard#needs-you"
     assert workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(minutes=30)) == \
         {"skipped": "ran lately"}
-    # An hour on, the job runs, but books not on AIBOS auto wait their three hours.
+    # An hour on, the job runs, but books not on AI-BOS auto wait their three hours.
     assert workers.run_all(db, lambda *a: told.append(a), now=NOW + timedelta(hours=1)) == \
         {"owners": 1, "new": 0, "closed": 0}
 

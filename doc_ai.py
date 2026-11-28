@@ -1,5 +1,5 @@
 """
-AIBOS — Document understanding: let the model read the whole workbook.
+AI-BOS — Document understanding: let the model read the whole workbook.
 
 sheetscan.py works out the SHAPE of a file (which sheets, which tables, where the
 header is, which way round the months run). This module works out its MEANING:
@@ -230,7 +230,7 @@ def plan(scanned: dict, filename: str = "", use_ai: bool = True) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.warning("doc_ai: planning failed (%s); using the rules", exc)
         out = plan_locally(scanned)
-        out["reason"] = "The AI could not read the file this time, so AIBOS used its own rules."
+        out["reason"] = "The AI could not read the file this time, so AI-BOS used its own rules."
         return out
 
 

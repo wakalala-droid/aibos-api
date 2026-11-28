@@ -1,5 +1,5 @@
 """
-AIBOS: lock-screen alerts in the iPhone app, through Apple's push service.
+AI-BOS: lock-screen alerts in the iPhone app, through Apple's push service.
 
 The iPhone app (aibos-ios) shows the website in a web view, and a web view
 has no web push, so webpush.py cannot reach it. The app asks iOS for a device
@@ -153,8 +153,8 @@ def is_token(endpoint: str | None) -> bool:
 
 def payload(message: dict) -> dict:
     """What the phone shows: the title and words on the lock screen, the
-    sound, and the page of AIBOS a tap opens (read by the app)."""
-    alert = {"title": str(message.get("title") or "AIBOS")[:120]}
+    sound, and the page of AI-BOS a tap opens (read by the app)."""
+    alert = {"title": str(message.get("title") or "AI-BOS")[:120]}
     if message.get("body"):
         alert["body"] = str(message["body"])[:300]
     aps: dict = {"alert": alert, "sound": "default"}

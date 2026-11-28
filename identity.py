@@ -1,5 +1,5 @@
 """
-AIBOS — Business identity lookup ("it already knew me").
+AI-BOS — Business identity lookup ("it already knew me").
 
 When an owner types their business name in the Setup Wizard, this finds their
 existing public presence and offers it back as a one-tap pre-fill: industry,

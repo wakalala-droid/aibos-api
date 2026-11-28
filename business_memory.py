@@ -1,5 +1,5 @@
 """
-AIBOS — Business Memory (Evolution Initiatives 8 & 13).
+AI-BOS — Business Memory (Evolution Initiatives 8 & 13).
 
 Every user correction becomes reusable intelligence so future inputs need less
 work (Bible 8th Law: nothing entered twice). Two halves:
@@ -151,8 +151,8 @@ def recall_all(db, user_id: str, kind: str) -> dict:
 
 
 # Bookkeeping the app keeps for itself (the last column mapping, which files
-# were imported), not something AIBOS learned about the business. Shown in the
-# "What AIBOS has learned" list they read as nonsense like "excel_import: 3f9a…".
+# were imported), not something AI-BOS learned about the business. Shown in the
+# "What AI-BOS has learned" list they read as nonsense like "excel_import: 3f9a…".
 _INTERNAL_KINDS = ("excel_mapping", "excel_import", "latest_analysis", "workbook_rows")
 
 
@@ -169,14 +169,14 @@ def list_mappings(db, user_id: str) -> list:
 
 
 def forget(db, user_id: str, mapping_id: str) -> None:
-    """Delete one learned mapping — the owner corrects AIBOS (audit #57)."""
+    """Delete one learned mapping — the owner corrects AI-BOS (audit #57)."""
     if db is None:
         return
     db.table("business_memory").delete().eq("id", mapping_id).eq("user_id", user_id).execute()
 
 
 def summary(db, user_id: str) -> dict:
-    """What AIBOS has learned about this business, for the owner to SEE (audit
+    """What AI-BOS has learned about this business, for the owner to SEE (audit
     #57). Counts per kind + a few sample aliases. Best-effort; never raises."""
     if db is None:
         return {"available": False}

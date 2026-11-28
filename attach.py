@@ -1,5 +1,5 @@
 """
-AIBOS — Attach: put every imported row against the thing it actually concerns.
+AI-BOS — Attach: put every imported row against the thing it actually concerns.
 
 An amount and a date is bookkeeping. A business needs to know WHO and WHAT: that
 K4,500 was Mary's wages, that K2,300 bought 40 bags of mealie meal on the 8th,
@@ -594,7 +594,7 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
                 "title": (f"Who is {named}?" if named else "Who was this paid to?"),
                 "ask": (f"This looks like wages, but {named} is not on your worker list yet."
                         if named else
-                        "This looks like wages, but AIBOS does not know who it was paid to."),
+                        "This looks like wages, but AI-BOS does not know who it was paid to."),
                 "why": ("Wages need a worker behind them so their pay, NAPSA and PAYE "
                         "are worked out properly from here on."),
                 "options": ["Add them as a worker", "Point it at an existing worker",
@@ -681,7 +681,7 @@ def resolve_row(row: dict, text: str, amount, context: dict, hint: dict | None =
             "type": "uncategorised",
             "name": text[:80],
             "title": "What was this spent on?",
-            "ask": ("AIBOS could not tell what this was for from the wording on "
+            "ask": ("AI-BOS could not tell what this was for from the wording on "
                     "the line."),
             "why": ("Naming it puts the money in the right place on your expense "
                     "breakdown instead of a general pile you cannot act on."),

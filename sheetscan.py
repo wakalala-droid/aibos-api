@@ -1,5 +1,5 @@
 """
-AIBOS — Sheet scanner: read EVERY sheet of a workbook the way a person reads it.
+AI-BOS — Sheet scanner: read EVERY sheet of a workbook the way a person reads it.
 
 The old reader asked pandas for one sheet and assumed row 1 was the header. Real
 books from real businesses are almost never shaped that way, and a village-banking
@@ -598,7 +598,7 @@ def check_running_balance(grid: list, names: list, data_rows: list, used: list,
 
     A cash book proves itself: balance[n] = balance[n-1] + in - out. Where that
     fails, either a figure or the balance was typed wrong, and only the person
-    who was there knows which. AIBOS never silently "corrects" money — it points
+    who was there knows which. AI-BOS never silently "corrects" money — it points
     at the line.
 
     A blank balance means a new section started, so the chain restarts rather

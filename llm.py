@@ -1,5 +1,5 @@
 """
-AIBOS — which AI provider we talk to, which models, and the one-shot fallback.
+AI-BOS — which AI provider we talk to, which models, and the one-shot fallback.
 
 WHY THIS FILE GREW A PROVIDER SWITCH (September 2026)
 
@@ -504,7 +504,7 @@ QUOTA_MESSAGE = ("The AI assistant has reached its usage limit for now, so it ca
                  "Please try again a little later.")
 
 # The paid budget is spent (is_budget_error). The owner of the business asking
-# cannot do anything about it, and the AI comes back when AIBOS tops up the
+# cannot do anything about it, and the AI comes back when AI-BOS tops up the
 # credit or the month turns, so the message says neither "tomorrow" nor "free".
 BUDGET_MESSAGE = ("The AI assistant is paused on our side for now, so it cannot answer. Your "
                   "records are all still there and every other page works, including Record "

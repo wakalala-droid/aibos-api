@@ -1,5 +1,5 @@
 """
-AIBOS — Business Nervous System  (Directive Initiative 11).
+AI-BOS — Business Nervous System  (Directive Initiative 11).
 
 The single pipeline every business input flows through. Nothing bypasses it
 (Directive: "No feature should bypass this pipeline."). It is NOT another engine —
@@ -494,7 +494,7 @@ def confirm(db, user_id: str, event_id: str) -> dict:
 
 
 def unconfirm(db, user_id: str, event_id: str, note: str = "put back to wait for the owner") -> dict:
-    """Put a confirmed entry back to waiting (AIBOS auto confirmed it and the
+    """Put a confirmed entry back to waiting (AI-BOS auto confirmed it and the
     owner tapped Undo). Nothing is removed: it waits on Activity as it did."""
     ev = _get_event(db, user_id, event_id)
     if ev["status"] != "confirmed":
@@ -755,7 +755,7 @@ def list_events(db, user_id: str, *, status: str | None = None, event_type: str 
 # via the normal ingest() path.
 
 CLASSIFY_SYSTEM = (
-    "You are the data-entry brain of AIBOS, a business operating system for Zambian SMEs. "
+    "You are the data-entry brain of AI-BOS, a business operating system for Zambian SMEs. "
     "Convert ONE plain-language description of something that happened in a business into a "
     "single structured Business Event. Respond with STRICT JSON only — no prose, no markdown.\n\n"
     "Schema:\n"

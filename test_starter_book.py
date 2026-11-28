@@ -1,5 +1,5 @@
 """
-The AIBOS workbook (starter_book.py): made for the business, known again by its
+The AI-BOS workbook (starter_book.py): made for the business, known again by its
 headings, every line filed as the owner wrote it.
 
 Covered here:
@@ -90,7 +90,7 @@ def test_the_workbook_has_a_sheet_for_each_kind_of_money():
     assert wb.sheetnames == ["Start here", "Lists", "Sales", "Expenses", "Stock bought",
                              "Wages", "Products", "Workers"]
     assert wb["Lists"].sheet_state == "hidden"
-    assert wb["Start here"]["A1"].value == "Mwape Hardware: AIBOS workbook"
+    assert wb["Start here"]["A1"].value == "Mwape Hardware: AI-BOS workbook"
     for spec in sb.SHEETS:
         ws = wb[spec["title"]]
         assert [c.value for c in ws[1]] == [c[0] for c in spec["columns"]]
@@ -141,7 +141,7 @@ def test_every_word_follows_the_house_style():
 # ── Knowing it again ──────────────────────────────────────────────────────────
 
 def test_a_filled_workbook_is_known_table_by_table():
-    scanned = sheetscan.scan(_filled(LINES), "AIBOS workbook.xlsx")
+    scanned = sheetscan.scan(_filled(LINES), "AI-BOS workbook.xlsx")
     plans = sb.plan_tables(scanned)
     assert len(plans) == len(scanned["tables"])             # so no AI is asked
     kinds = {sb.recognise(t): t["sheet"] for t in scanned["tables"]}
@@ -295,7 +295,7 @@ def test_the_workbook_downloads_made_for_the_business(restore):
     client = _client(db, "/templates/workbook.xlsx")
     r = client.get("/templates/workbook.xlsx")
     assert r.status_code == 200, r.text
-    assert 'filename="Mwape Hardware AIBOS workbook.xlsx"' in r.headers["content-disposition"]
+    assert 'filename="Mwape Hardware AI-BOS workbook.xlsx"' in r.headers["content-disposition"]
     wb = openpyxl.load_workbook(io.BytesIO(r.content))
     assert wb["Lists"]["A2"].value == "Mobile money"
     assert wb["Products"]["A2"].value == "Cement 50kg" and wb["Workers"]["A2"].value == "Mary Banda"

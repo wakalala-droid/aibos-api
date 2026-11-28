@@ -1,10 +1,10 @@
 """
-AIBOS — Teach AIBOS your business: the owner interview.
+AI-BOS — Teach AI-BOS your business: the owner interview.
 
 A new account's books are empty, and empty books say nothing about the business
 behind them: how old it is, what sells, which months are busy, what the owner
-is aiming for. Every answer AIBOS gave in its first weeks was generic for want
-of it. So AIBOS asks, the way a good accountant does on the first visit: one
+is aiming for. Every answer AI-BOS gave in its first weeks was generic for want
+of it. So AI-BOS asks, the way a good accountant does on the first visit: one
 question at a time, in five short chapters, every one of them skippable.
 
 What it does with the answers:
@@ -20,7 +20,7 @@ What it does with the answers:
   • the busy and quiet months stop a month that was always busy or quiet
     being called unusual; the forecast says so where it matters
     (seasons.py reads them through seasons());
-  • the AIBOS workbook (starter_book.py) offers the owner's own payment methods
+  • the AI-BOS workbook (starter_book.py) offers the owner's own payment methods
     and biggest costs first in its dropdowns.
 
 The pieces:
@@ -28,8 +28,8 @@ The pieces:
                    the tests read it.
   applicable()     the questions for THIS business: an industry's own pack,
                    and a follow-up only after the answer that calls for it.
-  read_answer()    the owner's words as a value AIBOS can use (K50k → 50000).
-  reflect()        one line back, so the owner sees what AIBOS took from it.
+  read_answer()    the owner's words as a value AI-BOS can use (K50k → 50000).
+  reflect()        one line back, so the owner sees what AI-BOS took from it.
   facts_for_ai()   the answers as a briefing for the AI chat.
   goal_plan()      the goals as monthly revenue and profit targets.
 
@@ -70,7 +70,7 @@ QUESTIONS: tuple = (
     {"id": "started", "chapter": "story", "kind": "month", "label": "Started",
      "ask": "When did {business} start?",
      "placeholder": "e.g. March 2019, or just 2019",
-     "why": "AIBOS reads your figures knowing how young or old the business is."},
+     "why": "AI-BOS reads your figures knowing how young or old the business is."},
     {"id": "why_started", "chapter": "story", "kind": "text", "label": "Why it started",
      "ask": "Why did you start it? A sentence or two is plenty.",
      "placeholder": "e.g. Nobody near us sold building materials, so builders had to go to town",
@@ -78,7 +78,7 @@ QUESTIONS: tuple = (
     {"id": "people", "chapter": "story", "kind": "text", "label": "Who runs it",
      "ask": "Who owns it and who runs it day to day?",
      "placeholder": "e.g. I own it with my wife. Joseph manages the shop.",
-     "why": "So AIBOS knows who decides and who it is talking to."},
+     "why": "So AI-BOS knows who decides and who it is talking to."},
     {"id": "team", "chapter": "story", "kind": "number", "label": "People working",
      "ask": "How many people work in it, counting you?",
      "placeholder": "e.g. 4",
@@ -88,7 +88,7 @@ QUESTIONS: tuple = (
     {"id": "sells", "chapter": "offer", "kind": "text", "label": "What it sells",
      "ask": "What do you sell? Name your main products or services.",
      "placeholder": "e.g. Cement, roofing sheets, paint and hardware",
-     "why": "AIBOS files your sales against these."},
+     "why": "AI-BOS files your sales against these."},
     {"id": "best_sellers", "chapter": "offer", "kind": "text", "label": "Best sellers",
      "ask": "Which of those bring in the most money?",
      "placeholder": "e.g. Cement, by far",
@@ -101,7 +101,7 @@ QUESTIONS: tuple = (
     {"id": "paid_by", "chapter": "offer", "kind": "multi", "label": "How customers pay",
      "ask": "How do customers pay you?",
      "options": ["Cash", "Mobile money", "Bank transfer", "Card"],
-     "why": "Your AIBOS workbook offers these first under Paid by."},
+     "why": "Your AI-BOS workbook offers these first under Paid by."},
     {"id": "credit", "chapter": "offer", "kind": "choice", "label": "Sells on credit",
      "ask": "Do customers ever buy now and pay later?",
      "options": ["Never", "Sometimes", "Most of them"],
@@ -110,7 +110,7 @@ QUESTIONS: tuple = (
      "ask": "Roughly how much do customers owe you right now?",
      "placeholder": "e.g. 12,000",
      "after": {"id": "credit", "not": ["Never"]},
-     "why": "AIBOS keeps it in mind when it talks about your cash."},
+     "why": "AI-BOS keeps it in mind when it talks about your cash."},
 
     # Each industry's own questions
     {"id": "rooms", "chapter": "offer", "kind": "number", "label": "Rooms or units",
@@ -120,7 +120,7 @@ QUESTIONS: tuple = (
     {"id": "night_rate", "chapter": "offer", "kind": "money", "label": "Average rate a night",
      "ask": "What do you charge a night, on average?", "placeholder": "e.g. 850",
      "industries": ("Hospitality",),
-     "why": "With the rooms, this tells AIBOS what a full month is worth."},
+     "why": "With the rooms, this tells AI-BOS what a full month is worth."},
     {"id": "daily_customers", "chapter": "offer", "kind": "number", "label": "Customers a day",
      "ask": "About how many customers do you serve on a normal day?", "placeholder": "e.g. 60",
      "industries": ("Restaurant / Food", "Retail"),
@@ -128,7 +128,7 @@ QUESTIONS: tuple = (
     {"id": "stock_worth", "chapter": "offer", "kind": "money", "label": "Stock worth now",
      "ask": "Roughly what is the stock on your shelves worth today?", "placeholder": "e.g. 80,000",
      "industries": ("Retail", "Wholesale"),
-     "why": "Stock is cash sitting on a shelf. AIBOS weighs it against what sells."},
+     "why": "Stock is cash sitting on a shelf. AI-BOS weighs it against what sells."},
     {"id": "vehicles", "chapter": "offer", "kind": "number", "label": "Vehicles",
      "ask": "How many vehicles do you run?", "placeholder": "e.g. 3",
      "industries": ("Transport",),
@@ -137,7 +137,7 @@ QUESTIONS: tuple = (
      "ask": "What do you grow or raise and when do you sell it?",
      "placeholder": "e.g. Maize and soya. We plant in November and sell from May.",
      "industries": ("Agriculture",),
-     "why": "A farm's money comes in seasons. AIBOS should not call a planting month a bad one."},
+     "why": "A farm's money comes in seasons. AI-BOS should not call a planting month a bad one."},
     {"id": "charge_by", "chapter": "offer", "kind": "choice", "label": "How you charge",
      "ask": "How do you charge for your work?",
      "options": ["By the job", "By the hour or day", "A monthly fee", "A mix"],
@@ -158,7 +158,7 @@ QUESTIONS: tuple = (
     {"id": "normal_sales", "chapter": "money", "kind": "money", "label": "Sales in a normal month",
      "ask": "In a normal month, roughly how much comes in from sales?",
      "placeholder": "e.g. 50,000",
-     "why": "AIBOS uses this as the yardstick until your own records build up."},
+     "why": "AI-BOS uses this as the yardstick until your own records build up."},
     {"id": "normal_costs", "chapter": "money", "kind": "money", "label": "Costs in a normal month",
      "ask": "And roughly how much goes out in a normal month: stock, rent, wages, everything?",
      "placeholder": "e.g. 38,000",
@@ -167,7 +167,7 @@ QUESTIONS: tuple = (
      "ask": "Which costs are the biggest?",
      "options": ["Stock", "Rent", "Wages", "Fuel and transport", "Electricity and water",
                  "Airtime and data", "Loan repayments", "Repairs"],
-     "why": "Your AIBOS workbook lists these first under Category."},
+     "why": "Your AI-BOS workbook lists these first under Category."},
     {"id": "busy_months", "chapter": "money", "kind": "months", "label": "Busiest months",
      "ask": "Which months are busiest?",
      "why": "A busy month should be judged against other busy months."},
@@ -181,12 +181,12 @@ QUESTIONS: tuple = (
     {"id": "loan_monthly", "chapter": "money", "kind": "money", "label": "Loan repayment a month",
      "ask": "How much do you repay each month?", "placeholder": "e.g. 4,000",
      "after": {"id": "loan", "not": ["No"]},
-     "why": "AIBOS keeps it in mind when it talks about what is safe to spend."},
+     "why": "AI-BOS keeps it in mind when it talks about what is safe to spend."},
 
     # Money goals
     {"id": "sales_goal", "chapter": "money_goals", "kind": "money", "label": "Sales goal a month",
      "ask": "What would you like sales to be each month?", "placeholder": "e.g. 80,000",
-     "why": "AIBOS turns it into a target for each month, so you can see if you are on pace."},
+     "why": "AI-BOS turns it into a target for each month, so you can see if you are on pace."},
     {"id": "sales_goal_by", "chapter": "money_goals", "kind": "choice", "label": "Sales goal by",
      "ask": "By when?",
      "options": ["In 3 months", "In 6 months", "In a year", "In 2 years"],
@@ -194,11 +194,11 @@ QUESTIONS: tuple = (
      "why": "The time you give it decides how much each month has to grow."},
     {"id": "profit_goal", "chapter": "money_goals", "kind": "money", "label": "Profit goal a month",
      "ask": "How much profit a month would make you happy?", "placeholder": "e.g. 15,000",
-     "why": "Sales can grow while profit shrinks. AIBOS watches both."},
+     "why": "Sales can grow while profit shrinks. AI-BOS watches both."},
     {"id": "cushion", "chapter": "money_goals", "kind": "money", "label": "Cash cushion",
      "ask": "How much cash do you want to keep in the business at all times, as a cushion?",
      "placeholder": "e.g. 20,000",
-     "why": "AIBOS keeps it in mind when it tells you what is safe to spend."},
+     "why": "AI-BOS keeps it in mind when it tells you what is safe to spend."},
     {"id": "saving_for", "chapter": "money_goals", "kind": "text", "label": "Saving for",
      "ask": "Are you saving for something big? Say what and roughly how much.",
      "placeholder": "e.g. A delivery van, about K150,000",
@@ -208,21 +208,21 @@ QUESTIONS: tuple = (
     {"id": "three_years", "chapter": "goals", "kind": "text", "label": "In three years",
      "ask": "Picture the business in three years. What does it look like?",
      "placeholder": "e.g. Two shops, a delivery van and a manager in each",
-     "why": "Every answer AIBOS gives should move you towards this."},
+     "why": "Every answer AI-BOS gives should move you towards this."},
     {"id": "next_steps", "chapter": "goals", "kind": "multi", "label": "Next big steps",
      "ask": "What are the next big steps?",
      "options": ["Open another branch", "Hire more people", "Buy equipment or a vehicle",
                  "Get a loan to grow", "Register for tax properly", "Sell online",
                  "Pay myself a proper salary", "Keep better books"],
-     "why": "AIBOS can tell you when the numbers say a step is affordable."},
+     "why": "AI-BOS can tell you when the numbers say a step is affordable."},
     {"id": "worries", "chapter": "goals", "kind": "text", "label": "Worries",
      "ask": "What worries you most about the business?",
      "placeholder": "e.g. Running out of cash in January when school fees are due",
-     "why": "What keeps you up at night is what AIBOS should watch first."},
+     "why": "What keeps you up at night is what AI-BOS should watch first."},
     {"id": "watch_for", "chapter": "goals", "kind": "text", "label": "Watch for",
-     "ask": "What should AIBOS keep an eye on for you?",
+     "ask": "What should AI-BOS keep an eye on for you?",
      "placeholder": "e.g. Staff giving discounts and the cement running out",
-     "why": "AIBOS keeps it in mind every time it answers you."},
+     "why": "AI-BOS keeps it in mind every time it answers you."},
 )
 
 BY_ID = {q["id"]: q for q in QUESTIONS}
@@ -480,7 +480,7 @@ def read_answer(q: dict, raw, today: date | None = None):
             raise ValueError("Pick at least one month, or press Skip.")
         return months, None
 
-    raise ValueError("AIBOS does not know how to read that answer.")
+    raise ValueError("AI-BOS does not know how to read that answer.")
 
 
 def record(answers: dict, qid: str, raw=None, skip: bool = False, clear: bool = False,
@@ -569,7 +569,7 @@ def _years_since(when: str, today: date) -> float | None:
 
 
 def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) -> str | None:
-    """One line back after an answer, showing what AIBOS took from it. Only
+    """One line back after an answer, showing what AI-BOS took from it. Only
     arithmetic on what the owner said: never a claim about the books."""
     today = today or date.today()
     v = _value(answers, qid)
@@ -582,7 +582,7 @@ def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) 
         if years is None:
             return None
         if years < 1:
-            return "So the business is less than a year old. Every month you record teaches AIBOS more."
+            return "So the business is less than a year old. Every month you record teaches AI-BOS more."
         return f"So the business is {_age(years)} old."
 
     if qid == "normal_costs" and sales:
@@ -592,7 +592,7 @@ def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) 
                     f"{round(left / sales * 100)}% of sales.")
         if left < 0:
             return (f"So a normal month spends about {money_text(-left, sym)} more than it "
-                    "brings in. AIBOS will keep that in view.")
+                    "brings in. AI-BOS will keep that in view.")
         return "So a normal month just breaks even."
 
     if qid == "owed_to_you" and sales:
@@ -606,7 +606,7 @@ def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) 
 
     if qid == "sales_goal" and sales:
         if v <= sales:
-            return "A normal month already reaches that. AIBOS will hold you to it."
+            return "A normal month already reaches that. AI-BOS will hold you to it."
         return f"That is {money_text(v - sales, sym)} a month more than a normal month today."
 
     if qid == "sales_goal_by":
@@ -641,7 +641,7 @@ def reflect(qid: str, answers: dict, sym: str = "K", today: date | None = None) 
     if qid in ("busy_months", "quiet_months"):
         names = join_words([MONTH_NAMES[m - 1] for m in v])
         word = "busy" if qid == "busy_months" else "quiet"
-        return f"AIBOS will keep in mind that {names} run {word}, in its answers and in your reports."
+        return f"AI-BOS will keep in mind that {names} run {word}, in its answers and in your reports."
 
     return None
 
@@ -668,7 +668,7 @@ def _weeks(w: float) -> str:
 AI_MAX_CHARS = 2400
 
 AI_HEADER = (
-    "WHAT THE OWNER TOLD AIBOS ABOUT THIS BUSINESS (the setup interview, in "
+    "WHAT THE OWNER TOLD AI-BOS ABOUT THIS BUSINESS (the setup interview, in "
     "their own words). Use it to make every answer about THIS business: judge "
     "a month against their normal month and their goals, mind their busy and "
     "quiet months and keep their worries in view. These are the owner's own "
@@ -803,7 +803,7 @@ def own_targets(kept: list) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# For the rest of AIBOS
+# For the rest of AI-BOS
 # ══════════════════════════════════════════════════════════════════════════════
 # What the cash plan, the reports and the morning brief take from the answers.
 # Only what the owner actually said: a skipped question gives None, never a guess.

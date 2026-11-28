@@ -1,10 +1,10 @@
 """
-AIBOS: notifications to the phone (upgrade 10, migration 0036).
+AI-BOS: notifications to the phone (upgrade 10, migration 0036).
 
 Everything that lands in the bell (a booking request, a guest's payment, a plan
 renewal) now also reaches the owner's phone or computer as a notification, even
-with AIBOS closed, on any browser or installed app that allows it (Android,
-Windows, Mac; iPhone once AIBOS is added to the Home Screen). The iPhone app's
+with AI-BOS closed, on any browser or installed app that allows it (Android,
+Windows, Mac; iPhone once AI-BOS is added to the Home Screen). The iPhone app's
 web view has no web push: its alerts go through Apple's push service (apns.py)
 and are kept in the same list, so send_to_user reaches both.
 
@@ -18,7 +18,7 @@ THE SIGNING KEY NEEDS NO SETUP. VAPID_PRIVATE_KEY (a base64url P-256 scalar)
 is used when set. Otherwise the key is derived from SUPABASE_JWT_SECRET, which
 the API already holds, so it is stable across restarts without a new secret to
 manage. Changing that secret changes the key; browsers then sign up again the
-next time the owner opens AIBOS.
+next time the owner opens AI-BOS.
 
 NEVER RAISES into a caller: a push that fails must not cost a booking.
 """
@@ -151,7 +151,7 @@ def _send_one(sub: dict, message: dict, subject: str) -> int:
 def send_to_user(db, user_id: str, title: str, body: str = "", link: str = "",
                  wait: bool = False, extra: dict | None = None) -> dict:
     """Notify every browser this person turned notifications on in, and every
-    iPhone with the AIBOS app (apns.py). Runs on a thread unless `wait`; dead
+    iPhone with the AI-BOS app (apns.py). Runs on a thread unless `wait`; dead
     subscriptions (404/410, or Apple's "gone") are removed. `extra` rides along
     to the service worker: `tag` keeps one notification from replacing
     another, `sticky` keeps it on screen until it is dealt with."""
@@ -232,7 +232,7 @@ def describe(agent: str | None) -> str:
                else "Chrome" if "chrome" in a or "crios" in a
                else "Safari" if "safari" in a else "")
     if "aibos-ios" in a:
-        return f"the AIBOS app on {'an iPad' if device == 'iPad' else 'an iPhone'}"
+        return f"the AI-BOS app on {'an iPad' if device == 'iPad' else 'an iPhone'}"
     if device and browser:
         return f"{browser} on {'an' if device[0].lower() in 'aeiou' else 'a'} {device}"
     return device or browser or "A browser"
@@ -243,7 +243,7 @@ def describe_service(endpoint: str | None) -> str:
     user agent says nothing: the website's relay used to pass on its own
     instead of the browser's, so early sign-ups were all "a browser"."""
     if apns.is_token(endpoint):
-        return "the AIBOS app on an iPhone"
+        return "the AI-BOS app on an iPhone"
     host = urlparse(str(endpoint or "")).netloc.lower()
     if host.endswith("notify.windows.com"):
         return "Edge on a Windows computer"
@@ -264,7 +264,7 @@ def devices(db, user_id: str) -> list[dict]:
     out = []
     for r in getattr(res, "data", None) or []:
         name = describe(r.get("user_agent"))
-        if name == "A browser" or (apns.is_token(r.get("endpoint")) and not name.startswith("the AIBOS app")):
+        if name == "A browser" or (apns.is_token(r.get("endpoint")) and not name.startswith("the AI-BOS app")):
             name = describe_service(r.get("endpoint"))
         out.append({"id": r.get("id"), "device": name, "since": r.get("created_at")})
     return out

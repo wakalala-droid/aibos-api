@@ -1028,7 +1028,7 @@ def test_a_reversal_is_booked_as_a_refund_not_as_income():
 def test_the_running_balance_is_checked_against_the_figures():
     """A cash book proves itself: balance[n] = balance[n-1] + in - out. Where it
     does not, a figure or the balance was typed wrong, and only the owner knows
-    which — so AIBOS points at the line and changes nothing."""
+    which — so AI-BOS points at the line and changes nothing."""
     def build(wb):
         ws = wb.active
         for j, h in enumerate(["DATE", "DESCRIPTION", "IN", "OUT", "BALANCE"]):
@@ -1087,7 +1087,7 @@ def test_a_break_in_the_book_does_not_cascade_into_false_errors():
 
 
 def test_every_figure_in_a_cash_book_is_accounted_for(cashbook):
-    """The whole point, stated as arithmetic: what AIBOS reads must net to what
+    """The whole point, stated as arithmetic: what AI-BOS reads must net to what
     the sheet says, to the cent. Not a sample — every row."""
     import openpyxl
     import io as _io
@@ -1133,7 +1133,7 @@ def test_the_same_figure_is_never_counted_twice(cashbook):
 # ══════════════════════════════════════════════════════════════════════════════
 # The invariant: money that goes in must come out
 # ══════════════════════════════════════════════════════════════════════════════
-# Every event AIBOS builds is validated by the spine before it is saved, and a
+# Every event AI-BOS builds is validated by the spine before it is saved, and a
 # rejected event is reported in a "skipped" list the owner has no reason to
 # open. Loan.direction was being set to "in" when the spine wants "received",
 # so eighteen rows — K90,818 of the director's floats — were thrown away while
@@ -1184,7 +1184,7 @@ def test_every_kwacha_in_the_file_reaches_the_books(cashbook):
     ("laundry", "out", "Expense"),
 ])
 def test_everything_the_classifier_produces_is_a_valid_event(text, direction, event_type, context):
-    """Every shape AIBOS builds must pass the spine's own validation. A payload
+    """Every shape AI-BOS builds must pass the spine's own validation. A payload
     the spine refuses is a row dropped after the owner was told it imported."""
     import nervous_system as nervous
     out = attach.resolve_row({}, text, 1000, context, None, direction)
@@ -1287,7 +1287,7 @@ def test_every_sheet_is_added_up_together(multi_sheet_book):
 @pytest.mark.parametrize("sheet", ["July", "August", "September"])
 def test_each_sheet_also_reads_on_its_own(multi_sheet_book, sheet):
     """Switching to a tab must never answer "no recognisable revenue column"
-    about figures AIBOS can plainly read when it reads them all together."""
+    about figures AI-BOS can plainly read when it reads them all together."""
     import main
     df = main._ledger_to_monthly(multi_sheet_book, "book.xlsx", only_sheet=sheet)
     assert df is not None and not df.empty
@@ -1404,7 +1404,7 @@ def test_the_analyse_screen_reads_the_whole_workbook(multi_sheet_book):
 # ══════════════════════════════════════════════════════════════════════════════
 # Questions a person can actually answer
 # ══════════════════════════════════════════════════════════════════════════════
-# "Money came in here, but AIBOS cannot tell what for. (2 lines, sheet Sheet1)"
+# "Money came in here, but AI-BOS cannot tell what for. (2 lines, sheet Sheet1)"
 # names no figure, no day, and none of the words from the owner's own book. The
 # only ways through it are to guess or to skip, and guessing is how a wrong
 # figure gets into real books.

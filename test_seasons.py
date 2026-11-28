@@ -1,7 +1,7 @@
 """
 The owner's busy and quiet months in Unusual spending, Month by month and the
 Forecast (seasons.py): a month the owner named is not called unusual for being
-what they said it is, the reports say "You told AIBOS November runs busy"
+what they said it is, the reports say "You told AI-BOS November runs busy"
 where it changes a reading, and every other month reads exactly as before.
 """
 
@@ -34,7 +34,7 @@ def test_a_busy_month_high_is_not_unusual_and_says_why():
     assert not any(f["month"] == "2025-12" for f in out["flags"])
     held = next(h for h in out["held"] if h["month"] == "2025-12")
     assert held["field"] == "Revenue" and held["direction"] == "up"
-    assert held["told"] == "You told AIBOS December runs busy, so high sales are not counted as unusual."
+    assert held["told"] == "You told AI-BOS December runs busy, so high sales are not counted as unusual."
     dec = next(m for m in out["months"] if m["month"] == "2025-12")
     assert dec["status"] == "Busy month" and dec["season"] == "busy"
 
@@ -54,7 +54,7 @@ def test_the_wrong_way_in_a_named_month_is_still_flagged_and_says_so():
     out = ss.unusual(rows, BUSY_DEC)
     dec = next(f for f in out["flags"] if f["month"] == "2025-12")
     assert dec["direction"] == "down"
-    assert dec["told"] == "You told AIBOS December runs busy, which makes sales this low stand out more."
+    assert dec["told"] == "You told AI-BOS December runs busy, which makes sales this low stand out more."
     assert any(f["month"] == "2026-01" and f["direction"] == "up" for f in out["flags"])
     assert out["held"] == []
 
@@ -85,19 +85,19 @@ def test_month_by_month_reads_a_season_as_a_season():
     assert by["2025-10"]["first"] is True
     # Costs up 40% into a busy December: not the wrong way.
     assert by["2025-12"]["costs_pct"] == 40.0 and by["2025-12"]["costs_wrong"] is False
-    assert by["2025-12"]["told"] == "You told AIBOS December runs busy."
+    assert by["2025-12"]["told"] == "You told AI-BOS December runs busy."
     # Sales down into a quiet January.
-    assert by["2026-01"]["sales_wrong"] is False and by["2026-01"]["told"] == "You told AIBOS January runs quiet."
+    assert by["2026-01"]["sales_wrong"] is False and by["2026-01"]["told"] == "You told AI-BOS January runs quiet."
     # Out of the quiet month, costs up: explained by the month before.
     assert by["2026-02"]["costs_wrong"] is False
-    assert by["2026-02"]["told"] == "Up from January, which you told AIBOS runs quiet."
+    assert by["2026-02"]["told"] == "Up from January, which you told AI-BOS runs quiet."
 
 
 def test_a_fall_out_of_a_busy_month_is_said_and_an_ordinary_fall_is_still_red():
     rows = _months([10000, 20000, 12000, 9000], [7000] * 4, start=(2025, 11))   # Nov, Dec, Jan, Feb
     by = {c["month"]: c for c in ss.changes(rows, {"busy": [12]})}
     assert by["2026-01"]["sales_wrong"] is False
-    assert by["2026-01"]["told"] == "Down from December, which you told AIBOS runs busy."
+    assert by["2026-01"]["told"] == "Down from December, which you told AI-BOS runs busy."
     assert by["2026-02"]["sales_wrong"] is True and by["2026-02"]["told"] is None
     plain = {c["month"]: c for c in ss.changes(rows, {})}
     assert plain["2026-01"]["sales_wrong"] is True
@@ -107,9 +107,9 @@ def test_the_forecast_says_where_a_season_changes_its_reading():
     out = ss.forecast_notes(["2026-10", "2026-11", "2026-12", "2027-01"], [], False,
                             {"busy": [11, 12], "quiet": [1]})
     assert out["notes"] == [
-        "You told AIBOS November and December run busy. Until two full years are recorded the "
+        "You told AI-BOS November and December run busy. Until two full years are recorded the "
         "forecast assumes no seasons, so November and December may come in above the forecast.",
-        "You told AIBOS January runs quiet. Until two full years are recorded the forecast "
+        "You told AI-BOS January runs quiet. Until two full years are recorded the forecast "
         "assumes no seasons, so January may come in below the forecast.",
     ]
     # Once the seasons are learned from the books the forecast carries them.
@@ -118,7 +118,7 @@ def test_the_forecast_says_where_a_season_changes_its_reading():
     soft = ss.forecast_notes(["2026-11"], ["2025-12", "2026-03"], True, {"busy": [12]})
     assert soft["named"] == ["2025-12"]
     assert soft["notes"] == ["December 2025 is softened so one season does not drive the months around it. "
-                             "You told AIBOS December runs busy: it is your season, not a one-off."]
+                             "You told AI-BOS December runs busy: it is your season, not a one-off."]
 
 
 def test_the_forecast_page_outlook_carries_the_notes():

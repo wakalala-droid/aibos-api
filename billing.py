@@ -323,7 +323,7 @@ def card_drive_audience(db, prices: dict, now: datetime | None = None,
     'payment'), still on or in their grace week, and no card paying for it.
 
     Left out on purpose: a card plan (Paddle renews it, and asking invites a
-    second payment), the Free plan (nothing to pay), a plan AIBOS set up with
+    second payment), the Free plan (nothing to pay), a plan AI-BOS set up with
     no end date, and a plan that has already switched off."""
     now = now or datetime.now(timezone.utc)
     try:
@@ -352,8 +352,8 @@ def card_drive_message(plan: str, billing: str, amount: float,
     name = PLAN_NAMES.get(plan, plan.capitalize())
     period = "year" if billing == "annual" else "month"
     renews = f"It then renews automatically for {money(amount)} each {period} until you cancel."
-    title = "Update your payment details: AIBOS is card only now"
-    lead = "AIBOS plans are now paid by card only."
+    title = "Update your payment details: AI-BOS is card only now"
+    lead = "AI-BOS plans are now paid by card only."
     if paid_until is None:
         return title, f"{lead} Add your card to keep your {name} plan on. {renews}"
     if now <= paid_until:
@@ -546,7 +546,7 @@ def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None 
                 card: dict | None = None) -> dict:
     """The owner's plan in plain words. Pure.
 
-    state: free | included (set up by AIBOS, no end date) | active | grace |
+    state: free | included (set up by AI-BOS, no end date) | active | grace |
     expired. `sentence` is what the page shows first. `card` is the account's
     card subscription (card_plan_of), when there is one."""
     now = now or datetime.now(timezone.utc)
@@ -562,27 +562,27 @@ def plan_status(profile: dict, prices: dict, billing: str, now: datetime | None 
 
     if plan not in prices:
         return {**out, "state": "free", "plan_name": "Free",
-                "sentence": "You are on the Free plan. Upgrade any time to switch on more of AIBOS."}
+                "sentence": "You are on the Free plan. Upgrade any time to switch on more of AI-BOS."}
     by_card = card_status(card, plan, until, now)
     if by_card:
         return {**out, **by_card}
     gift_until = _parse(profile.get("paid_until")) if profile.get("tier_source") == "gift" else None
     if gift_until is not None and now <= gift_until:
-        # Given free by AIBOS (gifts.py): it ends on its day, with no grace.
+        # Given free by AI-BOS (gifts.py): it ends on its day, with no grace.
         days = (gift_until.astimezone(LUSAKA).date() - now.astimezone(LUSAKA).date()).days
         return {**out, "state": "active", "days_left": days, "switches_off_on": gift_until.isoformat(),
-                "sentence": f"Your {name} plan is a gift from AIBOS, free until {_long_day(gift_until)}. "
+                "sentence": f"Your {name} plan is a gift from AI-BOS, free until {_long_day(gift_until)}. "
                             f"To keep it on after that, set up card payment on or before that day: "
                             f"it then renews automatically for {money(price)} each {period} until you cancel."}
     if gift_until is not None:
         return {**out, "state": "expired", "switches_off_on": gift_until.isoformat(),
-                "sentence": f"Your free {name} plan from AIBOS ended on {_day(gift_until)}, so the account "
+                "sentence": f"Your free {name} plan from AI-BOS ended on {_day(gift_until)}, so the account "
                             f"is on Free for now. Your records are all there. Set up card payment to switch "
                             f"{name} back on: it then renews automatically for {money(price)} each {period} "
                             f"until you cancel."}
     if until is None:
         return {**out, "state": "included",
-                "sentence": f"Your {name} plan was set up for you by AIBOS and has no end date."}
+                "sentence": f"Your {name} plan was set up for you by AI-BOS and has no end date."}
 
     # Paid for a fixed period (by mobile money before the switch to cards, or
     # recorded by an admin): it does not renew by itself until a card is set up.
@@ -612,7 +612,7 @@ def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=No
     sub_rows: subscription_payments (card payments, and mobile money checkouts
     from before the switch to cards, which were in Kwacha).
     audit_rows: admin_audit set_tier rows; those with source 'payment' are money
-    paid to AIBOS by hand and recorded by an admin. A row that stored its
+    paid to AI-BOS by hand and recorded by an admin. A row that stored its
     amount and currency says what was paid; an older one did not, and was paid
     in Kwacha at the price of the time (LEGACY_ZMW_PRICES). Putting an account
     on billing records no money. `prices` is kept for callers; history never
@@ -626,7 +626,7 @@ def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=No
         network = r.get("network") or ""
         phone = "".join(ch for ch in str(r.get("payer_phone") or "") if ch.isdigit())
         # Paddle sold a card plan in its own name (Merchant of Record), so its
-        # invoice is the receipt that counts. AIBOS does not print a second one.
+        # invoice is the receipt that counts. AI-BOS does not print a second one.
         by_card = network == "paddle"
         out.append({
             "id": f"{'c' if by_card else 'm'}-{r.get('reference')}",
@@ -657,7 +657,7 @@ def payment_history(sub_rows: list, audit_rows: list, prices: dict, simulated=No
             "date": a.get("created_at"),
             "plan": plan, "plan_name": PLAN_NAMES.get(plan, plan),
             "billing": billing, "amount": float(amount), "currency": currency,
-            "method": "Paid to AIBOS directly", "phone_tail": None,
+            "method": "Paid to AI-BOS directly", "phone_tail": None,
             "status": "successful", "paid_until": d.get("paid_until"),
             "receipt": True, "invoice": False,
         })
@@ -680,9 +680,9 @@ def receipt_text(payment: dict, business: str | None, email: str | None) -> str:
         f"*Receipt {receipt_number(payment)}*",
         "",
         f"Date paid: {_long_day(when) if when else '-'}",
-        f"Paid by: {business or 'AIBOS customer'}" + (f" ({email})" if email else ""),
+        f"Paid by: {business or 'AI-BOS customer'}" + (f" ({email})" if email else ""),
         "",
-        f"*AIBOS {payment.get('plan_name')} plan, {period}*",
+        f"*AI-BOS {payment.get('plan_name')} plan, {period}*",
         f"Amount paid: {money(float(payment.get('amount') or 0), currency)} ({currency})",
         f"Paid by: {payment.get('method')}"
         + (f", phone ending {payment['phone_tail']}" if payment.get("phone_tail") else ""),
@@ -692,7 +692,7 @@ def receipt_text(payment: dict, business: str | None, email: str | None) -> str:
         lines.append(f"Plan paid up to: {_long_day(until)}")
     lines += [
         "",
-        "Received with thanks by AIBOS, ai-bos.website.",
+        "Received with thanks by AI-BOS, ai-bos.website.",
         "Keep this receipt for your business records.",
     ]
     return "\n".join(lines)

@@ -1,5 +1,5 @@
 """
-AIBOS: each business's own payment account (migration 0038).
+AI-BOS: each business's own payment account (migration 0038).
 
 A payment link collects money that belongs to the business that sent it: the
 invoice it wrote, the stay it sold. Until this module there was one set of
@@ -18,7 +18,7 @@ The key is the business's money. It is:
     characters;
   * kept in a table only the API can read (RLS on, no policies).
 
-One account per owner (the tenant). An owner with several businesses in AIBOS
+One account per owner (the tenant). An owner with several businesses in AI-BOS
 collects into the same account for all of them.
 """
 
@@ -44,7 +44,7 @@ _CACHE: dict[str, tuple[Optional[payments.Account], float]] = {}
 
 class NotSetUp(RuntimeError):
     """The table is missing: migration 0038 has not been run. /health names
-    the migration for the AIBOS team; the owner is told something they can use."""
+    the migration for the AI-BOS team; the owner is told something they can use."""
 
 
 NOT_SET_UP = ("Taking mobile money into your own account is being switched on. "

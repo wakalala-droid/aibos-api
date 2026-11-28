@@ -1,5 +1,5 @@
 """
-Jobs AIBOS does (Jarvis, phase 2): the trust levels, the record and Undo.
+Jobs AI-BOS does (Jarvis, phase 2): the trust levels, the record and Undo.
 
 Pins the promises made to the owner: small jobs are done at once and can be
 taken back; money in the books, issuing an invoice and marking one paid always

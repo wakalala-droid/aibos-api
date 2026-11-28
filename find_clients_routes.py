@@ -244,7 +244,7 @@ def clients_prospect_delete(pid: str, ctx: membership.Context = Depends(membersh
 def clients_find(body: Dict[str, Any] = Body(...),
                  ctx: membership.Context = Depends(membership.require_write)):
     """Find one kind of business around one town: the nearest ones not in the
-    list yet, from AIBOS's own directory. A pair the directory does not hold
+    list yet, from AI-BOS's own directory. A pair the directory does not hold
     yet waits on the public map, and the proxy in front of the API gives up
     at 60 seconds (the 504 of 7 Nov 2026), so the search runs on after the
     answer, like research; GET /clients reports it. With "research": true the

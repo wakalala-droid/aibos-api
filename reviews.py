@@ -1,13 +1,13 @@
 """
-Owners review AIBOS (20 Nov 2026, migration 0048): the review centre.
+Owners review AI-BOS (20 Nov 2026, migration 0048): the review centre.
 
-An owner gives AIBOS one to five stars and says why, on Review AIBOS in the
-app (/dashboard/reviews), and chooses where it goes: to the AIBOS team only,
-or also onto the AIBOS website with the name, business and town they type.
+An owner gives AI-BOS one to five stars and says why, on Review AI-BOS in the
+app (/dashboard/reviews), and chooses where it goes: to the AI-BOS team only,
+or also onto the AI-BOS website with the name, business and town they type.
 Their logo goes with it only if they tick that as well. One review per
 account; they can change it or take it back at any time.
 
-THE WEBSITE SHOWS WHAT OWNERS SAID, NOT WHAT AIBOS WOULD LIKE THEM TO SAY.
+THE WEBSITE SHOWS WHAT OWNERS SAID, NOT WHAT AI-BOS WOULD LIKE THEM TO SAY.
 GET /public/reviews lists every review its writer shared that an
 administrator has not hidden, newest first, low stars and high, with the
 average of all of them once there are enough to mean something
@@ -21,7 +21,7 @@ and on their phone where alerts are on (notify.broadcast: once, whatever
 happens), leaving out the accounts that have already reviewed. A dry run
 says how many it would reach first.
 
-No review is ever written, edited or invented by AIBOS. The landing page
+No review is ever written, edited or invented by AI-BOS. The landing page
 shows nothing at all until a real owner shares one.
 """
 
@@ -53,8 +53,8 @@ MIN_FOR_AVERAGE = 5
 ON_PAGE = 12
 # The ask, unless the administrator names a new one for a later round.
 ASK_KEY = "review-ask-2026-11"
-ASK_TITLE = "How is AIBOS working for you?"
-ASK_BODY = "Give AIBOS one to five stars and say why. It takes a minute. You choose whether it goes on the AIBOS website."
+ASK_TITLE = "How is AI-BOS working for you?"
+ASK_BODY = "Give AI-BOS one to five stars and say why. It takes a minute. You choose whether it goes on the AI-BOS website."
 ASK_LINK = "/dashboard/reviews"
 
 _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
@@ -159,7 +159,7 @@ def save(db, user_id: str, data: dict, business_id: Optional[str] = None,
         raise ReviewError("Choose from one to five stars.")
     body = " ".join(str(data.get("body") or "").split())
     if len(body) < BODY_MIN:
-        raise ReviewError("Say a little more: a sentence about what AIBOS does for you.")
+        raise ReviewError("Say a little more: a sentence about what AI-BOS does for you.")
     if len(body) > BODY_MAX:
         raise ReviewError(f"Keep it to {BODY_MAX} characters, about a short paragraph.")
     name = _clean(data.get("name"), FIELD_MAX)
@@ -280,7 +280,7 @@ def ask(db, dry_run: bool = False, key: str = "", now: Optional[datetime] = None
     done = {str(r["user_id"]) for r in _ready(lambda: _rows(
         db.table(TABLE).select("user_id").limit(5000).execute())) if r.get("user_id")}
     try:
-        # Of the people it would reach, how many are using AIBOS right now.
+        # Of the people it would reach, how many are using AI-BOS right now.
         recent = (now - timedelta(minutes=15)).isoformat()
         active = len([p for p in _rows(db.table("profiles").select("id").gte("last_active_at", recent)
                                        .limit(5000).execute()) if str(p.get("id")) not in done])
@@ -359,7 +359,7 @@ def delete_mine(user_id: str = Depends(require_user)):
 
 @router.get("/public/reviews")
 def public_reviews(request: Request):
-    """What owners said about AIBOS, for the website. No sign-in."""
+    """What owners said about AI-BOS, for the website. No sign-in."""
     import rate_limit
     forwarded = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
     client_ip = forwarded[-1] if forwarded else (request.client.host if request.client else "unknown")

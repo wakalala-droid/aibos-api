@@ -1,11 +1,11 @@
 """
-AIBOS: Mobile Money payments.
+AI-BOS: Mobile Money payments.
 
 Two kinds of money move through here and they must never share an account.
 
 THE PLATFORM'S OWN MONEY (initiate / status). MTN MoMo Collections and Airtel
 Money Collections, with the keys in the environment below: one set for the
-whole of AIBOS. Plans are paid by card now, so this only settles mobile money
+whole of AI-BOS. Plans are paid by card now, so this only settles mobile money
 plan payments started before that switch.
 
 A BUSINESS'S MONEY (collect / collection_status). An invoice a business sent or
@@ -229,7 +229,7 @@ def _airtel_status(reference: str) -> str:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def initiate(network: str, reference: str, amount: float, currency: str, phone: str,
-             note: str = "AIBOS subscription") -> str:
+             note: str = "AI-BOS subscription") -> str:
     """Kick off a collection. Returns 'pending' | 'failed' | 'unconfigured'."""
     if not provider_configured(network):
         if SIMULATION_ENABLED:

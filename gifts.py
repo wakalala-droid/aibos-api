@@ -68,18 +68,18 @@ def message(plan: str, months: int, until: datetime, name: str, business: str,
     if more:
         span = "One more month" if months == 1 else f"{months} more months"
         title = f"{span} of {plan_name}, free"
-        body = (f"{name}, {who} stays on AIBOS {plan_name} free until {_long_day(until)}. "
+        body = (f"{name}, {who} stays on AI-BOS {plan_name} free until {_long_day(until)}. "
                 f"Nothing to pay and no card needed.")
         return title, body
     span = "one month" if months == 1 else f"{months} months"
     title = f"{plan_name} is yours, free for {span}"
-    body = (f"Welcome, {name}. {who} is on AIBOS {plan_name} free until {_long_day(until)}. "
+    body = (f"Welcome, {name}. {who} is on AI-BOS {plan_name} free until {_long_day(until)}. "
             f"Everything in {plan_name} is switched on now. Nothing to pay and no card needed.")
     return title, body
 
 
 def grant(db, user_id: str, plan: str, months: int, name: str, business: str = "",
-          granted_by: str = "AIBOS", now: datetime | None = None, note: str = "") -> dict:
+          granted_by: str = "AI-BOS", now: datetime | None = None, note: str = "") -> dict:
     """Give `user_id` `plan` free for `months` and leave the welcome in their bell.
 
     A gift that is still running is not cut short: the months go on its end.

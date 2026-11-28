@@ -1,5 +1,5 @@
 """
-The live guide (27 Nov 2026): a token locked to AIBOS's setup, minutes a
+The live guide (27 Nov 2026): a token locked to AI-BOS's setup, minutes a
 month by plan, a monthly ceiling on spend, and the real cost from Google's
 own token counts.
 
@@ -55,9 +55,10 @@ def test_the_token_is_locked_to_aibos_setup_and_never_carries_the_key(db):
     setup = body[field]
     assert setup["model"] == "models/gemini-3.8-live"
     assert [f["name"] for f in setup["tools"][0]["functionDeclarations"]] == \
-        ["read_screen", "point_at", "go_to", "aibos_manual", "end_guide"]
+        ["read_screen", "point_at", "click", "type_text", "go_to", "ask_aibos", "answer_job",
+         "aibos_manual", "end_guide"]
     text = setup["systemInstruction"]["parts"][0]["text"]
-    assert "Zoe's Kitchen" in text and '"AI boss"' in text and "never say you did" in text
+    assert "Zoe's Kitchen" in text and '"AI boss"' in text and "Say \"done\" only after answer_job" in text
     assert out["token"] == "auth_tokens/abc" and "test-key" not in str(out)
     assert out["setup"] == setup and out["max_seconds"] == 600
 
@@ -131,3 +132,49 @@ def test_odd_usage_is_cleaned(db):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_the_sphere_can_act_and_ask_the_one_aibos_brain():
+    names = [t["name"] for t in lg.TOOLS[0]["functionDeclarations"]]
+    for n in ("click", "type_text", "ask_aibos", "answer_job"):
+        assert n in names
+    text = lg.instructions("Shop", "owner", "Pro+", NOW, person="Mwansa")
+    assert "AI-BOS" in text and '"AI boss"' in text and "Mwansa" in text
+    # It knows why gratuity is 25%, word for word as the chat does.
+    assert "25% of the basic pay" in text
+    # Money, sending and deleting wait for the owner's yes.
+    assert "confirmed true" in text
+
+
+def test_the_chosen_voice_is_used_and_an_unknown_one_falls_back():
+    s = lg.setup("Shop", "owner", "Pro", "Aoede", "Mwansa")
+    assert s["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Aoede"
+    assert lg.voice("Robot") == "Kore"
+
+
+def test_sphere_settings_keep_only_known_choices():
+    import assistant_prefs as ap
+    assert ap.clean({"voice": "Charon", "spoken_report": True, "tips": "yes", "evil": 1}) == {
+        "voice": "Charon", "spoken_report": True, "tips": True}
+    assert ap.clean({"voice": "Robot"})["voice"] == "Kore"
+
+
+def test_sphere_settings_before_and_after_migration_0050():
+    import assistant_prefs as ap
+
+    class Missing:
+        def table(self, _):
+            raise RuntimeError('column profiles.assistant_prefs does not exist')
+
+    assert ap.get(Missing(), "owner") == {**ap.DEFAULTS, "saved": False}
+    with pytest.raises(ap.NotMigrated):
+        ap.put(Missing(), "owner", {"voice": "Puck"})
+
+    d = _fresh()
+    d.rows["profiles"] = [{"id": "owner", "assistant_prefs": {}}]
+    # Migrated but never chosen: the defaults, NOT saved, so the device's own
+    # earlier choice is kept and sent up instead of being overwritten.
+    assert ap.get(d, "owner") == {**ap.DEFAULTS, "saved": False}
+    out = ap.put(d, "owner", {"voice": "Puck", "spoken_report": True})
+    assert out["voice"] == "Puck" and out["spoken_report"] and out["tips"] and out["saved"]
+    assert ap.get(d, "owner")["voice"] == "Puck"

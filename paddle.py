@@ -1,5 +1,5 @@
 """
-AIBOS: card payments through Paddle.
+AI-BOS: card payments through Paddle.
 
 Mobile money is how most Zambian owners pay. A card is how the rest do: the
 diaspora, a business whose accountant pays the software bills, anyone who
@@ -18,7 +18,7 @@ Two facts shape everything here.
 
 ONE KEY. The owner pastes PADDLE_API_KEY on Render and nothing else. The key
 says which environment it belongs to (sandbox keys start pdl_sdbx_), and on
-first use this module makes sure Paddle has everything AIBOS needs, creating
+first use this module makes sure Paddle has everything AI-BOS needs, creating
 only what is missing:
 
   - the three plans, each with a monthly and a yearly price
@@ -90,10 +90,10 @@ EVENTS = (
 )
 
 WEBHOOK_PATH = "/payments/paddle/webhook"
-CLIENT_TOKEN_NAME = "AIBOS website"
+CLIENT_TOKEN_NAME = "AI-BOS website"
 
 # Paddle's own statuses for a subscription that is still going. Anything in
-# here renews by itself, so AIBOS sends no "time to pay" reminders for it.
+# here renews by itself, so AI-BOS sends no "time to pay" reminders for it.
 LIVE_STATUSES = ("active", "trialing", "past_due", "paused")
 
 # Currencies Paddle counts in whole units (no cents).
@@ -198,9 +198,9 @@ def parse_time(value) -> datetime | None:
 
 
 def plan_of_price(price: dict | None, by_product: dict | None = None) -> tuple[str, str] | None:
-    """Which AIBOS plan and billing a Paddle price sells, or None. Pure.
+    """Which AI-BOS plan and billing a Paddle price sells, or None. Pure.
 
-    Prices AIBOS created say so in their custom_data. A price the owner made
+    Prices AI-BOS created say so in their custom_data. A price the owner made
     later in the dashboard does not, so the product it belongs to names the
     plan and its billing cycle names the period."""
     if not isinstance(price, dict):
@@ -227,7 +227,7 @@ def plan_of_items(items, by_product: dict | None = None) -> tuple[str, str] | No
 
 def topup_of_price(price: dict | None, topup_by_price: dict | None = None) -> int:
     """How many Find clients credits a Paddle price sells, or 0. Pure. Prices
-    AIBOS made say so in their custom_data; failing that, the price id."""
+    AI-BOS made say so in their custom_data; failing that, the price id."""
     if not isinstance(price, dict):
         return 0
     try:
@@ -251,7 +251,7 @@ def topup_of_items(items, topup_by_price: dict | None = None) -> int:
 
 
 def transaction_fact(data: dict, by_product: dict | None = None, topup_by_price: dict | None = None) -> dict:
-    """What a completed transaction means for AIBOS. Pure."""
+    """What a completed transaction means for AI-BOS. Pure."""
     details = data.get("details") or {}
     totals = details.get("totals") or {}
     currency = (totals.get("currency_code") or data.get("currency_code") or "USD").upper()
@@ -304,7 +304,7 @@ def subscription_fact(data: dict, occurred_at=None, by_product: dict | None = No
 
 
 def adjustment_fact(data: dict) -> dict:
-    """What a refund or chargeback means for AIBOS. Pure. `full` is only true
+    """What a refund or chargeback means for AI-BOS. Pure. `full` is only true
     when Paddle says the whole payment went back."""
     return {
         "adjustment_id": data.get("id"),
@@ -382,7 +382,7 @@ def _list(path: str, params: dict | None = None, pages: int = 10) -> list:
     return out
 
 
-# ── Making sure Paddle has what AIBOS needs ─────────────────────────────────
+# ── Making sure Paddle has what AI-BOS needs ─────────────────────────────────
 
 # Paddle will not open any checkout until its dashboard has a default payment
 # link (Checkout settings), and on a live account until that domain is
@@ -405,7 +405,7 @@ RETRY_AFTER = 120           # and this often while something is missing
 
 
 def _create_product(plan: str) -> dict:
-    return _post_product({"name": f"AIBOS {PLAN_NAMES[plan]}", "tax_category": "saas",
+    return _post_product({"name": f"AI-BOS {PLAN_NAMES[plan]}", "tax_category": "saas",
                           "description": PLAN_BLURBS[plan], "custom_data": {"aibos_plan": plan}})
 
 
@@ -425,7 +425,7 @@ def _create_price(product_id: str, plan: str, billing: str, usd: float) -> dict:
     return api("POST", "/prices", {
         "product_id": product_id,
         "name": "Monthly" if billing == "monthly" else "Yearly",
-        "description": f"AIBOS {name}, billed {'monthly' if billing == 'monthly' else 'yearly'} in USD",
+        "description": f"AI-BOS {name}, billed {'monthly' if billing == 'monthly' else 'yearly'} in USD",
         "unit_price": {"amount": to_minor(usd), "currency_code": "USD"},
         "billing_cycle": {"interval": INTERVAL[billing], "frequency": 1},
         "tax_mode": "account_setting",
@@ -460,7 +460,7 @@ def _ensure_catalog(notes: list) -> tuple[dict, dict, dict]:
                           and (p.get("billing_cycle") or {}).get("interval") == INTERVAL[billing]
                           and (p.get("billing_cycle") or {}).get("frequency", 1) == 1]
             # The newest active price wins, so a price added in the dashboard
-            # replaces the one AIBOS first made: that is how a price changes
+            # replaces the one AI-BOS first made: that is how a price changes
             # without a deploy. Customers already on the old price keep it.
             candidates.sort(key=lambda p: str(p.get("created_at") or ""), reverse=True)
             price = candidates[0] if candidates else None
@@ -478,7 +478,7 @@ def _ensure_catalog(notes: list) -> tuple[dict, dict, dict]:
 # Find clients credits (find_clients.TOPUPS), sold once and never renewed: the
 # pay as you go that Explee sells (owner's decision, 9 Nov 2026). One product,
 # one price a pack, each price saying in its custom_data how many credits it is.
-TOPUP_PRODUCT = "AIBOS Find clients credits"
+TOPUP_PRODUCT = "AI-BOS Find clients credits"
 
 
 def _create_topup_price(product_id: str, credits: int, usd: float) -> dict:
@@ -503,7 +503,7 @@ def _ensure_topups(notes: list) -> tuple[dict, dict]:
     if product is None:
         product = dict(_post_product({
             "name": TOPUP_PRODUCT, "tax_category": "saas",
-            "description": "Businesses researched and written to by Find clients in AIBOS. Bought once; "
+            "description": "Businesses researched and written to by Find clients in AI-BOS. Bought once; "
                            "they never run out.",
             "custom_data": {"aibos_topup": "find_clients"}}), prices=[])
         notes.append("Created the Find clients credits in Paddle.")
@@ -550,7 +550,7 @@ def _ensure_webhook(notes: list) -> tuple[str | None, str | None, str | None]:
     mine = next((s for s in settings if s.get("destination") == url and s.get("type", "url") == "url"), None)
     if mine is None:
         mine = api("POST", "/notification-settings", {
-            "description": "AIBOS: plan payments by card",
+            "description": "AI-BOS: plan payments by card",
             "type": "url", "destination": url,
             "subscribed_events": list(EVENTS), "traffic_source": "all",
         })["data"]

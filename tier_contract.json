@@ -2,7 +2,7 @@
   "_comment": [
     "AUTHORITATIVE tier contract — the one place the frontend and backend agree.",
     "",
-    "AIBOS runs as two repos that cannot be deployed atomically, and each used to",
+    "AI-BOS runs as two repos that cannot be deployed atomically, and each used to",
     "keep its own copy of what a plan unlocks. Nothing checked them against each",
     "other, so they drifted silently and shipped real bugs: 'multi_business' was",
     "granted by entitlements.py but missing from tiers.ts (paying Growth owners",

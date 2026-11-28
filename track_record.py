@@ -1,10 +1,10 @@
 """
-AIBOS — the forecast's track record, earned in public (16 October 2026).
+AI-BOS — the forecast's track record, earned in public (16 October 2026).
 
 The Forecast page says how far the forecast missed on the owner's past months.
-That is a backtest: honest, but worked out today about months AIBOS already
+That is a backtest: honest, but worked out today about months AI-BOS already
 knew. Owners keep paying for a forecast they have watched come true, so once a
-month AIBOS keeps what it said BEFORE the month happens, and once the month
+month AI-BOS keeps what it said BEFORE the month happens, and once the month
 has closed holds it against the confirmed books:
 
   * next month's sales, cautious to likely to hopeful (outlook.py), for every

@@ -1,6 +1,6 @@
 """
 Payslips that reach the staff themselves (28 October 2026): a phone and an
-email on each person, every payslip in a run emailed by AIBOS with the PDF
+email on each person, every payslip in a run emailed by AI-BOS with the PDF
 attached and replies going to the owner, a WhatsApp link with the payslip
 already written for the owner to send from their own phone, and a record of
 who has theirs. Also the two things that ride on the first payroll run: the

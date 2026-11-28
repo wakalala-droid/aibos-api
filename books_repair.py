@@ -1,5 +1,5 @@
 """
-AIBOS — Repair postings that reached the books with no business.
+AI-BOS — Repair postings that reached the books with no business.
 
 From migration 0023 until the September 2026 fix, every caller without a
 request context (hospitality bookings and expenses, payroll, the WhatsApp bot),

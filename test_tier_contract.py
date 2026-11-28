@@ -1,7 +1,7 @@
 """
 The backend half of the tier-contract guard.
 
-AIBOS is two repos that deploy independently and each kept its own copy of what
+AI-BOS is two repos that deploy independently and each kept its own copy of what
 a plan unlocks. Nothing compared them, so they drifted and shipped real bugs
 (see tier_contract.json for the roll of honour). tier_contract.json is now the
 authoritative statement; this suite asserts the SERVER matches it, and the

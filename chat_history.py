@@ -1,5 +1,5 @@
 """
-AIBOS: the AI chat's memory (migration 0034).
+AI-BOS: the AI chat's memory (migration 0034).
 
 The chat used to forget. Every question reached the AI on its own, and the
 conversation lived only in the open page, so a reload or a second device

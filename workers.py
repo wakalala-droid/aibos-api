@@ -1,7 +1,7 @@
 """
-AIBOS as Jarvis, phase 3: the workers.
+AI-BOS as Jarvis, phase 3: the workers.
 
-Phase 2 let the owner ask AIBOS for a job. The workers go looking for the jobs
+Phase 2 let the owner ask AI-BOS for a job. The workers go looking for the jobs
 the owner has not asked for yet. Each has one area of the business and reads
 only the records behind it:
 
@@ -59,8 +59,8 @@ QUIET_VISITS = 3            # a regular has bought on at least this many days
 QUIET_MIN_DAYS = 14
 QUIET_MAX_DAYS = 120        # quiet longer than this is gone, not quiet
 EVERY_HOURS = 3             # how often a pass runs
-AUTO_EVERY_HOURS = 1        # how often it runs while AIBOS auto is on
-EVENING_HOUR = 18           # from here, auto's "what AIBOS did today" goes out
+AUTO_EVERY_HOURS = 1        # how often it runs while AI-BOS auto is on
+EVENING_HOUR = 18           # from here, auto's "what AI-BOS did today" goes out
 DAY_FROM, DAY_TO = 7, 21    # Lusaka hours a pass may run in
 
 
@@ -123,7 +123,7 @@ def collector(report: dict, today: date) -> list:
         if total < 1 or late < LATE_DAYS:
             continue
         refs = [i.get("ref") for i in c.get("items") or [] if i.get("kind") == "invoice" and i.get("ref")]
-        why = "AIBOS writes the reminder. You send it from your own WhatsApp, to the person you choose."
+        why = "AI-BOS writes the reminder. You send it from your own WhatsApp, to the person you choose."
         out.append(_find(f"owed:{c.get('key') or normalize_key(c.get('name') or '')}:{year}W{week:02d}",
                          "chase_payment",
                          {"customer": c.get("name"), "total": round(total, 2), "oldest_days": late,
@@ -544,7 +544,7 @@ def _due(uid, biz_id, auto: bool, now: datetime) -> bool:
 
 
 def did_today(db, tenant: str, biz, now: datetime) -> int:
-    """Jobs AIBOS did by itself today (Lusaka), for auto's evening note."""
+    """Jobs AI-BOS did by itself today (Lusaka), for auto's evening note."""
     today = now.astimezone(LUSAKA).date().isoformat()
     n = 0
     for r in actions._recent(db, tenant, biz, limit=200):
@@ -560,10 +560,10 @@ def did_today(db, tenant: str, biz, now: datetime) -> int:
 
 
 def run_all(db, record_notification, now: datetime | None = None) -> dict:
-    """The hourly job: every owner whose plan lets AIBOS do jobs, in the day:
-    every hour for books with AIBOS auto on, every few hours for the rest.
+    """The hourly job: every owner whose plan lets AI-BOS do jobs, in the day:
+    every hour for books with AI-BOS auto on, every few hours for the rest.
     Tells the owner once a day when something new needs them, and on auto,
-    once in the evening what AIBOS did by itself."""
+    once in the evening what AI-BOS did by itself."""
     import businesses
     import entitlements
     now = now or datetime.now(timezone.utc)
@@ -610,8 +610,8 @@ def run_all(db, record_notification, now: datetime | None = None) -> dict:
                         suffix = f": {biz.get('name')}" if biz.get("name") and len(owned) > 1 else ""
                         record_notification(
                             db, uid, "auto_day",
-                            f"AIBOS did {done} {'thing' if done == 1 else 'things'} for you today{suffix}",
-                            "Each one has an Undo with your AIBOS team on Home.", "/dashboard#team",
+                            f"AI-BOS did {done} {'thing' if done == 1 else 'things'} for you today{suffix}",
+                            "Each one has an Undo with your AI-BOS team on Home.", "/dashboard#team",
                             {"booking_id": f"autoday-{biz.get('id')}-{local.date().isoformat()}",
                              "business_id": biz.get("id")})
         except actions.NotReady:

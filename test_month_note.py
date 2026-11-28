@@ -1,5 +1,5 @@
 """
-What AIBOS did for you this month (28 October 2026): one note on the 1st,
+What AI-BOS did for you this month (28 October 2026): one note on the 1st,
 every line from the owner's own records, nothing said that did not happen,
 nothing sent when nothing happened, never twice. Also the two other pieces of
 the same change that are pure words: the one-line morning brief below Pro+,
@@ -33,16 +33,16 @@ def test_the_note_adds_up_the_month_in_plain_lines():
         "invoices_paid": {"count": 3, "total": 12300.0},
         "booking_requests": 1, "reminders": 4, "books_check_days": 2,
     })
-    assert title == "What AIBOS did for you in October"
+    assert title == "What AI-BOS did for you in October"
     lines = body.split("\n\n")
     assert lines[0] == "The cash watch warned you 2 times, first on 3 Oct: Cash may run short in the week of 14 Oct."
     assert lines[1] == ("Payroll for October: 6 people paid, K45,200.00 take-home, "
                         "with PAYE, NAPSA and NHIMA worked out to the ngwee.")
     assert "6 payslips reached your staff." in lines
-    assert "Customers paid 3 invoices you sent from AIBOS: K12,300.00." in lines
+    assert "Customers paid 3 invoices you sent from AI-BOS: K12,300.00." in lines
     assert "1 booking request reached you the moment it came in." in lines
-    assert "AIBOS reminded you of 4 things on your schedule." in lines
-    assert lines[-1] == "AIBOS keeps watching in November."
+    assert "AI-BOS reminded you of 4 things on your schedule." in lines
+    assert lines[-1] == "AI-BOS keeps watching in November."
 
 
 def test_a_month_with_nothing_done_sends_nothing():
@@ -58,7 +58,7 @@ def test_taxes_still_waiting_are_said_with_what_late_costs():
     })
     assert ("Still waiting: PAYE and NAPSA for September, K2,226.00, due on 10 October. "
             "ZRA adds 5% a month to PAYE paid late.") in body
-    # Waiting taxes alone are not something AIBOS did: no note for them only.
+    # Waiting taxes alone are not something AI-BOS did: no note for them only.
     assert mn.compose({"month": "2026-10", "taxes": {"period": "2026-09", "paid": [],
                                                     "waiting": [{"tax": "PAYE", "amount": 1.0}]}}) is None
     _, paid = mn.compose({"month": "2026-10", "taxes": {"period": "2026-09", "waiting": [],
@@ -136,7 +136,7 @@ def test_on_the_first_every_owner_hears_once(owners, monkeypatch):
     out = mn.deliver(db, now=datetime(2026, 11, 1, 6, 0, tzinfo=UTC))      # 08:00 in Lusaka
     assert out["told"] == 1 and out["emailed"] == 1
     note = next(n for n in db.rows["notifications"] if n["kind"] == "month_note")
-    assert note["title"] == "What AIBOS did for you in October"
+    assert note["title"] == "What AI-BOS did for you in October"
     assert note["meta"] == {"booking_id": "monthnote-2026-10"} and note["link"] == "/dashboard"
     assert emails[0][0] == "owner@zoes.zm" and emails[0][1] == note["title"]
     # The job runs every hour: a second pass the same month tells nobody again.

@@ -1,5 +1,5 @@
 """
-AIBOS: tidy up test and mistaken entries (upgrade 16).
+AI-BOS: tidy up test and mistaken entries (upgrade 16).
 
 Trying things out leaves clutter that nothing could clear: a K0 salary line,
 invoices sent and then undone, bookings called off before any money moved, a

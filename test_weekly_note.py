@@ -42,7 +42,7 @@ def test_a_quiet_week_says_so_and_a_still_business_hears_nothing():
     title, body = wn.compose({"monday": MON, "in": 0, "out": 0, "moved_recently": 2, "waiting": 0, "owed": 0})
     assert title == "Your week in the books"
     assert body.startswith("Nothing was recorded last week, 9 to 15 November.")
-    assert "tell AIBOS each sale and expense as it happens" in body
+    assert "tell AI-BOS each sale and expense as it happens" in body
     assert wn.compose({"monday": MON, "in": 0, "out": 0, "moved_recently": 0, "waiting": 0, "owed": 0}) is None
 
 

@@ -2,7 +2,7 @@
 VAT you can claim (29 October 2026).
 
 Since 1 January 2025 input VAT in Zambia is claimed only against a ZRA Smart
-Invoice. AIBOS marks an entry recorded from one (its QR code or its photo) and
+Invoice. AI-BOS marks an entry recorded from one (its QR code or its photo) and
 the books view splits a period's purchases into the VAT the business can claim
 and what it bought without a Smart Invoice. Pinned here:
 

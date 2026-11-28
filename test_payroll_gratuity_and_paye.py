@@ -97,7 +97,7 @@ def test_a_missing_month_puts_them_on_the_month_1_basis():
     emp = {"basic_pay": 10_000, "start_date": "2024-01-01"}
     earlier = [_slip(f"2026-{m:02d}", 10_000, 1_326) for m in (1, 2, 4)]
     assert payroll.year_to_date(emp, earlier, "2026-05", "2026-05-28")["basis"] == "month 1"
-    # Figures typed for before AIBOS cover the months AIBOS does not have.
+    # Figures typed for before AI-BOS cover the months AI-BOS does not have.
     emp["paye_prior"] = {"year": 2026, "through": "2026-03", "pay": 30_000, "paye": 3_978,
                          "source": "before_aibos"}
     later = [_slip("2026-04", 10_000, 1_326)]

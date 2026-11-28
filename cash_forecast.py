@@ -1,5 +1,5 @@
 """
-AIBOS — Probabilistic cash forecast (audit 2026-07 item #19, rebuilt on the
+AI-BOS — Probabilistic cash forecast (audit 2026-07 item #19, rebuilt on the
 forecast engine 16 October 2026).
 
 The trend line becomes a fan: from the owner's OWN monthly net history the

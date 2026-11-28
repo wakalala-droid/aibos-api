@@ -1,7 +1,7 @@
 """
-AIBOS — Budgets & targets (audit 2026-07 item #37).
+AI-BOS — Budgets & targets (audit 2026-07 item #37).
 
-The owner sets a monthly PLAN (revenue / costs / profit target); AIBOS shows
+The owner sets a monthly PLAN (revenue / costs / profit target); AI-BOS shows
 actuals vs plan so "am I on track?" is answered against intent, not just last
 month. Targets are the ONLY thing stored — actuals are derived from the twin's
 recorded months on read (twin doctrine: one reality, projections replay).

@@ -1,11 +1,11 @@
 """
-Teach AIBOS your business: the owner interview (interview.py).
+Teach AI-BOS your business: the owner interview (interview.py).
 
 Covered here:
   • the owner's words read as figures however they were written (K50k, 50 000)
   • a question follows the industry and the answers before it, and a follow-up
     goes when the answer that called for it changes
-  • what AIBOS says back is arithmetic on what the owner said, never more
+  • what AI-BOS says back is arithmetic on what the owner said, never more
   • the AI chat's briefing, kept short and marked as the owner's statements
   • the goals as monthly targets that climb to the goal and never overwrite a
     target the owner set
@@ -200,7 +200,7 @@ def test_a_cushion_in_weeks_of_costs():
 def test_months_are_said_back_without_a_comma_before_and():
     a = _say({}, "busy_months", ["Oct", "Nov", "Dec"])
     assert iv.reflect("busy_months", a) == \
-        "AIBOS will keep in mind that October, November and December run busy, in its answers and in your reports."
+        "AI-BOS will keep in mind that October, November and December run busy, in its answers and in your reports."
 
 
 def test_nothing_is_said_back_about_a_skip_or_an_unknown_link():
@@ -299,7 +299,7 @@ def test_plan_figures_are_round():
     assert iv._round_plan(55555) == 55600 and iv._round_plan(456) == 460
 
 
-# ── For the rest of AIBOS ─────────────────────────────────────────────────────
+# ── For the rest of AI-BOS ─────────────────────────────────────────────────────
 
 def test_the_cushion_and_the_loan_are_only_what_the_owner_said():
     assert iv.cushion({}) is None and iv.loan_monthly({}) is None

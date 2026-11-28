@@ -64,26 +64,26 @@ def pushes(monkeypatch):
 
 def test_everyone_gets_it_and_the_devices_are_pushed(pushes):
     db = _db()
-    out = notify.broadcast(db, "AIBOS has been updated", "Reminders now reach your phone.", "/dashboard/schedule")
+    out = notify.broadcast(db, "AI-BOS has been updated", "Reminders now reach your phone.", "/dashboard/schedule")
     assert out["people"] == 3 and out["told"] == 3 and out["pushed"] == 2
     assert {r["user_id"] for r in db.rows["notifications"]} == {"owner", "dunslim", "quiet"}
     assert db.rows["notifications"][0]["kind"] == "announcement"
     assert db.rows["notifications"][0]["link"] == "/dashboard/schedule"
     assert [p["uid"] for p in pushes] == ["owner", "dunslim"]
-    assert pushes[0]["extra"] == {"tag": "announce-aibos-has-been-updated"}
+    assert pushes[0]["extra"] == {"tag": "announce-ai-bos-has-been-updated"}
 
 
 def test_sending_it_again_tells_nobody_twice(pushes):
     db = _db()
-    notify.broadcast(db, "AIBOS has been updated", "Once.")
-    again = notify.broadcast(db, "AIBOS has been updated", "Once.")
+    notify.broadcast(db, "AI-BOS has been updated", "Once.")
+    again = notify.broadcast(db, "AI-BOS has been updated", "Once.")
     assert again["told"] == 0 and again["already"] == 3 and again["pushed"] == 0
     assert len(db.rows["notifications"]) == 3
 
 
 def test_a_different_message_reaches_them_again(pushes):
     db = _db()
-    notify.broadcast(db, "AIBOS has been updated", "One.")
+    notify.broadcast(db, "AI-BOS has been updated", "One.")
     second = notify.broadcast(db, "Another thing", "Two.")
     assert second["told"] == 3
     assert len(db.rows["notifications"]) == 6
@@ -100,7 +100,7 @@ def test_it_can_leave_people_out(pushes):
     # The ask to review leaves out whoever has reviewed (reviews.ask).
     db = _db()
     people = [r["id"] for r in db.rows["profiles"]]
-    out = notify.broadcast(db, "Review AIBOS", skip={people[0]})
+    out = notify.broadcast(db, "Review AI-BOS", skip={people[0]})
     assert out["people"] == 2 and out["left_out"] == 1 and out["told"] == 2
     assert {n["user_id"] for n in db.rows["notifications"]} == set(people[1:])
 

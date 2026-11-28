@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
+import assistant_prefs
 import entitlements
 import live_guide as lg
 import membership
@@ -58,15 +59,21 @@ def live_allowance(ctx: membership.Context = Depends(membership.require_context)
 
 
 @router.post("/live/session")
-def live_session(ctx: membership.Context = Depends(membership.require_context),
+def live_session(body: Dict[str, Any] = Body(default={}),
+                 ctx: membership.Context = Depends(membership.require_context),
                  _rl: str = Depends(rate_limit.limiter("live_session", 12, 600))):
-    """Open a live guide session: a token locked to AIBOS's setup, good for
-    one session of at most ten minutes (or what is left of the month)."""
+    """Open a live guide session: a token locked to AI-BOS's setup, in the
+    person's chosen voice, good for one session of at most ten minutes (or
+    what is left of the month). `person` is the first name to call them by."""
     db = _db()
     tier = _tier(ctx)
+    prefs = assistant_prefs.get(db, ctx.actor)
+    person = body.get("person") if isinstance(body.get("person"), str) else ""
+    person = " ".join(person.split())[:40]
     try:
         return {"ok": True, **lg.start(db, ctx.tenant, ctx.actor, tier, _PLAN.get(tier, "Free"),
-                                       _name(db, ctx.tenant), ctx.role or "owner")}
+                                       _name(db, ctx.tenant), ctx.role or "owner",
+                                       voice_name=prefs.get("voice"), person=person)}
     except PermissionError as e:
         raise HTTPException(status_code=402, detail={"code": "live_unavailable", "message": str(e)})
     except RuntimeError as e:
@@ -88,6 +95,25 @@ def live_end(session_id: str, body: Dict[str, Any] = Body(default={}),
     out = lg.finish(db, ctx.tenant, session_id, seconds, usage, err)
     left = lg.allowance(db, ctx.tenant, _tier(ctx))
     return {**out, "minutes_left": left["minutes_left"]}
+
+
+@router.get("/assistant/prefs")
+def get_prefs(ctx: membership.Context = Depends(membership.require_context)):
+    """The sphere's settings for this person, and the voices to choose from."""
+    db = _db()
+    return {"ok": True, **assistant_prefs.get(db, ctx.actor),
+            "voices": [{"name": k, "sounds": v} for k, v in lg.VOICES.items()]}
+
+
+@router.put("/assistant/prefs")
+def put_prefs(body: Dict[str, Any] = Body(default={}),
+              ctx: membership.Context = Depends(membership.require_context)):
+    """Change the voice, the spoken report or tips. Unknown values are ignored."""
+    db = _db()
+    try:
+        return {"ok": True, **assistant_prefs.put(db, ctx.actor, body)}
+    except assistant_prefs.NotMigrated as e:
+        raise HTTPException(status_code=409, detail={"code": "migration_0050", "message": str(e)})
 
 
 def _admin(user_id: str):

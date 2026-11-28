@@ -1,13 +1,13 @@
 """
-AIBOS: the live guide (owner, 27 November 2026).
+AI-BOS: the live guide (owner, 27 November 2026).
 
 "Give AI boss the ability to have a live talk with its users ... sit anywhere
 on the screen and point to things, helping users navigate, because the
-interface is one of a kind." So the app has a small AIBOS sphere on every
-page. Tap it and AIBOS talks with the owner out loud, in real time, through
-Google's Live API (gemini-3.8-live): the owner can interrupt, and AIBOS
+interface is one of a kind." So the app has a small AI-BOS sphere on every
+page. Tap it and AI-BOS talks with the owner out loud, in real time, through
+Google's Live API (gemini-3.8-live): the owner can interrupt, and AI-BOS
 answers in a natural voice. While they talk it reads what is on the screen,
-points at things with the sphere, opens pages and explains AIBOS itself from
+points at things with the sphere, opens pages and explains AI-BOS itself from
 its own manual.
 
 HOW THE BROWSER TALKS TO GOOGLE WITHOUT OUR KEY
@@ -15,14 +15,18 @@ The voice goes straight from the browser to Google over a WebSocket. That
 needs a credential in the browser, and the API key must never go there. So
 this server mints an ephemeral token (POST /v1beta/auth_tokens): one use, a
 minute to start, a few minutes to live, and LOCKED to our setup: the model,
-AIBOS's instructions and the five tools below. A token lifted from a browser
+AI-BOS's instructions and the tools below. A token lifted from a browser
 can open one short guide session and nothing else.
 
-WHAT IT CAN DO, AND WHAT IT CANNOT
-The tools run in the browser (lib/guide): read_screen, point_at, go_to,
-aibos_manual and end_guide. There is no tool that clicks, types, records,
-sends or pays. It shows; the owner taps. Business work stays in the chat and
-Talk, where every job waits for the owner's yes (actions.py).
+WHAT IT CAN DO (owner, 28 November 2026: "touch and control things ... record
+this for me ... one unified field of intelligence")
+The tools run in the browser (lib/guide): read_screen, point_at, click,
+type_text, go_to, aibos_manual, end_guide, and ask_aibos / answer_job, which
+put the owner's words to the very same AI-BOS as the chat (lib/aiAssistant):
+their books, every lookup, the payroll rules, and jobs on the books that wait
+for the owner's yes (actions.py). The sphere and the chat are one AI-BOS.
+Taps that pay, send, delete, buy or sign out are refused in the browser until
+the owner has said yes to that tap.
 
 WHAT IT COSTS, AND THE TWO LIMITS
 Google bills Live by the token: audio in $3.00 and out $12.00 per million
@@ -77,8 +81,26 @@ def model() -> str:
     return os.environ.get("LIVE_MODEL") or "gemini-3.8-live"
 
 
-def voice() -> str:
-    return os.environ.get("LIVE_VOICE") or "Kore"
+# The voices the owner can choose from (Settings, "The AI-BOS sphere"), by
+# Google's names, with how each sounds in plain words. Kore stays the default.
+VOICES = {
+    "Kore": "Firm and clear",
+    "Aoede": "Warm and bright",
+    "Leda": "Young and light",
+    "Charon": "Deep and calm",
+    "Orus": "Steady and sure",
+    "Puck": "Upbeat",
+    "Fenrir": "Lively",
+    "Zephyr": "Bright and easy",
+}
+
+
+def voice(choice: str | None = None) -> str:
+    """The owner's chosen voice if it is one Google has, else the default."""
+    if choice in VOICES:
+        return choice
+    v = os.environ.get("LIVE_VOICE") or "Kore"
+    return v if v in VOICES else "Kore"
 
 
 def budget_usd() -> float:
@@ -102,66 +124,121 @@ def api_key() -> str:
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
 
-# ── What AIBOS is told ───────────────────────────────────────────────────────
+# ── What AI-BOS is told ───────────────────────────────────────────────────────
+
+_ID = {"type": "OBJECT", "properties": {
+    "id": {"type": "STRING", "description": "The id from the latest read_screen, like g12."}}, "required": ["id"]}
 
 TOOLS = [{"functionDeclarations": [
     {"name": "read_screen",
      "description": ("Read what is on the user's screen right now: the page, its headings, the figures shown, "
-                     "and every button, link, tab and field, each with an id you can point at. Call it before "
-                     "you say anything about the screen, and again whenever the page may have changed.")},
+                     "and every button, link, tab and field, each with an id. Call it before you say anything "
+                     "about the screen, and again whenever the page may have changed.")},
     {"name": "point_at",
-     "description": ("Point at one thing on the screen: the AIBOS sphere moves beside it and rings it, and the "
+     "description": ("Point at one thing on the screen: the AI-BOS sphere moves beside it and rings it, and the "
                      "page scrolls to it. Use an id from the latest read_screen. Say what it is as you point."),
+     "parameters": _ID},
+    {"name": "click",
+     "description": ("Tap a button, link, tab or switch on the screen for the user, when they ask you to (open "
+                     "that, press save, switch it on). Returns the screen after the tap. A button that pays, "
+                     "sends, deletes, signs out or buys is refused until the user has said yes to that exact "
+                     "tap: ask them, then call again with confirmed true."),
      "parameters": {"type": "OBJECT", "properties": {
-         "id": {"type": "STRING", "description": "The id from read_screen, like g12."}},
+         "id": {"type": "STRING", "description": "The id from the latest read_screen."},
+         "confirmed": {"type": "BOOLEAN", "description": "True only after the user said yes to this tap."}},
          "required": ["id"]}},
+    {"name": "type_text",
+     "description": ("Type into a field or text box on the screen for the user (a search, a name, a note, an "
+                     "amount they told you). Never a password or card field. Replaces what is in the field."),
+     "parameters": {"type": "OBJECT", "properties": {
+         "id": {"type": "STRING", "description": "The field's id from the latest read_screen."},
+         "text": {"type": "STRING", "description": "Exactly what to type."}},
+         "required": ["id", "text"]}},
     {"name": "go_to",
-     "description": ("Open a page of AIBOS. Only when the user asks to go there or says yes to it. "
+     "description": ("Open a page of AI-BOS when the user asks to go there or says yes to it. "
                      "Returns what is on the new page."),
      "parameters": {"type": "OBJECT", "properties": {
          "page": {"type": "STRING", "description": "The page's path from the manual, like /dashboard/cash."}},
          "required": ["page"]}},
+    {"name": "ask_aibos",
+     "description": ("Ask the AI-BOS brain: the same AI-BOS as the chat, with the user's own books and every "
+                     "lookup. Use it for ANY question about their figures (sales, cash, who owes, stock, staff, "
+                     "tax), for why AI-BOS works something out the way it does (payroll, PAYE, gratuity, NAPSA, "
+                     "VAT, forecasts), for their report, and to DO work on their books: record a sale or an "
+                     "expense, send a reminder, make an invoice, add a customer. Pass their words. Work that "
+                     "changes the books comes back waiting for their yes."),
+     "parameters": {"type": "OBJECT", "properties": {
+         "request": {"type": "STRING", "description": "The question or the job, in the user's own words."}},
+         "required": ["request"]}},
+    {"name": "answer_job",
+     "description": ("Give the user's answer to the job AI-BOS has waiting (from ask_aibos): yes to do it, no to "
+                     "leave it, or undo to take back the job just done. Only with their own yes, no or undo."),
+     "parameters": {"type": "OBJECT", "properties": {
+         "answer": {"type": "STRING", "enum": ["yes", "no", "undo"], "description": "yes, no or undo."}},
+         "required": ["answer"]}},
     {"name": "aibos_manual",
-     "description": ("Look up how AIBOS works: any page, feature, setting, plan, accessibility option, the "
-                     "AIBOS team, AIBOS auto, Talk, the morning brief or this guide. Use it rather than "
-                     "guessing; AIBOS is new and works its own way."),
+     "description": ("Look up how AI-BOS works: any page, feature, setting, plan, accessibility option, the "
+                     "AI-BOS team, AI-BOS auto, the morning brief, the spoken report or this sphere. Use it "
+                     "rather than guessing; AI-BOS is new and works its own way."),
      "parameters": {"type": "OBJECT", "properties": {
          "topic": {"type": "STRING", "description": "A few words, like 'record a sale' or 'dark mode'."}},
          "required": ["topic"]}},
     {"name": "end_guide",
-     "description": "End the live guide when the user says goodbye, thanks you and is done, or asks you to stop."},
+     "description": "End the conversation when the user says goodbye, thanks you and is done, or asks you to stop."},
 ]}]
 
 
-def instructions(name: str = "", role: str = "owner", plan: str = "Free", now: datetime | None = None) -> str:
+def _rules() -> str:
+    """The payroll rules AI-BOS applies, word for word as the chat has them."""
+    try:
+        import payroll
+        return payroll.rules_for_ai()
+    except Exception:  # noqa: BLE001 - the guide still runs; ask_aibos has them too
+        return ""
+
+
+def instructions(name: str = "", role: str = "owner", plan: str = "Free", now: datetime | None = None,
+                 person: str = "") -> str:
     now = now or datetime.now(timezone.utc)
     day = (now + timedelta(hours=2)).strftime("%A %d %B %Y").replace(" 0", " ")
     who = f"the {role} of {name}" if name else f"the {role} of the business"
-    return f"""You are AIBOS, the guide inside the AIBOS business app, talking out loud with {who}. Their plan is {plan}. Today is {day} in Lusaka.
+    call = f" Their name is {person}; use it now and then, not in every sentence." if person else ""
+    return f"""You are AI-BOS, the business partner inside the AI-BOS app, talking out loud with {who}.{call} Their plan is {plan}. Today is {day} in Lusaka.
 
-Your name is written AIBOS and said "AI boss". Money is in Kwacha; "ngwee" is said "ngwe". Speak plainly and warmly, like a helpful colleague sitting beside them: short sentences, one idea at a time, no jargon, no lists read out. Most answers are one to three sentences. Answer in the language they speak to you in.
+WHO YOU ARE
+Your name is written AI-BOS and always said "AI boss": never spell it out and never say "dash". Money is in Kwacha; "ngwee" is said "ngwe". You are one AI-BOS: the same mind as the chat, the morning brief and the team on Home, so never send them anywhere else for an answer. You are warm, sharp and on their side, like a trusted colleague who knows the business and the app inside out. A little humour is fine; never silly. Speak plainly: short sentences, one idea at a time, no jargon, no lists read out. Most answers are one to three sentences. Answer in the language they speak to you in (English, Nyanja, Bemba or Tonga).
 
-AIBOS is new and works its own way, so nobody knows it yet. Your job is to show them round and explain it while they work:
-- To see their screen, call read_screen. Do it before you say anything about the screen and again when they move. Never guess what is on screen.
-- To show something, call point_at with its id while you say what it is and what it does. Point at one thing at a time.
-- To explain AIBOS itself (a page, feature, setting, plan, accessibility option, the team, AIBOS auto, Talk), call aibos_manual first and answer from it. If the manual does not say, say you are not sure rather than invent it.
-- To take them to another page, ask first or wait until they ask, then call go_to.
-- Figures on the screen are theirs: you may read them out and explain what they mean. Never make figures up.
+Ask good questions. When it helps, ask ONE short question that moves them forward, like "Is that a cash sale or on account?" or "Shall I remind them about the rest too?". Notice what they are doing and teach the quicker way once, like "Next time you can just tell me". Never lecture.
 
-You cannot click, type, record, send or pay, and you must never say you did. Show them where to tap and let them do it. For work on their books (recording a sale, an invoice, a reminder), tell them to use Record, or Talk and Ask AIBOS, where every job waits for their yes.
+WHAT YOU CAN DO
+- See: call read_screen before you talk about the screen and again after anything changes. Never guess what is on it.
+- Show: point_at one thing at a time while you say what it is.
+- Do it for them: when they ask, click buttons, links, tabs and switches, type_text into fields and go_to pages. Say what you are doing in a few words as you do it ("Opening Money now"). After a tap, look at what changed and tell them.
+- Know: for any question about their own figures, about why AI-BOS works something out the way it does, or anything deeper than the screen shows, call ask_aibos with their words, then say its answer in your own spoken words.
+- Their books: to record a sale or an expense, make or send an invoice, send a reminder or add a customer, call ask_aibos with their words. Anything that changes the books comes back waiting for their yes: read it back in one sentence, ask "Shall I?", then answer_job with their answer. Say "done" only after answer_job says it is done. If ask_aibos says recording from the chat is not on their plan, do it on the Record page instead: go_to /dashboard/record, type_text what happened into its box, read back what it shows, and tap its save button only after their yes.
+- The app itself: for any page, feature, setting, plan or accessibility option, call aibos_manual and answer from it.
 
-Begin with one short hello and ask what they would like help with. When they are done, say goodbye in a few words and call end_guide."""
+SAFETY, ALWAYS
+Never move money, pay, send a message, delete, buy a plan or sign out unless they asked for that exact thing and then said yes when you read it back. Such a tap is refused until you call click again with confirmed true after their yes. Never type passwords or card numbers. Never make up a figure: say you will check, and call ask_aibos.
+
+THE SPOKEN REPORT
+When the conversation opens with "(spoken report)", they asked to hear how the business is doing. Call ask_aibos with "Give me my spoken report: how the business is doing today and this month, what needs me, and three or four things you suggest I do next, with figures." Then tell it in about forty seconds: how it is going, the one or two things that need them, and your suggestions as a short plan ("First ..., then ..."). End by asking which one they would like you to start on, and help them do it.
+
+Begin with one short hello and ask what they would like help with, unless the opening says otherwise. When they are done, say goodbye in a few words and call end_guide.
+
+{_rules()}""".rstrip()
 
 
-def setup(name: str = "", role: str = "owner", plan: str = "Free") -> dict:
+def setup(name: str = "", role: str = "owner", plan: str = "Free", voice_name: str | None = None,
+          person: str = "") -> dict:
     """The Live session's setup, exactly as the token locks it and the browser sends it."""
     return {
         "model": f"models/{model()}",
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice()}}},
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice(voice_name)}}},
         },
-        "systemInstruction": {"parts": [{"text": instructions(name, role, plan)}]},
+        "systemInstruction": {"parts": [{"text": instructions(name, role, plan, person=person)}]},
         "tools": TOOLS,
         # Words on screen as captions, both ways (also for people who cannot hear).
         "inputAudioTranscription": {},
@@ -281,22 +358,22 @@ def allowance(db, user_id: str, tier: str, now: datetime | None = None) -> dict:
     if not api_key():
         out.update(available=False, reason="The live guide needs Google's AI, which is not set up yet.")
     elif month_spend(db, now) >= budget_usd():
-        out.update(available=False, reason="The live guide is resting until the 1st. Talk and Ask AIBOS still work.")
+        out.update(available=False, reason="The live guide is resting until the 1st. Talk and Ask AI-BOS still work.")
     elif left < 15:
         out.update(available=False, reason=(f"This month's {minutes} minutes with the live guide are used. "
-                                            "They come back on the 1st. Talk and Ask AIBOS still work."))
+                                            "They come back on the 1st. Talk and Ask AI-BOS still work."))
     return out
 
 
 def start(db, user_id: str, actor: str, tier: str, plan_name: str, name: str, role: str,
-          now: datetime | None = None, post=None) -> dict:
+          now: datetime | None = None, post=None, voice_name: str | None = None, person: str = "") -> dict:
     """Open a guide session: reserve its time, mint its token. The reserved
     time counts until the browser says how long it really ran (finish)."""
     a = allowance(db, user_id, tier, now)
     if not a["available"]:
         raise PermissionError(a["reason"])
     seconds = min(MAX_SESSION_SECONDS, a["seconds_left"])
-    s = setup(name, role, plan_name)
+    s = setup(name, role, plan_name, voice_name, person)
     token = mint(s, seconds, now, post)
     row = {"user_id": user_id, "event": EVENT,
            "meta": {"seconds": seconds, "reserved": True, "actor": actor, "model": model()}}

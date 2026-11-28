@@ -3,7 +3,7 @@ The October 2026 money audit (docs/MONEY_AUDIT_2026-10.md).
 
 Each test pins one defect that could lose, double or misplace money: a client's
 own money (their customers paying them, their payroll), or the money a client
-pays AIBOS for a plan. Every one of these passed the existing suite before the
+pays AI-BOS for a plan. Every one of these passed the existing suite before the
 fix, because each failure needs a write to fail half way, a payment to arrive
 twice, or a rule nobody had checked against ZRA's own table.
 """
@@ -26,7 +26,7 @@ from test_stay_payment_links import _patch_booking, _stay
 
 def _books():
     """A fresh database with the owner's business already made, as on any
-    account that has opened AIBOS once."""
+    account that has opened AI-BOS once."""
     db = _fresh()
     db.rows["profiles"].append({"id": "u1", "business_name": "Zoe's Kitchen", "currency": "ZMW"})
     businesses.resolve_business_id(db, "u1", None, create=True)

@@ -1,7 +1,7 @@
 """
-AIBOS — Invoices: the get-paid loop (audit 2026-07 item #7).
+AI-BOS — Invoices: the get-paid loop (audit 2026-07 item #7).
 
-AIBOS recorded the past; this is the first feature that helps the owner
+AI-BOS recorded the past; this is the first feature that helps the owner
 COLLECT. An invoice is a commitment, not a fact — the facts flow through the
 event spine on exactly the record-bridge discipline Scheduler and Payroll use
 (digital_twin.py already models the accounting):
@@ -16,7 +16,7 @@ trail). Drafts are freely editable.
 
 Sharing is the owner-sends-from-their-own-WhatsApp pattern (lib/automation.ts
 precedent): share_text() renders the message, the frontend opens wa.me with it
-prefilled. AIBOS never messages a customer itself.
+prefilled. AI-BOS never messages a customer itself.
 
 PAYMENT LINKS (migration 0025) close the loop the MVP left open. A sent invoice
 carries an unguessable `pay_token`; that token addresses a public page where the
